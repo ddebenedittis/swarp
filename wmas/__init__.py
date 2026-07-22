@@ -1,0 +1,33 @@
+"""wmas — Warp Multi-Agent Simulator.
+
+GPU-resident, differentiable, vectorized 2D multi-agent simulation on NVIDIA
+Warp with zero-copy PyTorch interop.
+"""
+
+from wmas.core.config import WorldConfig
+from wmas.core.environment import Environment
+from wmas.core.stepper import Stepper
+from wmas.core.world import World
+from wmas.dynamics.base import AgentConfig, ControlMode, DynamicsModel, Integrator
+from wmas.interop.autograd import TorchState, rollout, warp_step
+from wmas.scenarios.base import Scenario
+from wmas.scenarios.navigation import NavigationScenario
+
+__version__ = "0.1.0"
+
+__all__ = [
+    "AgentConfig",
+    "ControlMode",
+    "DynamicsModel",
+    "Environment",
+    "Integrator",
+    "NavigationScenario",
+    "Scenario",
+    "Stepper",
+    "TorchState",
+    "World",
+    "WorldConfig",
+    "rollout",
+    "warp_step",
+    "__version__",
+]
