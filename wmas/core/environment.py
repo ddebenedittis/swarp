@@ -126,5 +126,10 @@ class Environment:
         return obs, reward, done, info
 
     def radius_graph(self) -> torch.Tensor:
-        """COO edge index [2, E] of the current within-radius neighbor graph."""
-        return self.world.edge_index()
+        """COO edge index [2, E] of the current within-radius neighbor graph.
+
+        Reuses the neighbor grid that ``step``/``reset`` already built on the
+        current state (via the scenario's cache refresh), so no rebuild is
+        needed — just the one sync to materialize E.
+        """
+        return self.world.edge_index(rebuild=False)

@@ -141,7 +141,10 @@ def warp_step(stepper: Stepper, state: TorchState, actions: torch.Tensor) -> Tor
     with _torch_stream_scope(stepper.device):
         state_wp, _ = _wrap_input_state(state, scalar, with_grad=False)
         actions_wp, _ = _wrap_actions(actions, scalar, with_grad=False)
-        out_wp = stepper.alloc_state(n_envs)
+        # Recycled ping-pong output (zero steady-state allocation); input and
+        # output never alias. Returned tensors are valid until this batch size
+        # is stepped twice more (documented on Stepper.output_state).
+        out_wp = stepper.output_state(n_envs)
         stepper.launch_substeps(state_wp, actions_wp, out_wp, stepper.cached_buffers(n_envs))
         return TorchState(*(wp.to_torch(a, requires_grad=False) for a in out_wp.arrays()))
 

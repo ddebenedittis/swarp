@@ -100,11 +100,18 @@ class World:
     # -------------------------------------------------------------- neighbors
 
     def neighbors(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """Padded within-radius neighbor lists on the *current* state.
+        """Padded within-radius neighbor lists on the *current* (post-step) state.
 
         Returns zero-copy ``(neighbor_idx [n_envs, n_agents, K] int32,
         neighbor_count [n_envs, n_agents] int32)`` views; they are overwritten
         by the next call, so gather from them within the same step.
+
+        This is a separate build from the stepper's per-substep neighbor lists:
+        those are queried on each *intermediate* (pre-integration) substep state
+        to compute collision forces and are discarded, whereas observations and
+        rewards need neighbors on the final post-step state. The two are
+        genuinely different states, so the build here is not redundant with the
+        force-time queries (it is intentionally recomputed once per step).
         """
         if not self.stepper.collisions:
             raise RuntimeError("neighbor lists require WorldConfig.collisions=True")
@@ -123,7 +130,13 @@ class World:
         their collision forces and counts are truncated). Zero-copy, no sync."""
         return self.stepper.grid(self.n_envs).overflow_view()
 
-    def edge_index(self) -> torch.Tensor:
-        """Radius graph on the current state as COO [2, E] (syncs once for E)."""
-        self.neighbors()
+    def edge_index(self, rebuild: bool = True) -> torch.Tensor:
+        """Radius graph on the current state as COO [2, E] (syncs once for E).
+
+        With ``rebuild=False`` the grid is assumed already built on the current
+        state (e.g. by the scenario's ``post_step``/reset, which both call
+        :meth:`neighbors`) and the redundant rebuild is skipped.
+        """
+        if rebuild:
+            self.neighbors()
         return self.stepper.grid(self.n_envs).edge_index()

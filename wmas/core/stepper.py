@@ -111,6 +111,8 @@ class Stepper:
         self._zero_nbr: dict[int, tuple[wp.array, wp.array]] = {}
         self._grids: dict[int, NeighborGrid] = {}
         self._cached_buffers: dict[int, StepBuffers] = {}
+        self._out_states: dict[int, list[WorldState]] = {}
+        self._out_idx: dict[int, int] = {}
 
     # ------------------------------------------------------------------ setup
 
@@ -248,6 +250,25 @@ class Stepper:
             bufs = self.make_buffers(n_envs, requires_grad=False)
             self._cached_buffers[n_envs] = bufs
         return bufs
+
+    def output_state(self, n_envs: int) -> WorldState:
+        """Ping-pong output buffer for the tape-free hot path (two states cycled
+        per batch size), so steady-state stepping allocates no output arrays —
+        also the fixed buffer a future CUDA-graph capture needs.
+
+        The returned tensors stay valid until this method is called twice more
+        for the same ``n_envs`` (the two-buffer cycle guarantees a step's input
+        and output never alias). The grad path never uses this — it allocates a
+        fresh output per step for tape correctness.
+        """
+        states = self._out_states.get(n_envs)
+        if states is None:
+            states = [self.alloc_state(n_envs), self.alloc_state(n_envs)]
+            self._out_states[n_envs] = states
+            self._out_idx[n_envs] = 0
+        i = self._out_idx[n_envs]
+        self._out_idx[n_envs] = 1 - i
+        return states[i]
 
     # ---------------------------------------------------------------- stepping
 
