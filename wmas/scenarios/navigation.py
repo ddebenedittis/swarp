@@ -97,45 +97,64 @@ class NavigationScenario(Scenario):
             dtype=dtype,
         )
         self._nbr_cache: dict[str, torch.Tensor] | None = None
+        self._prev_dist: torch.Tensor | None = None
         return self.world
 
     def _sample_separated(self, n_envs: int, n_points: int, min_dist: float, tries: int = 16):
-        """Uniform positions with pairwise separation via bounded resampling."""
+        """Uniform positions with pairwise separation via bounded resampling.
+
+        Host-sync-free: runs a fixed ``tries`` iterations with no early-exit
+        ``.any()`` check, so it never forces a device→host round-trip (safe to
+        call inside a masked reset on the step loop).
+        """
         w = self.world
         lim = self.world_size - 2.0 * self.agent_radius
         pos = w.sample_uniform((n_envs, n_points, 2), -lim, lim)
         if n_points == 1:
             return pos
+        eye = torch.eye(n_points, device=w.device, dtype=w.dtype) * 1e9
         for _ in range(tries):
-            d = torch.cdist(pos, pos)
-            d += torch.eye(n_points, device=w.device, dtype=w.dtype) * 1e9
+            d = torch.cdist(pos, pos) + eye
             conflict = (d.min(dim=-1).values < min_dist).unsqueeze(-1)  # [n_envs, n_points, 1]
-            if not conflict.any():
-                break
             resampled = w.sample_uniform((n_envs, n_points, 2), -lim, lim)
             pos = torch.where(conflict, resampled, pos)
         return pos
 
-    def reset_world(self, env_indices: torch.Tensor | None = None) -> None:
+    def reset_world(self, env_mask: torch.Tensor | None = None) -> None:
+        """Reset all envs (``env_mask=None``) or the ``True`` entries of a
+        boolean ``[n_envs]`` mask. Host-sync-free: the full batch is always
+        sampled and blended with ``torch.where`` so no variable-length gather or
+        ``.any()`` is needed."""
         w = self.world
-        if env_indices is None:
-            n = w.n_envs
-            idx = slice(None)
-        else:
-            n = len(env_indices)
-            idx = env_indices
-
+        n = w.n_envs  # always sample full width; blend selected envs with where
         spawn = self._sample_separated(n, self.n_agents, self.min_spawn_separation)
         goals = self._sample_separated(n, self.n_agents, self.min_spawn_separation)
-        w.state.pos.data[idx] = spawn
-        w.state.theta.data[idx] = w.sample_uniform((n, self.n_agents), -torch.pi, torch.pi)
-        w.state.vel.data[idx] = 0.0
-        w.state.speed.data[idx] = 0.0
-        w.state.ang_vel.data[idx] = 0.0
+        theta = w.sample_uniform((n, self.n_agents), -torch.pi, torch.pi)
 
         if w.goals is None:
             w.goals = torch.zeros(w.n_envs, self.n_agents, 2, device=w.device, dtype=w.dtype)
-        w.goals[idx] = goals
+
+        if env_mask is None:
+            w.state.pos.data.copy_(spawn)
+            w.state.theta.data.copy_(theta)
+            w.state.vel.data.zero_()
+            w.state.speed.data.zero_()
+            w.state.ang_vel.data.zero_()
+            w.goals.copy_(goals)
+        else:
+            m3 = env_mask.view(-1, 1, 1)
+            m2 = env_mask.view(-1, 1)
+            zeros_v = torch.zeros_like(w.state.vel.data)
+            w.state.pos.data.copy_(torch.where(m3, spawn, w.state.pos.data))
+            w.state.theta.data.copy_(torch.where(m2, theta, w.state.theta.data))
+            w.state.vel.data.copy_(torch.where(m3, zeros_v, w.state.vel.data))
+            w.state.speed.data.copy_(
+                torch.where(m2, torch.zeros_like(w.state.speed.data), w.state.speed.data)
+            )
+            w.state.ang_vel.data.copy_(
+                torch.where(m2, torch.zeros_like(w.state.ang_vel.data), w.state.ang_vel.data)
+            )
+            w.goals.copy_(torch.where(m3, goals, w.goals))
 
         if self.n_obstacles > 0:
             lim = self.world_size - self.obstacle_radius
@@ -147,24 +166,29 @@ class NavigationScenario(Scenario):
                         (self.n_obstacles,), self.obstacle_radius, device=w.device, dtype=w.dtype
                     ),
                 )
-            w.obstacle_pos[idx] = obs_pos
+            if env_mask is None:
+                w.obstacle_pos.copy_(obs_pos)
+            else:
+                w.obstacle_pos.copy_(torch.where(env_mask.view(-1, 1, 1), obs_pos, w.obstacle_pos))
             w.set_obstacles(w.obstacle_pos, w.obstacle_radius)
 
-        dist = (w.state.pos - w.goals).norm(dim=-1)
-        if not hasattr(self, "_prev_dist") or self._prev_dist is None:
-            self._prev_dist = dist.clone()
-        else:
-            self._prev_dist[idx] = dist[idx]
         self._nbr_cache = None
-        self._refresh_step_cache()
+        self._refresh_step_cache(reset_mask=env_mask)
 
     # ------------------------------------------------------- per-step caching
 
     def post_step(self) -> None:
         self._refresh_step_cache()
 
-    def _refresh_step_cache(self) -> None:
-        """Neighbor features, distances, and reward terms for the current state."""
+    def _refresh_step_cache(self, reset_mask: torch.Tensor | None = None) -> None:
+        """Neighbor features, distances, and reward terms for the current state.
+
+        ``reset_mask`` (a boolean ``[n_envs]`` or ``None``) marks envs that were
+        just reset: their position-shaping baseline is rebased to the fresh
+        spawn distance and their shaping term zeroed, while non-reset envs keep
+        their carried-over baseline. On a normal step (``None``) every env's
+        baseline advances to the current distance. This masked rebase is what
+        keeps a partial/auto reset from clobbering other envs' shaping."""
         w = self.world
         pos, vel = w.state.pos, w.state.vel
         idx, cnt = w.neighbors()
@@ -194,8 +218,19 @@ class NavigationScenario(Scenario):
         rel_vel = (nvel - vel.unsqueeze(2)) * valid[:, :, :k].unsqueeze(-1)
 
         dist_to_goal = (pos - w.goals).norm(dim=-1)
+        if self._prev_dist is None:
+            self._prev_dist = dist_to_goal.detach().clone()
         pos_shaping = (self._prev_dist - dist_to_goal) * self.pos_shaping_factor
-        self._prev_dist = dist_to_goal.detach().clone()
+        if reset_mask is None:
+            self._prev_dist = dist_to_goal.detach().clone()
+        else:
+            # Rebase only reset envs; others keep their continuous baseline.
+            pos_shaping = torch.where(
+                reset_mask.unsqueeze(-1), torch.zeros_like(pos_shaping), pos_shaping
+            )
+            self._prev_dist = torch.where(
+                reset_mask.unsqueeze(-1), dist_to_goal.detach(), self._prev_dist
+            )
 
         self._nbr_cache = {
             "rel_pos": rel_pos,

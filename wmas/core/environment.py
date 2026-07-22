@@ -17,8 +17,11 @@ class Environment:
     under ``torch.no_grad()`` it runs the tape-free hot path with no per-step
     host<->device transfers.
 
-    There is no auto-reset (like raw VMAS): inspect ``done`` and call
-    :meth:`reset` when you want fresh episodes.
+    By default there is no auto-reset (like raw VMAS): inspect ``done`` and call
+    :meth:`reset` or :meth:`reset_at` when you want fresh episodes. Set
+    ``auto_reset=True`` to have :meth:`step` reset done envs in-place via a
+    host-sync-free masked path (no ``.any()``/``.nonzero()`` round-trip), so the
+    whole loop can stay on device.
     """
 
     def __init__(
@@ -31,12 +34,14 @@ class Environment:
         dtype: torch.dtype = torch.float32,
         max_steps: int | None = None,
         seed: int = 0,
+        auto_reset: bool = False,
     ) -> None:
         self.scenario = scenario
         self.n_envs = n_envs
         self.device = device
         self.dtype = dtype
         self.max_steps = max_steps
+        self.auto_reset = auto_reset
         self.world = scenario.make_world(
             n_envs=n_envs, device=device, dt=dt, substeps=substeps, dtype=dtype
         )
@@ -58,6 +63,20 @@ class Environment:
             self.world.state = self.world.zero_state()
             self.scenario.reset_world(None)
         self._step_count.zero_()
+        return self.scenario.observations()
+
+    def reset_at(self, env_mask: torch.Tensor) -> torch.Tensor:
+        """Reset the envs where ``env_mask`` (bool ``[n_envs]``) is True.
+
+        Host-sync-free: the scenario samples the full batch and blends the
+        selected envs with ``torch.where``; unselected envs are untouched.
+        Returns stacked observations for all envs.
+        """
+        with torch.no_grad():
+            self.scenario.reset_world(env_mask)
+        self._step_count = torch.where(
+            env_mask, torch.zeros_like(self._step_count), self._step_count
+        )
         return self.scenario.observations()
 
     def step(
@@ -83,13 +102,25 @@ class Environment:
         self.world.step(actions)
         self.scenario.post_step()
 
-        obs = self.scenario.observations()
+        # Reward/done/info describe the transition just taken (terminal state).
         reward = self.scenario.rewards()
         self._step_count += 1
         done = self.scenario.done()
         if self.max_steps is not None:
             done = done | (self._step_count >= self.max_steps)
-        return obs, reward, done, self.scenario.info()
+        info = self.scenario.info()
+
+        if self.auto_reset:
+            with torch.no_grad():
+                self.scenario.reset_world(done)
+            self._step_count = torch.where(
+                done, torch.zeros_like(self._step_count), self._step_count
+            )
+
+        # Observations reflect the state after any auto-reset (next episode's
+        # first obs for done envs), matching the gym/VMAS vec-env convention.
+        obs = self.scenario.observations()
+        return obs, reward, done, info
 
     def radius_graph(self) -> torch.Tensor:
         """COO edge index [2, E] of the current within-radius neighbor graph."""

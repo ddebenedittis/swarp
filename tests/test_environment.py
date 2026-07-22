@@ -126,6 +126,59 @@ def test_nonholonomic_navigation_smoke(model):
     assert torch.isfinite(obs).all() and torch.isfinite(rew).all()
 
 
+@pytest.mark.parametrize("device", DEVICES)
+def test_reset_at_masked(device):
+    """reset_at zeroes step_count and randomizes only the masked envs."""
+    env = make_env(device, n_envs=4, n_agents=3, world_size=5.0)
+    env.reset(seed=0)
+    for _ in range(3):
+        env.step(0.2 * torch.ones(4, 3, 2, device=device))
+    pos_before = env.world.state.pos.clone()
+    count_before = env._step_count.clone()
+    assert (count_before == 3).all()
+
+    mask = torch.tensor([True, False, True, False], device=device)
+    env.reset_at(mask)
+
+    torch.testing.assert_close(
+        env._step_count, torch.tensor([0, 3, 0, 3], dtype=torch.int32, device=device)
+    )
+    # unreset envs untouched; reset envs moved
+    torch.testing.assert_close(env.world.state.pos[1], pos_before[1])
+    torch.testing.assert_close(env.world.state.pos[3], pos_before[3])
+    assert not torch.equal(env.world.state.pos[0], pos_before[0])
+    assert not torch.equal(env.world.state.pos[2], pos_before[2])
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_auto_reset_on_truncation(device):
+    """auto_reset=True resets done envs in-place; step_count returns to zero."""
+    env = make_env(device, n_envs=3, n_agents=2, max_steps=3, auto_reset=True)
+    env.reset(seed=0)
+    done = None
+    for _ in range(3):
+        _, _, done, _ = env.step(torch.zeros(3, 2, 2, device=device))
+    assert bool(done.all())  # truncated at max_steps
+    assert (env._step_count == 0).all()  # and auto-reset back to zero
+    # keeps running afterwards
+    _, _, done2, _ = env.step(torch.zeros(3, 2, 2, device=device))
+    assert (env._step_count == 1).all()
+
+
+def test_partial_reset_preserves_other_envs_shaping_baseline():
+    """Regression: reset_at must not rebase a non-reset env's _prev_dist."""
+    env = make_env("cpu", n_envs=2, n_agents=2, world_size=5.0)
+    env.reset(seed=0)
+    prev1_before = env.scenario._prev_dist[1].clone()
+    # Move env 1 without refreshing the cache, so its baseline != current dist.
+    with torch.no_grad():
+        env.world.state.pos[1] += 1.0
+    env.reset_at(torch.tensor([True, False]))
+    # env 1 was not reset: its shaping baseline must be exactly preserved
+    # (the old code clobbered _prev_dist for all envs during the reset refresh).
+    torch.testing.assert_close(env.scenario._prev_dist[1], prev1_before)
+
+
 def test_radius_graph_api():
     env = make_env("cpu", n_envs=3, n_agents=4)
     env.reset(seed=0)

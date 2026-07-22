@@ -54,6 +54,17 @@ def test_hot_loop_api_guard(device):
     assert obs.device.type == torch.device(device).type
 
 
+@pytest.mark.parametrize("device", DEVICES)
+def test_reset_no_host_transfer(device):
+    """reset / reset_at must also stay host-sync-free (no .any() in spawn)."""
+    env = make_env(device)
+    env.reset(seed=0)  # warmup (kernel compilation) outside the guard
+    with torch.no_grad(), forbid_host_transfers():
+        env.reset(seed=1)
+        env.reset_at(torch.ones(env.n_envs, dtype=torch.bool, device=device))
+        env.reset_at(torch.zeros(env.n_envs, dtype=torch.bool, device=device))
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_no_memcpy_dtoh_in_profile():
     from torch.profiler import ProfilerActivity, profile

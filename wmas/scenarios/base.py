@@ -37,11 +37,15 @@ class Scenario(ABC):
         """Build and return the World (agents, limits, interaction config)."""
 
     @abstractmethod
-    def reset_world(self, env_indices: torch.Tensor | None = None) -> None:
+    def reset_world(self, env_mask: torch.Tensor | None = None) -> None:
         """(Re)randomize state, goals, and obstacles.
 
-        ``env_indices`` selects a subset of envs (None = all). Called by the
-        Environment under ``torch.no_grad()``; may sync (not on the hot path).
+        ``env_mask`` is either ``None`` (reset every env) or a boolean
+        ``[n_envs]`` tensor selecting which envs to reset; unselected envs are
+        left untouched. Implementations should stay host-sync-free (sample the
+        full batch width and blend with ``torch.where(env_mask, ...)`` rather
+        than gathering a variable number of indices) so masked auto-reset can
+        run inside the step loop without a device→host round-trip.
         """
 
     @abstractmethod
