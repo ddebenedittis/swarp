@@ -17,6 +17,15 @@ dependencies = [
     "numpy>=1.26",
 ]
 
+[project.optional-dependencies]
+# Interactive/headless visualization. Install with `pip install wmas[viz]` or
+# `uv pip install -e '.[viz]'`. Kept out of the core so the simulator stays lean.
+viz = [
+    "pygame-ce>=2.5",
+    "imageio[ffmpeg]>=2.34",
+    "pillow>=10",
+]
+
 [dependency-groups]
 dev = [
     "pytest>=8.0",
