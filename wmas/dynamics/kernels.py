@@ -29,6 +29,7 @@ from wmas.dynamics.base import (
     P_MAX_ANG_VEL,
     P_MAX_SPEED,
     P_MAX_STEER,
+    P_RADIUS,
     AgentParams,
     DynamicsModel,
 )
@@ -60,6 +61,9 @@ def integrate_kernel(
     model_tag: wp.array(dtype=wp.int32),
     ctrl_mode: wp.array(dtype=wp.int32),
     dt: Any,
+    bounds_min: Any,
+    bounds_max: Any,
+    clamp_bounds: wp.int32,
     # state out
     pos_out: wp.array2d(dtype=Any),
     theta_out: wp.array2d(dtype=Any),
@@ -87,11 +91,11 @@ def integrate_kernel(
             acc_vec = clamp_norm(act, params[a, P_MAX_ACCEL])
             v_new = clamp_norm(v + acc_vec * dt, params[a, P_MAX_SPEED])
         v_new = v_new + dv_f
-        pos_out[e, a] = p + v_new * dt
-        theta_out[e, a] = th
-        vel_out[e, a] = v_new
-        speed_out[e, a] = wp.length(v_new)
-        ang_vel_out[e, a] = zero
+        p_new = p + v_new * dt
+        th_new = th
+        v_out = v_new
+        s_out = wp.length(v_new)
+        w_out = zero
     elif tag == TAG_DIFF_DRIVE:
         max_s = params[a, P_MAX_SPEED]
         max_w = params[a, P_MAX_ANG_VEL]
@@ -106,11 +110,11 @@ def integrate_kernel(
             s_new = wp.clamp(s + acc * dt, -max_s, max_s)
             w_new = wp.clamp(w + alp * dt, -max_w, max_w)
         v_trans = type(p)(s_new * wp.cos(th), s_new * wp.sin(th)) + dv_f
-        pos_out[e, a] = p + v_trans * dt
-        theta_out[e, a] = th + w_new * dt
-        vel_out[e, a] = v_trans
-        speed_out[e, a] = s_new
-        ang_vel_out[e, a] = w_new
+        p_new = p + v_trans * dt
+        th_new = th + w_new * dt
+        v_out = v_trans
+        s_out = s_new
+        w_out = w_new
     elif tag == TAG_BICYCLE:
         # Kinematic bicycle with slip angle beta (Polack et al. 2017, eq. 2).
         max_s = params[a, P_MAX_SPEED]
@@ -123,18 +127,31 @@ def integrate_kernel(
         beta = wp.atan(wp.tan(delta) * params[a, P_LR] / wheelbase)
         v_trans = type(p)(s_new * wp.cos(th + beta), s_new * wp.sin(th + beta)) + dv_f
         w_new = s_new / wheelbase * wp.cos(beta) * wp.tan(delta)
-        pos_out[e, a] = p + v_trans * dt
-        theta_out[e, a] = th + w_new * dt
-        vel_out[e, a] = v_trans
-        speed_out[e, a] = s_new
-        ang_vel_out[e, a] = w_new
+        p_new = p + v_trans * dt
+        th_new = th + w_new * dt
+        v_out = v_trans
+        s_out = s_new
+        w_out = w_new
     else:
         # Unknown tag (e.g. future models): hold state.
-        pos_out[e, a] = p
-        theta_out[e, a] = th
-        vel_out[e, a] = v
-        speed_out[e, a] = s
-        ang_vel_out[e, a] = w
+        p_new = p
+        th_new = th
+        v_out = v
+        s_out = s
+        w_out = w
+
+    if clamp_bounds == 1:
+        ra = params[a, P_RADIUS]
+        p_new = type(p)(
+            wp.clamp(p_new[0], bounds_min[0] + ra, bounds_max[0] - ra),
+            wp.clamp(p_new[1], bounds_min[1] + ra, bounds_max[1] - ra),
+        )
+
+    pos_out[e, a] = p_new
+    theta_out[e, a] = th_new
+    vel_out[e, a] = v_out
+    speed_out[e, a] = s_out
+    ang_vel_out[e, a] = w_out
 
 
 def _signature(dtype) -> list:
@@ -145,6 +162,7 @@ def _signature(dtype) -> list:
     return [
         a2v, a2s, a2v, a2s, a2s,  # state in
         a2v, a2v, a2s, a1i, a1i, dtype,  # actions, forces, params, tags, modes, dt
+        vec2, vec2, wp.int32,  # bounds_min, bounds_max, clamp_bounds
         a2v, a2s, a2v, a2s, a2s,  # state out
     ]
 
@@ -160,10 +178,21 @@ def launch_integrate(
     forces: wp.array,
     params: AgentParams,
     dt: float,
+    clamp_bounds: tuple[float, float, float, float] | None = None,
 ) -> None:
-    """Launch one integration sub-step. Functional: never writes to ``state_in``."""
+    """Launch one integration sub-step. Functional: never writes to ``state_in``.
+
+    ``clamp_bounds=(x_min, x_max, y_min, y_max)`` hard-clamps positions inside
+    the rectangle (inset by each agent's radius).
+    """
     dtype = state_in.theta.dtype
+    vec2 = VEC2[dtype]
     n_envs, n_agents = state_in.pos.shape
+    if clamp_bounds is None:
+        b_min, b_max, do_clamp = vec2(0.0, 0.0), vec2(0.0, 0.0), 0
+    else:
+        x_min, x_max, y_min, y_max = clamp_bounds
+        b_min, b_max, do_clamp = vec2(x_min, y_min), vec2(x_max, y_max), 1
     wp.launch(
         integrate_kernel,
         dim=(n_envs, n_agents),
@@ -175,6 +204,9 @@ def launch_integrate(
             params.model_tag,
             params.ctrl_mode,
             dtype(dt),
+            b_min,
+            b_max,
+            wp.int32(do_clamp),
         ],
         outputs=state_out.arrays(),
         device=state_in.pos.device,

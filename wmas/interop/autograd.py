@@ -79,17 +79,16 @@ class _WarpStepFn(torch.autograd.Function):
             state_wp, in_grads = _wrap_input_state(state, scalar, with_grad=True)
             actions_wp, act_grad = _wrap_actions(actions, scalar, with_grad=True)
             out_wp = stepper.alloc_state(n_envs, requires_grad=True)
+            buffers = stepper.make_buffers(n_envs, requires_grad=True)
 
             tape = wp.Tape()
             with tape:
-                stepper.launch_substeps(
-                    state_wp, actions_wp, out_wp,
-                    make_buffer=lambda: stepper.alloc_state(n_envs, requires_grad=True),
-                )
+                stepper.launch_substeps(state_wp, actions_wp, out_wp, buffers)
             out_tensors = tuple(wp.to_torch(a) for a in out_wp.arrays())
 
         ctx.stepper = stepper
         ctx.tape = tape
+        ctx.buffers = buffers
         ctx.scalar = scalar
         ctx.state_wp = state_wp
         ctx.actions_wp = actions_wp
@@ -136,18 +135,7 @@ def warp_step(stepper: Stepper, state: TorchState, actions: torch.Tensor) -> Tor
         state_wp, _ = _wrap_input_state(state, scalar, with_grad=False)
         actions_wp, _ = _wrap_actions(actions, scalar, with_grad=False)
         out_wp = stepper.alloc_state(n_envs)
-        scratch = [stepper.alloc_state(n_envs) for _ in range(min(stepper.substeps - 1, 2))]
-        k = 0
-
-        def recycled() -> WorldState:
-            nonlocal k
-            buf = scratch[k % len(scratch)]
-            k += 1
-            return buf
-
-        stepper.launch_substeps(
-            state_wp, actions_wp, out_wp, make_buffer=recycled if scratch else None
-        )
+        stepper.launch_substeps(state_wp, actions_wp, out_wp, stepper.cached_buffers(n_envs))
         return TorchState(*(wp.to_torch(a, requires_grad=False) for a in out_wp.arrays()))
 
 

@@ -128,6 +128,14 @@ class NeighborGrid:
 
     def build(self, pos: wp.array) -> None:
         """Rebuild the grid from positions [n_envs, n_agents] (vec2) and refresh lists."""
+        self.query_into(pos, self.neighbor_idx, self.neighbor_count)
+
+    def query_into(self, pos: wp.array, neighbor_idx: wp.array, neighbor_count: wp.array) -> None:
+        """Rebuild the grid and write padded lists into caller-owned buffers.
+
+        Launches use ``record_tape=False``: neighbor construction is a discrete,
+        non-differentiable pass and must not be replayed by tape adjoints.
+        """
         dim = (self.n_envs, self.n_agents)
         wp.launch(
             _fill_points,
@@ -135,14 +143,16 @@ class NeighborGrid:
             inputs=[pos, self.dtype(self.z_spacing)],
             outputs=[self._points],
             device=self.device,
+            record_tape=False,
         )
         self._grid.build(self._points, self.radius)
         wp.launch(
             _query_grid,
             dim=dim,
             inputs=[wp.uint64(self._grid.id), self._points, self.dtype(self.radius)],
-            outputs=[self.neighbor_idx, self.neighbor_count],
+            outputs=[neighbor_idx, neighbor_count],
             device=self.device,
+            record_tape=False,
         )
 
     def build_brute_force(self, pos: wp.array) -> None:
@@ -153,6 +163,7 @@ class NeighborGrid:
             inputs=[pos, self.dtype(self.radius)],
             outputs=[self.neighbor_idx, self.neighbor_count],
             device=self.device,
+            record_tape=False,
         )
 
     def torch_views(self) -> tuple[torch.Tensor, torch.Tensor]:
