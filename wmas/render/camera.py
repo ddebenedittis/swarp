@@ -52,3 +52,19 @@ class Camera:
         wx = self.wcx + (s[..., 0] - self.vcx - self.pan_x) / self.scale
         wy = self.wcy - (s[..., 1] - self.vcy - self.pan_y) / self.scale
         return np.stack([wx, wy], axis=-1)
+
+    def pan(self, dx: float, dy: float) -> Camera:
+        """Shift the view by a screen-pixel delta (e.g. a mouse drag)."""
+        self.pan_x += dx
+        self.pan_y += dy
+        return self
+
+    def zoom_at(self, factor: float, screen_point) -> Camera:
+        """Multiply zoom by ``factor``, keeping the world point under ``screen_point`` fixed."""
+        wx, wy = self.screen_to_world(screen_point)
+        self.zoom *= factor
+        sx, sy = float(screen_point[0]), float(screen_point[1])
+        # Solve world_to_screen(w) == screen_point for the new pan at the new scale.
+        self.pan_x = sx - self.vcx - self.scale * (wx - self.wcx)
+        self.pan_y = sy - self.vcy + self.scale * (wy - self.wcy)
+        return self
