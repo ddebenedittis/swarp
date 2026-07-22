@@ -54,10 +54,15 @@ def _wrap_input_state(tensors: TorchState, scalar, with_grad: bool):
 
 
 def _wrap_actions(actions: torch.Tensor, scalar, with_grad: bool):
+    """Wrap ``[n_envs, n_agents, act_dim]`` actions as a scalar ``array3d``.
+
+    Action arity is decoupled from geometry (``vec2``): the integrate kernel
+    reads the scalar slots each model needs, so ``act_dim`` may exceed 2.
+    """
     grad = torch.zeros_like(actions) if with_grad else None
     arr = wp.from_torch(
         actions.contiguous(),
-        dtype=VEC2[scalar],
+        dtype=scalar,
         **({"grad": grad} if with_grad else {"requires_grad": False}),
     )
     return arr, grad

@@ -85,15 +85,18 @@ class Environment:
         """Advance every env by one step.
 
         Args:
-            actions: ``[n_envs, n_agents, 2]`` tensor on the env device.
+            actions: ``[n_envs, n_agents, act_dim]`` tensor on the env device
+                (``act_dim`` = ``world.act_dim``, the max action arity over agent
+                models; 2 for the current 2D vehicle models).
 
         Returns:
             ``(obs [n_envs, n_agents, obs_dim], reward [n_envs, n_agents],
             done [n_envs] bool, info dict)`` — all on the env device.
         """
-        if actions.shape != (self.n_envs, self.n_agents, 2):
+        act_dim = self.world.act_dim
+        if actions.shape != (self.n_envs, self.n_agents, act_dim):
             raise ValueError(
-                f"actions must have shape {(self.n_envs, self.n_agents, 2)}, "
+                f"actions must have shape {(self.n_envs, self.n_agents, act_dim)}, "
                 f"got {tuple(actions.shape)}"
             )
         if actions.dtype != self.dtype:

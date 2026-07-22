@@ -92,7 +92,8 @@ def rollout_warp(cfgs, init, actions_seq, dt, device, dtype=wp.float64):
     out = WorldState.zeros(1, n_agents, dtype=dtype, device=device)
     traj = []
     for actions in actions_seq:
-        acts = wp.array(actions.astype(npdt).reshape(1, n_agents, 2), dtype=vec2, device=device)
+        # actions are now a scalar [n_envs, n_agents, act_dim] array3d (not vec2)
+        acts = wp.array(actions.astype(npdt).reshape(1, n_agents, 2), dtype=dtype, device=device)
         launch_integrate(state, out, acts, forces, params, dt)
         state, out = out, state
         # .numpy() is a zero-copy view on CPU -> copy before the buffer is reused

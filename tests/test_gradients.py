@@ -72,6 +72,33 @@ def test_gradcheck_single_step(name, model, mode):
     assert torch.autograd.gradcheck(fn, (*state, actions), eps=1e-6, atol=1e-5)
 
 
+def test_action_dim_gt_2_ignored_and_gradchecks():
+    """Actions may carry more than 2 slots; models read only slots 0,1, so the
+    extra slot has exactly zero gradient and the step matches the 2-slot case."""
+    cfgs = [AgentConfig(model=DynamicsModel.HOLONOMIC, max_speed=BIG, max_accel=BIG)]
+    stepper = make_stepper(cfgs)
+    state = make_state(1, 1, requires_grad=True, seed=7)
+
+    a2 = 0.3 * torch.randn(1, 1, 2, dtype=torch.float64)
+    a3 = torch.cat([a2, torch.full((1, 1, 1), 5.0, dtype=torch.float64)], dim=-1)
+    out2 = warp_step(stepper, state, a2)
+    out3 = warp_step(stepper, state, a3)
+    # the padded slot must not change the dynamics
+    for x2, x3 in zip(out2, out3, strict=True):
+        torch.testing.assert_close(x2, x3)
+
+    a3 = a3.requires_grad_(True)
+    warp_step(stepper, state, a3).pos.sum().backward()
+    assert a3.grad is not None
+    torch.testing.assert_close(a3.grad[..., 2], torch.zeros(1, 1, dtype=torch.float64))
+
+    def fn(pos, theta, vel, speed, ang_vel, act):
+        return tuple(warp_step(stepper, TorchState(pos, theta, vel, speed, ang_vel), act))
+
+    acts = (0.3 * torch.randn(1, 1, 3, dtype=torch.float64)).requires_grad_(True)
+    assert torch.autograd.gradcheck(fn, (*state, acts), eps=1e-6, atol=1e-5)
+
+
 def test_gradcheck_substeps():
     cfgs = [AgentConfig(model=DynamicsModel.DIFF_DRIVE, max_speed=BIG, max_ang_vel=BIG)]
     stepper = make_stepper(cfgs, substeps=4)

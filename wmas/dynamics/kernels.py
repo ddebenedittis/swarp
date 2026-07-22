@@ -55,7 +55,7 @@ def integrate_kernel(
     speed: wp.array2d(dtype=Any),
     ang_vel: wp.array2d(dtype=Any),
     # inputs
-    actions: wp.array2d(dtype=Any),
+    actions: wp.array3d(dtype=Any),  # [n_envs, n_agents, act_dim] scalar
     forces: wp.array2d(dtype=Any),
     params: wp.array2d(dtype=Any),
     model_tag: wp.array(dtype=wp.int32),
@@ -77,18 +77,22 @@ def integrate_kernel(
     v = vel[e, a]
     s = speed[e, a]
     w = ang_vel[e, a]
-    act = actions[e, a]
+    # Action arity is decoupled from geometry: read the scalar slots each model
+    # needs (all current models use 2). act01 is the 2-vector view of slots 0,1.
+    a0 = actions[e, a, 0]
+    a1 = actions[e, a, 1]
     tag = model_tag[a]
     mode = ctrl_mode[a]
 
     zero = type(dt)(0.0)
     dv_f = forces[e, a] * (dt / params[a, P_MASS])
+    act01 = type(p)(a0, a1)
 
     if tag == TAG_HOLONOMIC:
         if mode == MODE_VELOCITY:
-            v_new = clamp_norm(act, params[a, P_MAX_SPEED])
+            v_new = clamp_norm(act01, params[a, P_MAX_SPEED])
         else:
-            acc_vec = clamp_norm(act, params[a, P_MAX_ACCEL])
+            acc_vec = clamp_norm(act01, params[a, P_MAX_ACCEL])
             v_new = clamp_norm(v + acc_vec * dt, params[a, P_MAX_SPEED])
         v_new = v_new + dv_f
         p_new = p + v_new * dt
@@ -100,13 +104,13 @@ def integrate_kernel(
         max_s = params[a, P_MAX_SPEED]
         max_w = params[a, P_MAX_ANG_VEL]
         if mode == MODE_VELOCITY:
-            s_new = wp.clamp(act[0], -max_s, max_s)
-            w_new = wp.clamp(act[1], -max_w, max_w)
+            s_new = wp.clamp(a0, -max_s, max_s)
+            w_new = wp.clamp(a1, -max_w, max_w)
         else:
             max_a = params[a, P_MAX_ACCEL]
             max_al = params[a, P_MAX_ANG_ACCEL]
-            acc = wp.clamp(act[0], -max_a, max_a)
-            alp = wp.clamp(act[1], -max_al, max_al)
+            acc = wp.clamp(a0, -max_a, max_a)
+            alp = wp.clamp(a1, -max_al, max_al)
             s_new = wp.clamp(s + acc * dt, -max_s, max_s)
             w_new = wp.clamp(w + alp * dt, -max_w, max_w)
         v_trans = type(p)(s_new * wp.cos(th), s_new * wp.sin(th)) + dv_f
@@ -120,8 +124,8 @@ def integrate_kernel(
         max_s = params[a, P_MAX_SPEED]
         max_a = params[a, P_MAX_ACCEL]
         max_d = params[a, P_MAX_STEER]
-        acc = wp.clamp(act[0], -max_a, max_a)
-        delta = wp.clamp(act[1], -max_d, max_d)
+        acc = wp.clamp(a0, -max_a, max_a)
+        delta = wp.clamp(a1, -max_d, max_d)
         s_new = wp.clamp(s + acc * dt, -max_s, max_s)
         wheelbase = params[a, P_LF] + params[a, P_LR]
         beta = wp.atan(wp.tan(delta) * params[a, P_LR] / wheelbase)
@@ -158,6 +162,7 @@ def _signature(dtype) -> list:
     vec2 = VEC2[dtype]
     a2v = wp.array2d(dtype=vec2)
     a2s = wp.array2d(dtype=dtype)
+    a3s = wp.array3d(dtype=dtype)  # actions: [n_envs, n_agents, act_dim] scalar
     a1i = wp.array(dtype=wp.int32)
     return [
         a2v,
@@ -165,7 +170,7 @@ def _signature(dtype) -> list:
         a2v,
         a2s,
         a2s,  # state in
-        a2v,
+        a3s,
         a2v,
         a2s,
         a1i,

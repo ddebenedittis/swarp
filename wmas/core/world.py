@@ -8,7 +8,7 @@ import warp as wp
 from wmas.core.config import WorldConfig
 from wmas.core.state import VEC2
 from wmas.core.stepper import Stepper
-from wmas.dynamics.base import AgentConfig
+from wmas.dynamics.base import AgentConfig, action_dim
 from wmas.interop.autograd import TorchState, warp_step
 
 TORCH_TO_WP = {torch.float32: wp.float32, torch.float64: wp.float64}
@@ -38,6 +38,9 @@ class World:
         self.dtype = dtype
         self.wp_dtype = TORCH_TO_WP[dtype]
         self.agent_configs = agent_configs
+        # Env-level action width: max arity over agent models (models ignore
+        # slots beyond their own). All current 2D vehicle models use 2.
+        self.act_dim = max(action_dim(c.model) for c in agent_configs)
         self.config = world_config
         self.stepper = Stepper(
             agent_configs,

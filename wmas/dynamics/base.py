@@ -19,6 +19,22 @@ class DynamicsModel(IntEnum):
     DRONE = 3  # placeholder, see wmas.dynamics.drone
 
 
+#: Number of scalar action slots each model reads from the action vector. All
+#: current 2D vehicle models use 2; the action array is padded to the env-level
+#: max, and models simply ignore slots beyond their arity (see integrate_kernel).
+MODEL_ACTION_DIM = {
+    "HOLONOMIC": 2,
+    "DIFF_DRIVE": 2,
+    "KINEMATIC_BICYCLE": 2,
+    "DRONE": 4,  # reserved for the 6-DOF drone slot (rotor commands)
+}
+
+
+def action_dim(model: DynamicsModel) -> int:
+    """Action arity for a dynamics model."""
+    return MODEL_ACTION_DIM[model.name]
+
+
 class ControlMode(IntEnum):
     """Interpretation of the 2D action vector.
 
