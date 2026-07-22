@@ -108,6 +108,12 @@ class World:
         grid.build(pos_wp)
         return grid.torch_views()
 
+    def neighbor_overflow(self) -> torch.Tensor:
+        """Bool ``[n_envs, n_agents]`` flagging agents whose in-radius neighbor
+        count exceeded ``max_neighbors`` on the last :meth:`neighbors` build (so
+        their collision forces and counts are truncated). Zero-copy, no sync."""
+        return self.stepper.grid(self.n_envs).overflow_view()
+
     def edge_index(self) -> torch.Tensor:
         """Radius graph on the current state as COO [2, E] (syncs once for E)."""
         self.neighbors()

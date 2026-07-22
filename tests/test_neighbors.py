@@ -80,6 +80,26 @@ def test_max_neighbors_overflow(device):
         assert len(picked) == 2 and a not in picked and picked <= set(range(5))
 
 
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("method", ["brute", "grid"])
+def test_overflow_flag(device, method):
+    """The overflow flag fires exactly where the true count exceeds the cap."""
+    pos_np = np.zeros((1, 5, 2))
+    pos_np[0, :, 0] = np.linspace(0.0, 0.04, 5)  # 5-agent cluster, 4 neighbors each
+    vec2 = wp.vec2f
+    pos = wp.array(pos_np.astype(np.float32), dtype=vec2, device=device)
+
+    grid = NeighborGrid(1, 5, radius=0.5, max_neighbors=2, device=device)
+    getattr(grid, "build_brute_force" if method == "brute" else "build_grid")(pos)
+    # every agent truly sees 4 neighbors, capped to 2 -> overflow everywhere
+    np.testing.assert_array_equal(grid.true_count_view().cpu().numpy(), np.full((1, 5), 4))
+    assert grid.overflow_view().all()
+
+    grid_ok = NeighborGrid(1, 5, radius=0.5, max_neighbors=8, device=device)
+    getattr(grid_ok, "build_brute_force" if method == "brute" else "build_grid")(pos)
+    assert not grid_ok.overflow_view().any()  # room for all 4 -> no overflow
+
+
 def test_float64_grid():
     rng = np.random.default_rng(3)
     pos_np = make_positions(rng, 2, 24)

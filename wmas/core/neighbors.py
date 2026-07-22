@@ -45,20 +45,25 @@ def _query_grid(
     radius: Any,
     neighbor_idx: wp.array3d(dtype=wp.int32),
     neighbor_count: wp.array2d(dtype=wp.int32),
+    neighbor_true: wp.array2d(dtype=wp.int32),
 ):
     e, a = wp.tid()
     n_agents = neighbor_idx.shape[1]
     max_neighbors = neighbor_idx.shape[2]
     i = e * n_agents + a
     p = points[i]
-    count = wp.int32(0)
+    count = wp.int32(0)  # written (capped at max_neighbors)
+    total = wp.int32(0)  # true in-radius count (uncapped)
     query = wp.hash_grid_query(grid_id, p, radius * type(radius)(1.001))
     j = wp.int32(0)
     while wp.hash_grid_query_next(query, j):
-        if j != i and wp.length(points[j] - p) <= radius and count < max_neighbors:
-            neighbor_idx[e, a, count] = j - e * n_agents
-            count += wp.int32(1)
+        if j != i and wp.length(points[j] - p) <= radius:
+            total += wp.int32(1)
+            if count < max_neighbors:
+                neighbor_idx[e, a, count] = j - e * n_agents
+                count += wp.int32(1)
     neighbor_count[e, a] = count
+    neighbor_true[e, a] = total
 
 
 @wp.kernel
@@ -67,17 +72,22 @@ def _brute_force(
     radius: Any,
     neighbor_idx: wp.array3d(dtype=wp.int32),
     neighbor_count: wp.array2d(dtype=wp.int32),
+    neighbor_true: wp.array2d(dtype=wp.int32),
 ):
     e, a = wp.tid()
     n_agents = pos.shape[1]
     max_neighbors = neighbor_idx.shape[2]
     p = pos[e, a]
-    count = wp.int32(0)
+    count = wp.int32(0)  # written (capped at max_neighbors)
+    total = wp.int32(0)  # true in-radius count (uncapped)
     for b in range(n_agents):
-        if b != a and wp.length(pos[e, b] - p) <= radius and count < max_neighbors:
-            neighbor_idx[e, a, count] = b
-            count += wp.int32(1)
+        if b != a and wp.length(pos[e, b] - p) <= radius:
+            total += wp.int32(1)
+            if count < max_neighbors:
+                neighbor_idx[e, a, count] = b
+                count += wp.int32(1)
     neighbor_count[e, a] = count
+    neighbor_true[e, a] = total
 
 
 for _T in (wp.float32, wp.float64):
@@ -90,11 +100,18 @@ for _T in (wp.float32, wp.float64):
             _T,
             wp.array3d(dtype=wp.int32),
             wp.array2d(dtype=wp.int32),
+            wp.array2d(dtype=wp.int32),
         ],
     )
     wp.overload(
         _brute_force,
-        [wp.array2d(dtype=VEC2[_T]), _T, wp.array3d(dtype=wp.int32), wp.array2d(dtype=wp.int32)],
+        [
+            wp.array2d(dtype=VEC2[_T]),
+            _T,
+            wp.array3d(dtype=wp.int32),
+            wp.array2d(dtype=wp.int32),
+            wp.array2d(dtype=wp.int32),
+        ],
     )
 
 
@@ -149,6 +166,11 @@ class NeighborGrid:
             (n_envs, n_agents, max_neighbors), dtype=wp.int32, device=device
         )
         self.neighbor_count = wp.zeros((n_envs, n_agents), dtype=wp.int32, device=device)
+        # True (uncapped) in-radius count per agent; > max_neighbors means the
+        # padded list truncated (collision forces + counts undercount). One
+        # grid-owned buffer shared by every query_into call — it is not taped
+        # and only read after build()/neighbors(), so sharing is safe.
+        self.neighbor_true_count = wp.zeros((n_envs, n_agents), dtype=wp.int32, device=device)
 
     def build(self, pos: wp.array) -> None:
         """Refresh the padded lists from positions [n_envs, n_agents] (vec2)."""
@@ -188,7 +210,7 @@ class NeighborGrid:
             _query_grid,
             dim=dim,
             inputs=[wp.uint64(self._grid.id), self._points, self.dtype(self.radius)],
-            outputs=[neighbor_idx, neighbor_count],
+            outputs=[neighbor_idx, neighbor_count, self.neighbor_true_count],
             device=self.device,
             record_tape=False,
         )
@@ -198,7 +220,7 @@ class NeighborGrid:
             _brute_force,
             dim=(self.n_envs, self.n_agents),
             inputs=[pos, self.dtype(self.radius)],
-            outputs=[neighbor_idx, neighbor_count],
+            outputs=[neighbor_idx, neighbor_count, self.neighbor_true_count],
             device=self.device,
             record_tape=False,
         )
@@ -214,6 +236,17 @@ class NeighborGrid:
     def torch_views(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Zero-copy (neighbor_idx, neighbor_count) torch tensors (no sync)."""
         return wp.to_torch(self.neighbor_idx), wp.to_torch(self.neighbor_count)
+
+    def true_count_view(self) -> torch.Tensor:
+        """Zero-copy true (uncapped) in-radius count ``[n_envs, n_agents]``."""
+        return wp.to_torch(self.neighbor_true_count)
+
+    def overflow_view(self) -> torch.Tensor:
+        """Zero-copy bool ``[n_envs, n_agents]``: agents whose in-radius count
+        exceeded ``max_neighbors`` (their padded list — and thus collision
+        forces/counts — is truncated). Valid after :meth:`build`; no host sync.
+        """
+        return wp.to_torch(self.neighbor_true_count) > wp.to_torch(self.neighbor_count)
 
     def edge_index(self) -> torch.Tensor:
         """Radius graph as COO ``[2, E]`` (sender, receiver) with global node ids

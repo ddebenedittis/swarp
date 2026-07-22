@@ -240,6 +240,8 @@ class NavigationScenario(Scenario):
             "dist_to_goal": dist_to_goal,
             "on_goal": dist_to_goal < self.goal_tolerance,
             "pos_shaping": pos_shaping,
+            # agents whose neighbor list truncated at max_neighbors (undercounted)
+            "neighbor_overflow": w.neighbor_overflow(),
         }
 
     # ------------------------------------------------------------ obs/rewards
@@ -302,4 +304,5 @@ class NavigationScenario(Scenario):
             "dist_to_goal": self._nbr_cache["dist_to_goal"],
             "on_goal": self._nbr_cache["on_goal"],
             "collisions": self._nbr_cache["touching"],
+            "neighbor_overflow": self._nbr_cache["neighbor_overflow"],
         }
