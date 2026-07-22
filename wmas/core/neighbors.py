@@ -97,7 +97,20 @@ for _T in (wp.float32, wp.float64):
 
 
 class NeighborGrid:
-    """Padded within-radius neighbor lists for [n_envs, n_agents] worlds."""
+    """Padded within-radius neighbor lists for [n_envs, n_agents] worlds.
+
+    ``method`` selects the search strategy:
+
+    * ``"brute"`` — per-env O(n_agents²) kernel. Linear in ``n_envs`` with a
+      tiny constant; the fastest choice for the usual multi-agent regime
+      (measured ~300x faster than the grid at 16k envs x 64 agents).
+    * ``"grid"`` — one ``wp.HashGrid`` over all envs via a z-lift. Warp's hash
+      grid wraps *cell coordinates* modulo its dims, so many envs alias into
+      the same cells and query cost grows with ``n_envs``; only worthwhile for
+      very large per-env populations and few envs.
+    * ``"auto"`` (default) — grid only when ``n_agents > 512`` and all env
+      z-slabs fit inside ``grid_dim`` without wrapping; brute otherwise.
+    """
 
     def __init__(
         self,
@@ -108,9 +121,12 @@ class NeighborGrid:
         device: str = "cuda:0",
         dtype=wp.float32,
         grid_dim: int = 128,
+        method: str = "auto",
     ) -> None:
         if radius <= 0.0:
             raise ValueError("radius must be positive")
+        if method not in ("auto", "grid", "brute"):
+            raise ValueError('method must be "auto", "grid", or "brute"')
         self.n_envs = n_envs
         self.n_agents = n_agents
         self.radius = radius
@@ -119,23 +135,43 @@ class NeighborGrid:
         self.dtype = dtype
         # Strictly larger than the (padded) query radius -> no cross-env pairs.
         self.z_spacing = 2.0 * radius
-        self._points = wp.zeros(n_envs * n_agents, dtype=VEC3[dtype], device=device)
-        self._grid = wp.HashGrid(grid_dim, grid_dim, grid_dim, device=device, dtype=dtype)
+        if method == "auto":
+            method = "grid" if (n_agents > 512 and 2 * n_envs <= grid_dim) else "brute"
+        self.method = method
+        self._points: wp.array | None = None
+        self._grid: wp.HashGrid | None = None
+        if method == "grid":
+            self._points = wp.zeros(n_envs * n_agents, dtype=VEC3[dtype], device=device)
+            self._grid = wp.HashGrid(grid_dim, grid_dim, grid_dim, device=device, dtype=dtype)
         self.neighbor_idx = wp.zeros(
             (n_envs, n_agents, max_neighbors), dtype=wp.int32, device=device
         )
         self.neighbor_count = wp.zeros((n_envs, n_agents), dtype=wp.int32, device=device)
 
     def build(self, pos: wp.array) -> None:
-        """Rebuild the grid from positions [n_envs, n_agents] (vec2) and refresh lists."""
+        """Refresh the padded lists from positions [n_envs, n_agents] (vec2)."""
         self.query_into(pos, self.neighbor_idx, self.neighbor_count)
 
     def query_into(self, pos: wp.array, neighbor_idx: wp.array, neighbor_count: wp.array) -> None:
-        """Rebuild the grid and write padded lists into caller-owned buffers.
+        """Write padded lists into caller-owned buffers using the selected method.
 
         Launches use ``record_tape=False``: neighbor construction is a discrete,
         non-differentiable pass and must not be replayed by tape adjoints.
         """
+        if self.method == "grid":
+            self._query_grid_into(pos, neighbor_idx, neighbor_count)
+        else:
+            self._query_brute_into(pos, neighbor_idx, neighbor_count)
+
+    def _ensure_grid(self) -> None:
+        if self._grid is None:
+            self._points = wp.zeros(
+                self.n_envs * self.n_agents, dtype=VEC3[self.dtype], device=self.device
+            )
+            self._grid = wp.HashGrid(128, 128, 128, device=self.device, dtype=self.dtype)
+
+    def _query_grid_into(self, pos, neighbor_idx, neighbor_count) -> None:
+        self._ensure_grid()
         dim = (self.n_envs, self.n_agents)
         wp.launch(
             _fill_points,
@@ -155,16 +191,23 @@ class NeighborGrid:
             record_tape=False,
         )
 
-    def build_brute_force(self, pos: wp.array) -> None:
-        """O(n_agents^2) reference path with identical output format."""
+    def _query_brute_into(self, pos, neighbor_idx, neighbor_count) -> None:
         wp.launch(
             _brute_force,
             dim=(self.n_envs, self.n_agents),
             inputs=[pos, self.dtype(self.radius)],
-            outputs=[self.neighbor_idx, self.neighbor_count],
+            outputs=[neighbor_idx, neighbor_count],
             device=self.device,
             record_tape=False,
         )
+
+    def build_grid(self, pos: wp.array) -> None:
+        """Force the hash-grid path into the internal buffers (used by tests)."""
+        self._query_grid_into(pos, self.neighbor_idx, self.neighbor_count)
+
+    def build_brute_force(self, pos: wp.array) -> None:
+        """Force the O(n_agents^2) reference path into the internal buffers."""
+        self._query_brute_into(pos, self.neighbor_idx, self.neighbor_count)
 
     def torch_views(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Zero-copy (neighbor_idx, neighbor_count) torch tensors (no sync)."""

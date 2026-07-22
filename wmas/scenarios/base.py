@@ -48,6 +48,17 @@ class Scenario(ABC):
     def observation(self, agent_idx: int) -> torch.Tensor:
         """Observation for one agent across all envs: ``[n_envs, obs_dim]``."""
 
+    def observations(self) -> torch.Tensor:
+        """All observations stacked: ``[n_envs, n_agents, obs_dim]``.
+
+        Default stacks :meth:`observation` per agent; override with a fully
+        batched version for large fleets (the per-agent loop costs
+        O(n_agents) small kernel launches).
+        """
+        return torch.stack(
+            [self.observation(i) for i in range(self.world.n_agents)], dim=1
+        )
+
     def agent_reward(self, agent_idx: int) -> torch.Tensor:
         """Per-agent reward term ``[n_envs]``."""
         return torch.zeros(self.world.n_envs, device=self.world.device, dtype=self.world.dtype)
@@ -55,6 +66,13 @@ class Scenario(ABC):
     def global_reward(self) -> torch.Tensor:
         """Reward term shared by every agent of an env: ``[n_envs]``."""
         return torch.zeros(self.world.n_envs, device=self.world.device, dtype=self.world.dtype)
+
+    def rewards(self) -> torch.Tensor:
+        """Total rewards ``[n_envs, n_agents]`` (per-agent + shared terms)."""
+        per_agent = torch.stack(
+            [self.agent_reward(i) for i in range(self.world.n_agents)], dim=1
+        )
+        return per_agent + self.global_reward().unsqueeze(1)
 
     def done(self) -> torch.Tensor:
         """Termination flags ``[n_envs]`` (bool). Default: never."""

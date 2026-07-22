@@ -32,7 +32,7 @@ def build_both(pos_np, radius, max_neighbors, device, dtype=wp.float32):
         n_envs, n_agents, radius=radius, max_neighbors=max_neighbors,
         device=device, dtype=dtype,
     )
-    grid.build(pos)
+    grid.build_grid(pos)  # force the hash-grid path (build() may auto-pick brute)
     g_idx, g_cnt = grid.neighbor_idx.numpy().copy(), grid.neighbor_count.numpy().copy()
 
     grid.build_brute_force(pos)

@@ -23,6 +23,8 @@ class WorldConfig:
             interaction reach ``2 * max_agent_radius + collision_margin``.
             Must not be smaller than that reach when collisions are on.
         max_neighbors: padded neighbor-list width (truncates beyond).
+        neighbor_method: ``"auto"`` | ``"grid"`` | ``"brute"`` — see
+            :class:`wmas.core.neighbors.NeighborGrid`.
         grid_dim: hash-grid bucket dimension per axis.
     """
 
@@ -34,6 +36,7 @@ class WorldConfig:
     bounds_mode: str = "soft"
     neighbor_radius: float | None = None
     max_neighbors: int = 32
+    neighbor_method: str = "auto"
     grid_dim: int = 128
     integrator: Integrator = Integrator.EULER
 

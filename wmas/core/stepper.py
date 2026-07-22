@@ -162,6 +162,7 @@ class Stepper:
                 n_envs, self.n_agents, radius=self.neighbor_radius,
                 max_neighbors=self.world.max_neighbors, device=self.device,
                 dtype=self.dtype, grid_dim=self.world.grid_dim,
+                method=self.world.neighbor_method,
             )
             self._grids[n_envs] = g
         return g

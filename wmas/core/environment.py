@@ -58,7 +58,7 @@ class Environment:
             self.world.state = self.world.zero_state()
             self.scenario.reset_world(None)
         self._step_count.zero_()
-        return self._observations()
+        return self.scenario.observations()
 
     def step(
         self, actions: torch.Tensor
@@ -83,10 +83,8 @@ class Environment:
         self.world.step(actions)
         self.scenario.post_step()
 
-        obs = self._observations()
-        reward = torch.stack(
-            [self.scenario.agent_reward(i) for i in range(self.n_agents)], dim=1
-        ) + self.scenario.global_reward().unsqueeze(1)
+        obs = self.scenario.observations()
+        reward = self.scenario.rewards()
         self._step_count += 1
         done = self.scenario.done()
         if self.max_steps is not None:
@@ -96,10 +94,3 @@ class Environment:
     def radius_graph(self) -> torch.Tensor:
         """COO edge index [2, E] of the current within-radius neighbor graph."""
         return self.world.edge_index()
-
-    # --------------------------------------------------------------- internal
-
-    def _observations(self) -> torch.Tensor:
-        return torch.stack(
-            [self.scenario.observation(i) for i in range(self.n_agents)], dim=1
-        )

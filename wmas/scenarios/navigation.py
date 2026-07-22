@@ -160,24 +160,29 @@ class NavigationScenario(Scenario):
         pos, vel = w.state.pos, w.state.vel
         idx, cnt = w.neighbors()
         idx = idx.long()
-        k = idx.shape[-1]
+        k_all = idx.shape[-1]
         valid = (
-            torch.arange(k, device=w.device).view(1, 1, -1) < cnt.long().unsqueeze(-1)
-        )  # [n_envs, n_agents, k]
-        # gather neighbor positions/velocities: [n_envs, n_agents, k, 2]
+            torch.arange(k_all, device=w.device).view(1, 1, -1) < cnt.long().unsqueeze(-1)
+        )  # [n_envs, n_agents, k_all]
+        # neighbor positions (all slots: needed for touching counts)
         flat = idx.reshape(w.n_envs, -1)
         npos = torch.gather(pos, 1, flat.unsqueeze(-1).expand(-1, -1, 2))
-        npos = npos.view(w.n_envs, w.n_agents, k, 2)
-        nvel = torch.gather(vel, 1, flat.unsqueeze(-1).expand(-1, -1, 2))
-        nvel = nvel.view(w.n_envs, w.n_agents, k, 2)
-        rel_pos = (npos - pos.unsqueeze(2)) * valid.unsqueeze(-1)
-        rel_vel = (nvel - vel.unsqueeze(2)) * valid.unsqueeze(-1)
+        npos = npos.view(w.n_envs, w.n_agents, k_all, 2)
+        rel_pos_all = npos - pos.unsqueeze(2)
 
         # touching pairs -> per-agent collision counts (non-differentiable count)
-        ndist = (npos - pos.unsqueeze(2)).norm(dim=-1)
+        ndist = rel_pos_all.norm(dim=-1)
         r = w.agent_radius  # [n_agents]
         min_dist = r.view(1, -1, 1) + r[idx]  # r_i + r_j
         touching = ((ndist < min_dist) & valid).sum(dim=-1).to(w.dtype)
+
+        # observation features only need the first `neighbor_obs` slots
+        k = min(self.neighbor_obs, k_all)
+        rel_pos = rel_pos_all[:, :, :k] * valid[:, :, :k].unsqueeze(-1)
+        flat_k = idx[:, :, :k].reshape(w.n_envs, -1)
+        nvel = torch.gather(vel, 1, flat_k.unsqueeze(-1).expand(-1, -1, 2))
+        nvel = nvel.view(w.n_envs, w.n_agents, k, 2)
+        rel_vel = (nvel - vel.unsqueeze(2)) * valid[:, :, :k].unsqueeze(-1)
 
         dist_to_goal = (pos - w.goals).norm(dim=-1)
         pos_shaping = (self._prev_dist - dist_to_goal) * self.pos_shaping_factor
@@ -192,28 +197,41 @@ class NavigationScenario(Scenario):
 
     # ------------------------------------------------------------ obs/rewards
 
-    def observation(self, agent_idx: int) -> torch.Tensor:
+    def observations(self) -> torch.Tensor:
+        """Fully batched observations [n_envs, n_agents, obs_dim]."""
         w = self.world
         s = w.state
-        i = agent_idx
         cache = self._nbr_cache
         feats = [
-            s.pos[:, i],
-            s.vel[:, i],
-            torch.cos(s.theta[:, i]).unsqueeze(-1),
-            torch.sin(s.theta[:, i]).unsqueeze(-1),
-            s.ang_vel[:, i].unsqueeze(-1),
-            w.goals[:, i] - s.pos[:, i],
+            s.pos,
+            s.vel,
+            torch.cos(s.theta).unsqueeze(-1),
+            torch.sin(s.theta).unsqueeze(-1),
+            s.ang_vel.unsqueeze(-1),
+            w.goals - s.pos,
         ]
         k = min(self.neighbor_obs, cache["rel_pos"].shape[2])
         if k > 0:
-            n_envs = w.n_envs
+            n_envs, n_agents = w.n_envs, w.n_agents
             feats += [
-                cache["rel_pos"][:, i, :k].reshape(n_envs, -1),
-                cache["rel_vel"][:, i, :k].reshape(n_envs, -1),
-                cache["valid"][:, i, :k].to(w.dtype),
+                cache["rel_pos"][:, :, :k].reshape(n_envs, n_agents, -1),
+                cache["rel_vel"][:, :, :k].reshape(n_envs, n_agents, -1),
+                cache["valid"][:, :, :k].to(w.dtype),
             ]
         return torch.cat(feats, dim=-1)
+
+    def observation(self, agent_idx: int) -> torch.Tensor:
+        return self.observations()[:, agent_idx]
+
+    def rewards(self) -> torch.Tensor:
+        cache = self._nbr_cache
+        rew = self.collision_penalty * cache["touching"]
+        if self.shared_reward:
+            rew = rew + cache["pos_shaping"].sum(dim=-1, keepdim=True)
+        else:
+            rew = rew + cache["pos_shaping"]
+        final = self.final_reward * cache["on_goal"].all(dim=-1).to(self.world.dtype)
+        return rew + final.unsqueeze(-1)
 
     def agent_reward(self, agent_idx: int) -> torch.Tensor:
         cache = self._nbr_cache
