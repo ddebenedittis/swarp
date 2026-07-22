@@ -67,8 +67,11 @@ class NavigationScenario(Scenario):
     def make_world(self, n_envs, device, dt, substeps, dtype) -> World:
         configs = [
             AgentConfig(
-                model=self.model, ctrl_mode=self.ctrl_mode, radius=self.agent_radius,
-                max_speed=self.max_speed, max_accel=2.0 * self.max_speed,
+                model=self.model,
+                ctrl_mode=self.ctrl_mode,
+                radius=self.agent_radius,
+                max_speed=self.max_speed,
+                max_accel=2.0 * self.max_speed,
             )
             for _ in range(self.n_agents)
         ]
@@ -85,8 +88,13 @@ class NavigationScenario(Scenario):
             max_neighbors=min(32, max(4, self.n_agents)),
         )
         self.world = World(
-            configs, world_config, n_envs=n_envs, device=device, dt=dt,
-            substeps=substeps, dtype=dtype,
+            configs,
+            world_config,
+            n_envs=n_envs,
+            device=device,
+            dt=dt,
+            substeps=substeps,
+            dtype=dtype,
         )
         self._nbr_cache: dict[str, torch.Tensor] | None = None
         return self.world
@@ -135,8 +143,9 @@ class NavigationScenario(Scenario):
             if w.obstacle_pos is None:
                 w.set_obstacles(
                     torch.zeros(w.n_envs, self.n_obstacles, 2, device=w.device, dtype=w.dtype),
-                    torch.full((self.n_obstacles,), self.obstacle_radius,
-                               device=w.device, dtype=w.dtype),
+                    torch.full(
+                        (self.n_obstacles,), self.obstacle_radius, device=w.device, dtype=w.dtype
+                    ),
                 )
             w.obstacle_pos[idx] = obs_pos
             w.set_obstacles(w.obstacle_pos, w.obstacle_radius)
@@ -161,8 +170,8 @@ class NavigationScenario(Scenario):
         idx, cnt = w.neighbors()
         idx = idx.long()
         k_all = idx.shape[-1]
-        valid = (
-            torch.arange(k_all, device=w.device).view(1, 1, -1) < cnt.long().unsqueeze(-1)
+        valid = torch.arange(k_all, device=w.device).view(1, 1, -1) < cnt.long().unsqueeze(
+            -1
         )  # [n_envs, n_agents, k_all]
         # neighbor positions (all slots: needed for touching counts)
         flat = idx.reshape(w.n_envs, -1)
@@ -189,8 +198,11 @@ class NavigationScenario(Scenario):
         self._prev_dist = dist_to_goal.detach().clone()
 
         self._nbr_cache = {
-            "rel_pos": rel_pos, "rel_vel": rel_vel, "valid": valid,
-            "touching": touching, "dist_to_goal": dist_to_goal,
+            "rel_pos": rel_pos,
+            "rel_vel": rel_vel,
+            "valid": valid,
+            "touching": touching,
+            "dist_to_goal": dist_to_goal,
             "on_goal": dist_to_goal < self.goal_tolerance,
             "pos_shaping": pos_shaping,
         }

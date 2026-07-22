@@ -49,8 +49,15 @@ MODEL_CASES = [
 def test_gradcheck_single_step(name, model, mode):
     cfgs = [
         AgentConfig(
-            model=model, ctrl_mode=mode, max_speed=BIG, max_accel=BIG,
-            max_ang_vel=BIG, max_ang_accel=BIG, max_steer=1.0, l_f=0.16, l_r=0.14,
+            model=model,
+            ctrl_mode=mode,
+            max_speed=BIG,
+            max_accel=BIG,
+            max_ang_vel=BIG,
+            max_ang_accel=BIG,
+            max_steer=1.0,
+            l_f=0.16,
+            l_r=0.14,
         )
         for _ in range(2)
     ]
@@ -81,8 +88,12 @@ def test_gradcheck_multistep_rollout():
     """BPTT over a 5-step rollout: grads w.r.t. the full action sequence and initial state."""
     cfgs = [
         AgentConfig(
-            model=DynamicsModel.KINEMATIC_BICYCLE, max_speed=BIG, max_accel=BIG,
-            max_steer=1.0, l_f=0.16, l_r=0.14,
+            model=DynamicsModel.KINEMATIC_BICYCLE,
+            max_speed=BIG,
+            max_accel=BIG,
+            max_steer=1.0,
+            l_f=0.16,
+            l_r=0.14,
         ),
         AgentConfig(model=DynamicsModel.DIFF_DRIVE, max_speed=BIG, max_ang_vel=BIG),
     ]
@@ -116,8 +127,14 @@ def test_bptt_analytic_holonomic():
 def test_bptt_analytic_holonomic_accel():
     """Acceleration mode, 2 steps from known state: d x_2 / d a_0x = 2*dt^2."""
     dt = 0.1
-    cfgs = [AgentConfig(model=DynamicsModel.HOLONOMIC, ctrl_mode=ControlMode.ACCELERATION,
-                        max_speed=BIG, max_accel=BIG)]
+    cfgs = [
+        AgentConfig(
+            model=DynamicsModel.HOLONOMIC,
+            ctrl_mode=ControlMode.ACCELERATION,
+            max_speed=BIG,
+            max_accel=BIG,
+        )
+    ]
     stepper = make_stepper(cfgs, dt=dt)
     state = make_state(1, 1, seed=5)
     actions_seq = (0.2 * torch.randn(2, 1, 1, 2, dtype=torch.float64)).requires_grad_(True)
@@ -145,18 +162,27 @@ def test_grads_finite_when_clamped():
 def test_gpu_float32_matches_cpu_float64():
     cfgs = [
         AgentConfig(
-            model=m, max_speed=BIG, max_accel=BIG, max_ang_vel=BIG,
-            max_steer=1.0, l_f=0.16, l_r=0.14,
+            model=m,
+            max_speed=BIG,
+            max_accel=BIG,
+            max_ang_vel=BIG,
+            max_steer=1.0,
+            l_f=0.16,
+            l_r=0.14,
         )
-        for m in (DynamicsModel.HOLONOMIC, DynamicsModel.DIFF_DRIVE,
-                  DynamicsModel.KINEMATIC_BICYCLE)
+        for m in (
+            DynamicsModel.HOLONOMIC,
+            DynamicsModel.DIFF_DRIVE,
+            DynamicsModel.KINEMATIC_BICYCLE,
+        )
     ]
     T = 4
 
     def run(device, tdtype, wdtype):
         stepper = make_stepper(cfgs, substeps=2, device=device, dtype=wdtype)
         state = TorchState(*(t.to(device=device, dtype=tdtype) for t in make_state(3, 3, seed=7)))
-        acts = 0.3 * torch.randn(T, 3, 3, 2, dtype=torch.float64, generator=torch.Generator().manual_seed(8))
+        gen = torch.Generator().manual_seed(8)
+        acts = 0.3 * torch.randn(T, 3, 3, 2, dtype=torch.float64, generator=gen)
         acts = acts.to(device=device, dtype=tdtype).requires_grad_(True)
         final, _ = rollout(stepper, state, acts)
         (final.pos.square().sum() + final.theta.square().sum()).backward()
@@ -175,7 +201,8 @@ def test_no_grad_path_gives_same_forward():
     state = make_state(2, 1, seed=9)
     actions = 0.5 * torch.randn(2, 1, 2, dtype=torch.float64)
 
-    out_grad = warp_step(stepper, TorchState(*(t.clone().requires_grad_(True) for t in state)), actions.clone().requires_grad_(True))
+    grad_state = TorchState(*(t.clone().requires_grad_(True) for t in state))
+    out_grad = warp_step(stepper, grad_state, actions.clone().requires_grad_(True))
     with torch.no_grad():
         out_fast = warp_step(stepper, state, actions)
     for a, b in zip(out_grad, out_fast, strict=True):

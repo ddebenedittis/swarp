@@ -56,7 +56,8 @@ def _wrap_input_state(tensors: TorchState, scalar, with_grad: bool):
 def _wrap_actions(actions: torch.Tensor, scalar, with_grad: bool):
     grad = torch.zeros_like(actions) if with_grad else None
     arr = wp.from_torch(
-        actions.contiguous(), dtype=VEC2[scalar],
+        actions.contiguous(),
+        dtype=VEC2[scalar],
         **({"grad": grad} if with_grad else {"requires_grad": False}),
     )
     return arr, grad
@@ -109,7 +110,8 @@ class _WarpStepFn(torch.autograd.Function):
                 TorchState._fields, ctx.out_wp.arrays(), adj_out, strict=True
             ):
                 seeds[arr] = wp.from_torch(
-                    adj.contiguous(), dtype=_field_wp_dtype(name, ctx.scalar),
+                    adj.contiguous(),
+                    dtype=_field_wp_dtype(name, ctx.scalar),
                     requires_grad=False,
                 )
             ctx.tape.backward(grads=seeds)

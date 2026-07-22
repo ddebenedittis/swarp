@@ -23,8 +23,13 @@ def make_state(pos, vel=None, dtype=torch.float64):
 
 def holo_cfgs(n, radius=0.1, mode=ControlMode.VELOCITY):
     return [
-        AgentConfig(model=DynamicsModel.HOLONOMIC, ctrl_mode=mode, radius=radius,
-                    max_speed=100.0, max_accel=100.0)
+        AgentConfig(
+            model=DynamicsModel.HOLONOMIC,
+            ctrl_mode=mode,
+            radius=radius,
+            max_speed=100.0,
+            max_accel=100.0,
+        )
         for _ in range(n)
     ]
 
@@ -51,8 +56,11 @@ def test_two_agent_spring_damper_analytic():
     k, c, margin, dt = 100.0, 2.0, 0.02, 0.1
     world = WorldConfig(collision_k=k, collision_c=c, collision_margin=margin)
     stepper = Stepper(
-        holo_cfgs(2, mode=ControlMode.ACCELERATION), dt=dt, device="cpu",
-        dtype=wp.float64, world=world,
+        holo_cfgs(2, mode=ControlMode.ACCELERATION),
+        dt=dt,
+        device="cpu",
+        dtype=wp.float64,
+        world=world,
     )
     state = make_state([[0.0, 0.0], [0.15, 0.0]], vel=[[0.5, 0.0], [-0.5, 0.0]])
     actions = torch.zeros(1, 2, 2, dtype=torch.float64)
@@ -71,8 +79,12 @@ def test_momentum_symmetry(device):
     """Equal agents, pure spring: center of mass stays put over many steps."""
     world = WorldConfig(collision_k=50.0, collision_c=0.5, collision_margin=0.05)
     stepper = Stepper(
-        holo_cfgs(4, mode=ControlMode.ACCELERATION), dt=0.05, substeps=2,
-        device=device, dtype=wp.float64, world=world,
+        holo_cfgs(4, mode=ControlMode.ACCELERATION),
+        dt=0.05,
+        substeps=2,
+        device=device,
+        dtype=wp.float64,
+        world=world,
     )
     rng = np.random.default_rng(0)
     pos0 = rng.random((4, 2)) * 0.2  # cramped -> collisions
@@ -108,12 +120,13 @@ def test_obstacle_repulsion_analytic(device):
 def test_soft_wall_analytic():
     k, margin, dt = 100.0, 0.02, 0.1
     world = WorldConfig(
-        collision_k=k, collision_c=0.0, collision_margin=margin,
-        bounds=(-1.0, 1.0, -1.0, 1.0), bounds_mode="soft",
+        collision_k=k,
+        collision_c=0.0,
+        collision_margin=margin,
+        bounds=(-1.0, 1.0, -1.0, 1.0),
+        bounds_mode="soft",
     )
-    stepper = Stepper(
-        holo_cfgs(1, radius=0.05), dt=dt, device="cpu", dtype=wp.float64, world=world
-    )
+    stepper = Stepper(holo_cfgs(1, radius=0.05), dt=dt, device="cpu", dtype=wp.float64, world=world)
     state = make_state([[0.95, 0.0]])
     actions = torch.zeros(1, 1, 2, dtype=torch.float64)
     with torch.no_grad():
@@ -137,7 +150,9 @@ def test_clamp_bounds():
 def test_neighbor_radius_validation():
     with pytest.raises(ValueError, match="neighbor_radius"):
         Stepper(
-            holo_cfgs(2, radius=0.2), dt=0.1, device="cpu",
+            holo_cfgs(2, radius=0.2),
+            dt=0.1,
+            device="cpu",
             world=WorldConfig(neighbor_radius=0.1),
         )
 
@@ -145,18 +160,26 @@ def test_neighbor_radius_validation():
 def test_gradcheck_with_collisions():
     """Full pipeline (neighbors -> forces -> integrate) is differentiable."""
     world = WorldConfig(
-        collision_k=10.0, collision_c=1.0, collision_margin=0.02,
-        bounds=(-1.0, 1.0, -1.0, 1.0), bounds_mode="soft",
+        collision_k=10.0,
+        collision_c=1.0,
+        collision_margin=0.02,
+        bounds=(-1.0, 1.0, -1.0, 1.0),
+        bounds_mode="soft",
     )
     stepper = Stepper(
-        holo_cfgs(2, mode=ControlMode.ACCELERATION), dt=0.1, substeps=2,
-        device="cpu", dtype=wp.float64, world=world,
+        holo_cfgs(2, mode=ControlMode.ACCELERATION),
+        dt=0.1,
+        substeps=2,
+        device="cpu",
+        dtype=wp.float64,
+        world=world,
     )
     # overlapping pair, comfortably inside contact (overlap ~0.04 >> fd eps)
     state = make_state([[0.0, 0.0], [0.18, 0.02]], vel=[[0.1, 0.0], [-0.1, 0.05]])
     state = TorchState(*(t.requires_grad_(True) for t in state))
-    actions = (0.1 * torch.randn(1, 2, 2, dtype=torch.float64,
-                                 generator=torch.Generator().manual_seed(0))).requires_grad_(True)
+    actions = (
+        0.1 * torch.randn(1, 2, 2, dtype=torch.float64, generator=torch.Generator().manual_seed(0))
+    ).requires_grad_(True)
 
     def fn(pos, theta, vel, speed, ang_vel, act):
         return tuple(warp_step(stepper, TorchState(pos, theta, vel, speed, ang_vel), act))
@@ -167,8 +190,12 @@ def test_gradcheck_with_collisions():
 def test_grad_and_nograd_forward_match_with_collisions():
     world = WorldConfig(collision_k=30.0, collision_c=1.0, collision_margin=0.05)
     stepper = Stepper(
-        holo_cfgs(3, mode=ControlMode.ACCELERATION), dt=0.05, substeps=3,
-        device="cpu", dtype=wp.float64, world=world,
+        holo_cfgs(3, mode=ControlMode.ACCELERATION),
+        dt=0.05,
+        substeps=3,
+        device="cpu",
+        dtype=wp.float64,
+        world=world,
     )
     rng = np.random.default_rng(1)
     state = make_state(rng.random((3, 2)) * 0.25)

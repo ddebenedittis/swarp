@@ -128,7 +128,10 @@ class Stepper:
 
     def alloc_state(self, n_envs: int, requires_grad: bool = False) -> WorldState:
         return WorldState.zeros(
-            n_envs, self.n_agents, dtype=self.dtype, device=self.device,
+            n_envs,
+            self.n_agents,
+            dtype=self.dtype,
+            device=self.device,
             requires_grad=requires_grad,
         )
 
@@ -159,9 +162,13 @@ class Stepper:
         g = self._grids.get(n_envs)
         if g is None:
             g = NeighborGrid(
-                n_envs, self.n_agents, radius=self.neighbor_radius,
-                max_neighbors=self.world.max_neighbors, device=self.device,
-                dtype=self.dtype, grid_dim=self.world.grid_dim,
+                n_envs,
+                self.n_agents,
+                radius=self.neighbor_radius,
+                max_neighbors=self.world.max_neighbors,
+                device=self.device,
+                dtype=self.dtype,
+                grid_dim=self.world.grid_dim,
                 method=self.world.neighbor_method,
             )
             self._grids[n_envs] = g
@@ -173,7 +180,9 @@ class Stepper:
         if self._needs_forces:
             forces = [
                 wp.zeros(
-                    (n_envs, self.n_agents), dtype=VEC2[self.dtype], device=self.device,
+                    (n_envs, self.n_agents),
+                    dtype=VEC2[self.dtype],
+                    device=self.device,
                     requires_grad=requires_grad,
                 )
                 for _ in range(self.substeps)
@@ -184,7 +193,8 @@ class Stepper:
             nbr_idx = [
                 wp.zeros(
                     (n_envs, self.n_agents, self.world.max_neighbors),
-                    dtype=wp.int32, device=self.device,
+                    dtype=wp.int32,
+                    device=self.device,
                 )
                 for _ in range(self.substeps)
             ]
@@ -227,13 +237,29 @@ class Stepper:
                 else:
                     idx, cnt = self._zero_neighbors(n_envs)
                 launch_collision_forces(
-                    st.pos, st.vel, self.params, idx, cnt,
-                    self._obs_pos, self._obs_radius, self.n_obstacles,
-                    world.collision_k, world.collision_c, world.collision_margin,
-                    self._soft_walls, self._bounds_min, self._bounds_max,
-                    forces, self.dtype,
+                    st.pos,
+                    st.vel,
+                    self.params,
+                    idx,
+                    cnt,
+                    self._obs_pos,
+                    self._obs_radius,
+                    self.n_obstacles,
+                    world.collision_k,
+                    world.collision_c,
+                    world.collision_margin,
+                    self._soft_walls,
+                    self._bounds_min,
+                    self._bounds_max,
+                    forces,
+                    self.dtype,
                 )
             launch_integrate(
-                st, chain[k + 1], actions, forces, self.params, self.sub_dt,
+                st,
+                chain[k + 1],
+                actions,
+                forces,
+                self.params,
+                self.sub_dt,
                 clamp_bounds=self._clamp_bounds,
             )

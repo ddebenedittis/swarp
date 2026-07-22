@@ -55,10 +55,9 @@ def _query_grid(
     query = wp.hash_grid_query(grid_id, p, radius * type(radius)(1.001))
     j = wp.int32(0)
     while wp.hash_grid_query_next(query, j):
-        if j != i and wp.length(points[j] - p) <= radius:
-            if count < max_neighbors:
-                neighbor_idx[e, a, count] = j - e * n_agents
-                count += wp.int32(1)
+        if j != i and wp.length(points[j] - p) <= radius and count < max_neighbors:
+            neighbor_idx[e, a, count] = j - e * n_agents
+            count += wp.int32(1)
     neighbor_count[e, a] = count
 
 
@@ -75,10 +74,9 @@ def _brute_force(
     p = pos[e, a]
     count = wp.int32(0)
     for b in range(n_agents):
-        if b != a and wp.length(pos[e, b] - p) <= radius:
-            if count < max_neighbors:
-                neighbor_idx[e, a, count] = b
-                count += wp.int32(1)
+        if b != a and wp.length(pos[e, b] - p) <= radius and count < max_neighbors:
+            neighbor_idx[e, a, count] = b
+            count += wp.int32(1)
     neighbor_count[e, a] = count
 
 
@@ -86,13 +84,17 @@ for _T in (wp.float32, wp.float64):
     wp.overload(_fill_points, [wp.array2d(dtype=VEC2[_T]), _T, wp.array(dtype=VEC3[_T])])
     wp.overload(
         _query_grid,
-        [wp.uint64, wp.array(dtype=VEC3[_T]), _T,
-         wp.array3d(dtype=wp.int32), wp.array2d(dtype=wp.int32)],
+        [
+            wp.uint64,
+            wp.array(dtype=VEC3[_T]),
+            _T,
+            wp.array3d(dtype=wp.int32),
+            wp.array2d(dtype=wp.int32),
+        ],
     )
     wp.overload(
         _brute_force,
-        [wp.array2d(dtype=VEC2[_T]), _T,
-         wp.array3d(dtype=wp.int32), wp.array2d(dtype=wp.int32)],
+        [wp.array2d(dtype=VEC2[_T]), _T, wp.array3d(dtype=wp.int32), wp.array2d(dtype=wp.int32)],
     )
 
 
@@ -225,12 +227,9 @@ class NeighborGrid:
         device = idx.device
         ar = torch.arange(self.max_neighbors, device=device)
         mask = ar.view(1, 1, -1) < cnt.long().unsqueeze(-1)  # [E?, valid slots]
-        env_offset = (
-            torch.arange(self.n_envs, device=device).view(-1, 1, 1) * self.n_agents
-        )
+        env_offset = torch.arange(self.n_envs, device=device).view(-1, 1, 1) * self.n_agents
         senders = (idx + env_offset)[mask]
-        receivers = (
-            (torch.arange(self.n_agents, device=device).view(1, -1, 1) + env_offset)
-            .expand(-1, -1, self.max_neighbors)[mask]
-        )
+        receivers = (torch.arange(self.n_agents, device=device).view(1, -1, 1) + env_offset).expand(
+            -1, -1, self.max_neighbors
+        )[mask]
         return torch.stack([senders, receivers], dim=0)

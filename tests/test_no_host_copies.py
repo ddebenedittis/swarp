@@ -70,7 +70,8 @@ def test_no_memcpy_dtoh_in_profile():
                 env.step(actions)
             torch.cuda.synchronize()
     dtoh = [
-        e for e in prof.events()
+        e
+        for e in prof.events()
         if "memcpy" in e.name.lower() and "dtoh" in e.name.lower().replace(" ", "")
     ]
     assert not dtoh, f"found device->host copies: {[e.name for e in dtoh]}"

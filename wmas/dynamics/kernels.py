@@ -160,10 +160,25 @@ def _signature(dtype) -> list:
     a2s = wp.array2d(dtype=dtype)
     a1i = wp.array(dtype=wp.int32)
     return [
-        a2v, a2s, a2v, a2s, a2s,  # state in
-        a2v, a2v, a2s, a1i, a1i, dtype,  # actions, forces, params, tags, modes, dt
-        vec2, vec2, wp.int32,  # bounds_min, bounds_max, clamp_bounds
-        a2v, a2s, a2v, a2s, a2s,  # state out
+        a2v,
+        a2s,
+        a2v,
+        a2s,
+        a2s,  # state in
+        a2v,
+        a2v,
+        a2s,
+        a1i,
+        a1i,
+        dtype,  # actions, forces, params, tags, modes, dt
+        vec2,
+        vec2,
+        wp.int32,  # bounds_min, bounds_max, clamp_bounds
+        a2v,
+        a2s,
+        a2v,
+        a2s,
+        a2s,  # state out
     ]
 
 

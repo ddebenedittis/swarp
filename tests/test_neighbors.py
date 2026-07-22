@@ -13,9 +13,7 @@ DEVICES = ["cpu"] + (["cuda:0"] if torch.cuda.is_available() else [])
 def neighbor_sets(idx: np.ndarray, cnt: np.ndarray) -> list[list[set]]:
     """[n_envs][n_agents] -> set of neighbor indices."""
     n_envs, n_agents, _ = idx.shape
-    return [
-        [set(idx[e, a, : cnt[e, a]].tolist()) for a in range(n_agents)] for e in range(n_envs)
-    ]
+    return [[set(idx[e, a, : cnt[e, a]].tolist()) for a in range(n_agents)] for e in range(n_envs)]
 
 
 def make_positions(rng, n_envs, n_agents, extent=2.0):
@@ -29,8 +27,12 @@ def build_both(pos_np, radius, max_neighbors, device, dtype=wp.float32):
     pos = wp.array(pos_np.astype(npdt), dtype=vec2, device=device)
 
     grid = NeighborGrid(
-        n_envs, n_agents, radius=radius, max_neighbors=max_neighbors,
-        device=device, dtype=dtype,
+        n_envs,
+        n_agents,
+        radius=radius,
+        max_neighbors=max_neighbors,
+        device=device,
+        dtype=dtype,
     )
     grid.build_grid(pos)  # force the hash-grid path (build() may auto-pick brute)
     g_idx, g_cnt = grid.neighbor_idx.numpy().copy(), grid.neighbor_count.numpy().copy()

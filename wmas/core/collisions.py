@@ -62,9 +62,7 @@ def collision_forces_kernel(
 
     for n_i in range(neighbor_count[e, a]):
         b = neighbor_idx[e, a, n_i]
-        f += _pair_force(
-            p - pos[e, b], v - vel[e, b], ra + params[b, P_RADIUS] + margin, k, c
-        )
+        f += _pair_force(p - pos[e, b], v - vel[e, b], ra + params[b, P_RADIUS] + margin, k, c)
 
     for o in range(n_obstacles):
         f += _pair_force(p - obs_pos[e, o], v, ra + obs_radius[o] + margin, k, c)
@@ -93,11 +91,20 @@ def collision_forces_kernel(
 def _signature(dtype) -> list:
     vec2 = VEC2[dtype]
     return [
-        wp.array2d(dtype=vec2), wp.array2d(dtype=vec2), wp.array2d(dtype=dtype),
-        wp.array3d(dtype=wp.int32), wp.array2d(dtype=wp.int32),
-        wp.array2d(dtype=vec2), wp.array(dtype=dtype), wp.int32,
-        dtype, dtype, dtype,
-        wp.int32, vec2, vec2,
+        wp.array2d(dtype=vec2),
+        wp.array2d(dtype=vec2),
+        wp.array2d(dtype=dtype),
+        wp.array3d(dtype=wp.int32),
+        wp.array2d(dtype=wp.int32),
+        wp.array2d(dtype=vec2),
+        wp.array(dtype=dtype),
+        wp.int32,
+        dtype,
+        dtype,
+        dtype,
+        wp.int32,
+        vec2,
+        vec2,
         wp.array2d(dtype=vec2),
     ]
 
@@ -129,11 +136,20 @@ def launch_collision_forces(
         collision_forces_kernel,
         dim=(n_envs, n_agents),
         inputs=[
-            pos, vel, params.floats,
-            neighbor_idx, neighbor_count,
-            obs_pos, obs_radius, wp.int32(n_obstacles),
-            dtype(k), dtype(c), dtype(margin),
-            wp.int32(1 if soft_walls else 0), bounds_min, bounds_max,
+            pos,
+            vel,
+            params.floats,
+            neighbor_idx,
+            neighbor_count,
+            obs_pos,
+            obs_radius,
+            wp.int32(n_obstacles),
+            dtype(k),
+            dtype(c),
+            dtype(margin),
+            wp.int32(1 if soft_walls else 0),
+            bounds_min,
+            bounds_max,
         ],
         outputs=[forces],
         device=pos.device,

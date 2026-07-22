@@ -9,9 +9,19 @@ DEVICES = ["cpu"] + (["cuda:0"] if torch.cuda.is_available() else [])
 
 
 def make_env(device, n_envs=8, n_agents=3, **kw):
-    scenario_kw = {k: kw.pop(k) for k in list(kw) if k in (
-        "model", "n_obstacles", "neighbor_obs", "shared_reward", "world_size", "max_speed",
-    )}
+    scenario_kw = {
+        k: kw.pop(k)
+        for k in list(kw)
+        if k
+        in (
+            "model",
+            "n_obstacles",
+            "neighbor_obs",
+            "shared_reward",
+            "world_size",
+            "max_speed",
+        )
+    }
     scenario = NavigationScenario(n_agents=n_agents, **scenario_kw)
     return Environment(scenario, n_envs=n_envs, device=device, dt=0.1, seed=7, **kw)
 

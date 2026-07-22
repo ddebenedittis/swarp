@@ -40,8 +40,12 @@ class World:
         self.agent_configs = agent_configs
         self.config = world_config
         self.stepper = Stepper(
-            agent_configs, dt=dt, substeps=substeps, device=device,
-            dtype=self.wp_dtype, world=world_config,
+            agent_configs,
+            dt=dt,
+            substeps=substeps,
+            device=device,
+            dtype=self.wp_dtype,
+            world=world_config,
         )
         self.state: TorchState = self.zero_state()
         self.goals: torch.Tensor | None = None  # [n_envs, n_agents, 2]
@@ -60,8 +64,9 @@ class World:
         def z(*shape):
             return torch.zeros(*shape, device=self.device, dtype=self.dtype)
 
-        return TorchState(pos=z(e, a, 2), theta=z(e, a), vel=z(e, a, 2), speed=z(e, a),
-                          ang_vel=z(e, a))
+        return TorchState(
+            pos=z(e, a, 2), theta=z(e, a), vel=z(e, a, 2), speed=z(e, a), ang_vel=z(e, a)
+        )
 
     def step(self, actions: torch.Tensor) -> None:
         """Advance the world one step (differentiable when grads are enabled)."""
@@ -93,7 +98,8 @@ class World:
             raise RuntimeError("neighbor lists require WorldConfig.collisions=True")
         grid = self.stepper.grid(self.n_envs)
         pos_wp = wp.from_torch(
-            self.state.pos.detach().contiguous(), dtype=VEC2[self.wp_dtype],
+            self.state.pos.detach().contiguous(),
+            dtype=VEC2[self.wp_dtype],
             requires_grad=False,
         )
         grid.build(pos_wp)

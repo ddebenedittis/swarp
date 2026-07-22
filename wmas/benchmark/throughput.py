@@ -67,7 +67,9 @@ def main() -> None:
         print("device: cpu (no GPU in use — throughput will be far below GPU numbers)")
     print(f"timed steps per config: {args.steps}\n")
 
-    header = f"{'n_envs':>8} {'n_agents':>9} {'ms/step':>9} {'env-steps/s':>14} {'agent-steps/s':>15}"
+    header = (
+        f"{'n_envs':>8} {'n_agents':>9} {'ms/step':>9} {'env-steps/s':>14} {'agent-steps/s':>15}"
+    )
     print(header)
     print("-" * len(header))
     for n_envs in ENV_COUNTS:

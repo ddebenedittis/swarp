@@ -55,9 +55,7 @@ class Scenario(ABC):
         batched version for large fleets (the per-agent loop costs
         O(n_agents) small kernel launches).
         """
-        return torch.stack(
-            [self.observation(i) for i in range(self.world.n_agents)], dim=1
-        )
+        return torch.stack([self.observation(i) for i in range(self.world.n_agents)], dim=1)
 
     def agent_reward(self, agent_idx: int) -> torch.Tensor:
         """Per-agent reward term ``[n_envs]``."""
@@ -69,9 +67,7 @@ class Scenario(ABC):
 
     def rewards(self) -> torch.Tensor:
         """Total rewards ``[n_envs, n_agents]`` (per-agent + shared terms)."""
-        per_agent = torch.stack(
-            [self.agent_reward(i) for i in range(self.world.n_agents)], dim=1
-        )
+        per_agent = torch.stack([self.agent_reward(i) for i in range(self.world.n_agents)], dim=1)
         return per_agent + self.global_reward().unsqueeze(1)
 
     def done(self) -> torch.Tensor:
@@ -82,5 +78,5 @@ class Scenario(ABC):
         """Extra diagnostics (device tensors preferred)."""
         return {}
 
-    def post_step(self) -> None:
+    def post_step(self) -> None:  # noqa: B027 (optional hook, intentionally empty)
         """Hook called right after the physics step, before obs/rewards."""

@@ -135,9 +135,7 @@ def test_holonomic(device, ctrl_mode):
         np.testing.assert_allclose(traj[t]["vel"][0], ref[t][1], atol=1e-12)
     # holonomic ignores heading
     assert traj[-1]["theta"][0] == 0.0
-    np.testing.assert_allclose(
-        traj[-1]["speed"][0], np.linalg.norm(traj[-1]["vel"][0]), atol=1e-12
-    )
+    np.testing.assert_allclose(traj[-1]["speed"][0], np.linalg.norm(traj[-1]["vel"][0]), atol=1e-12)
 
 
 @pytest.mark.parametrize("device", DEVICES)
@@ -163,8 +161,13 @@ def test_diff_drive(device, ctrl_mode):
     }
     traj = rollout_warp([cfg], init, actions, dt, device)
     ref = ref_diff_drive(
-        init["pos"][0], init["theta"][0], init["speed"][0], init["ang_vel"][0],
-        actions[:, 0], cfg, dt,
+        init["pos"][0],
+        init["theta"][0],
+        init["speed"][0],
+        init["ang_vel"][0],
+        actions[:, 0],
+        cfg,
+        dt,
     )
     for t in range(T):
         np.testing.assert_allclose(traj[t]["pos"][0], ref[t][0], atol=1e-12)
@@ -290,10 +293,17 @@ def test_heterogeneous_fleet(device):
 
     ref_h = ref_holonomic(init["pos"][0], init["vel"][0], actions[:, 0], cfgs[0], dt)
     ref_d = ref_diff_drive(
-        init["pos"][1], init["theta"][1], init["speed"][1], init["ang_vel"][1],
-        actions[:, 1], cfgs[1], dt,
+        init["pos"][1],
+        init["theta"][1],
+        init["speed"][1],
+        init["ang_vel"][1],
+        actions[:, 1],
+        cfgs[1],
+        dt,
     )
-    ref_b = ref_bicycle(init["pos"][2], init["theta"][2], init["speed"][2], actions[:, 2], cfgs[2], dt)
+    ref_b = ref_bicycle(
+        init["pos"][2], init["theta"][2], init["speed"][2], actions[:, 2], cfgs[2], dt
+    )
     np.testing.assert_allclose(traj[-1]["pos"][0], ref_h[-1][0], atol=1e-12)
     np.testing.assert_allclose(traj[-1]["pos"][1], ref_d[-1][0], atol=1e-12)
     np.testing.assert_allclose(traj[-1]["pos"][2], ref_b[-1][0], atol=1e-12)
