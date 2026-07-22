@@ -21,6 +21,11 @@ from wmas.dynamics.base import P_RADIUS, AgentParams
 
 _EPS2 = 1.0e-10  # distance^2 floor: keeps sqrt adjoint finite for coincident points
 
+# Obstacle shape tags (mirror wmas.core.config.ObstacleShape).
+SHAPE_CIRCLE = wp.constant(0)
+SHAPE_BOX = wp.constant(1)
+SHAPE_SEGMENT = wp.constant(2)
+
 
 @wp.func
 def _pair_force(d: Any, rel_v: Any, min_dist: Any, k: Any, c: Any):
@@ -35,6 +40,78 @@ def _pair_force(d: Any, rel_v: Any, min_dist: Any, k: Any, c: Any):
     return f
 
 
+@wp.func
+def _normal_force(n: Any, overlap: Any, rel_v: Any, k: Any, c: Any):
+    """Spring-damper along a precomputed unit normal ``n`` (n points from the
+    surface toward the agent). Used when the normal is known analytically (box
+    SDF) rather than derived from a separation vector."""
+    return (k * overlap) * n - (c * wp.dot(rel_v, n)) * n
+
+
+@wp.func
+def _closest_on_segment(p: Any, center: Any, angle: Any, half_len: Any):
+    """Closest point on a segment core (center, orientation ``angle``, half
+    length ``half_len``) to ``p``. Differentiable (clamp subgradient)."""
+    d = type(p)(wp.cos(angle), wp.sin(angle))
+    t = wp.clamp(wp.dot(p - center, d), -half_len, half_len)
+    return center + t * d
+
+
+@wp.func
+def _box_force(p: Any, v: Any, center: Any, angle: Any, half: Any, reach: Any, k: Any, c: Any):
+    """Contact force from an oriented box using its signed distance field, so
+    an agent whose center penetrates the box is still pushed out (a plain
+    closest-point clamp has a zero-force interior dead-zone).
+
+    ``reach = agent_radius + margin``; contact when the signed distance from the
+    agent center to the box surface drops below ``reach``.
+    """
+    zero = type(k)(0.0)
+    one = type(k)(1.0)
+    ca = wp.cos(angle)
+    sa = wp.sin(angle)
+    d = p - center
+    # rotate into the box frame (R^T d)
+    lx = ca * d[0] + sa * d[1]
+    ly = -sa * d[0] + ca * d[1]
+    qx = wp.abs(lx) - half[0]
+    qy = wp.abs(ly) - half[1]
+    # closest boundary point in the box frame (exterior) via clamp
+    cx = wp.clamp(lx, -half[0], half[0])
+    cy = wp.clamp(ly, -half[1], half[1])
+    ox = lx - cx
+    oy = ly - cy
+    out_d2 = ox * ox + oy * oy
+    if out_d2 > type(k)(_EPS2):
+        # exterior: signed distance is the positive outside distance
+        s = wp.sqrt(out_d2)
+        nlx = ox / s
+        nly = oy / s
+    else:
+        # interior: nearest face determines the (negative) signed distance
+        if qx > qy:
+            s = qx
+            if lx >= zero:
+                nlx = one
+            else:
+                nlx = -one
+            nly = zero
+        else:
+            s = qy
+            nlx = zero
+            if ly >= zero:
+                nly = one
+            else:
+                nly = -one
+    f = type(p)(zero, zero)
+    overlap = reach - s
+    if overlap > zero:
+        # rotate the box-frame normal back to world (R n_local)
+        n = type(p)(ca * nlx - sa * nly, sa * nlx + ca * nly)
+        f = _normal_force(n, overlap, v, k, c)
+    return f
+
+
 @wp.kernel
 def collision_forces_kernel(
     pos: wp.array2d(dtype=Any),
@@ -44,6 +121,9 @@ def collision_forces_kernel(
     neighbor_count: wp.array2d(dtype=wp.int32),
     obs_pos: wp.array2d(dtype=Any),
     obs_radius: wp.array(dtype=Any),
+    obs_type: wp.array(dtype=wp.int32),
+    obs_angle: wp.array(dtype=Any),
+    obs_half: wp.array(dtype=Any),
     n_obstacles: wp.int32,
     k: Any,
     c: Any,
@@ -65,7 +145,16 @@ def collision_forces_kernel(
         f += _pair_force(p - pos[e, b], v - vel[e, b], ra + params[b, P_RADIUS] + margin, k, c)
 
     for o in range(n_obstacles):
-        f += _pair_force(p - obs_pos[e, o], v, ra + obs_radius[o] + margin, k, c)
+        center = obs_pos[e, o]
+        st = obs_type[o]
+        if st == SHAPE_BOX:
+            # box surface is the boundary itself; agent inflated by ra + margin
+            f += _box_force(p, v, center, obs_angle[o], obs_half[o], ra + margin, k, c)
+        elif st == SHAPE_SEGMENT:
+            cp = _closest_on_segment(p, center, obs_angle[o], obs_half[o][0])
+            f += _pair_force(p - cp, v, ra + obs_radius[o] + margin, k, c)
+        else:  # SHAPE_CIRCLE
+            f += _pair_force(p - center, v, ra + obs_radius[o] + margin, k, c)
 
     if soft_walls == 1:
         reach = ra + margin
@@ -98,6 +187,9 @@ def _signature(dtype) -> list:
         wp.array2d(dtype=wp.int32),
         wp.array2d(dtype=vec2),
         wp.array(dtype=dtype),
+        wp.array(dtype=wp.int32),
+        wp.array(dtype=dtype),
+        wp.array(dtype=vec2),
         wp.int32,
         dtype,
         dtype,
@@ -121,6 +213,9 @@ def launch_collision_forces(
     neighbor_count: wp.array,
     obs_pos: wp.array,
     obs_radius: wp.array,
+    obs_type: wp.array,
+    obs_angle: wp.array,
+    obs_half: wp.array,
     n_obstacles: int,
     k: float,
     c: float,
@@ -143,6 +238,9 @@ def launch_collision_forces(
             neighbor_count,
             obs_pos,
             obs_radius,
+            obs_type,
+            obs_angle,
+            obs_half,
             wp.int32(n_obstacles),
             dtype(k),
             dtype(c),

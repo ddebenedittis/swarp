@@ -98,9 +98,14 @@ class Stepper:
             self._bounds_max = vec2(0.0, 0.0)
 
         # Obstacles (static per episode); dummies keep kernel signatures fixed.
+        # obs_pos is per-env [n_envs, n_obs]; shape attributes (type/angle/half)
+        # are env-independent [n_obs]. Default shape is a circle (type 0).
         self.n_obstacles = 0
         self._obs_pos = wp.zeros((1, 1), dtype=vec2, device=device)
         self._obs_radius = wp.zeros(1, dtype=dtype, device=device)
+        self._obs_type = wp.zeros(1, dtype=wp.int32, device=device)
+        self._obs_angle = wp.zeros(1, dtype=dtype, device=device)
+        self._obs_half = wp.zeros(1, dtype=vec2, device=device)
 
         self._zero_forces: dict[int, wp.array] = {}
         self._zero_nbr: dict[int, tuple[wp.array, wp.array]] = {}
@@ -109,17 +114,47 @@ class Stepper:
 
     # ------------------------------------------------------------------ setup
 
-    def set_obstacles(self, pos: torch.Tensor, radius: torch.Tensor) -> None:
-        """Install static circular obstacles.
+    def set_obstacles(
+        self,
+        pos: torch.Tensor,
+        radius: torch.Tensor,
+        shape: torch.Tensor | None = None,
+        angle: torch.Tensor | None = None,
+        half_extents: torch.Tensor | None = None,
+    ) -> None:
+        """Install static obstacles.
 
         Args:
-            pos: ``[n_envs, n_obstacles, 2]`` tensor of centers.
-            radius: ``[n_obstacles]`` tensor of radii.
+            pos: ``[n_envs, n_obstacles, 2]`` tensor of centers (per-env).
+            radius: ``[n_obstacles]`` radii. Circle radius, capsule radius; a box
+                ignores it (its surface is the box boundary).
+            shape: ``[n_obstacles]`` int tensor of :class:`ObstacleShape` tags
+                (0=circle, 1=box, 2=segment). Defaults to all circles.
+            angle: ``[n_obstacles]`` orientation (rad) for box/segment. Default 0.
+            half_extents: ``[n_obstacles, 2]`` box half-extents; for a segment
+                the ``[:, 0]`` column is the half-length. Default 0.
         """
         vec2 = VEC2[self.dtype]
-        self.n_obstacles = pos.shape[1]
+        n_obs = pos.shape[1]
+        self.n_obstacles = n_obs
         self._obs_pos = wp.clone(wp.from_torch(pos.detach().contiguous(), dtype=vec2))
         self._obs_radius = wp.clone(wp.from_torch(radius.detach().contiguous(), dtype=self.dtype))
+
+        dev = self.device
+        if shape is None:
+            self._obs_type = wp.zeros(n_obs, dtype=wp.int32, device=dev)
+        else:
+            self._obs_type = wp.clone(
+                wp.from_torch(shape.detach().to(torch.int32).contiguous(), dtype=wp.int32)
+            )
+        if angle is None:
+            self._obs_angle = wp.zeros(n_obs, dtype=self.dtype, device=dev)
+        else:
+            self._obs_angle = wp.clone(wp.from_torch(angle.detach().contiguous(), dtype=self.dtype))
+        if half_extents is None:
+            self._obs_half = wp.zeros(n_obs, dtype=vec2, device=dev)
+        else:
+            self._obs_half = wp.clone(wp.from_torch(half_extents.detach().contiguous(), dtype=vec2))
         # _needs_forces may have flipped: cached buffers could alias the shared
         # zero-force buffer, which the force pass would then overwrite.
         self._cached_buffers.clear()
@@ -244,6 +279,9 @@ class Stepper:
                     cnt,
                     self._obs_pos,
                     self._obs_radius,
+                    self._obs_type,
+                    self._obs_angle,
+                    self._obs_half,
                     self.n_obstacles,
                     world.collision_k,
                     world.collision_c,

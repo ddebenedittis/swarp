@@ -3,8 +3,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import IntEnum
 
 from wmas.dynamics.base import Integrator
+
+
+class ObstacleShape(IntEnum):
+    """Static obstacle geometry tags (must match wmas.core.collisions SHAPE_*)."""
+
+    CIRCLE = 0
+    BOX = 1
+    SEGMENT = 2
 
 
 @dataclass

@@ -83,10 +83,19 @@ class World:
 
     # -------------------------------------------------------------- obstacles
 
-    def set_obstacles(self, pos: torch.Tensor, radius: torch.Tensor) -> None:
+    def set_obstacles(
+        self,
+        pos: torch.Tensor,
+        radius: torch.Tensor,
+        shape: torch.Tensor | None = None,
+        angle: torch.Tensor | None = None,
+        half_extents: torch.Tensor | None = None,
+    ) -> None:
+        """Install static obstacles (circle/box/segment). See
+        :meth:`wmas.core.stepper.Stepper.set_obstacles` for shape semantics."""
         self.obstacle_pos = pos
         self.obstacle_radius = radius
-        self.stepper.set_obstacles(pos, radius)
+        self.stepper.set_obstacles(pos, radius, shape=shape, angle=angle, half_extents=half_extents)
 
     # -------------------------------------------------------------- neighbors
 

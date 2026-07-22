@@ -4,7 +4,7 @@ GPU-resident, differentiable, vectorized 2D multi-agent simulation on NVIDIA
 Warp with zero-copy PyTorch interop.
 """
 
-from wmas.core.config import WorldConfig
+from wmas.core.config import ObstacleShape, WorldConfig
 from wmas.core.environment import Environment
 from wmas.core.stepper import Stepper
 from wmas.core.world import World
@@ -22,6 +22,7 @@ __all__ = [
     "Environment",
     "Integrator",
     "NavigationScenario",
+    "ObstacleShape",
     "Scenario",
     "Stepper",
     "TorchState",
