@@ -37,6 +37,13 @@ but compiled as Warp kernels instead of PyTorch tensor ops.
   `act_dim` is the max over agent models (2 for the current 2D vehicles); models read
   only the slots they use, so a wider action space (e.g. a future drone) drops in without
   touching the geometry.
+- **Per-env parameter randomization** — agent params (mass, radius, speed/accel limits,
+  wheelbase, …) are shared across envs by default (`[n_agents, P]`), the zero-overhead
+  fast path. Opt in to domain randomization by handing
+  `Stepper.set_agent_params_per_env` a `[n_envs, n_agents, P]` tensor (start from
+  `per_env_float_template`); dedicated per-env kernel variants then index `params[e, a]`.
+  The dynamics recurrence is shared with the default kernel, so both stay in lock-step;
+  measured overhead on the hot path is ~2% in the mid band and within noise elsewhere.
 
 ## Install
 
@@ -233,15 +240,13 @@ for now:
   `balance`) need a rigid-body model that isn't built yet.
 - **Rendering** — no viewer; inspect state tensors / plot yourself.
 - **Discrete or communication action spaces** — actions are continuous real vectors.
-- **Per-env parameter randomization** — agent params are shared across envs
-  (`[n_agents, P]`); domain randomization (`[n_envs, n_agents, P]`) is deferred.
 
 ## Roadmap
 
 Done recently: box/segment static collision geometry; arbitrary action arity; host-sync-
-free masked/auto reset; allocation-free no-grad hot path.
+free masked/auto reset; allocation-free no-grad hot path; per-env parameter randomization.
 
 Next: TorchRL wrapper and circle-compatible VMAS scenario ports (sampling, discovery,
 flocking, formation); 6-DOF drone dynamics; lidar-style sensors; RK4 integrator; a
 batched uniform-grid neighbor backend (radix-sort based) for huge per-env populations;
-then per-env parameter randomization and movable rigid-body payloads for transport/balance.
+then movable rigid-body payloads for transport/balance.

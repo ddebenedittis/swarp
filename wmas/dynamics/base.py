@@ -111,11 +111,20 @@ class AgentConfig:
 
 @dataclass
 class AgentParams:
-    """Device-resident per-agent parameters shared by all envs."""
+    """Device-resident per-agent parameters.
+
+    ``floats`` is the shared ``[n_agents, NUM_PARAMS]`` layout used by all envs
+    (the default fast path). ``floats_per_env`` is an opt-in
+    ``[n_envs, n_agents, NUM_PARAMS]`` override for domain randomization; when it
+    is not ``None`` the stepper launches the per-env kernel variants that index
+    ``params[e, a, ...]`` instead of ``params[a, ...]``. ``model_tag``/
+    ``ctrl_mode`` stay per-agent (structural, never randomized).
+    """
 
     floats: wp.array  # [n_agents, NUM_PARAMS], dtype float32/float64
     model_tag: wp.array  # [n_agents], int32
     ctrl_mode: wp.array  # [n_agents], int32
+    floats_per_env: wp.array | None = None  # [n_envs, n_agents, NUM_PARAMS] or None
 
 
 def build_agent_params(
@@ -133,3 +142,14 @@ def build_agent_params(
         model_tag=wp.array(tags, dtype=wp.int32, device=device),
         ctrl_mode=wp.array(modes, dtype=wp.int32, device=device),
     )
+
+
+def per_env_float_template(configs: list[AgentConfig], n_envs: int) -> np.ndarray:
+    """A ``[n_envs, n_agents, NUM_PARAMS]`` float64 array pre-filled from ``configs``.
+
+    Every env starts as a copy of the shared per-agent rows; edit columns (e.g.
+    ``[..., P_MASS]``) to randomize, then hand the result to
+    :meth:`wmas.core.stepper.Stepper.set_agent_params_per_env`.
+    """
+    rows = np.array([c.to_row() for c in configs], dtype=np.float64)
+    return np.broadcast_to(rows, (n_envs, *rows.shape)).copy()
