@@ -18,6 +18,7 @@ from wmas.dynamics.base import (
 from wmas.interop.autograd import TorchState, rollout, warp_step
 from wmas.scenarios.base import Scenario
 from wmas.scenarios.navigation import NavigationScenario
+from wmas.sensors.lidar import Lidar, lidar_scan
 
 __version__ = "0.1.0"
 
@@ -27,6 +28,7 @@ __all__ = [
     "DynamicsModel",
     "Environment",
     "Integrator",
+    "Lidar",
     "NavigationScenario",
     "ObstacleShape",
     "Scenario",
@@ -34,6 +36,7 @@ __all__ = [
     "TorchState",
     "World",
     "WorldConfig",
+    "lidar_scan",
     "per_env_float_template",
     "rollout",
     "warp_step",

@@ -210,9 +210,10 @@ more.
 
 ```
 wmas/core        state, stepper (substep pipeline), neighbors, collisions, world, environment
-wmas/dynamics    model tags/configs, unified integrate kernel, drone placeholder
+wmas/dynamics    model tags/configs, unified integrate kernel (2D vehicles + drone)
 wmas/interop     torch.autograd.Function bridge + BPTT rollout
 wmas/scenarios   Scenario ABC + NavigationScenario
+wmas/sensors     opt-in differentiable observation sensors (lidar)
 wmas/benchmark   throughput script
 ```
 
@@ -253,6 +254,9 @@ at 4k on an RTX 3070); a **6-DOF quadrotor drone** model (quaternion attitude in
 differentiable step; the state SoA grew to carry altitude/vertical-velocity/attitude/body-
 rate fields that the 2D models pass through, ~9% latency cost at tiny per-env batches).
 
+a **lidar sensor** (`wmas.Lidar`): a differentiable, vectorized ray-cast returning per-ray
+ranges against circular agents/obstacles, opt-in as an observation component a scenario
+concatenates.
+
 Next: TorchRL wrapper and circle-compatible VMAS scenario ports (sampling, discovery,
-flocking, formation); lidar-style sensors; then movable rigid-body payloads for
-transport/balance.
+flocking, formation); then movable rigid-body payloads for transport/balance.
