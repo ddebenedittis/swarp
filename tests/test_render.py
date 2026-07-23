@@ -1,7 +1,5 @@
 """Visualization: geometry extraction, camera, renderer, video (headless)."""
 
-import os
-
 import numpy as np
 import pytest
 import torch
@@ -150,17 +148,19 @@ def test_render_frame_lidar_overlay_is_noop_without_data():
 # ------------------------------------------------------------------ video
 
 
-def test_frames_to_video_gif_roundtrips_frame_count(tmp_path):
+@pytest.mark.skipif(not _ffmpeg_available(), reason="imageio-ffmpeg not installed")
+def test_frames_to_video_mp4_roundtrips_frame_count(tmp_path):
     import imageio.v2 as imageio
 
-    frames = [np.full((30, 40, 3), fill, dtype=np.uint8) for fill in (10, 90, 170, 250)]
-    out = frames_to_video(frames, tmp_path / "clip.gif", fps=10)
+    frames = [np.full((32, 48, 3), fill, dtype=np.uint8) for fill in (10, 90, 170, 250)]
+    out = frames_to_video(frames, tmp_path / "clip.mp4", fps=10)
     read = imageio.mimread(out)
     assert len(read) == 4
-    assert read[0].shape[:2] == (30, 40)
+    assert read[0].shape[:2] == (32, 48)
 
 
-def test_save_video_gif_has_one_frame_per_step(tmp_path):
+@pytest.mark.skipif(not _ffmpeg_available(), reason="imageio-ffmpeg not installed")
+def test_save_video_webm_has_one_frame_per_step(tmp_path):
     import imageio.v2 as imageio
 
     env, _ = make_env(n_agents=3)
@@ -169,14 +169,12 @@ def test_save_video_gif_has_one_frame_per_step(tmp_path):
         return 0.6 * torch.ones(env.n_envs, env.n_agents, env.world.act_dim, dtype=env.dtype)
 
     out = save_video(
-        env, tmp_path / "roll.gif", action_fn=policy, n_steps=6, size=(100, 100), fps=10
+        env, tmp_path / "roll.webm", action_fn=policy, n_steps=6, size=(120, 120), fps=10
     )
     assert len(imageio.mimread(out)) == 6
 
 
-@pytest.mark.skipif(not _ffmpeg_available(), reason="imageio-ffmpeg not installed")
-def test_save_video_writes_nonempty_mp4(tmp_path):
-    env, _ = make_env(n_agents=3)
-    out = save_video(env, tmp_path / "roll.mp4", n_steps=5, size=(120, 120), fps=10)
-    assert os.path.exists(out)
-    assert os.path.getsize(out) > 0
+def test_save_video_rejects_gif(tmp_path):
+    env, _ = make_env(n_agents=2)
+    with pytest.raises(ValueError, match="mp4|webm"):
+        save_video(env, tmp_path / "roll.gif", n_steps=1, size=(80, 80))

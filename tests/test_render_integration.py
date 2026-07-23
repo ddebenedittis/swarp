@@ -87,13 +87,23 @@ def test_to_html5_video_embeds_mp4():
 # -------------------------------------------------------------------- demo
 
 
+def _ffmpeg_available() -> bool:
+    try:
+        import imageio_ffmpeg  # noqa: F401
+
+        return True
+    except Exception:
+        return False
+
+
+@pytest.mark.skipif(not _ffmpeg_available(), reason="imageio-ffmpeg not installed")
 def test_demo_save_path_writes_file(tmp_path):
     from wmas.render.demo import main
 
     out = main(
         [
             "--save",
-            str(tmp_path / "demo.gif"),
+            str(tmp_path / "demo.mp4"),
             "--steps",
             "4",
             "--size",

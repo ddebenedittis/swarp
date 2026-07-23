@@ -2,7 +2,7 @@
 
 With no ``--save`` it opens the interactive window (pan/zoom, toggle overlays with the
 per-overlay keys, ``[`` / ``]`` to switch env, drag an agent, right-click to move its goal,
-space to pause). With ``--save PATH`` it renders a rollout to a video/gif headlessly.
+space to pause). With ``--save PATH`` it renders a rollout to a video (.mp4/.webm) headlessly.
 """
 
 from __future__ import annotations
@@ -34,7 +34,9 @@ def goal_seeking_policy(env: Environment):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="wmas viewer demo")
-    parser.add_argument("--save", default=None, help="write a video/gif here instead of a window")
+    parser.add_argument(
+        "--save", default=None, help="write a video (.mp4 or .webm) here instead of a window"
+    )
     parser.add_argument("--steps", type=int, default=200)
     parser.add_argument("--envs", type=int, default=4)
     parser.add_argument("--agents", type=int, default=5)

@@ -38,7 +38,7 @@ but compiled as Warp kernels instead of PyTorch tensor ops.
   only the slots they use, so a wider action space (e.g. a future drone) drops in without
   touching the geometry.
 - **Interactive viewer** (optional `viz` extra) — a pygame renderer with headless frames,
-  gif/mp4 export, notebook embedding, a batch mosaic, live overlay toggles, and light
+  mp4/webm export, notebook embedding, a batch mosaic, live overlay toggles, and light
   write-back (drag an agent, right-click to move its goal). See [Visualization](#visualization).
 
 ## Install
@@ -154,7 +154,7 @@ from wmas.render import Viewer, save_video
 env = Environment(NavigationScenario(n_agents=5, n_obstacles=2), n_envs=16, device="cpu")
 env.reset()
 
-# Headless: an (H, W, 3) uint8 frame, or a rollout to gif/mp4 (chosen by extension).
+# Headless: an (H, W, 3) uint8 frame, or a rollout to mp4/webm (by extension).
 frame = env.render(mode="rgb_array", env_index=0)   # VMAS-compatible signature
 save_video(env, "nav.mp4", n_steps=200)             # pass action_fn=policy to drive it
 
@@ -168,7 +168,7 @@ per frame. Try it straight away:
 ```bash
 python -m wmas.render.demo               # interactive window (goal-seeking demo policy)
 python -m wmas.render.demo --mosaic      # grid of all envs + a focus pane
-python -m wmas.render.demo --save nav.gif --steps 200
+python -m wmas.render.demo --save nav.webm --steps 200
 ```
 
 **Controls** — wheel zoom, middle-drag pan, hover an agent to inspect it, `[` / `]` to step
@@ -286,7 +286,7 @@ for now:
 
 ## Roadmap
 
-Done recently: interactive pygame viewer (headless frames, gif/mp4 export, mosaic view,
+Done recently: interactive pygame viewer (headless frames, mp4/webm export, mosaic view,
 live overlay toggles, drag/goal write-back); box/segment static collision geometry;
 arbitrary action arity; host-sync-free masked/auto reset; allocation-free no-grad hot path.
 

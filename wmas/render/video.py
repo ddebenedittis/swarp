@@ -1,8 +1,8 @@
-"""Frame sequences -> video/gif, and one-call rollout recording.
+"""Frame sequences -> video, and one-call rollout recording.
 
-Uses imageio's streaming writer, so frames are encoded as they are produced (no need to
-hold a whole episode in memory). The container is chosen from the file extension: ``.mp4``
-(and friends) via the bundled ffmpeg, ``.gif`` via pillow.
+Uses imageio's streaming writer (bundled ffmpeg), so frames are encoded as they are produced
+(no need to hold a whole episode in memory). Only real video containers are supported —
+``.mp4`` (H.264) and ``.webm`` (VP9); ``.gif`` is intentionally rejected.
 """
 
 from __future__ import annotations
@@ -17,18 +17,26 @@ from wmas.render.geometry import extract_geometry
 from wmas.render.renderer import render_frame
 from wmas.render.style import Style
 
+# Only real video containers — gif is intentionally unsupported. webm needs an explicit
+# VP9 codec (ffmpeg's default libx264 is invalid in a webm container).
+_VIDEO_CODECS = {".mp4": "libx264", ".webm": "libvpx-vp9"}
+
 
 def _open_writer(path, fps: int):
     import imageio.v2 as imageio
 
-    if Path(path).suffix.lower() == ".gif":
-        # pillow's gif writer wants per-frame duration in ms, not fps; loop=0 => forever.
-        return imageio.get_writer(str(path), duration=1000.0 / fps, loop=0)
-    return imageio.get_writer(str(path), fps=fps)
+    suffix = Path(path).suffix.lower()
+    codec = _VIDEO_CODECS.get(suffix)
+    if codec is None:
+        raise ValueError(
+            f"unsupported video extension {suffix or '(none)'!r}; "
+            "wmas writes .mp4 (H.264) or .webm (VP9) only"
+        )
+    return imageio.get_writer(str(path), fps=fps, codec=codec)
 
 
 def frames_to_video(frames, path, fps: int = 30) -> str:
-    """Write an iterable of ``(H, W, 3)`` uint8 frames to ``path`` (mp4/gif by extension)."""
+    """Write an iterable of ``(H, W, 3)`` uint8 frames to ``path`` (.mp4 or .webm)."""
     writer = _open_writer(path, fps)
     n = 0
     try:
@@ -94,8 +102,8 @@ def save_video(
 ) -> str:
     """Roll ``env`` forward ``n_steps`` and stream one rendered frame per step to ``path``.
 
-    Container is chosen by extension (mp4 via ffmpeg, gif via pillow). Only env ``env_index``
-    is rendered. See :func:`iter_rollout_frames` for the rollout semantics.
+    ``path`` must end in ``.mp4`` (H.264) or ``.webm`` (VP9). Only env ``env_index`` is
+    rendered. See :func:`iter_rollout_frames` for the rollout semantics.
     """
     writer = _open_writer(path, fps)
     try:
