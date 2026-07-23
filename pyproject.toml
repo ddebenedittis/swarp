@@ -37,6 +37,18 @@ dev = [
 bench = [
     "vmas>=1.5",
 ]
+# Cross-simulator throughput benchmark (wmas/benchmark/compare_sims.py). JaxMARL
+# and CAMAR are JAX-based and want recent numpy, so they CANNOT share the `bench`
+# venv (vmas pins numpy < 2). Each is installed into its own Python 3.12 venv and
+# the orchestrator drives one subprocess per simulator with that venv's
+# interpreter (see `--python SIM=PATH`). Kept as two groups because jaxmarl and
+# camar may pin conflicting jax versions; collapse into one venv if they resolve.
+bench-jaxmarl = [
+    "jaxmarl",
+]
+bench-camar = [
+    "camar[cuda12]",
+]
 # TorchRL EnvBase wrapper (wmas/interop/torchrl.py). Optional: the core install
 # stays lean and only depends on warp + torch + numpy.
 torchrl = [

@@ -2,8 +2,9 @@
 __pycache__/
 *.py[cod]
 
-# Virtual environments
+# Virtual environments (compare_sims.py uses per-simulator venvs: .venv-jaxmarl, .venv-camar)
 .venv/
+.venv-*/
 
 # Packaging / build
 build/
