@@ -103,27 +103,34 @@ def make_jax_runner(
     _, state0 = reset_v(random.split(rk, n_envs))
 
     def one_step(carry, _):
-        state, k = carry
+        state, k, acc = carry
         k, ak, sk = random.split(k, 3)
         actions = sample_actions(ak, n_envs)
-        _, state, _, _, _ = step_v(random.split(sk, n_envs), state, actions)
-        return (state, k), None
+        obs, state, reward, _, _ = step_v(random.split(sk, n_envs), state, actions)
+        # Fold a reduction of obs+reward into the carry. Without this, XLA's
+        # dead-code elimination deletes the observation/reward computation
+        # entirely (they don't feed the next state), so the scan would time
+        # physics only — unfair vs wmas/VMAS, which always compute obs+reward.
+        acc = acc + sum(jax.numpy.sum(x) for x in jax.tree_util.tree_leaves((obs, reward)))
+        return (state, k, acc), None
 
     compiled: dict[int, Callable] = {}
 
     def _scan_fn(n: int) -> Callable:
         fn = compiled.get(n)
         if fn is None:
-            fn = jax.jit(lambda st, k: lax.scan(one_step, (st, k), None, length=n)[0])
+            fn = jax.jit(lambda st, k, a: lax.scan(one_step, (st, k, a), None, length=n)[0])
             compiled[n] = fn
         return fn
 
-    box = {"state": state0, "key": key}
+    box = {"state": state0, "key": key, "acc": jax.numpy.float32(0.0)}
 
     def rollout(n: int) -> None:
-        box["state"], box["key"] = _scan_fn(n)(box["state"], box["key"])
+        box["state"], box["key"], box["acc"] = _scan_fn(n)(
+            box["state"], box["key"], box["acc"]
+        )
 
     def sync() -> None:
-        jax.block_until_ready(box["state"])
+        jax.block_until_ready(box["acc"])
 
     return Runner(rollout, sync, n_envs, n_agents, "jax")

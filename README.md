@@ -356,34 +356,55 @@ where launch overhead is the binding constraint.
 #### wmas (optimized) vs the field
 
 env-steps/s, same GPU; `wmas` here is the optimized fused+graph configuration
-(JIT/XLA compile is excluded from the JAX sims via warmup at the timed length):
+(JIT/XLA compile is excluded from the JAX sims via warmup at the timed length; the
+JAX sims fold obs+reward into the scan carry so XLA cannot dead-code-eliminate them):
 
 ```
   n_envs  n_agents |        wmas        vmas     jaxmarl       camar |  vmas/w  jaxmarl/w  camar/w
-    1024         3 |   4,552,806     242,285  17,994,572     363,425 |   0.05x      3.95x    0.08x
-    4096         3 |  15,945,297     987,579  57,488,620     347,240 |   0.06x      3.61x    0.02x
-   16384         3 |  61,718,330   3,427,952  88,522,200     337,989 |   0.06x      1.43x    0.01x
-    1024        16 |   3,806,287      18,367   3,781,063      68,824 |   0.00x      0.99x    0.02x
-    4096        16 |  15,094,932      62,263   3,859,284      71,815 |   0.00x      0.26x    0.00x
-   16384        16 |  35,637,271     134,276   1,845,853         OOM |   0.00x      0.05x    -
+    1024         3 |   4,301,720     255,280  13,556,004     286,984 |   0.06x      3.15x    0.07x
+    4096         3 |  16,636,071     971,047  38,653,890     280,132 |   0.06x      2.32x    0.02x
+   16384         3 |  67,239,007   3,333,441  65,176,914     276,344 |   0.05x      0.97x    0.00x
+    1024        16 |   4,139,245      18,846   2,215,540      57,080 |   0.00x      0.54x    0.01x
+    4096        16 |  16,330,955      64,185   2,454,928      58,446 |   0.00x      0.15x    0.00x
+   16384        16 |  34,997,949     137,913   1,419,798         OOM |   0.00x      0.04x    -
 ```
 
-Reading it: **JaxMARL is fastest at few agents** — its fully-jitted `lax.scan` over a
-tiny point-particle MPE is hard to beat at 3 agents (still only ~1.4–4× over optimized
-wmas). But its per-step cost grows with agents (O(agents × landmarks) observations +
-pairwise terms), so **wmas overtakes it at 16 agents** (wmas's step is a fixed handful
-of fused Warp kernels, largely insensitive to agent count — it barely moves from 3→16
-agents while every competitor drops sharply; at 4096×16 wmas is ~4× JaxMARL). wmas is
-~20–265× faster than VMAS and ~12–210× faster than CAMAR on this task; CAMAR's
-throughput is roughly flat in `n_envs` here (its LIDAR observation / map machinery
-dominates) and OOMs at 16384×16 on the 8 GB card.
+Reading it: **JaxMARL leads only at low env counts with few agents** (~2–3× at 3 agents,
+1024–4096 envs), ties wmas by 16384 envs, and loses at 16 agents. Its fully-jitted
+`lax.scan` over a tiny 3-particle MPE has no per-step launch floor, which is the edge at
+low occupancy; but its per-step cost grows with agents (O(agents × landmarks)
+observations + pairwise terms), so wmas pulls ahead as agents rise. wmas is ~17–255×
+over VMAS and ~15–280× over CAMAR here — **but read the caveats below before taking
+those multipliers at face value; the four are not solving the same problem.**
 
-**Parity caveat (same as VMAS above).** This is a raw step-throughput comparison, not a
-task-equivalence one. Observation and reward models differ across all four by design
-(wmas padded neighbor lists; VMAS lidar; JaxMARL full-state MPE; CAMAR local LIDAR
-windows), agent dynamics and collision constants differ, and identical actions do not
-produce matching trajectories. The number measured is only how fast each engine advances
-a batch of navigation environments.
+#### This is not an apples-to-apples task comparison
+
+It measures raw step throughput of each engine *in its own default navigation setup*, so
+several asymmetries matter as much as the numbers:
+
+- **Task difficulty differs.** wmas `NavigationScenario` and VMAS/JaxMARL navigation are
+  effectively **obstacle-free** open-field goal-reaching. CAMAR's default `random_grid`
+  spawns **~800 obstacles** and runs `frameskip=2`, so it does *orders of magnitude* more
+  collision/LIDAR work per agent — a genuinely harder task, not a slower engine. (Notably
+  CAMAR still beats VMAS in most cells here — 1024×3 and both 16-agent rows — consistent
+  with the CAMAR paper's VMAS comparison. It only looks "slow" against wmas because wmas
+  is doing far less physics.)
+- **Observation/reward models differ by design** — wmas padded neighbor lists; VMAS 12-ray
+  lidar; JaxMARL 18-dim full-state MPE; CAMAR local LIDAR windows.
+- **Execution model differs.** The JAX sims run the whole rollout as one jitted `lax.scan`
+  (a single launch); wmas/VMAS run a Python per-step loop. At low `n_envs`, wmas is
+  **latency-bound** — its step floors at ~0.24 ms regardless of `n_envs` (1024→16384) *or*
+  agent count (3→16) — so JAX's fused-rollout model wins there simply by having no per-step
+  launch floor. This is the main reason JaxMARL leads at low env counts.
+- **`env-steps/s` flatters the overhead-bound sim.** wmas looking "insensitive to agent
+  count" is that latency floor hiding the agent work, *not* agents being free: in
+  `agent-steps/s` wmas rises from ~13 M (3 agents) to ~560 M (16 agents), ~43×, doing far
+  more actual work in nearly the same wall time. Only at 16384×16 does wmas become
+  compute-bound (step ~0.47 ms). Different agent counts across sims make any single metric
+  imperfect — compare rows, not just headline multipliers.
+- Identical actions do not reproduce trajectories across sims (dynamics/collision constants
+  differ). The number measured is only how fast each engine advances a batch of its own
+  navigation environments.
 
 ## Layout
 
