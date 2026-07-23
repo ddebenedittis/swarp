@@ -45,6 +45,7 @@ class ViewState:
     focus_env: int = 0
     paused: bool = False
     hover_agent: int | None = None
+    selected_agent: int | None = None
     quit: bool = False
 
 
@@ -68,12 +69,17 @@ class InteractionController:
         camera: Camera,
         geometry_getter: Callable[[], RenderGeometry] | None = None,
         tile_resolver: Callable[[tuple], int | None] | None = None,
+        on_drag_agent: Callable[[int, tuple[float, float]], None] | None = None,
+        on_place_goal: Callable[[int, tuple[float, float]], None] | None = None,
     ) -> None:
         self.state = state
         self.camera = camera
         self._geometry_getter = geometry_getter
         self._tile_resolver = tile_resolver
+        self._on_drag_agent = on_drag_agent
+        self._on_place_goal = on_place_goal
         self._panning = False
+        self._dragging_agent: int | None = None
         self._last_mouse = (0.0, 0.0)
 
     def handle_event(self, event) -> None:
@@ -89,18 +95,41 @@ class InteractionController:
                 self._panning = True
             elif event.button == 1:
                 self._on_left_down(event)
-        elif et == pygame.MOUSEBUTTONUP and event.button == _PAN_BUTTON:
-            self._panning = False
+            elif event.button == 3:
+                self._on_right_down(event)
+        elif et == pygame.MOUSEBUTTONUP:
+            if event.button == _PAN_BUTTON:
+                self._panning = False
+            elif event.button == 1:
+                self._dragging_agent = None
         elif et == pygame.QUIT:
             self.state.quit = True
 
+    def _world_at(self, pos) -> tuple[float, float]:
+        wx, wy = self.camera.screen_to_world(pos)
+        return float(wx), float(wy)
+
     def _on_left_down(self, event) -> None:
-        # A left click on a mosaic tile focuses that env. (Focus-pane left clicks are
-        # reserved for write-back in a later milestone.)
-        if self._tile_resolver is not None:
-            env_idx = self._tile_resolver(event.pos)
-            if env_idx is not None:
-                self.state.focus_env = env_idx
+        # In mosaic mode a left click on a tile focuses that env.
+        if self._tile_resolver is not None and self._tile_resolver(event.pos) is not None:
+            self.state.focus_env = self._tile_resolver(event.pos)
+            return
+        # Otherwise (focus pane) select the agent under the cursor and begin a drag.
+        if self._geometry_getter is None:
+            return
+        geometry = self._geometry_getter()
+        if geometry is None:
+            return
+        idx = pick_agent(geometry, self.camera, event.pos)
+        if idx is not None:
+            self.state.selected_agent = idx
+            if self._on_drag_agent is not None:
+                self._dragging_agent = idx
+
+    def _on_right_down(self, event) -> None:
+        # Right click moves the selected agent's goal to the clicked point.
+        if self.state.selected_agent is not None and self._on_place_goal is not None:
+            self._on_place_goal(self.state.selected_agent, self._world_at(event.pos))
 
     def _on_keydown(self, event) -> None:
         s = self.state
@@ -125,6 +154,8 @@ class InteractionController:
             if rel is None:
                 rel = (pos[0] - self._last_mouse[0], pos[1] - self._last_mouse[1])
             self.camera.pan(float(rel[0]), float(rel[1]))
+        elif self._dragging_agent is not None and self._on_drag_agent is not None:
+            self._on_drag_agent(self._dragging_agent, self._world_at(pos))
         elif self._geometry_getter is not None:
             geometry = self._geometry_getter()
             if geometry is not None:

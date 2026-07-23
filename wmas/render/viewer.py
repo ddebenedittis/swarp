@@ -40,6 +40,7 @@ class Viewer:
         mosaic: bool = False,
         max_tiles: int = 16,
         focus_frac: float = 0.68,
+        allow_write_back: bool = True,
     ) -> None:
         self.env = env
         self.scenario = scenario if scenario is not None else getattr(env, "scenario", None)
@@ -49,6 +50,7 @@ class Viewer:
         self.mosaic = mosaic
         self.max_tiles = max_tiles
         self.focus_frac = focus_frac
+        self.allow_write_back = allow_write_back
         enabled = set(overlays) if overlays is not None else set(DEFAULT_ENABLED)
         self.state = ViewState(n_envs=env.n_envs, enabled=enabled, focus_env=env_index)
         self._camera: Camera | None = None
@@ -81,6 +83,34 @@ class Viewer:
 
     def _tile_env_at(self, screen_xy) -> int | None:
         return tile_at(self._ensure_layout(), screen_xy) if self.mosaic else None
+
+    # ------------------------------------------------------------ write-back
+
+    def _write_agent_pos(self, agent_idx: int, world_xy) -> None:
+        """Move an agent in the focus env and zero its velocity (so it stays put).
+
+        Writes the *current* world.state, which the next step re-wraps for Warp; must not
+        cache a state reference across steps (World.step reassigns it).
+        """
+        with torch.no_grad():
+            e = self.state.focus_env
+            s = self.env.world.state
+            s.pos[e, agent_idx] = torch.tensor(
+                world_xy, dtype=self.env.dtype, device=self.env.device
+            )
+            s.vel[e, agent_idx] = 0
+            s.speed[e, agent_idx] = 0
+            s.ang_vel[e, agent_idx] = 0
+
+    def _write_goal(self, agent_idx: int, world_xy) -> None:
+        """Move an agent's goal in the focus env (no-op if the scenario has no goals)."""
+        world = self.env.world
+        if world.goals is None:
+            return
+        with torch.no_grad():
+            world.goals[self.state.focus_env, agent_idx] = torch.tensor(
+                world_xy, dtype=self.env.dtype, device=self.env.device
+            )
 
     def _draw(self, surface, geometry, camera, *, hud: bool, fps=None, clear: bool = True) -> None:
         draw_scene(surface, geometry, camera, self.state.enabled, self.style, clear=clear)
@@ -174,7 +204,12 @@ class Viewer:
         clock = pygame.time.Clock()
         camera = self._camera_for(self._geometry())
         controller = InteractionController(
-            self.state, camera, geometry_getter=self._geometry, tile_resolver=self._tile_env_at
+            self.state,
+            camera,
+            geometry_getter=self._geometry,
+            tile_resolver=self._tile_env_at,
+            on_drag_agent=self._write_agent_pos if self.allow_write_back else None,
+            on_place_goal=self._write_goal if self.allow_write_back else None,
         )
         obs = self.scenario.observations() if self.scenario is not None else None
         try:
