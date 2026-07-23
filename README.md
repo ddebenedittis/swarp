@@ -45,6 +45,9 @@ but compiled as Warp kernels instead of PyTorch tensor ops.
   `per_env_float_template`); dedicated per-env kernel variants then index `params[e, a]`.
   The dynamics recurrence is shared with the default kernel, so both stay in lock-step;
   measured overhead on the hot path is ~2% in the mid band and within noise elsewhere.
+- **Interactive viewer** (optional `viz` extra) — a pygame renderer with headless frames,
+  mp4/webm export, notebook embedding, a batch mosaic, live overlay toggles, and light
+  write-back (drag an agent, right-click to move its goal). See [Visualization](#visualization).
 
 ## Install
 
@@ -55,6 +58,7 @@ git clone <this-repo> wmas && cd wmas
 uv venv
 uv pip install -e . --group dev
 uv run pytest          # dynamics, gradients, neighbors, collisions, determinism, ...
+uv pip install -e '.[viz]'   # optional: interactive viewer + video export
 ```
 
 ## Quickstart
@@ -144,6 +148,51 @@ class MyScenario(Scenario):
 
 Observations and rewards are plain torch ops over `world.state`, so they are
 differentiable together with the Warp step and stay on-device.
+
+## Visualization
+
+An optional pygame-based viewer (install the `viz` extra: `uv pip install -e '.[viz]'`)
+renders one env of the batch — or a mosaic of the whole batch — either headless or in an
+interactive window.
+
+```python
+from wmas import Environment, NavigationScenario
+from wmas.render import Viewer, save_video
+
+env = Environment(NavigationScenario(n_agents=5, n_obstacles=2), n_envs=16, device="cpu")
+env.reset()
+
+# Headless: an (H, W, 3) uint8 frame, or a rollout to mp4/webm (by extension).
+frame = env.render(mode="rgb_array", env_index=0)   # VMAS-compatible signature
+save_video(env, "nav.mp4", n_steps=200)             # pass action_fn=policy to drive it
+
+# Interactive window: pan/zoom, hover to inspect, toggle overlays live, drag agents.
+Viewer(env, mosaic=True).run()                      # pass action_fn=policy to drive it
+```
+
+Rendering is opt-in, read-only, and off the differentiable hot path — one device→host copy
+per frame. Try it straight away:
+
+```bash
+python -m wmas.render.demo               # interactive window (goal-seeking demo policy)
+python -m wmas.render.demo --mosaic      # grid of all envs + a focus pane
+python -m wmas.render.demo --save nav.webm --steps 200
+```
+
+**Controls** — wheel zoom, middle-drag pan, hover an agent to inspect it, `[` / `]` to step
+through envs (or click a mosaic tile to focus it), space to pause. Overlays toggle by key:
+`g` goals, `n` neighbor graph, `h` heading, `v` velocity, `i` ids, `o` obstacles, `b`
+bounds, `l` lidar (drawn once a sensor supplies rays). Left-drag an agent to reposition it;
+right-click to move its goal (writes into the shown env only).
+
+In a notebook, embed a rollout inline:
+
+```python
+from wmas.render.notebook import animate
+animate(env, n_steps=200)   # returns an HTML5 <video>
+```
+
+Scenarios feed custom drawables to the viewer via `Scenario.render_extras(env_idx) -> dict`.
 
 ## Throughput
 
@@ -242,13 +291,14 @@ for now:
   (differentiable across a rollout), but full in-step rigid-body payloads with rotation
   fully on the Warp adjoint tape, non-circular bodies, and **joints** (VMAS `balance`) are
   still out of scope.
-- **Rendering** — no viewer; inspect state tensors / plot yourself.
 - **Discrete or communication action spaces** — actions are continuous real vectors.
 
 ## Roadmap
 
-Done recently: box/segment static collision geometry; arbitrary action arity; host-sync-
-free masked/auto reset; allocation-free no-grad hot path; per-env parameter randomization;
+Done recently: interactive pygame viewer (headless frames, mp4/webm export, mosaic view,
+live overlay toggles, drag/goal write-back); box/segment static collision geometry;
+arbitrary action arity; host-sync-free masked/auto reset; allocation-free no-grad hot path;
+per-env parameter randomization;
 RK4 integrator (`Integrator.RK4`, four evaluations of a pure derivative `@wp.func`); a
 batched uniform-grid neighbor backend (`neighbor_method="uniform_grid"`, radix-sort based)
 that stays linear in `n_envs` and beats brute force past ~512 agents/env (~4x at 1k, ~10x
