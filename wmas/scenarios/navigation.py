@@ -16,11 +16,18 @@ from __future__ import annotations
 from typing import Any
 
 import torch
+import warp as wp
 
 from wmas.core.config import WorldConfig
+from wmas.core.state import VEC2
 from wmas.core.world import World
 from wmas.dynamics.base import AgentConfig, ControlMode, DynamicsModel
 from wmas.scenarios.base import Scenario
+from wmas.scenarios.navigation_kernels import (
+    nav_obs_kernel,
+    nav_obs_kernel_per_env,
+    nav_reward_kernel,
+)
 
 
 class NavigationScenario(Scenario):
@@ -111,7 +118,18 @@ class NavigationScenario(Scenario):
         # Persistent eager-trim scratch (allocated lazily on first refresh).
         self._eager_k_all: int = -1
         self._eager_k: int = -1
+        # Fused-kernel obs width and lazy-allocation flag.
+        self._k_obs = min(self.neighbor_obs, world_config.max_neighbors)
+        self._fused_ready = False
         return self.world
+
+    def fused_available(self) -> bool:
+        """Navigation ships fused Warp obs/reward kernels (2D, needs neighbors)."""
+        return True
+
+    @property
+    def obs_dim(self) -> int:
+        return 9 + 5 * self._k_obs
 
     def _sample_separated(self, n_envs: int, n_points: int, min_dist: float, tries: int = 16):
         """Uniform positions with pairwise separation via bounded resampling.
@@ -187,12 +205,156 @@ class NavigationScenario(Scenario):
 
         w.mark_pos_dirty()  # positions written out of band; force a fresh build
         self._nbr_cache = None
-        self._refresh_step_cache(reset_mask=env_mask)
+        if self._fused_active:
+            self._ensure_fused(w.n_envs)
+            if env_mask is None:
+                self._f_resetmask.fill_(1)
+            else:
+                self._f_resetmask.copy_(env_mask)  # bool -> uint8
+            # An auto-reset (mid-step) must not clobber the reward/done/info
+            # buffers already returned this step: obs-only pass (full_pass=0). A
+            # standalone reset recomputes everything (full_pass=1) so info() is
+            # populated. Either way the shaping baseline rebases only reset envs.
+            full = 0 if self._fused_obs_only else 1
+            self._launch_obs(advance_prev=0, full_pass=full)
+        else:
+            self._refresh_step_cache(reset_mask=env_mask)
+
+    # --------------------------------------------------------- fused fast path
+
+    def _ensure_fused(self, n_envs: int) -> None:
+        """Allocate the persistent fused output buffers + cached wp handles."""
+        if self._fused_ready:
+            return
+        w = self.world
+        na, dev, dt = self.n_agents, w.device, w.dtype
+        od = self.obs_dim
+
+        def z(*shape, d=dt):
+            return torch.zeros(*shape, device=dev, dtype=d)
+
+        self._f_obs = z(n_envs, na, od)
+        self._f_touch = z(n_envs, na)
+        self._f_dist = z(n_envs, na)
+        self._f_shaping = z(n_envs, na)
+        self._f_reward = z(n_envs, na)
+        self._f_ongoal = z(n_envs, na, d=torch.uint8)
+        self._f_overflow = z(n_envs, na, d=torch.uint8)
+        self._f_done = z(n_envs, d=torch.uint8)
+        self._f_resetmask = z(n_envs, d=torch.uint8)
+        if self._prev_dist is None:
+            self._prev_dist = z(n_envs, na)
+        scalar = w.wp_dtype
+        self._wp = {
+            "obs": wp.from_torch(self._f_obs, dtype=scalar),
+            "touch": wp.from_torch(self._f_touch, dtype=scalar),
+            "dist": wp.from_torch(self._f_dist, dtype=scalar),
+            "shaping": wp.from_torch(self._f_shaping, dtype=scalar),
+            "reward": wp.from_torch(self._f_reward, dtype=scalar),
+            "ongoal": wp.from_torch(self._f_ongoal, dtype=wp.uint8),
+            "overflow": wp.from_torch(self._f_overflow, dtype=wp.uint8),
+            "done": wp.from_torch(self._f_done, dtype=wp.uint8),
+            "resetmask": wp.from_torch(self._f_resetmask, dtype=wp.uint8),
+        }
+        # Zero-copy bool reinterpret views (uint8 0/1 -> bool).
+        self._f_ongoal_bool = self._f_ongoal.view(torch.bool)
+        self._f_overflow_bool = self._f_overflow.view(torch.bool)
+        self._f_done_bool = self._f_done.view(torch.bool)
+        self._fused_ready = True
+
+    def _state_wp(self):
+        """(pos, vel, theta, ang_vel) as Warp arrays for the fused kernels."""
+        w = self.world
+        scalar = w.wp_dtype
+        vec2 = VEC2[scalar]
+        if w._persistent and not w._detached:
+            s = w.runtime.state
+            return s.pos, s.vel, s.theta, s.ang_vel
+        st = w.state
+        return (
+            wp.from_torch(st.pos.contiguous(), dtype=vec2),
+            wp.from_torch(st.vel.contiguous(), dtype=vec2),
+            wp.from_torch(st.theta.contiguous(), dtype=scalar),
+            wp.from_torch(st.ang_vel.contiguous(), dtype=scalar),
+        )
+
+    def _launch_obs(self, advance_prev: int, full_pass: int) -> None:
+        w = self.world
+        n_envs = w.n_envs
+        self._ensure_fused(n_envs)
+        w.neighbors()  # build the grid on the current state (fills grid buffers)
+        grid = w.stepper.grid(n_envs)
+        scalar = w.wp_dtype
+        vec2 = VEC2[scalar]
+        pos, vel, theta, ang_vel = self._state_wp()
+        goals = wp.from_torch(w.goals.contiguous(), dtype=vec2)
+        prev = wp.from_torch(self._prev_dist.contiguous(), dtype=scalar)
+        per_env = w.stepper.params.floats_per_env is not None
+        kernel = nav_obs_kernel_per_env if per_env else nav_obs_kernel
+        params = w.stepper.params.floats_per_env if per_env else w.stepper.params.floats
+        wp.launch(
+            kernel,
+            dim=(n_envs, self.n_agents),
+            inputs=[
+                pos,
+                vel,
+                theta,
+                ang_vel,
+                goals,
+                grid.neighbor_idx,
+                grid.neighbor_count,
+                grid.neighbor_true_count,
+                params,
+                self._wp["resetmask"],
+                wp.int32(self._k_obs),
+                scalar(self.pos_shaping_factor),
+                scalar(self.goal_tolerance),
+                wp.int32(advance_prev),
+                wp.int32(full_pass),
+            ],
+            outputs=[
+                self._wp["obs"],
+                self._wp["touch"],
+                self._wp["dist"],
+                self._wp["shaping"],
+                self._wp["ongoal"],
+                self._wp["overflow"],
+                prev,
+            ],
+            device=w.device,
+            record_tape=False,
+        )
+
+    def _launch_reward(self) -> None:
+        w = self.world
+        scalar = w.wp_dtype
+        wp.launch(
+            nav_reward_kernel,
+            dim=w.n_envs,
+            inputs=[
+                self._wp["touch"],
+                self._wp["shaping"],
+                self._wp["ongoal"],
+                wp.int32(self.n_agents),
+                scalar(self.collision_penalty),
+                scalar(self.final_reward),
+                wp.int32(1 if self.shared_reward else 0),
+            ],
+            outputs=[self._wp["reward"], self._wp["done"]],
+            device=w.device,
+            record_tape=False,
+        )
 
     # ------------------------------------------------------- per-step caching
 
     def post_step(self) -> None:
-        self._refresh_step_cache()
+        if self._fused_active:
+            self._ensure_fused(self.world.n_envs)
+            self._f_resetmask.zero_()  # a normal step resets no env
+            self._launch_obs(advance_prev=1, full_pass=1)
+            self._launch_reward()
+        else:
+            self._refresh_step_cache()
 
     def _ensure_eager_buffers(self, k_all: int, k: int) -> None:
         """Allocate the persistent eager-trim scratch (once per shape)."""
@@ -303,6 +465,8 @@ class NavigationScenario(Scenario):
 
     def observations(self) -> torch.Tensor:
         """Fully batched observations [n_envs, n_agents, obs_dim]."""
+        if self._fused_active:
+            return self._f_obs
         w = self.world
         s = w.state
         cache = self._nbr_cache
@@ -335,6 +499,8 @@ class NavigationScenario(Scenario):
         return self.observations()[:, agent_idx]
 
     def rewards(self) -> torch.Tensor:
+        if self._fused_active:
+            return self._f_reward
         cache = self._nbr_cache
         rew = self.collision_penalty * cache["touching"]
         if self.shared_reward:
@@ -359,9 +525,18 @@ class NavigationScenario(Scenario):
         return rew
 
     def done(self) -> torch.Tensor:
+        if self._fused_active:
+            return self._f_done_bool
         return self._nbr_cache["on_goal"].all(dim=-1)
 
     def info(self) -> dict[str, Any]:
+        if self._fused_active:
+            return {
+                "dist_to_goal": self._f_dist,
+                "on_goal": self._f_ongoal_bool,
+                "collisions": self._f_touch,
+                "neighbor_overflow": self._f_overflow_bool,
+            }
         return {
             "dist_to_goal": self._nbr_cache["dist_to_goal"],
             "on_goal": self._nbr_cache["on_goal"],
