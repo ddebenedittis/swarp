@@ -51,6 +51,10 @@ class World:
             world=world_config,
         )
         self.state: TorchState = self.zero_state()
+        # Persistent-buffer / CUDA-graph execution (opt-in via enable_persistent).
+        self.runtime = None
+        self._persistent = False
+        self._detached = False
         self.goals: torch.Tensor | None = None  # [n_envs, n_agents, 2]
         self.obstacle_pos: torch.Tensor | None = None  # [n_envs, n_obstacles, 2]
         self.obstacle_radius: torch.Tensor | None = None  # [n_obstacles]
@@ -73,7 +77,51 @@ class World:
 
     def step(self, actions: torch.Tensor) -> None:
         """Advance the world one step (differentiable when grads are enabled)."""
-        self.state = warp_step(self.stepper, self.state, actions)
+        grad_mode = torch.is_grad_enabled() and (
+            actions.requires_grad or any(t is not None and t.requires_grad for t in self.state)
+        )
+        if self._persistent and not grad_mode:
+            if self._detached:
+                # Returning from a grad step: reload persistent buffers from the
+                # current (fresh-tensor) state, then rebind to the stable views.
+                self.runtime.load_state(self.state)
+                self.state = self.runtime.state_views
+                self._detached = False
+            self.state = self.runtime.step(actions)
+        elif self._persistent:
+            # Grad step: detach+clone so the tape references fresh arrays, never
+            # the persistent buffers (which the no-grad path overwrites in place).
+            detached = TorchState(*(t.detach().clone() for t in self.state))
+            self._detached = True
+            self.state = warp_step(self.stepper, detached, actions)
+        else:
+            self.state = warp_step(self.stepper, self.state, actions)
+
+    def enable_persistent(self, use_graph: bool = True) -> None:
+        """Switch to persistent-buffer execution (optionally CUDA-graph-backed).
+
+        Builds a :class:`~wmas.interop.persistent.StepRuntime`, seeds it with the
+        current state, and rebinds ``self.state`` to the runtime's stable
+        zero-copy views. The no-grad :meth:`step` then routes through the runtime;
+        grad steps transparently fall back to the functional path.
+        """
+        from wmas.interop.persistent import StepRuntime
+
+        self.runtime = StepRuntime(self.stepper, self.n_envs, self.act_dim, use_graph=use_graph)
+        self.runtime.load_state(self.state)
+        self.state = self.runtime.state_views
+        self._persistent = True
+        self._detached = False
+
+    def reset_state(self) -> None:
+        """Reset the state to zeros. In persistent mode this zeroes the buffers
+        in place (keeping the views/graph valid); otherwise it reallocates."""
+        if self._persistent:
+            self.runtime.reset_state()
+            self.state = self.runtime.state_views
+            self._detached = False
+        else:
+            self.state = self.zero_state()
 
     # ------------------------------------------------------------- randomness
 
@@ -116,12 +164,18 @@ class World:
         if not self.stepper.collisions:
             raise RuntimeError("neighbor lists require WorldConfig.collisions=True")
         grid = self.stepper.grid(self.n_envs)
-        pos_wp = wp.from_torch(
-            self.state.pos.detach().contiguous(),
-            dtype=VEC2[self.wp_dtype],
-            requires_grad=False,
-        )
-        grid.build(pos_wp)
+        if self._persistent and not self._detached:
+            # The persistent state's pos is already a Warp array — build directly
+            # on it (no re-wrap). Runs on the default stream, ordered with the
+            # graph replay that reads the grid's lists on the next step.
+            grid.build(self.runtime.state.pos)
+        else:
+            pos_wp = wp.from_torch(
+                self.state.pos.detach().contiguous(),
+                dtype=VEC2[self.wp_dtype],
+                requires_grad=False,
+            )
+            grid.build(pos_wp)
         grid.built_version = self.stepper.state_version
         return grid.torch_views()
 

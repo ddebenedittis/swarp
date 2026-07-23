@@ -35,6 +35,8 @@ class Environment:
         max_steps: int | None = None,
         seed: int = 0,
         auto_reset: bool = False,
+        use_graph: bool = False,
+        copy_outputs: bool = False,
     ) -> None:
         self.scenario = scenario
         self.n_envs = n_envs
@@ -42,16 +44,26 @@ class Environment:
         self.dtype = dtype
         self.max_steps = max_steps
         self.auto_reset = auto_reset
+        self.copy_outputs = copy_outputs
         self.world = scenario.make_world(
             n_envs=n_envs, device=device, dt=dt, substeps=substeps, dtype=dtype
         )
         self.n_agents = self.world.n_agents
         self._seed(seed)
         self._step_count = torch.zeros(n_envs, device=device, dtype=torch.int32)
+        # Opt-in persistent-buffer + CUDA-graph execution for the no-grad hot
+        # path. Zero-copy views are returned by default; copy_outputs clones them.
+        if use_graph:
+            self.world.enable_persistent(use_graph=True)
 
     def _seed(self, seed: int) -> None:
         self.world.generator = torch.Generator(device=self.device)
         self.world.generator.manual_seed(seed)
+
+    @property
+    def graph_mode(self) -> bool:
+        """True when a CUDA graph is actively backing the no-grad step."""
+        return self.world.runtime is not None and self.world.runtime.graph_active
 
     # ------------------------------------------------------------------- API
 
@@ -60,7 +72,7 @@ class Environment:
         if seed is not None:
             self._seed(seed)
         with torch.no_grad():
-            self.world.state = self.world.zero_state()
+            self.world.reset_state()
             self.scenario.reset_world(None)
         self._step_count.zero_()
         return self.scenario.observations()

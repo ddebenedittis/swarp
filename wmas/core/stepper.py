@@ -434,6 +434,7 @@ class Stepper:
         state_out: WorldState,
         buffers: StepBuffers,
         reuse_neighbors: bool = False,
+        skip_drone: bool = False,
     ) -> None:
         """Advance one full env step. Functional: ``state_in`` is never written.
 
@@ -506,6 +507,7 @@ class Stepper:
                 clamp_bounds=self._clamp_bounds,
                 integrator=world.integrator,
                 slim=slim,
+                skip_drone=skip_drone and slim,
             )
         # State has advanced; the grid's lists no longer match this generation.
         self.state_version += 1
