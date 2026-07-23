@@ -9,9 +9,11 @@ against it (exact where the arithmetic is identical; ulp-close for the trig /
 norm / reduction slots).
 
 Layout follows :mod:`wmas.core.collisions`: generic over dtype via ``Any`` with
-explicit float32/float64 overloads, and shared / per-env twins that read
-``P_RADIUS`` from the ``[n_agents, P]`` or ``[n_envs, n_agents, P]`` layout so
-heterogeneous fleets and per-env randomization both work.
+explicit float32/float64 overloads. The touching count uses the *static*
+per-agent radius (``params.floats[a, P_RADIUS]``), matching the torch reference
+(``World.agent_radius``) — heterogeneous static radii are honored per agent;
+per-env radius randomization affects the physics forces but, like the reference,
+not the reward's touching count.
 
 Observation row (``obs_dim = 9 + 5 * k_obs``), matching the torch ``cat`` order::
 
@@ -194,68 +196,6 @@ def nav_obs_kernel(
 
 
 @wp.kernel
-def nav_obs_kernel_per_env(
-    pos: wp.array2d(dtype=Any),
-    vel: wp.array2d(dtype=Any),
-    theta: wp.array2d(dtype=Any),
-    ang_vel: wp.array2d(dtype=Any),
-    goals: wp.array2d(dtype=Any),
-    neighbor_idx: wp.array3d(dtype=wp.int32),
-    neighbor_count: wp.array2d(dtype=wp.int32),
-    neighbor_true: wp.array2d(dtype=wp.int32),
-    params: wp.array3d(dtype=Any),  # [n_envs, n_agents, NUM_PARAMS] per-env
-    reset_mask: wp.array(dtype=wp.uint8),
-    k_obs: wp.int32,
-    pos_shaping_factor: Any,
-    goal_tolerance: Any,
-    advance_prev: wp.int32,
-    full_pass: wp.int32,
-    obs: wp.array3d(dtype=Any),
-    touching: wp.array2d(dtype=Any),
-    dist_to_goal: wp.array2d(dtype=Any),
-    pos_shaping: wp.array2d(dtype=Any),
-    on_goal: wp.array(dtype=wp.uint8, ndim=2),
-    overflow: wp.array(dtype=wp.uint8, ndim=2),
-    prev_dist: wp.array2d(dtype=Any),
-):
-    e, a = wp.tid()
-    p = pos[e, a]
-    v = vel[e, a]
-    g = goals[e, a]
-    grel = g - p
-    d = wp.length(p - g)
-    cnt = neighbor_count[e, a]
-    ra = params[e, a, P_RADIUS]
-    touch = type(d)(0.0)
-    for ni in range(cnt):
-        b = neighbor_idx[e, a, ni]
-        nd = wp.length(pos[e, b] - p)
-        if nd < ra + params[e, b, P_RADIUS]:
-            touch += type(d)(1.0)
-    _obs_row(e, a, p, v, theta[e, a], ang_vel[e, a], grel, k_obs, cnt, pos, vel, neighbor_idx, obs)
-    reset_hit = wp.int32(reset_mask[e])
-    _shaping_and_flags(
-        e,
-        a,
-        d,
-        touch,
-        neighbor_true[e, a],
-        cnt,
-        pos_shaping_factor,
-        goal_tolerance,
-        advance_prev,
-        full_pass,
-        reset_hit,
-        prev_dist,
-        touching,
-        dist_to_goal,
-        pos_shaping,
-        on_goal,
-        overflow,
-    )
-
-
-@wp.kernel
 def nav_reward_kernel(
     touching: wp.array2d(dtype=Any),
     pos_shaping: wp.array2d(dtype=Any),
@@ -289,7 +229,7 @@ def nav_reward_kernel(
     done[e] = all_og
 
 
-def _obs_signature(dtype, per_env: bool = False) -> list:
+def _obs_signature(dtype) -> list:
     vec2 = VEC2[dtype]
     a2v = wp.array2d(dtype=vec2)
     a2s = wp.array2d(dtype=dtype)
@@ -298,7 +238,7 @@ def _obs_signature(dtype, per_env: bool = False) -> list:
     u8_1 = wp.array(dtype=wp.uint8)
     u8_2 = wp.array(dtype=wp.uint8, ndim=2)
     a3s = wp.array3d(dtype=dtype)
-    params = wp.array3d(dtype=dtype) if per_env else a2s
+    params = a2s
     return [
         a2v,  # pos
         a2v,  # vel
@@ -342,5 +282,4 @@ def _reward_signature(dtype) -> list:
 
 for _T in (wp.float32, wp.float64):
     wp.overload(nav_obs_kernel, _obs_signature(_T))
-    wp.overload(nav_obs_kernel_per_env, _obs_signature(_T, per_env=True))
     wp.overload(nav_reward_kernel, _reward_signature(_T))

@@ -23,11 +23,7 @@ from wmas.core.state import VEC2
 from wmas.core.world import World
 from wmas.dynamics.base import AgentConfig, ControlMode, DynamicsModel
 from wmas.scenarios.base import Scenario
-from wmas.scenarios.navigation_kernels import (
-    nav_obs_kernel,
-    nav_obs_kernel_per_env,
-    nav_reward_kernel,
-)
+from wmas.scenarios.navigation_kernels import nav_obs_kernel, nav_reward_kernel
 
 
 class NavigationScenario(Scenario):
@@ -289,11 +285,11 @@ class NavigationScenario(Scenario):
         pos, vel, theta, ang_vel = self._state_wp()
         goals = wp.from_torch(w.goals.contiguous(), dtype=vec2)
         prev = wp.from_torch(self._prev_dist.contiguous(), dtype=scalar)
-        per_env = w.stepper.params.floats_per_env is not None
-        kernel = nav_obs_kernel_per_env if per_env else nav_obs_kernel
-        params = w.stepper.params.floats_per_env if per_env else w.stepper.params.floats
+        # Touching uses the static per-agent radius (matches the torch reference's
+        # World.agent_radius); per-env randomization affects forces, not this count.
+        params = w.stepper.params.floats
         wp.launch(
-            kernel,
+            nav_obs_kernel,
             dim=(n_envs, self.n_agents),
             inputs=[
                 pos,
