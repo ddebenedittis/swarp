@@ -9,8 +9,9 @@ import pytest
 import torch
 import warp as wp
 
+from wmas.core.config import WorldConfig
 from wmas.core.stepper import Stepper
-from wmas.dynamics.base import AgentConfig, ControlMode, DynamicsModel
+from wmas.dynamics.base import AgentConfig, ControlMode, DynamicsModel, Integrator
 from wmas.interop.autograd import TorchState, rollout, warp_step
 
 BIG = 100.0  # limits far away from any test action
@@ -62,6 +63,40 @@ def test_gradcheck_single_step(name, model, mode):
         for _ in range(2)
     ]
     stepper = make_stepper(cfgs)
+    state = make_state(2, 2, requires_grad=True, seed=1)
+    actions = (0.3 * torch.randn(2, 2, 2, dtype=torch.float64)).requires_grad_(True)
+
+    def fn(pos, theta, vel, speed, ang_vel, act):
+        out = warp_step(stepper, TorchState(pos, theta, vel, speed, ang_vel), act)
+        return tuple(out)
+
+    assert torch.autograd.gradcheck(fn, (*state, actions), eps=1e-6, atol=1e-5)
+
+
+@pytest.mark.parametrize("name,model,mode", MODEL_CASES, ids=[c[0] for c in MODEL_CASES])
+def test_gradcheck_single_step_rk4(name, model, mode):
+    """The RK4 path (four _deriv evaluations) is differentiable end-to-end."""
+    cfgs = [
+        AgentConfig(
+            model=model,
+            ctrl_mode=mode,
+            max_speed=BIG,
+            max_accel=BIG,
+            max_ang_vel=BIG,
+            max_ang_accel=BIG,
+            max_steer=1.0,
+            l_f=0.16,
+            l_r=0.14,
+        )
+        for _ in range(2)
+    ]
+    stepper = Stepper(
+        configs=cfgs,
+        dt=0.1,
+        device="cpu",
+        dtype=wp.float64,
+        world=WorldConfig(collisions=False, integrator=Integrator.RK4),
+    )
     state = make_state(2, 2, requires_grad=True, seed=1)
     actions = (0.3 * torch.randn(2, 2, 2, dtype=torch.float64)).requires_grad_(True)
 

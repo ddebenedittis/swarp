@@ -32,12 +32,17 @@ from wmas.dynamics.base import (
     P_RADIUS,
     AgentParams,
     DynamicsModel,
+    Integrator,
 )
 
 TAG_HOLONOMIC = wp.constant(int(DynamicsModel.HOLONOMIC))
 TAG_DIFF_DRIVE = wp.constant(int(DynamicsModel.DIFF_DRIVE))
 TAG_BICYCLE = wp.constant(int(DynamicsModel.KINEMATIC_BICYCLE))
 MODE_VELOCITY = wp.constant(0)
+
+# Integrator tags (must match Integrator enum order in wmas.dynamics.base).
+INT_EULER = wp.constant(0)
+INT_RK4 = wp.constant(1)
 
 
 @wp.func
@@ -153,6 +158,234 @@ def _integrate_agent(
     ang_vel_out[e, a] = w_out
 
 
+@wp.func
+def _deriv(
+    # state (velocity-level fields hold the current instantaneous values)
+    p: Any,
+    th: Any,
+    v: Any,
+    s: Any,
+    w: Any,
+    # action + model
+    a0: Any,
+    a1: Any,
+    tag: wp.int32,
+    mode: wp.int32,
+    max_accel: Any,
+    max_ang_accel: Any,
+    max_steer: Any,
+    l_f: Any,
+    l_r: Any,
+):
+    """Pure continuous-time state derivative ``(dpos, dtheta, dvel, dspeed, dang_vel)``.
+
+    Shared by RK4; the semi-implicit Euler path keeps its own fused update. Only
+    the *independent* integrable states per model carry a nonzero derivative:
+    holonomic integrates ``(pos, vel)``; diff-drive ``(pos, theta, speed,
+    ang_vel)``; bicycle ``(pos, theta, speed)``. Derived quantities (``vel`` for
+    the nonholonomic models, ``speed`` for holonomic, ``ang_vel`` for the
+    bicycle) never feed back into any derivative, so they are integrated with a
+    zero rate here and reconstructed after the RK4 combine. In velocity-control
+    mode the velocity-level state is a constant input (its derivative is zero);
+    the caller sets it before integrating.
+    """
+    zero = type(s)(0.0)
+    zvec = type(p)(zero, zero)
+    if tag == TAG_HOLONOMIC:
+        dp = v
+        dth = zero
+        if mode == MODE_VELOCITY:
+            dv = zvec
+        else:
+            dv = clamp_norm(type(p)(a0, a1), max_accel)
+        ds = zero
+        dw = zero
+    elif tag == TAG_DIFF_DRIVE:
+        dp = type(p)(s * wp.cos(th), s * wp.sin(th))
+        dth = w
+        dv = zvec
+        if mode == MODE_VELOCITY:
+            ds = zero
+            dw = zero
+        else:
+            ds = wp.clamp(a0, -max_accel, max_accel)
+            dw = wp.clamp(a1, -max_ang_accel, max_ang_accel)
+    elif tag == TAG_BICYCLE:
+        wheelbase = l_f + l_r
+        delta = wp.clamp(a1, -max_steer, max_steer)
+        beta = wp.atan(wp.tan(delta) * l_r / wheelbase)
+        dp = type(p)(s * wp.cos(th + beta), s * wp.sin(th + beta))
+        dth = s / wheelbase * wp.cos(beta) * wp.tan(delta)
+        dv = zvec
+        ds = wp.clamp(a0, -max_accel, max_accel)
+        dw = zero
+    else:
+        dp = zvec
+        dth = zero
+        dv = zvec
+        ds = zero
+        dw = zero
+    return dp, dth, dv, ds, dw
+
+
+@wp.func
+def _integrate_rk4(
+    e: wp.int32,
+    a: wp.int32,
+    p: Any,
+    th: Any,
+    v: Any,
+    s: Any,
+    w: Any,
+    a0: Any,
+    a1: Any,
+    tag: wp.int32,
+    mode: wp.int32,
+    force: Any,
+    mass: Any,
+    max_speed: Any,
+    max_accel: Any,
+    max_ang_vel: Any,
+    max_ang_accel: Any,
+    l_f: Any,
+    l_r: Any,
+    max_steer: Any,
+    radius: Any,
+    dt: Any,
+    bounds_min: Any,
+    bounds_max: Any,
+    clamp_bounds: wp.int32,
+    pos_out: wp.array2d(dtype=Any),
+    theta_out: wp.array2d(dtype=Any),
+    vel_out: wp.array2d(dtype=Any),
+    speed_out: wp.array2d(dtype=Any),
+    ang_vel_out: wp.array2d(dtype=Any),
+):
+    """Classic RK4 over the model's independent state, four :func:`_deriv` calls.
+
+    Signature matches :func:`_integrate_agent` so the two kernels select between
+    them on the ``integrator`` tag. Actions are held constant across the four
+    stages; the actuation limits are enforced on the combined result (staying in
+    the unsaturated regime keeps the ~dt^4 convergence a clean test can measure).
+    Collision/boundary ``force`` enters as the same ``F/m`` velocity contribution
+    the Euler path uses.
+    """
+    zero = type(dt)(0.0)
+    half = type(dt)(0.5)
+    two = type(dt)(2.0)
+    dt2 = dt * half
+    sixth = dt / type(dt)(6.0)
+
+    # Velocity-control commands set the velocity-level state directly (constant
+    # input across the step); acceleration-control keeps the current state.
+    if mode == MODE_VELOCITY:
+        if tag == TAG_HOLONOMIC:
+            v = clamp_norm(type(p)(a0, a1), max_speed)
+        elif tag == TAG_DIFF_DRIVE:
+            s = wp.clamp(a0, -max_speed, max_speed)
+            w = wp.clamp(a1, -max_ang_vel, max_ang_vel)
+
+    k1p, k1th, k1v, k1s, k1w = _deriv(
+        p, th, v, s, w, a0, a1, tag, mode, max_accel, max_ang_accel, max_steer, l_f, l_r
+    )
+    k2p, k2th, k2v, k2s, k2w = _deriv(
+        p + k1p * dt2,
+        th + k1th * dt2,
+        v + k1v * dt2,
+        s + k1s * dt2,
+        w + k1w * dt2,
+        a0,
+        a1,
+        tag,
+        mode,
+        max_accel,
+        max_ang_accel,
+        max_steer,
+        l_f,
+        l_r,
+    )
+    k3p, k3th, k3v, k3s, k3w = _deriv(
+        p + k2p * dt2,
+        th + k2th * dt2,
+        v + k2v * dt2,
+        s + k2s * dt2,
+        w + k2w * dt2,
+        a0,
+        a1,
+        tag,
+        mode,
+        max_accel,
+        max_ang_accel,
+        max_steer,
+        l_f,
+        l_r,
+    )
+    k4p, k4th, k4v, k4s, k4w = _deriv(
+        p + k3p * dt,
+        th + k3th * dt,
+        v + k3v * dt,
+        s + k3s * dt,
+        w + k3w * dt,
+        a0,
+        a1,
+        tag,
+        mode,
+        max_accel,
+        max_ang_accel,
+        max_steer,
+        l_f,
+        l_r,
+    )
+
+    p_new = p + (k1p + k2p * two + k3p * two + k4p) * sixth
+    th_i = th + (k1th + k2th * two + k3th * two + k4th) * sixth
+    v_i = v + (k1v + k2v * two + k3v * two + k4v) * sixth
+    s_i = s + (k1s + k2s * two + k3s * two + k4s) * sixth
+    w_i = w + (k1w + k2w * two + k3w * two + k4w) * sixth
+
+    dv_f = force * (dt / mass)
+
+    if tag == TAG_HOLONOMIC:
+        v_out = clamp_norm(v_i, max_speed) + dv_f
+        p_new = p_new + dv_f * dt
+        th_new = th
+        s_out = wp.length(v_out)
+        w_out = zero
+    elif tag == TAG_DIFF_DRIVE:
+        s_out = wp.clamp(s_i, -max_speed, max_speed)
+        w_out = wp.clamp(w_i, -max_ang_vel, max_ang_vel)
+        th_new = th_i
+        v_out = type(p)(s_out * wp.cos(th_new), s_out * wp.sin(th_new)) + dv_f
+        p_new = p_new + dv_f * dt
+    elif tag == TAG_BICYCLE:
+        s_out = wp.clamp(s_i, -max_speed, max_speed)
+        th_new = th_i
+        delta = wp.clamp(a1, -max_steer, max_steer)
+        wheelbase = l_f + l_r
+        beta = wp.atan(wp.tan(delta) * l_r / wheelbase)
+        w_out = s_out / wheelbase * wp.cos(beta) * wp.tan(delta)
+        v_out = type(p)(s_out * wp.cos(th_new + beta), s_out * wp.sin(th_new + beta)) + dv_f
+        p_new = p_new + dv_f * dt
+    else:
+        p_new = p
+        th_new = th
+        v_out = v
+        s_out = s
+        w_out = w
+
+    if clamp_bounds == 1:
+        p_new = type(p)(
+            wp.clamp(p_new[0], bounds_min[0] + radius, bounds_max[0] - radius),
+            wp.clamp(p_new[1], bounds_min[1] + radius, bounds_max[1] - radius),
+        )
+
+    pos_out[e, a] = p_new
+    theta_out[e, a] = th_new
+    vel_out[e, a] = v_out
+    speed_out[e, a] = s_out
+    ang_vel_out[e, a] = w_out
+
+
 @wp.kernel
 def integrate_kernel(
     # state in
@@ -171,6 +404,7 @@ def integrate_kernel(
     bounds_min: Any,
     bounds_max: Any,
     clamp_bounds: wp.int32,
+    integrator: wp.int32,
     # state out
     pos_out: wp.array2d(dtype=Any),
     theta_out: wp.array2d(dtype=Any),
@@ -181,38 +415,72 @@ def integrate_kernel(
     e, a = wp.tid()
     # Action arity is decoupled from geometry: read the scalar slots each model
     # needs (all current models use 2); a0/a1 are slots 0,1.
-    _integrate_agent(
-        e,
-        a,
-        pos[e, a],
-        theta[e, a],
-        vel[e, a],
-        speed[e, a],
-        ang_vel[e, a],
-        actions[e, a, 0],
-        actions[e, a, 1],
-        model_tag[a],
-        ctrl_mode[a],
-        forces[e, a],
-        params[a, P_MASS],
-        params[a, P_MAX_SPEED],
-        params[a, P_MAX_ACCEL],
-        params[a, P_MAX_ANG_VEL],
-        params[a, P_MAX_ANG_ACCEL],
-        params[a, P_LF],
-        params[a, P_LR],
-        params[a, P_MAX_STEER],
-        params[a, P_RADIUS],
-        dt,
-        bounds_min,
-        bounds_max,
-        clamp_bounds,
-        pos_out,
-        theta_out,
-        vel_out,
-        speed_out,
-        ang_vel_out,
-    )
+    if integrator == INT_RK4:
+        _integrate_rk4(
+            e,
+            a,
+            pos[e, a],
+            theta[e, a],
+            vel[e, a],
+            speed[e, a],
+            ang_vel[e, a],
+            actions[e, a, 0],
+            actions[e, a, 1],
+            model_tag[a],
+            ctrl_mode[a],
+            forces[e, a],
+            params[a, P_MASS],
+            params[a, P_MAX_SPEED],
+            params[a, P_MAX_ACCEL],
+            params[a, P_MAX_ANG_VEL],
+            params[a, P_MAX_ANG_ACCEL],
+            params[a, P_LF],
+            params[a, P_LR],
+            params[a, P_MAX_STEER],
+            params[a, P_RADIUS],
+            dt,
+            bounds_min,
+            bounds_max,
+            clamp_bounds,
+            pos_out,
+            theta_out,
+            vel_out,
+            speed_out,
+            ang_vel_out,
+        )
+    else:
+        _integrate_agent(
+            e,
+            a,
+            pos[e, a],
+            theta[e, a],
+            vel[e, a],
+            speed[e, a],
+            ang_vel[e, a],
+            actions[e, a, 0],
+            actions[e, a, 1],
+            model_tag[a],
+            ctrl_mode[a],
+            forces[e, a],
+            params[a, P_MASS],
+            params[a, P_MAX_SPEED],
+            params[a, P_MAX_ACCEL],
+            params[a, P_MAX_ANG_VEL],
+            params[a, P_MAX_ANG_ACCEL],
+            params[a, P_LF],
+            params[a, P_LR],
+            params[a, P_MAX_STEER],
+            params[a, P_RADIUS],
+            dt,
+            bounds_min,
+            bounds_max,
+            clamp_bounds,
+            pos_out,
+            theta_out,
+            vel_out,
+            speed_out,
+            ang_vel_out,
+        )
 
 
 @wp.kernel
@@ -233,6 +501,7 @@ def integrate_kernel_per_env(
     bounds_min: Any,
     bounds_max: Any,
     clamp_bounds: wp.int32,
+    integrator: wp.int32,
     # state out
     pos_out: wp.array2d(dtype=Any),
     theta_out: wp.array2d(dtype=Any),
@@ -241,38 +510,72 @@ def integrate_kernel_per_env(
     ang_vel_out: wp.array2d(dtype=Any),
 ):
     e, a = wp.tid()
-    _integrate_agent(
-        e,
-        a,
-        pos[e, a],
-        theta[e, a],
-        vel[e, a],
-        speed[e, a],
-        ang_vel[e, a],
-        actions[e, a, 0],
-        actions[e, a, 1],
-        model_tag[a],
-        ctrl_mode[a],
-        forces[e, a],
-        params[e, a, P_MASS],
-        params[e, a, P_MAX_SPEED],
-        params[e, a, P_MAX_ACCEL],
-        params[e, a, P_MAX_ANG_VEL],
-        params[e, a, P_MAX_ANG_ACCEL],
-        params[e, a, P_LF],
-        params[e, a, P_LR],
-        params[e, a, P_MAX_STEER],
-        params[e, a, P_RADIUS],
-        dt,
-        bounds_min,
-        bounds_max,
-        clamp_bounds,
-        pos_out,
-        theta_out,
-        vel_out,
-        speed_out,
-        ang_vel_out,
-    )
+    if integrator == INT_RK4:
+        _integrate_rk4(
+            e,
+            a,
+            pos[e, a],
+            theta[e, a],
+            vel[e, a],
+            speed[e, a],
+            ang_vel[e, a],
+            actions[e, a, 0],
+            actions[e, a, 1],
+            model_tag[a],
+            ctrl_mode[a],
+            forces[e, a],
+            params[e, a, P_MASS],
+            params[e, a, P_MAX_SPEED],
+            params[e, a, P_MAX_ACCEL],
+            params[e, a, P_MAX_ANG_VEL],
+            params[e, a, P_MAX_ANG_ACCEL],
+            params[e, a, P_LF],
+            params[e, a, P_LR],
+            params[e, a, P_MAX_STEER],
+            params[e, a, P_RADIUS],
+            dt,
+            bounds_min,
+            bounds_max,
+            clamp_bounds,
+            pos_out,
+            theta_out,
+            vel_out,
+            speed_out,
+            ang_vel_out,
+        )
+    else:
+        _integrate_agent(
+            e,
+            a,
+            pos[e, a],
+            theta[e, a],
+            vel[e, a],
+            speed[e, a],
+            ang_vel[e, a],
+            actions[e, a, 0],
+            actions[e, a, 1],
+            model_tag[a],
+            ctrl_mode[a],
+            forces[e, a],
+            params[e, a, P_MASS],
+            params[e, a, P_MAX_SPEED],
+            params[e, a, P_MAX_ACCEL],
+            params[e, a, P_MAX_ANG_VEL],
+            params[e, a, P_MAX_ANG_ACCEL],
+            params[e, a, P_LF],
+            params[e, a, P_LR],
+            params[e, a, P_MAX_STEER],
+            params[e, a, P_RADIUS],
+            dt,
+            bounds_min,
+            bounds_max,
+            clamp_bounds,
+            pos_out,
+            theta_out,
+            vel_out,
+            speed_out,
+            ang_vel_out,
+        )
 
 
 def _signature(dtype, per_env: bool = False) -> list:
@@ -296,7 +599,8 @@ def _signature(dtype, per_env: bool = False) -> list:
         dtype,  # actions, forces, params, tags, modes, dt
         vec2,
         vec2,
-        wp.int32,  # bounds_min, bounds_max, clamp_bounds
+        wp.int32,
+        wp.int32,  # bounds_min, bounds_max, clamp_bounds, integrator
         a2v,
         a2s,
         a2v,
@@ -310,6 +614,10 @@ for _T in (wp.float32, wp.float64):
     wp.overload(integrate_kernel_per_env, _signature(_T, per_env=True))
 
 
+#: Integrator enum value -> kernel tag (must match the INT_* constants above).
+_INTEGRATOR_TAG = {Integrator.EULER: 0, Integrator.RK4: 1}
+
+
 def launch_integrate(
     state_in: WorldState,
     state_out: WorldState,
@@ -318,11 +626,13 @@ def launch_integrate(
     params: AgentParams,
     dt: float,
     clamp_bounds: tuple[float, float, float, float] | None = None,
+    integrator: Integrator = Integrator.EULER,
 ) -> None:
     """Launch one integration sub-step. Functional: never writes to ``state_in``.
 
     ``clamp_bounds=(x_min, x_max, y_min, y_max)`` hard-clamps positions inside
-    the rectangle (inset by each agent's radius).
+    the rectangle (inset by each agent's radius). ``integrator`` selects the
+    semi-implicit Euler recurrence (default) or classic RK4.
     """
     dtype = state_in.theta.dtype
     vec2 = VEC2[dtype]
@@ -350,6 +660,7 @@ def launch_integrate(
             b_min,
             b_max,
             wp.int32(do_clamp),
+            wp.int32(_INTEGRATOR_TAG[integrator]),
         ],
         outputs=state_out.arrays(),
         device=state_in.pos.device,
