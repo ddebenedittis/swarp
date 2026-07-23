@@ -141,4 +141,15 @@ class FormationScenario(Scenario):
         return self._cache["in_formation"].all(dim=-1)
 
     def info(self) -> dict[str, Any]:
-        return {"formation_error": self._cache["dist"].mean(-1)}
+        c = self._cache
+        # Per-agent objective vector [n_envs, n_agents, n_obj]: the two reward terms
+        # (shaping, collision) kept separate so a lexicographic/multi-objective loop can
+        # consume them via ``("next", "info", "multiobj_reward")``. Their sum over the last
+        # dim equals the scalar per-agent reward; the reward key itself stays scalar.
+        multiobj_reward = torch.stack(
+            [c["shaping"], self.collision_penalty * c["touching"]], dim=-1
+        )
+        return {
+            "multiobj_reward": multiobj_reward,  # [n_envs, n_agents, 2]
+            "formation_error": c["dist"].mean(-1),  # [n_envs] scalar diagnostic
+        }

@@ -27,6 +27,27 @@ class WmasEnv(EnvBase):
     actions ``"action"`` ``[n_envs, n_agents, act_dim]`` (bounded to the
     normalized ``[-1, 1]`` range the wmas kernels clamp against); reward
     ``[n_envs, n_agents, 1]``; a shared per-env ``done`` ``[n_envs, 1]``.
+
+    Scenario ``info()``
+    -------------------
+    If the scenario emits a non-empty :meth:`~wmas.scenarios.base.Scenario.info`
+    dict, each key is spec'd and forwarded as a nested ``info`` ``Composite``
+    inside ``observation_spec``, so it appears in both the reset output and the
+    step output under the **flat** path ``("next", "info", <key>)``. This is how
+    a multi-objective reward vector (e.g. ``multiobj_reward``
+    ``[n_envs, n_agents, n_obj]``) reaches a downstream lexicographic-MAPPO loop
+    while the ``reward`` key itself stays scalar (``[n_envs, n_agents, 1]``).
+
+    Note the layout: ``WmasEnv`` is flat (no ``("agents", …)`` group), so info is
+    at ``("next", "info", <key>)`` — **not** group-nested like TorchRL's
+    ``VmasEnv`` (``("next", "<group>", "info", <key>)``). Downstream code that
+    expects the grouped path must use the flat path here.
+
+    The info schema (per-key shape/dtype) is discovered at construction from
+    ``scenario.info()`` read **after the probe reset**, without advancing the
+    dynamics — so a scenario must populate its ``info()`` by reset time to have
+    it spec'd. Every info tensor must have leading dim ``n_envs``. Scenarios with
+    empty info (``{}``) get no info spec and behave exactly as before.
     """
 
     def __init__(
@@ -38,15 +59,34 @@ class WmasEnv(EnvBase):
         self.act_dim = env.world.act_dim
         obs = env.reset()  # one reset to discover obs_dim
         self.obs_dim = obs.shape[-1]
-        self._make_specs(action_low, action_high, obs.dtype)
+        # Sample the info schema without advancing dynamics (the scenario populates
+        # info() at reset time via reset_world -> post_step's cache refresh).
+        info = self._env.scenario.info()
+        self._info_keys = list(info.keys())
+        self._make_specs(action_low, action_high, obs.dtype, info)
 
-    def _make_specs(self, low: float, high: float, dtype: torch.dtype) -> None:
+    def _make_specs(
+        self, low: float, high: float, dtype: torch.dtype, info: dict[str, torch.Tensor]
+    ) -> None:
         ne, na = self._env.n_envs, self.n_agents
         self.observation_spec = Composite(
             observation=Unbounded(shape=(ne, na, self.obs_dim), dtype=dtype, device=self.device),
             shape=(ne,),
             device=self.device,
         )
+        if info:
+            info_spec = Composite(shape=(ne,), device=self.device)
+            for key, val in info.items():
+                if val.shape[0] != ne:
+                    raise ValueError(
+                        f"info[{key!r}] must have leading dim n_envs={ne}, "
+                        f"got shape {tuple(val.shape)}"
+                    )
+                info_spec[key] = Unbounded(
+                    shape=tuple(val.shape), dtype=val.dtype, device=self.device
+                )
+            # Nest under observation_spec so it surfaces in both reset and ("next", ...).
+            self.observation_spec["info"] = info_spec
         self.action_spec = Composite(
             action=Bounded(
                 low=low, high=high, shape=(ne, na, self.act_dim), dtype=dtype, device=self.device
@@ -76,7 +116,7 @@ class WmasEnv(EnvBase):
         else:
             obs = self._env.reset()
         ne = self._env.n_envs
-        return TensorDict(
+        out = TensorDict(
             {
                 "observation": obs,
                 "done": torch.zeros(ne, 1, dtype=torch.bool, device=self.device),
@@ -85,18 +125,35 @@ class WmasEnv(EnvBase):
             batch_size=self.batch_size,
             device=self.device,
         )
+        if self._info_keys:
+            # The scenario populated info() during reset_world's cache refresh; forward it
+            # so reset and step satisfy the same info spec. Tensors stay on-device.
+            info = self._env.scenario.info()
+            out.set("info", self._info_td(info))
+        return out
 
     def _step(self, tensordict: TensorDict) -> TensorDict:
         action = tensordict.get("action")
-        obs, reward, done, _info = self._env.step(action)
+        obs, reward, done, info = self._env.step(action)
         done = done.reshape(-1, 1)
-        return TensorDict(
+        out = TensorDict(
             {
                 "observation": obs,
                 "reward": reward.unsqueeze(-1),
                 "done": done,
                 "terminated": done,
             },
+            batch_size=self.batch_size,
+            device=self.device,
+        )
+        if self._info_keys:
+            out.set("info", self._info_td(info))
+        return out
+
+    def _info_td(self, info: dict[str, torch.Tensor]) -> TensorDict:
+        """Pack the scenario info dict into a nested TensorDict (tensors kept on-device)."""
+        return TensorDict(
+            {key: info[key] for key in self._info_keys},
             batch_size=self.batch_size,
             device=self.device,
         )
