@@ -195,7 +195,9 @@ def _trajectory(env: Environment, action_seq: list[torch.Tensor]) -> dict:
     return {"obs": obs_l, "reward": rew_l, "done": done_l}
 
 
-def _parity_ok(ref: dict, cur: dict, rtol: float = 1e-5, atol: float = 1e-6) -> tuple[bool, str]:
+def _parity_ok(ref: dict, cur: dict, rtol: float = 1e-5, atol: float = 1e-5) -> tuple[bool, str]:
+    # atol 1e-5 tolerates the documented ulp-scale drift of the fused kernels vs
+    # the torch reference (sqrt/reduction order); a real regression is far larger.
     for key in ("obs", "reward"):
         for t, (r, c) in enumerate(zip(ref[key], cur[key], strict=True)):
             if r.shape != c.shape:
