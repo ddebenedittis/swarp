@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 import warp as wp
 
@@ -28,7 +29,13 @@ from wmas.core.collisions import launch_collision_forces
 from wmas.core.config import WorldConfig
 from wmas.core.neighbors import NeighborGrid
 from wmas.core.state import VEC2, WorldState
-from wmas.dynamics.base import AgentConfig, AgentParams, Integrator, build_agent_params
+from wmas.dynamics.base import (
+    NUM_PARAMS,
+    P_RADIUS,
+    AgentConfig,
+    AgentParams,
+    build_agent_params,
+)
 from wmas.dynamics.kernels import launch_integrate
 
 
@@ -55,11 +62,6 @@ class Stepper:
         world: WorldConfig | None = None,
     ) -> None:
         world = world if world is not None else WorldConfig(collisions=False)
-        if world.integrator is not Integrator.EULER:
-            raise NotImplementedError(
-                f"Integrator {world.integrator} is not implemented yet; the dynamics "
-                "derivative is a pure @wp.func, so RK4 slots into wmas/dynamics/kernels.py."
-            )
         if substeps < 1:
             raise ValueError("substeps must be >= 1")
         self.configs = configs
@@ -161,6 +163,41 @@ class Stepper:
         # zero-force buffer, which the force pass would then overwrite.
         self._cached_buffers.clear()
 
+    def set_agent_params_per_env(self, floats: torch.Tensor | np.ndarray) -> None:
+        """Install a per-env parameter override for domain randomization.
+
+        Once set, every step launches the per-env kernel variants that index
+        ``params[e, a, ...]``; pass ``None``-equivalent by never calling this to
+        keep the shared fast path. Static per episode — call again at reset to
+        re-randomize. Buffer shapes are unchanged, so no hot-path buffers are
+        cleared.
+
+        Args:
+            floats: ``[n_envs, n_agents, NUM_PARAMS]`` array (torch.Tensor or
+                np.ndarray); columns follow ``AgentConfig.to_row()`` order. See
+                :func:`wmas.dynamics.base.per_env_float_template` for a template.
+                ``n_envs`` must match the batch size passed to the step.
+        """
+        arr = floats.detach().cpu().numpy() if hasattr(floats, "detach") else np.asarray(floats)
+        if arr.ndim != 3 or arr.shape[1:] != (self.n_agents, NUM_PARAMS):
+            raise ValueError(
+                f"per-env params must have shape [n_envs, n_agents={self.n_agents}, "
+                f"NUM_PARAMS={NUM_PARAMS}]; got {tuple(arr.shape)}"
+            )
+        if self.collisions:
+            max_r = float(arr[..., P_RADIUS].max())
+            reach = 2.0 * max_r + self.world.collision_margin
+            if self.neighbor_radius < reach:
+                raise ValueError(
+                    f"per-env radius up to {max_r} needs neighbor_radius >= {reach} "
+                    f"(= 2 * max per-env radius + margin), but neighbor_radius="
+                    f"{self.neighbor_radius}; set WorldConfig.neighbor_radius accordingly."
+                )
+        npdt = np.float64 if self.dtype == wp.float64 else np.float32
+        self.params.floats_per_env = wp.array(
+            np.ascontiguousarray(arr, dtype=npdt), dtype=self.dtype, device=self.device
+        )
+
     # ------------------------------------------------------------- allocation
 
     def alloc_state(self, n_envs: int, requires_grad: bool = False) -> WorldState:
@@ -207,6 +244,7 @@ class Stepper:
                 dtype=self.dtype,
                 grid_dim=self.world.grid_dim,
                 method=self.world.neighbor_method,
+                uniform_bins=self.world.uniform_bins,
             )
             self._grids[n_envs] = g
         return g
@@ -321,4 +359,5 @@ class Stepper:
                 self.params,
                 self.sub_dt,
                 clamp_bounds=self._clamp_bounds,
+                integrator=world.integrator,
             )

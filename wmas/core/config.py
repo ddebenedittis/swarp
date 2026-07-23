@@ -32,9 +32,11 @@ class WorldConfig:
             interaction reach ``2 * max_agent_radius + collision_margin``.
             Must not be smaller than that reach when collisions are on.
         max_neighbors: padded neighbor-list width (truncates beyond).
-        neighbor_method: ``"auto"`` | ``"grid"`` | ``"brute"`` — see
-            :class:`wmas.core.neighbors.NeighborGrid`.
+        neighbor_method: ``"auto"`` | ``"grid"`` | ``"brute"`` |
+            ``"uniform_grid"`` — see :class:`wmas.core.neighbors.NeighborGrid`.
         grid_dim: hash-grid bucket dimension per axis.
+        uniform_bins: cells per axis for the ``"uniform_grid"`` backend
+            (``None`` -> a ~sqrt(n_agents) heuristic).
     """
 
     collisions: bool = True
@@ -47,6 +49,7 @@ class WorldConfig:
     max_neighbors: int = 32
     neighbor_method: str = "auto"
     grid_dim: int = 128
+    uniform_bins: int | None = None
     integrator: Integrator = Integrator.EULER
 
     def __post_init__(self) -> None:

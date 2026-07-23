@@ -64,7 +64,15 @@ P_MAX_ANG_ACCEL = 5
 P_LF = 6
 P_LR = 7
 P_MAX_STEER = 8
-NUM_PARAMS = 9
+# 6-DOF drone parameters (ignored by the 2D vehicle models).
+P_THRUST_MAX = 9  # per-rotor max thrust (N)
+P_ARM = 10  # rotor arm length from CoG (m)
+P_IXX = 11  # body-frame diagonal inertia
+P_IYY = 12
+P_IZZ = 13
+P_KAPPA = 14  # yaw reaction torque per unit rotor thrust
+P_GRAVITY = 15  # gravitational acceleration (m/s^2)
+NUM_PARAMS = 16
 
 
 @dataclass
@@ -82,18 +90,25 @@ class AgentConfig:
     l_f: float = 0.1  # front axle to center of gravity (bicycle only)
     l_r: float = 0.1  # rear axle to center of gravity (bicycle only)
     max_steer: float = math.pi / 4  # bicycle only
+    # 6-DOF drone parameters (used only when model == DRONE).
+    thrust_max: float = 10.0  # per-rotor max thrust (N)
+    arm_length: float = 0.15  # rotor arm length from CoG (m)
+    inertia_xx: float = 0.01
+    inertia_yy: float = 0.01
+    inertia_zz: float = 0.02
+    torque_coeff: float = 0.02  # yaw reaction torque per unit rotor thrust
+    gravity: float = 9.81
 
     def __post_init__(self) -> None:
-        if self.model == DynamicsModel.DRONE:
-            raise NotImplementedError(
-                "6-DOF drone dynamics are not implemented yet; "
-                "see wmas.dynamics.drone.DronePlaceholder for the plug-in point."
-            )
         if self.l_f + self.l_r <= 0.0:
             raise ValueError("Bicycle wheelbase l_f + l_r must be positive.")
         for name in ("radius", "mass", "max_speed", "max_accel", "max_ang_vel", "max_ang_accel"):
             if getattr(self, name) <= 0.0:
                 raise ValueError(f"AgentConfig.{name} must be positive.")
+        if self.model == DynamicsModel.DRONE:
+            for name in ("thrust_max", "arm_length", "inertia_xx", "inertia_yy", "inertia_zz"):
+                if getattr(self, name) <= 0.0:
+                    raise ValueError(f"AgentConfig.{name} must be positive for a drone.")
 
     def to_row(self) -> list[float]:
         return [
@@ -106,16 +121,32 @@ class AgentConfig:
             self.l_f,
             self.l_r,
             self.max_steer,
+            self.thrust_max,
+            self.arm_length,
+            self.inertia_xx,
+            self.inertia_yy,
+            self.inertia_zz,
+            self.torque_coeff,
+            self.gravity,
         ]
 
 
 @dataclass
 class AgentParams:
-    """Device-resident per-agent parameters shared by all envs."""
+    """Device-resident per-agent parameters.
+
+    ``floats`` is the shared ``[n_agents, NUM_PARAMS]`` layout used by all envs
+    (the default fast path). ``floats_per_env`` is an opt-in
+    ``[n_envs, n_agents, NUM_PARAMS]`` override for domain randomization; when it
+    is not ``None`` the stepper launches the per-env kernel variants that index
+    ``params[e, a, ...]`` instead of ``params[a, ...]``. ``model_tag``/
+    ``ctrl_mode`` stay per-agent (structural, never randomized).
+    """
 
     floats: wp.array  # [n_agents, NUM_PARAMS], dtype float32/float64
     model_tag: wp.array  # [n_agents], int32
     ctrl_mode: wp.array  # [n_agents], int32
+    floats_per_env: wp.array | None = None  # [n_envs, n_agents, NUM_PARAMS] or None
 
 
 def build_agent_params(
@@ -133,3 +164,14 @@ def build_agent_params(
         model_tag=wp.array(tags, dtype=wp.int32, device=device),
         ctrl_mode=wp.array(modes, dtype=wp.int32, device=device),
     )
+
+
+def per_env_float_template(configs: list[AgentConfig], n_envs: int) -> np.ndarray:
+    """A ``[n_envs, n_agents, NUM_PARAMS]`` float64 array pre-filled from ``configs``.
+
+    Every env starts as a copy of the shared per-agent rows; edit columns (e.g.
+    ``[..., P_MASS]``) to randomize, then hand the result to
+    :meth:`wmas.core.stepper.Stepper.set_agent_params_per_env`.
+    """
+    rows = np.array([c.to_row() for c in configs], dtype=np.float64)
+    return np.broadcast_to(rows, (n_envs, *rows.shape)).copy()

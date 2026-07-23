@@ -112,13 +112,12 @@ def _box_force(p: Any, v: Any, center: Any, angle: Any, half: Any, reach: Any, k
     return f
 
 
-@wp.kernel
-def collision_forces_kernel(
-    pos: wp.array2d(dtype=Any),
-    vel: wp.array2d(dtype=Any),
-    params: wp.array2d(dtype=Any),
-    neighbor_idx: wp.array3d(dtype=wp.int32),
-    neighbor_count: wp.array2d(dtype=wp.int32),
+@wp.func
+def _static_forces(
+    e: wp.int32,
+    p: Any,
+    v: Any,
+    ra: Any,
     obs_pos: wp.array2d(dtype=Any),
     obs_radius: wp.array(dtype=Any),
     obs_type: wp.array(dtype=wp.int32),
@@ -131,18 +130,13 @@ def collision_forces_kernel(
     soft_walls: wp.int32,
     bounds_min: Any,
     bounds_max: Any,
-    forces: wp.array2d(dtype=Any),
 ):
-    e, a = wp.tid()
-    p = pos[e, a]
-    v = vel[e, a]
-    ra = params[a, P_RADIUS]
+    """Env-static contact forces on an agent at ``p`` (radius ``ra``): obstacles
+    and soft walls. Independent of the per-agent param layout, so both the
+    shared and per-env kernels reuse it; only the pairwise-neighbor radius read
+    differs between them."""
     zero = type(k)(0.0)
     f = type(p)(zero, zero)
-
-    for n_i in range(neighbor_count[e, a]):
-        b = neighbor_idx[e, a, n_i]
-        f += _pair_force(p - pos[e, b], v - vel[e, b], ra + params[b, P_RADIUS] + margin, k, c)
 
     for o in range(n_obstacles):
         center = obs_pos[e, o]
@@ -174,15 +168,123 @@ def collision_forces_kernel(
             fy += -(k * pen) - c * v[1]
         f += type(p)(fx, fy)
 
+    return f
+
+
+@wp.kernel
+def collision_forces_kernel(
+    pos: wp.array2d(dtype=Any),
+    vel: wp.array2d(dtype=Any),
+    params: wp.array2d(dtype=Any),  # [n_agents, NUM_PARAMS] shared across envs
+    neighbor_idx: wp.array3d(dtype=wp.int32),
+    neighbor_count: wp.array2d(dtype=wp.int32),
+    obs_pos: wp.array2d(dtype=Any),
+    obs_radius: wp.array(dtype=Any),
+    obs_type: wp.array(dtype=wp.int32),
+    obs_angle: wp.array(dtype=Any),
+    obs_half: wp.array(dtype=Any),
+    n_obstacles: wp.int32,
+    k: Any,
+    c: Any,
+    margin: Any,
+    soft_walls: wp.int32,
+    bounds_min: Any,
+    bounds_max: Any,
+    forces: wp.array2d(dtype=Any),
+):
+    e, a = wp.tid()
+    p = pos[e, a]
+    v = vel[e, a]
+    ra = params[a, P_RADIUS]
+    zero = type(k)(0.0)
+    f = type(p)(zero, zero)
+
+    for n_i in range(neighbor_count[e, a]):
+        b = neighbor_idx[e, a, n_i]
+        f += _pair_force(p - pos[e, b], v - vel[e, b], ra + params[b, P_RADIUS] + margin, k, c)
+
+    f += _static_forces(
+        e,
+        p,
+        v,
+        ra,
+        obs_pos,
+        obs_radius,
+        obs_type,
+        obs_angle,
+        obs_half,
+        n_obstacles,
+        k,
+        c,
+        margin,
+        soft_walls,
+        bounds_min,
+        bounds_max,
+    )
     forces[e, a] = f
 
 
-def _signature(dtype) -> list:
+@wp.kernel
+def collision_forces_kernel_per_env(
+    pos: wp.array2d(dtype=Any),
+    vel: wp.array2d(dtype=Any),
+    params: wp.array3d(dtype=Any),  # [n_envs, n_agents, NUM_PARAMS] per-env
+    neighbor_idx: wp.array3d(dtype=wp.int32),
+    neighbor_count: wp.array2d(dtype=wp.int32),
+    obs_pos: wp.array2d(dtype=Any),
+    obs_radius: wp.array(dtype=Any),
+    obs_type: wp.array(dtype=wp.int32),
+    obs_angle: wp.array(dtype=Any),
+    obs_half: wp.array(dtype=Any),
+    n_obstacles: wp.int32,
+    k: Any,
+    c: Any,
+    margin: Any,
+    soft_walls: wp.int32,
+    bounds_min: Any,
+    bounds_max: Any,
+    forces: wp.array2d(dtype=Any),
+):
+    e, a = wp.tid()
+    p = pos[e, a]
+    v = vel[e, a]
+    ra = params[e, a, P_RADIUS]
+    zero = type(k)(0.0)
+    f = type(p)(zero, zero)
+
+    for n_i in range(neighbor_count[e, a]):
+        b = neighbor_idx[e, a, n_i]
+        # neighbor b's radius is env-specific in the per-env layout
+        f += _pair_force(p - pos[e, b], v - vel[e, b], ra + params[e, b, P_RADIUS] + margin, k, c)
+
+    f += _static_forces(
+        e,
+        p,
+        v,
+        ra,
+        obs_pos,
+        obs_radius,
+        obs_type,
+        obs_angle,
+        obs_half,
+        n_obstacles,
+        k,
+        c,
+        margin,
+        soft_walls,
+        bounds_min,
+        bounds_max,
+    )
+    forces[e, a] = f
+
+
+def _signature(dtype, per_env: bool = False) -> list:
     vec2 = VEC2[dtype]
+    params = wp.array3d(dtype=dtype) if per_env else wp.array2d(dtype=dtype)
     return [
         wp.array2d(dtype=vec2),
         wp.array2d(dtype=vec2),
-        wp.array2d(dtype=dtype),
+        params,
         wp.array3d(dtype=wp.int32),
         wp.array2d(dtype=wp.int32),
         wp.array2d(dtype=vec2),
@@ -203,6 +305,7 @@ def _signature(dtype) -> list:
 
 for _T in (wp.float32, wp.float64):
     wp.overload(collision_forces_kernel, _signature(_T))
+    wp.overload(collision_forces_kernel_per_env, _signature(_T, per_env=True))
 
 
 def launch_collision_forces(
@@ -227,13 +330,17 @@ def launch_collision_forces(
     dtype,
 ) -> None:
     n_envs, n_agents = pos.shape
+    if params.floats_per_env is None:
+        kernel, floats = collision_forces_kernel, params.floats
+    else:
+        kernel, floats = collision_forces_kernel_per_env, params.floats_per_env
     wp.launch(
-        collision_forces_kernel,
+        kernel,
         dim=(n_envs, n_agents),
         inputs=[
             pos,
             vel,
-            params.floats,
+            floats,
             neighbor_idx,
             neighbor_count,
             obs_pos,

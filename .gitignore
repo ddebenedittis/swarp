@@ -1,3 +1,28 @@
-.venv
+# Byte-compiled / optimized
+__pycache__/
+*.py[cod]
 
-VectorizedMultiAgentSimulator
+# Virtual environments
+.venv/
+
+# Packaging / build
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Test / lint / type caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Coverage
+.coverage
+.coverage.*
+htmlcov/
+
+# OS
+.DS_Store
+
+# Vendored reference repo
+VectorizedMultiAgentSimulator/

@@ -18,34 +18,63 @@ from typing import NamedTuple
 import torch
 import warp as wp
 
-from wmas.core.state import STATE_FIELDS, VEC2, WorldState
+from wmas.core.state import WorldState, field_wp_dtype
 from wmas.core.stepper import Stepper
 
 _WP_SCALAR = {torch.float32: wp.float32, torch.float64: wp.float64}
 
 
 class TorchState(NamedTuple):
-    """Torch-side view of the world state (see wmas.core.state.WorldState)."""
+    """Torch-side view of the world state (see wmas.core.state.WorldState).
+
+    The last four fields are the 6-DOF drone state; they default to ``None`` and
+    are auto-filled (zeros, identity attitude) by :func:`warp_step` so the 2D
+    models keep their five-field construction.
+    """
 
     pos: torch.Tensor  # [n_envs, n_agents, 2]
     theta: torch.Tensor  # [n_envs, n_agents]
     vel: torch.Tensor  # [n_envs, n_agents, 2]
     speed: torch.Tensor  # [n_envs, n_agents]
     ang_vel: torch.Tensor  # [n_envs, n_agents]
+    z: torch.Tensor | None = None  # [n_envs, n_agents]
+    vz: torch.Tensor | None = None  # [n_envs, n_agents]
+    attitude: torch.Tensor | None = None  # [n_envs, n_agents, 4] (x, y, z, w)
+    body_rates: torch.Tensor | None = None  # [n_envs, n_agents, 3]
 
 
-def _field_wp_dtype(name: str, scalar):
-    return VEC2[scalar] if STATE_FIELDS[name] else scalar
+def fill_state_defaults(state: TorchState) -> TorchState:
+    """Materialize any ``None`` drone fields as zeros (identity attitude),
+    matching the batch shape/device/dtype of ``pos``."""
+    if all(t is not None for t in state):
+        return state
+    ref = state.pos
+    n_envs, n_agents = ref.shape[0], ref.shape[1]
+    opts = {"device": ref.device, "dtype": ref.dtype}
+    z = state.z if state.z is not None else torch.zeros(n_envs, n_agents, **opts)
+    vz = state.vz if state.vz is not None else torch.zeros(n_envs, n_agents, **opts)
+    if state.attitude is not None:
+        att = state.attitude
+    else:
+        att = torch.zeros(n_envs, n_agents, 4, **opts)
+        att[..., 3] = 1.0  # identity quaternion (x, y, z, w)
+    br = (
+        state.body_rates
+        if state.body_rates is not None
+        else torch.zeros(n_envs, n_agents, 3, **opts)
+    )
+    return state._replace(z=z, vz=vz, attitude=att, body_rates=br)
 
 
 def _wrap_input_state(tensors: TorchState, scalar, with_grad: bool):
     """Wrap torch tensors as Warp arrays; optionally attach fresh grad buffers."""
+    n = len(TorchState._fields)
     grads = TorchState(*(torch.zeros_like(t) for t in tensors)) if with_grad else None
     arrays = {}
     for name, t, g in zip(
-        TorchState._fields, tensors, grads if with_grad else (None,) * 5, strict=True
+        TorchState._fields, tensors, grads if with_grad else (None,) * n, strict=True
     ):
-        dt = _field_wp_dtype(name, scalar)
+        dt = field_wp_dtype(name, scalar)
         if with_grad:
             arrays[name] = wp.from_torch(t.contiguous(), dtype=dt, grad=g)
         else:
@@ -116,7 +145,7 @@ class _WarpStepFn(torch.autograd.Function):
             ):
                 seeds[arr] = wp.from_torch(
                     adj.contiguous(),
-                    dtype=_field_wp_dtype(name, ctx.scalar),
+                    dtype=field_wp_dtype(name, ctx.scalar),
                     requires_grad=False,
                 )
             ctx.tape.backward(grads=seeds)
@@ -130,6 +159,7 @@ def warp_step(stepper: Stepper, state: TorchState, actions: torch.Tensor) -> Tor
     Under ``torch.no_grad()`` (or when no input requires grad) a tape-free fast
     path is used with recycled intermediate buffers.
     """
+    state = fill_state_defaults(state)
     grad_mode = torch.is_grad_enabled() and (
         actions.requires_grad or any(t.requires_grad for t in state)
     )
