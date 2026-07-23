@@ -118,6 +118,27 @@ def test_formation_shaping_rewards_progress(device):
 
 
 @pytest.mark.parametrize("device", DEVICES)
+def test_formation_info_multiobj_reward(device):
+    """FormationScenario.info() emits a stacked objective vector + a scalar diagnostic,
+    both on-device, with leading dim n_envs."""
+    ne, na = 8, 4
+    scenario = FormationScenario(n_agents=na)
+    env = Environment(scenario, n_envs=ne, device=device, dt=0.1, seed=0)
+    env.reset()  # populates the cache via reset_world -> _refresh
+    info = scenario.info()
+    assert set(info) >= {"multiobj_reward", "formation_error"}
+    mo = info["multiobj_reward"]
+    assert mo.shape == (ne, na, 2)  # [shaping, collision] per agent
+    assert mo.device.type == torch.device(device).type
+    fe = info["formation_error"]
+    assert fe.shape == (ne,)
+    assert fe.device.type == torch.device(device).type
+    # The objective vector must sum (over objectives) to the scalar per-agent reward.
+    per_agent = torch.stack([scenario.agent_reward(i) for i in range(na)], dim=1)
+    assert torch.allclose(mo.sum(-1), per_agent, atol=1e-6)
+
+
+@pytest.mark.parametrize("device", DEVICES)
 def test_flocking_separation_penalty(device):
     """Two agents on top of each other incur a crowding (separation) penalty."""
     scenario = FlockingScenario(n_agents=4, separation_dist=0.2)

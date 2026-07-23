@@ -35,6 +35,9 @@ class Environment:
         max_steps: int | None = None,
         seed: int = 0,
         auto_reset: bool = False,
+        use_graph: bool = False,
+        copy_outputs: bool = False,
+        fused: bool | str = "auto",
     ) -> None:
         self.scenario = scenario
         self.n_envs = n_envs
@@ -42,16 +45,33 @@ class Environment:
         self.dtype = dtype
         self.max_steps = max_steps
         self.auto_reset = auto_reset
+        self.copy_outputs = copy_outputs
         self.world = scenario.make_world(
             n_envs=n_envs, device=device, dt=dt, substeps=substeps, dtype=dtype
         )
         self.n_agents = self.world.n_agents
         self._seed(seed)
         self._step_count = torch.zeros(n_envs, device=device, dtype=torch.int32)
+        # Fused Warp obs/reward/done kernels for the no-grad hot path. "auto"
+        # follows the scenario; grad mode always falls back to the torch path.
+        self._fused = scenario.fused_available() if fused == "auto" else bool(fused)
+        # Opt-in persistent-buffer + CUDA-graph execution for the no-grad hot
+        # path. Zero-copy views are returned by default; copy_outputs clones them.
+        if use_graph:
+            self.world.enable_persistent(use_graph=True)
+
+    def _set_fused_active(self) -> None:
+        """Fused kernels run only on the no-grad path (grad uses the torch ref)."""
+        self.scenario._fused_active = self._fused and not torch.is_grad_enabled()
 
     def _seed(self, seed: int) -> None:
         self.world.generator = torch.Generator(device=self.device)
         self.world.generator.manual_seed(seed)
+
+    @property
+    def graph_mode(self) -> bool:
+        """True when a CUDA graph is actively backing the no-grad step."""
+        return self.world.runtime is not None and self.world.runtime.graph_active
 
     # ------------------------------------------------------------------- API
 
@@ -59,8 +79,10 @@ class Environment:
         """Reset all envs; returns stacked observations [n_envs, n_agents, obs_dim]."""
         if seed is not None:
             self._seed(seed)
+        self._set_fused_active()
+        self.scenario._fused_obs_only = False
         with torch.no_grad():
-            self.world.state = self.world.zero_state()
+            self.world.reset_state()
             self.scenario.reset_world(None)
         self._step_count.zero_()
         return self.scenario.observations()
@@ -72,6 +94,8 @@ class Environment:
         selected envs with ``torch.where``; unselected envs are untouched.
         Returns stacked observations for all envs.
         """
+        self._set_fused_active()
+        self.scenario._fused_obs_only = False
         with torch.no_grad():
             self.scenario.reset_world(env_mask)
         self._step_count = torch.where(
@@ -102,6 +126,8 @@ class Environment:
         if actions.dtype != self.dtype:
             raise TypeError(f"actions dtype {actions.dtype} != env dtype {self.dtype}")
 
+        self._set_fused_active()
+        self.scenario._fused_obs_only = False
         self.world.step(actions)
         self.scenario.post_step()
 
@@ -114,8 +140,12 @@ class Environment:
         info = self.scenario.info()
 
         if self.auto_reset:
+            # Obs-only reset pass: reward/done/info were already returned for this
+            # transition and their (fused) buffers must not be clobbered.
+            self.scenario._fused_obs_only = True
             with torch.no_grad():
                 self.scenario.reset_world(done)
+            self.scenario._fused_obs_only = False
             self._step_count = torch.where(
                 done, torch.zeros_like(self._step_count), self._step_count
             )
@@ -123,6 +153,9 @@ class Environment:
         # Observations reflect the state after any auto-reset (next episode's
         # first obs for done envs), matching the gym/VMAS vec-env convention.
         obs = self.scenario.observations()
+        if self.copy_outputs:
+            obs, reward = obs.clone(), reward.clone()
+            done = done.clone()
         return obs, reward, done, info
 
     def radius_graph(self) -> torch.Tensor:

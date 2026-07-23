@@ -138,6 +138,12 @@ def compiled_warp_step(stepper: Stepper, state: TorchState, actions: torch.Tenso
 class CudaGraphStep:
     """CUDA-graph capture of the no-grad hot path to cut per-step launch latency.
 
+    Standalone building block kept for the tests. For end-to-end use prefer
+    :class:`wmas.interop.persistent.StepRuntime` (via ``Environment(...,
+    use_graph=True)``), which owns persistent state, replays on the default
+    stream so eager torch resets/observations stay ordered, and recaptures
+    automatically on obstacle/param changes.
+
     Captures a single ``launch_substeps`` on fixed input/output/scratch buffers
     with ``wp.ScopedCapture``; each call copies the incoming state+actions into
     the fixed inputs, replays the graph, and returns cloned outputs. The step

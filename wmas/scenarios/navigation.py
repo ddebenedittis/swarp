@@ -16,11 +16,14 @@ from __future__ import annotations
 from typing import Any
 
 import torch
+import warp as wp
 
 from wmas.core.config import WorldConfig
+from wmas.core.state import VEC2
 from wmas.core.world import World
 from wmas.dynamics.base import AgentConfig, ControlMode, DynamicsModel
 from wmas.scenarios.base import Scenario
+from wmas.scenarios.navigation_kernels import nav_obs_kernel, nav_reward_kernel
 
 
 class NavigationScenario(Scenario):
@@ -43,6 +46,7 @@ class NavigationScenario(Scenario):
         goal_tolerance: float | None = None,
         min_spawn_separation: float | None = None,
         neighbor_method: str = "auto",
+        eager_trims: bool = True,
     ) -> None:
         self.n_agents = n_agents
         self.agent_radius = agent_radius
@@ -63,6 +67,12 @@ class NavigationScenario(Scenario):
             min_spawn_separation if min_spawn_separation is not None else 3.0 * agent_radius
         )
         self.neighbor_method = neighbor_method
+        # When True (default) the per-step obs/reward cache reuses persistent
+        # scratch buffers (arange, int64 index, gathered neighbor pos/vel,
+        # cos/sin) and writes the position-shaping baseline in place, cutting the
+        # eager-torch layer's per-step allocations. Bit-exact vs the untrimmed
+        # path; set False (used by the ablation baseline) to measure the churn.
+        self.eager_trims = eager_trims
 
     # ------------------------------------------------------------------ world
 
@@ -101,7 +111,21 @@ class NavigationScenario(Scenario):
         )
         self._nbr_cache: dict[str, torch.Tensor] | None = None
         self._prev_dist: torch.Tensor | None = None
+        # Persistent eager-trim scratch (allocated lazily on first refresh).
+        self._eager_k_all: int = -1
+        self._eager_k: int = -1
+        # Fused-kernel obs width and lazy-allocation flag.
+        self._k_obs = min(self.neighbor_obs, world_config.max_neighbors)
+        self._fused_ready = False
         return self.world
+
+    def fused_available(self) -> bool:
+        """Navigation ships fused Warp obs/reward kernels (2D, needs neighbors)."""
+        return True
+
+    @property
+    def obs_dim(self) -> int:
+        return 9 + 5 * self._k_obs
 
     def _sample_separated(self, n_envs: int, n_points: int, min_dist: float, tries: int = 16):
         """Uniform positions with pairwise separation via bounded resampling.
@@ -175,13 +199,173 @@ class NavigationScenario(Scenario):
                 w.obstacle_pos.copy_(torch.where(env_mask.view(-1, 1, 1), obs_pos, w.obstacle_pos))
             w.set_obstacles(w.obstacle_pos, w.obstacle_radius)
 
+        w.mark_pos_dirty()  # positions written out of band; force a fresh build
         self._nbr_cache = None
-        self._refresh_step_cache(reset_mask=env_mask)
+        if self._fused_active:
+            self._ensure_fused(w.n_envs)
+            if env_mask is None:
+                self._f_resetmask.fill_(1)
+            else:
+                self._f_resetmask.copy_(env_mask)  # bool -> uint8
+            # An auto-reset (mid-step) must not clobber the reward/done/info
+            # buffers already returned this step: obs-only pass (full_pass=0). A
+            # standalone reset recomputes everything (full_pass=1) so info() is
+            # populated. Either way the shaping baseline rebases only reset envs.
+            full = 0 if self._fused_obs_only else 1
+            self._launch_obs(advance_prev=0, full_pass=full)
+        else:
+            self._refresh_step_cache(reset_mask=env_mask)
+
+    # --------------------------------------------------------- fused fast path
+
+    def _ensure_fused(self, n_envs: int) -> None:
+        """Allocate the persistent fused output buffers + cached wp handles."""
+        if self._fused_ready:
+            return
+        w = self.world
+        na, dev, dt = self.n_agents, w.device, w.dtype
+        od = self.obs_dim
+
+        def z(*shape, d=dt):
+            return torch.zeros(*shape, device=dev, dtype=d)
+
+        self._f_obs = z(n_envs, na, od)
+        self._f_touch = z(n_envs, na)
+        self._f_dist = z(n_envs, na)
+        self._f_shaping = z(n_envs, na)
+        self._f_reward = z(n_envs, na)
+        self._f_ongoal = z(n_envs, na, d=torch.uint8)
+        self._f_overflow = z(n_envs, na, d=torch.uint8)
+        self._f_done = z(n_envs, d=torch.uint8)
+        self._f_resetmask = z(n_envs, d=torch.uint8)
+        if self._prev_dist is None:
+            self._prev_dist = z(n_envs, na)
+        scalar = w.wp_dtype
+        self._wp = {
+            "obs": wp.from_torch(self._f_obs, dtype=scalar),
+            "touch": wp.from_torch(self._f_touch, dtype=scalar),
+            "dist": wp.from_torch(self._f_dist, dtype=scalar),
+            "shaping": wp.from_torch(self._f_shaping, dtype=scalar),
+            "reward": wp.from_torch(self._f_reward, dtype=scalar),
+            "ongoal": wp.from_torch(self._f_ongoal, dtype=wp.uint8),
+            "overflow": wp.from_torch(self._f_overflow, dtype=wp.uint8),
+            "done": wp.from_torch(self._f_done, dtype=wp.uint8),
+            "resetmask": wp.from_torch(self._f_resetmask, dtype=wp.uint8),
+        }
+        # Zero-copy bool reinterpret views (uint8 0/1 -> bool).
+        self._f_ongoal_bool = self._f_ongoal.view(torch.bool)
+        self._f_overflow_bool = self._f_overflow.view(torch.bool)
+        self._f_done_bool = self._f_done.view(torch.bool)
+        self._fused_ready = True
+
+    def _state_wp(self):
+        """(pos, vel, theta, ang_vel) as Warp arrays for the fused kernels."""
+        w = self.world
+        scalar = w.wp_dtype
+        vec2 = VEC2[scalar]
+        if w._persistent and not w._detached:
+            s = w.runtime.state
+            return s.pos, s.vel, s.theta, s.ang_vel
+        st = w.state
+        return (
+            wp.from_torch(st.pos.contiguous(), dtype=vec2),
+            wp.from_torch(st.vel.contiguous(), dtype=vec2),
+            wp.from_torch(st.theta.contiguous(), dtype=scalar),
+            wp.from_torch(st.ang_vel.contiguous(), dtype=scalar),
+        )
+
+    def _launch_obs(self, advance_prev: int, full_pass: int) -> None:
+        w = self.world
+        n_envs = w.n_envs
+        self._ensure_fused(n_envs)
+        w.neighbors()  # build the grid on the current state (fills grid buffers)
+        grid = w.stepper.grid(n_envs)
+        scalar = w.wp_dtype
+        vec2 = VEC2[scalar]
+        pos, vel, theta, ang_vel = self._state_wp()
+        goals = wp.from_torch(w.goals.contiguous(), dtype=vec2)
+        prev = wp.from_torch(self._prev_dist.contiguous(), dtype=scalar)
+        # Touching uses the static per-agent radius (matches the torch reference's
+        # World.agent_radius); per-env randomization affects forces, not this count.
+        params = w.stepper.params.floats
+        wp.launch(
+            nav_obs_kernel,
+            dim=(n_envs, self.n_agents),
+            inputs=[
+                pos,
+                vel,
+                theta,
+                ang_vel,
+                goals,
+                grid.neighbor_idx,
+                grid.neighbor_count,
+                grid.neighbor_true_count,
+                params,
+                self._wp["resetmask"],
+                wp.int32(self._k_obs),
+                scalar(self.pos_shaping_factor),
+                scalar(self.goal_tolerance),
+                wp.int32(advance_prev),
+                wp.int32(full_pass),
+            ],
+            outputs=[
+                self._wp["obs"],
+                self._wp["touch"],
+                self._wp["dist"],
+                self._wp["shaping"],
+                self._wp["ongoal"],
+                self._wp["overflow"],
+                prev,
+            ],
+            device=w.device,
+            record_tape=False,
+        )
+
+    def _launch_reward(self) -> None:
+        w = self.world
+        scalar = w.wp_dtype
+        wp.launch(
+            nav_reward_kernel,
+            dim=w.n_envs,
+            inputs=[
+                self._wp["touch"],
+                self._wp["shaping"],
+                self._wp["ongoal"],
+                wp.int32(self.n_agents),
+                scalar(self.collision_penalty),
+                scalar(self.final_reward),
+                wp.int32(1 if self.shared_reward else 0),
+            ],
+            outputs=[self._wp["reward"], self._wp["done"]],
+            device=w.device,
+            record_tape=False,
+        )
 
     # ------------------------------------------------------- per-step caching
 
     def post_step(self) -> None:
-        self._refresh_step_cache()
+        if self._fused_active:
+            self._ensure_fused(self.world.n_envs)
+            self._f_resetmask.zero_()  # a normal step resets no env
+            self._launch_obs(advance_prev=1, full_pass=1)
+            self._launch_reward()
+        else:
+            self._refresh_step_cache()
+
+    def _ensure_eager_buffers(self, k_all: int, k: int) -> None:
+        """Allocate the persistent eager-trim scratch (once per shape)."""
+        if self._eager_k_all == k_all and self._eager_k == k:
+            return
+        w = self.world
+        ne, na, dev, dt = w.n_envs, w.n_agents, w.device, w.dtype
+        self._arange_k = torch.arange(k_all, device=dev)
+        self._idx_long = torch.empty((ne, na, k_all), dtype=torch.int64, device=dev)
+        self._npos_flat = torch.empty((ne, na * k_all, 2), dtype=dt, device=dev)
+        self._cosbuf = torch.empty((ne, na), dtype=dt, device=dev)
+        self._sinbuf = torch.empty((ne, na), dtype=dt, device=dev)
+        self._nvel_flat = torch.empty((ne, na * k, 2), dtype=dt, device=dev) if k > 0 else None
+        self._eager_k_all = k_all
+        self._eager_k = k
 
     def _refresh_step_cache(self, reset_mask: torch.Tensor | None = None) -> None:
         """Neighbor features, distances, and reward terms for the current state.
@@ -195,28 +379,50 @@ class NavigationScenario(Scenario):
         w = self.world
         pos, vel = w.state.pos, w.state.vel
         idx, cnt = w.neighbors()
-        idx = idx.long()
         k_all = idx.shape[-1]
-        valid = torch.arange(k_all, device=w.device).view(1, 1, -1) < cnt.long().unsqueeze(
-            -1
-        )  # [n_envs, n_agents, k_all]
+        k = min(self.neighbor_obs, k_all)
+        eager = self.eager_trims
+        # ``gather(out=)`` is not autograd-compatible, so the out= fast path is
+        # only taken when no grad is being recorded; the persistent int64 index,
+        # arange, and in-place shaping baseline are grad-safe and always used.
+        fast = eager and not torch.is_grad_enabled()
+
+        if eager:
+            self._ensure_eager_buffers(k_all, k)
+            idx_long = self._idx_long
+            idx_long.copy_(idx)
+            arange_k = self._arange_k
+        else:
+            idx_long = idx.long()
+            arange_k = torch.arange(k_all, device=w.device)
+
+        valid = arange_k.view(1, 1, -1) < cnt.long().unsqueeze(-1)  # [n_envs, n_agents, k_all]
         # neighbor positions (all slots: needed for touching counts)
-        flat = idx.reshape(w.n_envs, -1)
-        npos = torch.gather(pos, 1, flat.unsqueeze(-1).expand(-1, -1, 2))
+        flat = idx_long.reshape(w.n_envs, -1)
+        idx_exp = flat.unsqueeze(-1).expand(-1, -1, 2)
+        npos = (
+            torch.gather(pos, 1, idx_exp, out=self._npos_flat)
+            if fast
+            else torch.gather(pos, 1, idx_exp)
+        )
         npos = npos.view(w.n_envs, w.n_agents, k_all, 2)
         rel_pos_all = npos - pos.unsqueeze(2)
 
         # touching pairs -> per-agent collision counts (non-differentiable count)
         ndist = rel_pos_all.norm(dim=-1)
         r = w.agent_radius  # [n_agents]
-        min_dist = r.view(1, -1, 1) + r[idx]  # r_i + r_j
+        min_dist = r.view(1, -1, 1) + r[idx_long]  # r_i + r_j
         touching = ((ndist < min_dist) & valid).sum(dim=-1).to(w.dtype)
 
         # observation features only need the first `neighbor_obs` slots
-        k = min(self.neighbor_obs, k_all)
         rel_pos = rel_pos_all[:, :, :k] * valid[:, :, :k].unsqueeze(-1)
-        flat_k = idx[:, :, :k].reshape(w.n_envs, -1)
-        nvel = torch.gather(vel, 1, flat_k.unsqueeze(-1).expand(-1, -1, 2))
+        flat_k = idx_long[:, :, :k].reshape(w.n_envs, -1)
+        vidx_exp = flat_k.unsqueeze(-1).expand(-1, -1, 2)
+        nvel = (
+            torch.gather(vel, 1, vidx_exp, out=self._nvel_flat)
+            if (fast and k > 0)
+            else torch.gather(vel, 1, vidx_exp)
+        )
         nvel = nvel.view(w.n_envs, w.n_agents, k, 2)
         rel_vel = (nvel - vel.unsqueeze(2)) * valid[:, :, :k].unsqueeze(-1)
 
@@ -225,15 +431,19 @@ class NavigationScenario(Scenario):
             self._prev_dist = dist_to_goal.detach().clone()
         pos_shaping = (self._prev_dist - dist_to_goal) * self.pos_shaping_factor
         if reset_mask is None:
-            self._prev_dist = dist_to_goal.detach().clone()
+            if eager:
+                self._prev_dist.copy_(dist_to_goal.detach())
+            else:
+                self._prev_dist = dist_to_goal.detach().clone()
         else:
             # Rebase only reset envs; others keep their continuous baseline.
-            pos_shaping = torch.where(
-                reset_mask.unsqueeze(-1), torch.zeros_like(pos_shaping), pos_shaping
-            )
-            self._prev_dist = torch.where(
-                reset_mask.unsqueeze(-1), dist_to_goal.detach(), self._prev_dist
-            )
+            m = reset_mask.unsqueeze(-1)
+            pos_shaping = torch.where(m, torch.zeros_like(pos_shaping), pos_shaping)
+            new_prev = torch.where(m, dist_to_goal.detach(), self._prev_dist)
+            if eager:
+                self._prev_dist.copy_(new_prev)
+            else:
+                self._prev_dist = new_prev
 
         self._nbr_cache = {
             "rel_pos": rel_pos,
@@ -251,14 +461,23 @@ class NavigationScenario(Scenario):
 
     def observations(self) -> torch.Tensor:
         """Fully batched observations [n_envs, n_agents, obs_dim]."""
+        if self._fused_active:
+            return self._f_obs
         w = self.world
         s = w.state
         cache = self._nbr_cache
+        fast = self.eager_trims and not torch.is_grad_enabled()
+        if fast:
+            cos = torch.cos(s.theta, out=self._cosbuf).unsqueeze(-1)
+            sin = torch.sin(s.theta, out=self._sinbuf).unsqueeze(-1)
+        else:
+            cos = torch.cos(s.theta).unsqueeze(-1)
+            sin = torch.sin(s.theta).unsqueeze(-1)
         feats = [
             s.pos,
             s.vel,
-            torch.cos(s.theta).unsqueeze(-1),
-            torch.sin(s.theta).unsqueeze(-1),
+            cos,
+            sin,
             s.ang_vel.unsqueeze(-1),
             w.goals - s.pos,
         ]
@@ -276,6 +495,8 @@ class NavigationScenario(Scenario):
         return self.observations()[:, agent_idx]
 
     def rewards(self) -> torch.Tensor:
+        if self._fused_active:
+            return self._f_reward
         cache = self._nbr_cache
         rew = self.collision_penalty * cache["touching"]
         if self.shared_reward:
@@ -300,9 +521,18 @@ class NavigationScenario(Scenario):
         return rew
 
     def done(self) -> torch.Tensor:
+        if self._fused_active:
+            return self._f_done_bool
         return self._nbr_cache["on_goal"].all(dim=-1)
 
     def info(self) -> dict[str, Any]:
+        if self._fused_active:
+            return {
+                "dist_to_goal": self._f_dist,
+                "on_goal": self._f_ongoal_bool,
+                "collisions": self._f_touch,
+                "neighbor_overflow": self._f_overflow_bool,
+            }
         return {
             "dist_to_goal": self._nbr_cache["dist_to_goal"],
             "on_goal": self._nbr_cache["on_goal"],

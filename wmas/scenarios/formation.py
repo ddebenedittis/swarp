@@ -13,11 +13,14 @@ import math
 from typing import Any
 
 import torch
+import warp as wp
 
 from wmas.core.config import WorldConfig
+from wmas.core.state import VEC2
 from wmas.core.world import World
 from wmas.dynamics.base import AgentConfig, ControlMode, DynamicsModel
 from wmas.scenarios.base import Scenario
+from wmas.scenarios.formation_kernels import formation_obs_kernel, formation_reward_kernel
 
 
 class FormationScenario(Scenario):
@@ -74,7 +77,16 @@ class FormationScenario(Scenario):
         )  # [n_agents, 2]
         self._prev_dist: torch.Tensor | None = None
         self._cache: dict[str, torch.Tensor] | None = None
+        self._fused_ready = False
         return self.world
+
+    def fused_available(self) -> bool:
+        """Formation ships fused Warp obs/reward kernels (2D holonomic)."""
+        return True
+
+    @property
+    def obs_dim(self) -> int:
+        return 6
 
     def reset_world(self, env_mask: torch.Tensor | None = None) -> None:
         w = self.world
@@ -98,10 +110,139 @@ class FormationScenario(Scenario):
                 torch.where(m3, torch.zeros_like(w.state.vel.data), w.state.vel.data)
             )
             w.goals.copy_(torch.where(m3, goals, w.goals))
-        self._refresh(reset_mask=env_mask)
+        if self._fused_active:
+            self._ensure_fused(w.n_envs)
+            if env_mask is None:
+                self._f_resetmask.fill_(1)
+            else:
+                self._f_resetmask.copy_(env_mask)  # bool -> uint8
+            full = 0 if self._fused_obs_only else 1
+            self._launch_obs(advance_prev=0, full_pass=full)
+        else:
+            self._refresh(reset_mask=env_mask)
 
     def post_step(self) -> None:
-        self._refresh()
+        if self._fused_active:
+            self._ensure_fused(self.world.n_envs)
+            self._f_resetmask.zero_()  # a normal step resets no env
+            self._launch_obs(advance_prev=1, full_pass=1)
+            self._launch_reward()
+        else:
+            self._refresh()
+
+    # --------------------------------------------------------- fused fast path
+
+    def _ensure_fused(self, n_envs: int) -> None:
+        """Allocate the persistent fused output buffers + cached wp handles."""
+        if self._fused_ready:
+            return
+        w = self.world
+        na, dev, dt = self.n_agents, w.device, w.dtype
+
+        def z(*shape, d=dt):
+            return torch.zeros(*shape, device=dev, dtype=d)
+
+        self._f_obs = z(n_envs, na, self.obs_dim)
+        self._f_shaping = z(n_envs, na)
+        self._f_touch = z(n_envs, na)
+        self._f_dist = z(n_envs, na)
+        self._f_reward = z(n_envs, na)
+        self._f_multiobj = z(n_envs, na, 2)
+        self._f_ferror = z(n_envs)
+        self._f_inform = z(n_envs, na, d=torch.uint8)
+        self._f_done = z(n_envs, d=torch.uint8)
+        self._f_resetmask = z(n_envs, d=torch.uint8)
+        if self._prev_dist is None:
+            self._prev_dist = z(n_envs, na)
+        scalar = w.wp_dtype
+        self._wp = {
+            "obs": wp.from_torch(self._f_obs, dtype=scalar),
+            "shaping": wp.from_torch(self._f_shaping, dtype=scalar),
+            "touch": wp.from_torch(self._f_touch, dtype=scalar),
+            "dist": wp.from_torch(self._f_dist, dtype=scalar),
+            "reward": wp.from_torch(self._f_reward, dtype=scalar),
+            "multiobj": wp.from_torch(self._f_multiobj, dtype=scalar),
+            "ferror": wp.from_torch(self._f_ferror, dtype=scalar),
+            "inform": wp.from_torch(self._f_inform, dtype=wp.uint8),
+            "done": wp.from_torch(self._f_done, dtype=wp.uint8),
+            "resetmask": wp.from_torch(self._f_resetmask, dtype=wp.uint8),
+        }
+        self._f_inform_bool = self._f_inform.view(torch.bool)
+        self._f_done_bool = self._f_done.view(torch.bool)
+        self._fused_ready = True
+
+    def _state_wp(self):
+        """(pos, vel, goals) as Warp arrays for the fused kernels."""
+        w = self.world
+        vec2 = VEC2[w.wp_dtype]
+        goals = wp.from_torch(w.goals.contiguous(), dtype=vec2)
+        if w._persistent and not w._detached:
+            s = w.runtime.state
+            return s.pos, s.vel, goals
+        st = w.state
+        return (
+            wp.from_torch(st.pos.contiguous(), dtype=vec2),
+            wp.from_torch(st.vel.contiguous(), dtype=vec2),
+            goals,
+        )
+
+    def _launch_obs(self, advance_prev: int, full_pass: int) -> None:
+        w = self.world
+        self._ensure_fused(w.n_envs)
+        scalar = w.wp_dtype
+        pos, vel, goals = self._state_wp()
+        prev = wp.from_torch(self._prev_dist.contiguous(), dtype=scalar)
+        wp.launch(
+            formation_obs_kernel,
+            dim=(w.n_envs, self.n_agents),
+            inputs=[
+                pos,
+                vel,
+                goals,
+                self._wp["resetmask"],
+                scalar((2.0 * self.agent_radius) ** 2),
+                scalar(self.goal_tolerance),
+                scalar(self.pos_shaping_factor),
+                wp.int32(self.n_agents),
+                wp.int32(advance_prev),
+                wp.int32(full_pass),
+            ],
+            outputs=[
+                self._wp["obs"],
+                self._wp["shaping"],
+                self._wp["touch"],
+                self._wp["dist"],
+                self._wp["inform"],
+                prev,
+            ],
+            device=w.device,
+            record_tape=False,
+        )
+
+    def _launch_reward(self) -> None:
+        w = self.world
+        scalar = w.wp_dtype
+        wp.launch(
+            formation_reward_kernel,
+            dim=w.n_envs,
+            inputs=[
+                self._wp["shaping"],
+                self._wp["touch"],
+                self._wp["dist"],
+                self._wp["inform"],
+                wp.int32(self.n_agents),
+                scalar(self.collision_penalty),
+                scalar(1.0 / self.n_agents),
+            ],
+            outputs=[
+                self._wp["reward"],
+                self._wp["done"],
+                self._wp["multiobj"],
+                self._wp["ferror"],
+            ],
+            device=w.device,
+            record_tape=False,
+        )
 
     def _refresh(self, reset_mask: torch.Tensor | None = None) -> None:
         w = self.world
@@ -116,8 +257,13 @@ class FormationScenario(Scenario):
             shaping = torch.where(reset_mask.unsqueeze(-1), torch.zeros_like(shaping), shaping)
             self._prev_dist = torch.where(reset_mask.unsqueeze(-1), dist.detach(), self._prev_dist)
 
-        dd = torch.cdist(pos, pos)
-        touching = (dd < 2.0 * self.agent_radius).sum(dim=-1).to(w.dtype) - 1.0
+        # Squared broadcast distance (dx^2 + dy^2, no sqrt) so the reference's
+        # touching count matches the fused kernel bit-for-bit at the < 2r
+        # boundary; torch.cdist's matmul expansion rounds differently (and its
+        # non-matmul mode is ~50x slower). Same O(n_agents^2) as the original.
+        diff = pos.unsqueeze(2) - pos.unsqueeze(1)  # [n_envs, n_agents, n_agents, 2]
+        dd2 = (diff * diff).sum(dim=-1)
+        touching = (dd2 < (2.0 * self.agent_radius) ** 2).sum(dim=-1).to(w.dtype) - 1.0
         self._cache = {
             "dist": dist,
             "shaping": shaping,
@@ -126,6 +272,8 @@ class FormationScenario(Scenario):
         }
 
     def observations(self) -> torch.Tensor:
+        if self._fused_active:
+            return self._f_obs
         w = self.world
         s = w.state
         return torch.cat([s.pos, s.vel, w.goals - s.pos], dim=-1)
@@ -137,8 +285,31 @@ class FormationScenario(Scenario):
         c = self._cache
         return c["shaping"][:, agent_idx] + self.collision_penalty * c["touching"][:, agent_idx]
 
+    def rewards(self) -> torch.Tensor:
+        if self._fused_active:
+            return self._f_reward
+        return super().rewards()
+
     def done(self) -> torch.Tensor:
+        if self._fused_active:
+            return self._f_done_bool
         return self._cache["in_formation"].all(dim=-1)
 
     def info(self) -> dict[str, Any]:
-        return {"formation_error": self._cache["dist"].mean(-1)}
+        if self._fused_active:
+            return {
+                "multiobj_reward": self._f_multiobj,
+                "formation_error": self._f_ferror,
+            }
+        c = self._cache
+        # Per-agent objective vector [n_envs, n_agents, n_obj]: the two reward terms
+        # (shaping, collision) kept separate so a lexicographic/multi-objective loop can
+        # consume them via ``("next", "info", "multiobj_reward")``. Their sum over the last
+        # dim equals the scalar per-agent reward; the reward key itself stays scalar.
+        multiobj_reward = torch.stack(
+            [c["shaping"], self.collision_penalty * c["touching"]], dim=-1
+        )
+        return {
+            "multiobj_reward": multiobj_reward,  # [n_envs, n_agents, 2]
+            "formation_error": c["dist"].mean(-1),  # [n_envs] scalar diagnostic
+        }
