@@ -237,9 +237,11 @@ wmas deliberately does **not** aim to be a drop-in physics clone of VMAS. Out of
 for now:
 
 - **Trajectory parity with VMAS** — see the parity caveat above.
-- **Movable non-circular rigid bodies** — obstacles (box/segment) are *static*. Pushable
-  box payloads with rotational rigid-body dynamics and **joints** (VMAS `transport`,
-  `balance`) need a rigid-body model that isn't built yet.
+- **In-tape rigid-body payloads / joints** — `TransportScenario` provides a *first* movable
+  circular package (agents push it to a goal) via staggered coupling at the torch layer
+  (differentiable across a rollout), but full in-step rigid-body payloads with rotation
+  fully on the Warp adjoint tape, non-circular bodies, and **joints** (VMAS `balance`) are
+  still out of scope.
 - **Rendering** — no viewer; inspect state tensors / plot yourself.
 - **Discrete or communication action spaces** — actions are continuous real vectors.
 
@@ -259,6 +261,9 @@ ranges against circular agents/obstacles, opt-in as an observation component a s
 concatenates; and four circle-compatible **VMAS-style scenario ports** —
 `SamplingScenario` (consume a batched sum-of-Gaussians field), `DiscoveryScenario`
 (cover targets that each need several agents), `FlockingScenario` (Reynolds boids reward),
-and `FormationScenario` (hold polygon slots).
+and `FormationScenario` (hold polygon slots); and a first **movable-package**
+`TransportScenario` (agents push a circular payload to a goal; staggered torch-layer
+coupling, differentiable across a rollout).
 
-Next: TorchRL wrapper; then movable rigid-body payloads for transport/balance.
+Next: TorchRL wrapper; torch.compile / CUDA-graph capture; then in-tape rigid-body
+payloads.

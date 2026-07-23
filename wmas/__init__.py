@@ -22,6 +22,7 @@ from wmas.scenarios.flocking import FlockingScenario
 from wmas.scenarios.formation import FormationScenario
 from wmas.scenarios.navigation import NavigationScenario
 from wmas.scenarios.sampling import SamplingScenario
+from wmas.scenarios.transport import TransportScenario
 from wmas.sensors.lidar import Lidar, lidar_scan
 
 __version__ = "0.1.0"
@@ -42,6 +43,7 @@ __all__ = [
     "Scenario",
     "Stepper",
     "TorchState",
+    "TransportScenario",
     "World",
     "WorldConfig",
     "lidar_scan",
