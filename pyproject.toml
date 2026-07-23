@@ -22,6 +22,18 @@ dev = [
     "pytest>=8.0",
     "ruff>=0.8",
 ]
+# VMAS comparison benchmark (wmas/benchmark/compare_vmas.py). VMAS pulls in gym,
+# which requires numpy < 2. Falls back to a vendored ./VectorizedMultiAgentSimulator
+# checkout if `vmas` is not importable.
+bench = [
+    "vmas>=1.5",
+]
+# TorchRL EnvBase wrapper (wmas/interop/torchrl.py). Optional: the core install
+# stays lean and only depends on warp + torch + numpy.
+torchrl = [
+    "torchrl>=0.5",
+    "tensordict>=0.5",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["wmas"]

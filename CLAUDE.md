@@ -1,0 +1,72 @@
+# CLAUDE.md
+
+## Project Overview
+
+`wmas` (Warp Multi-Agent Simulator) is a GPU-resident, differentiable, vectorized 2D
+multi-agent simulator built on NVIDIA Warp with zero-copy PyTorch interop. Conceptually
+VMAS, but the step is compiled Warp kernels instead of per-entity PyTorch ops. All state
+lives on-device as `[n_envs, n_agents]` Warp arrays; the hot loop does no host↔device copies.
+
+`VectorizedMultiAgentSimulator/` is a vendored VMAS git submodule used **only** by the
+comparison benchmark — it is ruff-excluded and not part of this package. Do not edit it.
+
+## Build & Run
+
+```bash
+uv venv
+uv pip install -e . --group dev
+uv run pytest                              # dynamics, gradients, neighbors, collisions, determinism
+python -m wmas.benchmark.throughput        # NavigationScenario hot-path env-steps/s
+python -m wmas.benchmark.compare_vmas      # vs VMAS; needs `--group bench` (pulls in vmas, numpy<2)
+```
+
+`compare_vmas` takes `--metric {throughput,memory,both}`; falls back to the
+`./VectorizedMultiAgentSimulator` checkout if `vmas` is not importable.
+
+## Architecture
+
+Layering (torch-facing at the top, Warp kernels at the bottom):
+
+```
+Environment          wmas/core/environment.py   VMAS-style API: reset/step/radius_graph over a Scenario
+    ↓ drives
+Scenario (ABC)       wmas/scenarios/base.py     make_world / reset_world / observation / *_reward
+    ↓ builds
+World                wmas/core/world.py         batched state tensors, goals, obstacles, RNG
+    ↓ owns
+Stepper              wmas/core/stepper.py       THE substep pipeline: neighbors → forces → integrate
+    ↓ launches
+kernels              wmas/dynamics/kernels.py, wmas/core/collisions.py, wmas/core/neighbors.py
+```
+
+- `wmas/core/state.py` — `WorldState`: structure-of-arrays Warp storage. One unified state
+  for all models (`pos/theta/vel/speed/ang_vel`); holonomic agents ignore `theta/ang_vel`.
+- `wmas/dynamics/base.py` — `DynamicsModel`/`ControlMode`/`Integrator` enums, `AgentConfig`
+  (per-agent, mixable in one world), and `build_agent_params`. Three models: holonomic point,
+  diff-drive, kinematic bicycle. `wmas/dynamics/drone.py` `DronePlaceholder` marks the 6-DOF slot.
+- `wmas/interop/autograd.py` — the torch↔Warp bridge: `_WarpStepFn` (a `torch.autograd.Function`
+  replaying Warp adjoints in `backward`), `warp_step`, and `rollout` for BPTT over multi-step rollouts.
+- `wmas/core/neighbors.py` — `NeighborGrid` with two backends (per-env brute force and one
+  `wp.HashGrid` over all envs), selected via `WorldConfig.neighbor_method`; tested to agree exactly.
+
+## Design Invariants (read before extending the step)
+
+- **The step is functional** (`state_in → state_out`). Every array written during a taped step
+  (intermediate states, force buffers, neighbor lists) must be allocated **fresh per step** —
+  overwriting an array recorded on a `wp.Tape` silently corrupts its adjoint. `Stepper` is the
+  single place that knows this; the no-grad hot path recycles one cached `StepBuffers` per batch size.
+- **Precision is explicit.** Kernels are generic over dtype and instantiated for float32/float64
+  via `wp.overload` (see the `_signature(dtype)` helpers in `kernels.py`/`collisions.py`).
+  float64-on-CPU is what makes strict `torch.autograd.gradcheck` possible.
+- **Collision forces are gather-based** — each agent sums over its own neighbor list. No atomics:
+  deterministic and race-free.
+- **Neighbor construction is not taped** (`record_tape=False`); the neighbor *set* is discrete, so
+  gradients flow through contact geometry, not through membership.
+- `wp.HashGrid` wraps cell coordinates modulo its dims, which aliases cells across the z-lifted
+  env batching — brute force wins up to a few hundred agents/env.
+
+## Code Style
+
+- Formatter/linter: ruff (config in `pyproject.toml`), line length 100, `target-version = py312`.
+- Lint set: `E,W,F,I,UP,B,SIM`; `SIM108` ignored (ternaries aren't always clearer inside kernels).
+- `VectorizedMultiAgentSimulator/` is `extend-exclude`d.
