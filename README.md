@@ -266,6 +266,7 @@ and `FormationScenario` (hold polygon slots); a first **movable-package**
 coupling, differentiable across a rollout); and a **torch.compile-compatible step**
 (`wmas.interop.compile.compiled_warp_step`, a `torch.library.custom_op` with fake +
 autograd rules) plus an optional **CUDA-graph capture** of the no-grad hot path
-(`CudaGraphStep`).
+(`CudaGraphStep`); and a **TorchRL `EnvBase` wrapper** (`wmas.interop.torchrl.WmasEnv`,
+batched `TensorDict` specs, `--group torchrl`) that passes TorchRL's `check_env_specs`.
 
-Next: TorchRL wrapper; then in-tape rigid-body payloads.
+Next: in-tape rigid-body payloads and joints (VMAS `transport`/`balance` parity).
