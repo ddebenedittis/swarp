@@ -21,6 +21,16 @@ def make_state(pos, vel=None, dtype=torch.float64):
     return TorchState(pos=pos, theta=z.clone(), vel=v, speed=z.clone(), ang_vel=z.clone())
 
 
+def _core(state):
+    """The five 2D state tensors (drops the optional drone fields)."""
+    return (state.pos, state.theta, state.vel, state.speed, state.ang_vel)
+
+
+def _map5(state, f):
+    """Apply ``f`` to the five 2D fields, leaving the drone fields at default."""
+    return TorchState(*(f(t) for t in _core(state)))
+
+
 def holo_cfgs(n, radius=0.1, mode=ControlMode.VELOCITY):
     return [
         AgentConfig(
@@ -43,7 +53,7 @@ def test_two_agent_spring_analytic(device):
     state = make_state([[0.0, 0.0], [0.15, 0.0]])
     actions = torch.zeros(1, 2, 2, dtype=torch.float64)
     with torch.no_grad():
-        out = warp_step(stepper, TorchState(*(t.to(device) for t in state)), actions.to(device))
+        out = warp_step(stepper, _map5(state, lambda t: t.to(device)), actions.to(device))
     # overlap = 0.1 + 0.1 + 0.02 - 0.15 = 0.07 ; |F| = k * overlap = 7
     # velocity mode, zero action: v_new = F/m * dt ; pos += v_new * dt
     np.testing.assert_allclose(out.pos[0, 0].cpu(), [-0.07, 0.0], atol=1e-12)
@@ -88,7 +98,7 @@ def test_momentum_symmetry(device):
     )
     rng = np.random.default_rng(0)
     pos0 = rng.random((4, 2)) * 0.2  # cramped -> collisions
-    state = TorchState(*(t.to(device) for t in make_state(pos0)))
+    state = _map5(make_state(pos0), lambda t: t.to(device))
     actions = torch.zeros(1, 4, 2, dtype=torch.float64, device=device)
     com0 = state.pos.mean(dim=1)
     with torch.no_grad():
@@ -109,7 +119,7 @@ def test_obstacle_repulsion_analytic(device):
         pos=torch.tensor([[[0.3, 0.0]]], dtype=torch.float64, device=device),
         radius=torch.tensor([0.15], dtype=torch.float64, device=device),
     )
-    state = TorchState(*(t.to(device) for t in make_state([[0.1, 0.0]])))
+    state = _map5(make_state([[0.1, 0.0]]), lambda t: t.to(device))
     actions = torch.zeros(1, 1, 2, dtype=torch.float64, device=device)
     with torch.no_grad():
         out = warp_step(stepper, state, actions)
@@ -176,15 +186,15 @@ def test_gradcheck_with_collisions():
     )
     # overlapping pair, comfortably inside contact (overlap ~0.04 >> fd eps)
     state = make_state([[0.0, 0.0], [0.18, 0.02]], vel=[[0.1, 0.0], [-0.1, 0.05]])
-    state = TorchState(*(t.requires_grad_(True) for t in state))
+    state = _map5(state, lambda t: t.requires_grad_(True))
     actions = (
         0.1 * torch.randn(1, 2, 2, dtype=torch.float64, generator=torch.Generator().manual_seed(0))
     ).requires_grad_(True)
 
     def fn(pos, theta, vel, speed, ang_vel, act):
-        return tuple(warp_step(stepper, TorchState(pos, theta, vel, speed, ang_vel), act))
+        return tuple(warp_step(stepper, TorchState(pos, theta, vel, speed, ang_vel), act))[:5]
 
-    assert torch.autograd.gradcheck(fn, (*state, actions), eps=1e-6, atol=1e-5)
+    assert torch.autograd.gradcheck(fn, (*_core(state), actions), eps=1e-6, atol=1e-5)
 
 
 def test_grad_and_nograd_forward_match_with_collisions():
@@ -200,7 +210,7 @@ def test_grad_and_nograd_forward_match_with_collisions():
     rng = np.random.default_rng(1)
     state = make_state(rng.random((3, 2)) * 0.25)
     actions = torch.zeros(1, 3, 2, dtype=torch.float64)
-    grad_in = TorchState(*(t.clone().requires_grad_(True) for t in state))
+    grad_in = _map5(state, lambda t: t.clone().requires_grad_(True))
     out_grad = warp_step(stepper, grad_in, actions.clone().requires_grad_(True))
     with torch.no_grad():
         out_fast = warp_step(stepper, state, actions)

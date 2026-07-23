@@ -42,6 +42,7 @@ class NavigationScenario(Scenario):
         final_reward: float = 5.0,
         goal_tolerance: float | None = None,
         min_spawn_separation: float | None = None,
+        neighbor_method: str = "auto",
     ) -> None:
         self.n_agents = n_agents
         self.agent_radius = agent_radius
@@ -61,6 +62,7 @@ class NavigationScenario(Scenario):
         self.min_spawn_separation = (
             min_spawn_separation if min_spawn_separation is not None else 3.0 * agent_radius
         )
+        self.neighbor_method = neighbor_method
 
     # ------------------------------------------------------------------ world
 
@@ -86,6 +88,7 @@ class NavigationScenario(Scenario):
             bounds_mode="soft",
             neighbor_radius=max(self.neighbor_radius or 0.0, reach),
             max_neighbors=min(32, max(4, self.n_agents)),
+            neighbor_method=self.neighbor_method,
         )
         self.world = World(
             configs,

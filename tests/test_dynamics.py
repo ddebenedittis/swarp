@@ -11,7 +11,13 @@ import torch
 import warp as wp
 
 from wmas.core.state import WorldState
-from wmas.dynamics.base import AgentConfig, ControlMode, DynamicsModel, build_agent_params
+from wmas.dynamics.base import (
+    AgentConfig,
+    ControlMode,
+    DynamicsModel,
+    Integrator,
+    build_agent_params,
+)
 from wmas.dynamics.kernels import launch_integrate
 
 DEVICES = ["cpu"] + (["cuda:0"] if torch.cuda.is_available() else [])
@@ -74,7 +80,9 @@ def ref_bicycle(pos, theta, speed, actions, cfg: AgentConfig, dt: float):
     return traj
 
 
-def rollout_warp(cfgs, init, actions_seq, dt, device, dtype=wp.float64):
+def rollout_warp(
+    cfgs, init, actions_seq, dt, device, dtype=wp.float64, integrator=Integrator.EULER
+):
     """Step n_agents agents in a single env through actions_seq [T, n_agents, 2]."""
     n_agents = len(cfgs)
     params = build_agent_params(cfgs, device=device, dtype=dtype)
@@ -94,7 +102,7 @@ def rollout_warp(cfgs, init, actions_seq, dt, device, dtype=wp.float64):
     for actions in actions_seq:
         # actions are now a scalar [n_envs, n_agents, act_dim] array3d (not vec2)
         acts = wp.array(actions.astype(npdt).reshape(1, n_agents, 2), dtype=dtype, device=device)
-        launch_integrate(state, out, acts, forces, params, dt)
+        launch_integrate(state, out, acts, forces, params, dt, integrator=integrator)
         state, out = out, state
         # .numpy() is a zero-copy view on CPU -> copy before the buffer is reused
         traj.append(
@@ -327,10 +335,90 @@ def test_float32_matches_float64_loosely():
     np.testing.assert_allclose(t32[-1]["pos"], t64[-1]["pos"], atol=1e-4)
 
 
-def test_drone_placeholder_raises():
-    from wmas.dynamics.drone import DronePlaceholder
+def test_drone_config_builds():
+    """The 6-DOF drone is a first-class model now (see tests/test_drone.py)."""
+    from wmas.dynamics.drone import drone_config
 
-    with pytest.raises(NotImplementedError):
-        DronePlaceholder()
-    with pytest.raises(NotImplementedError):
-        AgentConfig(model=DynamicsModel.DRONE)
+    cfg = drone_config()
+    assert cfg.model == DynamicsModel.DRONE
+    row = cfg.to_row()  # extended parameter matrix packs cleanly
+    assert len(row) == 16
+
+
+# --------------------------------------------------------------------- RK4
+
+
+def _diff_drive_circle_analytic(x0, y0, th0, s, w, t):
+    """Exact solution of dtheta/dt = w, dp/dt = s*[cos theta, sin theta]."""
+    th = th0 + w * t
+    x = x0 + (s / w) * (np.sin(th) - np.sin(th0))
+    y = y0 - (s / w) * (np.cos(th) - np.cos(th0))
+    return np.array([x, y]), th
+
+
+def _diff_drive_final(dt, N, device, integrator):
+    """Roll a constant (speed, ang_vel) command for N steps; return final pos."""
+    cfg = AgentConfig(
+        model=DynamicsModel.DIFF_DRIVE,
+        ctrl_mode=ControlMode.VELOCITY,
+        max_speed=5.0,
+        max_ang_vel=5.0,
+    )
+    s, w = 1.3, 0.9
+    actions = np.tile(np.array([s, w]), (N, 1, 1))
+    init = {
+        "pos": np.array([[0.2, -0.1]]),
+        "theta": np.array([0.3]),
+        "vel": np.zeros((1, 2)),
+        "speed": np.zeros(1),
+        "ang_vel": np.zeros(1),
+    }
+    traj = rollout_warp([cfg], init, actions, dt, device, integrator=integrator)
+    return traj[-1]["pos"][0], (init, s, w)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_rk4_convergence_order(device):
+    """On a curved (circular) trajectory, RK4 converges ~dt^4, Euler ~dt^1, and
+    at a fixed step RK4 is far more accurate than semi-implicit Euler."""
+    total_t = 2.0
+
+    def errs(integrator, N):
+        dt = total_t / N
+        final, (init, s, w) = _diff_drive_final(dt, N, device, integrator)
+        exact, _ = _diff_drive_circle_analytic(
+            init["pos"][0, 0], init["pos"][0, 1], init["theta"][0], s, w, total_t
+        )
+        return np.linalg.norm(final - exact)
+
+    # Two resolutions to estimate the observed convergence order.
+    e_rk4_coarse = errs(Integrator.RK4, 100)
+    e_rk4_fine = errs(Integrator.RK4, 200)
+    e_eu_coarse = errs(Integrator.EULER, 100)
+    e_eu_fine = errs(Integrator.EULER, 200)
+
+    order_rk4 = np.log2(e_rk4_coarse / e_rk4_fine)
+    order_eu = np.log2(e_eu_coarse / e_eu_fine)
+
+    assert order_rk4 > 3.5, f"RK4 order {order_rk4:.2f} not ~4"
+    assert 0.8 < order_eu < 1.3, f"Euler order {order_eu:.2f} not ~1"
+    # RK4 is orders of magnitude tighter at the same step count.
+    assert e_rk4_coarse < e_eu_coarse * 1e-3
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_rk4_matches_euler_on_straight_line(device):
+    """With no curvature (constant holonomic velocity), RK4 and semi-implicit
+    Euler are both exact, so they agree to round-off."""
+    cfg = AgentConfig(model=DynamicsModel.HOLONOMIC, ctrl_mode=ControlMode.VELOCITY, max_speed=2.0)
+    actions = np.tile(np.array([0.7, -0.4]), (20, 1, 1))
+    init = {
+        "pos": np.zeros((1, 2)),
+        "theta": np.zeros(1),
+        "vel": np.zeros((1, 2)),
+        "speed": np.zeros(1),
+        "ang_vel": np.zeros(1),
+    }
+    t_eu = rollout_warp([cfg], init, actions, 0.05, device, integrator=Integrator.EULER)
+    t_rk = rollout_warp([cfg], init, actions, 0.05, device, integrator=Integrator.RK4)
+    np.testing.assert_allclose(t_rk[-1]["pos"], t_eu[-1]["pos"], atol=1e-12)

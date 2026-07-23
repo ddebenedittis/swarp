@@ -9,8 +9,9 @@ import pytest
 import torch
 import warp as wp
 
+from wmas.core.config import WorldConfig
 from wmas.core.stepper import Stepper
-from wmas.dynamics.base import AgentConfig, ControlMode, DynamicsModel
+from wmas.dynamics.base import AgentConfig, ControlMode, DynamicsModel, Integrator
 from wmas.interop.autograd import TorchState, rollout, warp_step
 
 BIG = 100.0  # limits far away from any test action
@@ -34,6 +35,16 @@ def make_state(n_envs, n_agents, device="cpu", dtype=torch.float64, requires_gra
         speed=t(n_envs, n_agents),
         ang_vel=t(n_envs, n_agents),
     )
+
+
+def _core(state):
+    """The five 2D state tensors (drops the optional drone fields)."""
+    return (state.pos, state.theta, state.vel, state.speed, state.ang_vel)
+
+
+def _map5(state, f):
+    """Apply ``f`` to the five 2D fields, leaving the drone fields at default."""
+    return TorchState(*(f(t) for t in _core(state)))
 
 
 MODEL_CASES = [
@@ -67,9 +78,43 @@ def test_gradcheck_single_step(name, model, mode):
 
     def fn(pos, theta, vel, speed, ang_vel, act):
         out = warp_step(stepper, TorchState(pos, theta, vel, speed, ang_vel), act)
-        return tuple(out)
+        return tuple(out)[:5]
 
-    assert torch.autograd.gradcheck(fn, (*state, actions), eps=1e-6, atol=1e-5)
+    assert torch.autograd.gradcheck(fn, (*_core(state), actions), eps=1e-6, atol=1e-5)
+
+
+@pytest.mark.parametrize("name,model,mode", MODEL_CASES, ids=[c[0] for c in MODEL_CASES])
+def test_gradcheck_single_step_rk4(name, model, mode):
+    """The RK4 path (four _deriv evaluations) is differentiable end-to-end."""
+    cfgs = [
+        AgentConfig(
+            model=model,
+            ctrl_mode=mode,
+            max_speed=BIG,
+            max_accel=BIG,
+            max_ang_vel=BIG,
+            max_ang_accel=BIG,
+            max_steer=1.0,
+            l_f=0.16,
+            l_r=0.14,
+        )
+        for _ in range(2)
+    ]
+    stepper = Stepper(
+        configs=cfgs,
+        dt=0.1,
+        device="cpu",
+        dtype=wp.float64,
+        world=WorldConfig(collisions=False, integrator=Integrator.RK4),
+    )
+    state = make_state(2, 2, requires_grad=True, seed=1)
+    actions = (0.3 * torch.randn(2, 2, 2, dtype=torch.float64)).requires_grad_(True)
+
+    def fn(pos, theta, vel, speed, ang_vel, act):
+        out = warp_step(stepper, TorchState(pos, theta, vel, speed, ang_vel), act)
+        return tuple(out)[:5]
+
+    assert torch.autograd.gradcheck(fn, (*_core(state), actions), eps=1e-6, atol=1e-5)
 
 
 def test_action_dim_gt_2_ignored_and_gradchecks():
@@ -93,10 +138,10 @@ def test_action_dim_gt_2_ignored_and_gradchecks():
     torch.testing.assert_close(a3.grad[..., 2], torch.zeros(1, 1, dtype=torch.float64))
 
     def fn(pos, theta, vel, speed, ang_vel, act):
-        return tuple(warp_step(stepper, TorchState(pos, theta, vel, speed, ang_vel), act))
+        return tuple(warp_step(stepper, TorchState(pos, theta, vel, speed, ang_vel), act))[:5]
 
     acts = (0.3 * torch.randn(1, 1, 3, dtype=torch.float64)).requires_grad_(True)
-    assert torch.autograd.gradcheck(fn, (*state, acts), eps=1e-6, atol=1e-5)
+    assert torch.autograd.gradcheck(fn, (*_core(state), acts), eps=1e-6, atol=1e-5)
 
 
 def test_gradcheck_substeps():
@@ -106,9 +151,9 @@ def test_gradcheck_substeps():
     actions = (0.3 * torch.randn(1, 1, 2, dtype=torch.float64)).requires_grad_(True)
 
     def fn(pos, theta, vel, speed, ang_vel, act):
-        return tuple(warp_step(stepper, TorchState(pos, theta, vel, speed, ang_vel), act))
+        return tuple(warp_step(stepper, TorchState(pos, theta, vel, speed, ang_vel), act))[:5]
 
-    assert torch.autograd.gradcheck(fn, (*state, actions), eps=1e-6, atol=1e-5)
+    assert torch.autograd.gradcheck(fn, (*_core(state), actions), eps=1e-6, atol=1e-5)
 
 
 def test_gradcheck_multistep_rollout():
@@ -132,7 +177,7 @@ def test_gradcheck_multistep_rollout():
         final, _ = rollout(stepper, TorchState(pos, theta, vel, speed, ang_vel), acts)
         return final.pos, final.theta
 
-    assert torch.autograd.gradcheck(fn, (*state, actions_seq), eps=1e-6, atol=1e-5)
+    assert torch.autograd.gradcheck(fn, (*_core(state), actions_seq), eps=1e-6, atol=1e-5)
 
 
 def test_bptt_analytic_holonomic():
@@ -207,7 +252,7 @@ def test_gpu_float32_matches_cpu_float64():
 
     def run(device, tdtype, wdtype):
         stepper = make_stepper(cfgs, substeps=2, device=device, dtype=wdtype)
-        state = TorchState(*(t.to(device=device, dtype=tdtype) for t in make_state(3, 3, seed=7)))
+        state = _map5(make_state(3, 3, seed=7), lambda t: t.to(device=device, dtype=tdtype))
         gen = torch.Generator().manual_seed(8)
         acts = 0.3 * torch.randn(T, 3, 3, 2, dtype=torch.float64, generator=gen)
         acts = acts.to(device=device, dtype=tdtype).requires_grad_(True)
@@ -228,7 +273,7 @@ def test_no_grad_path_gives_same_forward():
     state = make_state(2, 1, seed=9)
     actions = 0.5 * torch.randn(2, 1, 2, dtype=torch.float64)
 
-    grad_state = TorchState(*(t.clone().requires_grad_(True) for t in state))
+    grad_state = _map5(state, lambda t: t.clone().requires_grad_(True))
     out_grad = warp_step(stepper, grad_state, actions.clone().requires_grad_(True))
     with torch.no_grad():
         out_fast = warp_step(stepper, state, actions)

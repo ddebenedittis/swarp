@@ -28,6 +28,16 @@ from wmas.interop.autograd import TorchState, warp_step
 DEVICES = ["cpu"] + (["cuda:0"] if torch.cuda.is_available() else [])
 
 
+def _core(state):
+    """The five 2D state tensors (drops the optional drone fields)."""
+    return (state.pos, state.theta, state.vel, state.speed, state.ang_vel)
+
+
+def _map5(state, f):
+    """Apply ``f`` to the five 2D fields, leaving the drone fields at default."""
+    return TorchState(*(f(t) for t in _core(state)))
+
+
 def make_state(pos, vel=None, n_envs=1, dtype=torch.float64):
     pos = torch.as_tensor(pos, dtype=dtype)
     if pos.dim() == 2:
@@ -83,7 +93,7 @@ def test_per_env_mass_divergence_analytic(device):
     floats[1, 0, P_MASS] = 2.0
     stepper.set_agent_params_per_env(torch.as_tensor(floats, device=device))
 
-    state = TorchState(*(t.to(device) for t in make_state([[0.1, 0.0]], n_envs=2)))
+    state = _map5(make_state([[0.1, 0.0]], n_envs=2), lambda t: t.to(device))
     actions = torch.zeros(2, 1, 2, dtype=torch.float64, device=device)
     with torch.no_grad():
         out = warp_step(stepper, state, actions)
@@ -106,7 +116,7 @@ def test_per_env_radius_changes_contact_analytic(device):
     floats[1, :, P_RADIUS] = 0.15
     stepper.set_agent_params_per_env(torch.as_tensor(floats, device=device))
 
-    state = TorchState(*(t.to(device) for t in make_state([[0.0, 0.0], [0.25, 0.0]], n_envs=2)))
+    state = _map5(make_state([[0.0, 0.0], [0.25, 0.0]], n_envs=2), lambda t: t.to(device))
     actions = torch.zeros(2, 2, 2, dtype=torch.float64, device=device)
     with torch.no_grad():
         out = warp_step(stepper, state, actions)
@@ -182,15 +192,15 @@ def test_gradcheck_per_env_with_collisions():
     stepper.set_agent_params_per_env(torch.as_tensor(floats))
 
     state = make_state([[0.0, 0.0], [0.18, 0.02]], vel=[[0.1, 0.0], [-0.1, 0.05]], n_envs=2)
-    state = TorchState(*(t.requires_grad_(True) for t in state))
+    state = _map5(state, lambda t: t.requires_grad_(True))
     actions = (
         0.1 * torch.randn(2, 2, 2, dtype=torch.float64, generator=torch.Generator().manual_seed(0))
     ).requires_grad_(True)
 
     def fn(pos, theta, vel, speed, ang_vel, act):
-        return tuple(warp_step(stepper, TorchState(pos, theta, vel, speed, ang_vel), act))
+        return tuple(warp_step(stepper, TorchState(pos, theta, vel, speed, ang_vel), act))[:5]
 
-    assert torch.autograd.gradcheck(fn, (*state, actions), eps=1e-6, atol=1e-5)
+    assert torch.autograd.gradcheck(fn, (*_core(state), actions), eps=1e-6, atol=1e-5)
 
 
 def test_per_env_no_grad_matches_grad():
@@ -205,7 +215,7 @@ def test_per_env_no_grad_matches_grad():
     rng = np.random.default_rng(1)
     state = make_state(rng.random((3, 2)) * 0.25, n_envs=2)
     actions = torch.zeros(2, 3, 2, dtype=torch.float64)
-    grad_in = TorchState(*(t.clone().requires_grad_(True) for t in state))
+    grad_in = _map5(state, lambda t: t.clone().requires_grad_(True))
     out_grad = warp_step(stepper, grad_in, actions.clone().requires_grad_(True))
     with torch.no_grad():
         out_fast = warp_step(stepper, state, actions)

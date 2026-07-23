@@ -34,7 +34,6 @@ from wmas.dynamics.base import (
     P_RADIUS,
     AgentConfig,
     AgentParams,
-    Integrator,
     build_agent_params,
 )
 from wmas.dynamics.kernels import launch_integrate
@@ -63,11 +62,6 @@ class Stepper:
         world: WorldConfig | None = None,
     ) -> None:
         world = world if world is not None else WorldConfig(collisions=False)
-        if world.integrator is not Integrator.EULER:
-            raise NotImplementedError(
-                f"Integrator {world.integrator} is not implemented yet; the dynamics "
-                "derivative is a pure @wp.func, so RK4 slots into wmas/dynamics/kernels.py."
-            )
         if substeps < 1:
             raise ValueError("substeps must be >= 1")
         self.configs = configs
@@ -250,6 +244,7 @@ class Stepper:
                 dtype=self.dtype,
                 grid_dim=self.world.grid_dim,
                 method=self.world.neighbor_method,
+                uniform_bins=self.world.uniform_bins,
             )
             self._grids[n_envs] = g
         return g
@@ -364,4 +359,5 @@ class Stepper:
                 self.params,
                 self.sub_dt,
                 clamp_bounds=self._clamp_bounds,
+                integrator=world.integrator,
             )

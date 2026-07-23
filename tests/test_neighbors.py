@@ -42,6 +42,31 @@ def build_both(pos_np, radius, max_neighbors, device, dtype=wp.float32):
     return (g_idx, g_cnt), (b_idx, b_cnt)
 
 
+def build_uniform_and_brute(pos_np, radius, max_neighbors, device, dtype=wp.float32):
+    """Build the radix-sort uniform grid and the brute-force reference on one grid."""
+    n_envs, n_agents, _ = pos_np.shape
+    npdt = np.float64 if dtype == wp.float64 else np.float32
+    vec2 = wp.vec2d if dtype == wp.float64 else wp.vec2f
+    pos = wp.array(pos_np.astype(npdt), dtype=vec2, device=device)
+
+    grid = NeighborGrid(
+        n_envs,
+        n_agents,
+        radius=radius,
+        max_neighbors=max_neighbors,
+        device=device,
+        dtype=dtype,
+        method="uniform_grid",
+    )
+    grid.build_uniform(pos)
+    u_idx, u_cnt = grid.neighbor_idx.numpy().copy(), grid.neighbor_count.numpy().copy()
+    u_true = grid.neighbor_true_count.numpy().copy()
+    grid.build_brute_force(pos)
+    b_idx, b_cnt = grid.neighbor_idx.numpy().copy(), grid.neighbor_count.numpy().copy()
+    b_true = grid.neighbor_true_count.numpy().copy()
+    return (u_idx, u_cnt, u_true), (b_idx, b_cnt, b_true)
+
+
 @pytest.mark.parametrize("device", DEVICES)
 @pytest.mark.parametrize("n_envs,n_agents", [(1, 8), (4, 32), (2, 128)])
 @pytest.mark.parametrize("radius", [0.15, 0.5])
@@ -51,6 +76,65 @@ def test_grid_matches_brute_force(device, n_envs, n_agents, radius):
     (g_idx, g_cnt), (b_idx, b_cnt) = build_both(pos_np, radius, 64, device)
     np.testing.assert_array_equal(g_cnt, b_cnt)
     assert neighbor_sets(g_idx, g_cnt) == neighbor_sets(b_idx, b_cnt)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("n_envs,n_agents", [(1, 8), (4, 32), (2, 128), (2, 600)])
+@pytest.mark.parametrize("radius", [0.15, 0.5])
+def test_uniform_grid_matches_brute_force(device, n_envs, n_agents, radius):
+    """The radix-sort uniform grid agrees with brute force: byte-identical counts
+    and true counts, identical neighbor sets (sparse config, no truncation)."""
+    rng = np.random.default_rng(42)
+    pos_np = make_positions(rng, n_envs, n_agents)
+    (u_idx, u_cnt, u_true), (b_idx, b_cnt, b_true) = build_uniform_and_brute(
+        pos_np, radius, 128, device
+    )
+    np.testing.assert_array_equal(u_cnt, b_cnt)
+    np.testing.assert_array_equal(u_true, b_true)
+    assert not (b_true > 128).any(), "config truncated; widen max_neighbors"
+    assert neighbor_sets(u_idx, u_cnt) == neighbor_sets(b_idx, b_cnt)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_uniform_grid_no_cross_env_leaks(device):
+    """Identical dense layouts per env give identical, env-local neighbor sets."""
+    rng = np.random.default_rng(7)
+    single = make_positions(rng, 1, 16, extent=0.3)
+    pos_np = np.repeat(single, 8, axis=0)
+    (u_idx, u_cnt, u_true), (b_idx, b_cnt, _) = build_uniform_and_brute(pos_np, 0.4, 32, device)
+    np.testing.assert_array_equal(u_cnt, b_cnt)
+    sets = neighbor_sets(u_idx, u_cnt)
+    for e in range(1, 8):
+        assert sets[e] == sets[0]
+    assert u_idx.min() >= 0 and u_idx.max() < 16
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_uniform_grid_float64(device):
+    rng = np.random.default_rng(3)
+    pos_np = make_positions(rng, 2, 24)
+    (u_idx, u_cnt, _), (b_idx, b_cnt, _) = build_uniform_and_brute(
+        pos_np, 0.3, 32, device, dtype=wp.float64
+    )
+    np.testing.assert_array_equal(u_cnt, b_cnt)
+    assert neighbor_sets(u_idx, u_cnt) == neighbor_sets(b_idx, b_cnt)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_uniform_grid_rebuild_deterministic(device):
+    rng = np.random.default_rng(11)
+    pos_np = make_positions(rng, 4, 64, extent=0.5)
+    a = build_uniform_and_brute(pos_np, 0.25, 32, device)[0]
+    b = build_uniform_and_brute(pos_np, 0.25, 32, device)[0]
+    np.testing.assert_array_equal(a[0], b[0])
+    np.testing.assert_array_equal(a[1], b[1])
+    np.testing.assert_array_equal(a[2], b[2])
+
+
+def test_auto_selects_uniform_grid():
+    """auto picks the uniform grid for large per-env populations, brute otherwise."""
+    assert NeighborGrid(4, 600, radius=0.1, method="auto").method == "uniform_grid"
+    assert NeighborGrid(4, 512, radius=0.1, method="auto").method == "brute"
 
 
 @pytest.mark.parametrize("device", DEVICES)
@@ -80,8 +164,15 @@ def test_max_neighbors_overflow(device):
         assert len(picked) == 2 and a not in picked and picked <= set(range(5))
 
 
+_BUILD_METHOD = {
+    "brute": "build_brute_force",
+    "grid": "build_grid",
+    "uniform_grid": "build_uniform",
+}
+
+
 @pytest.mark.parametrize("device", DEVICES)
-@pytest.mark.parametrize("method", ["brute", "grid"])
+@pytest.mark.parametrize("method", ["brute", "grid", "uniform_grid"])
 def test_overflow_flag(device, method):
     """The overflow flag fires exactly where the true count exceeds the cap."""
     pos_np = np.zeros((1, 5, 2))
@@ -90,13 +181,13 @@ def test_overflow_flag(device, method):
     pos = wp.array(pos_np.astype(np.float32), dtype=vec2, device=device)
 
     grid = NeighborGrid(1, 5, radius=0.5, max_neighbors=2, device=device)
-    getattr(grid, "build_brute_force" if method == "brute" else "build_grid")(pos)
+    getattr(grid, _BUILD_METHOD[method])(pos)
     # every agent truly sees 4 neighbors, capped to 2 -> overflow everywhere
     np.testing.assert_array_equal(grid.true_count_view().cpu().numpy(), np.full((1, 5), 4))
     assert grid.overflow_view().all()
 
     grid_ok = NeighborGrid(1, 5, radius=0.5, max_neighbors=8, device=device)
-    getattr(grid_ok, "build_brute_force" if method == "brute" else "build_grid")(pos)
+    getattr(grid_ok, _BUILD_METHOD[method])(pos)
     assert not grid_ok.overflow_view().any()  # room for all 4 -> no overflow
 
 

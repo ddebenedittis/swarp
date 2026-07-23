@@ -12,10 +12,11 @@ but compiled as Warp kernels instead of PyTorch tensor ops.
 - **Batched worlds** — all state lives on-device as `[n_envs, n_agents]` Warp arrays;
   the hot loop performs no host↔device transfers (tested with an API guard and a CUDA
   profiler check).
-- **Three vehicle models**, mixable per-agent in one world (heterogeneous fleets):
+- **Four dynamics models**, mixable per-agent in one world (heterogeneous fleets):
   holonomic point (velocity or acceleration control), differential drive
-  (velocity or acceleration control), and kinematic bicycle (slip-angle β formulation).
-  A `DronePlaceholder` marks where 6-DOF models plug in.
+  (velocity or acceleration control), kinematic bicycle (slip-angle β formulation),
+  and a **6-DOF quadrotor drone** (quaternion attitude + body-rate dynamics, four
+  rotor-thrust commands). All are differentiable and integrate with Euler or RK4.
 - **Differentiable end-to-end** — the full step (dynamics + soft collisions + walls) runs
   under Warp's adjoint tape and is exposed to PyTorch autograd through a custom
   `torch.autograd.Function` with zero-copy `wp.from_torch`/`wp.to_torch`.
@@ -209,9 +210,10 @@ more.
 
 ```
 wmas/core        state, stepper (substep pipeline), neighbors, collisions, world, environment
-wmas/dynamics    model tags/configs, unified integrate kernel, drone placeholder
+wmas/dynamics    model tags/configs, unified integrate kernel (2D vehicles + drone)
 wmas/interop     torch.autograd.Function bridge + BPTT rollout
 wmas/scenarios   Scenario ABC + NavigationScenario
+wmas/sensors     opt-in differentiable observation sensors (lidar)
 wmas/benchmark   throughput script
 ```
 
@@ -235,18 +237,36 @@ wmas deliberately does **not** aim to be a drop-in physics clone of VMAS. Out of
 for now:
 
 - **Trajectory parity with VMAS** — see the parity caveat above.
-- **Movable non-circular rigid bodies** — obstacles (box/segment) are *static*. Pushable
-  box payloads with rotational rigid-body dynamics and **joints** (VMAS `transport`,
-  `balance`) need a rigid-body model that isn't built yet.
+- **In-tape rigid-body payloads / joints** — `TransportScenario` provides a *first* movable
+  circular package (agents push it to a goal) via staggered coupling at the torch layer
+  (differentiable across a rollout), but full in-step rigid-body payloads with rotation
+  fully on the Warp adjoint tape, non-circular bodies, and **joints** (VMAS `balance`) are
+  still out of scope.
 - **Rendering** — no viewer; inspect state tensors / plot yourself.
 - **Discrete or communication action spaces** — actions are continuous real vectors.
 
 ## Roadmap
 
 Done recently: box/segment static collision geometry; arbitrary action arity; host-sync-
-free masked/auto reset; allocation-free no-grad hot path; per-env parameter randomization.
+free masked/auto reset; allocation-free no-grad hot path; per-env parameter randomization;
+RK4 integrator (`Integrator.RK4`, four evaluations of a pure derivative `@wp.func`); a
+batched uniform-grid neighbor backend (`neighbor_method="uniform_grid"`, radix-sort based)
+that stays linear in `n_envs` and beats brute force past ~512 agents/env (~4x at 1k, ~10x
+at 4k on an RTX 3070); a **6-DOF quadrotor drone** model (quaternion attitude in the unified
+differentiable step; the state SoA grew to carry altitude/vertical-velocity/attitude/body-
+rate fields that the 2D models pass through, ~9% latency cost at tiny per-env batches).
 
-Next: TorchRL wrapper and circle-compatible VMAS scenario ports (sampling, discovery,
-flocking, formation); 6-DOF drone dynamics; lidar-style sensors; RK4 integrator; a
-batched uniform-grid neighbor backend (radix-sort based) for huge per-env populations;
-then movable rigid-body payloads for transport/balance.
+a **lidar sensor** (`wmas.Lidar`): a differentiable, vectorized ray-cast returning per-ray
+ranges against circular agents/obstacles, opt-in as an observation component a scenario
+concatenates; and four circle-compatible **VMAS-style scenario ports** —
+`SamplingScenario` (consume a batched sum-of-Gaussians field), `DiscoveryScenario`
+(cover targets that each need several agents), `FlockingScenario` (Reynolds boids reward),
+and `FormationScenario` (hold polygon slots); a first **movable-package**
+`TransportScenario` (agents push a circular payload to a goal; staggered torch-layer
+coupling, differentiable across a rollout); and a **torch.compile-compatible step**
+(`wmas.interop.compile.compiled_warp_step`, a `torch.library.custom_op` with fake +
+autograd rules) plus an optional **CUDA-graph capture** of the no-grad hot path
+(`CudaGraphStep`); and a **TorchRL `EnvBase` wrapper** (`wmas.interop.torchrl.WmasEnv`,
+batched `TensorDict` specs, `--group torchrl`) that passes TorchRL's `check_env_specs`.
+
+Next: in-tape rigid-body payloads and joints (VMAS `transport`/`balance` parity).
