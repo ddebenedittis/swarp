@@ -3,7 +3,15 @@
 import pytest
 import torch
 
-from wmas import Environment, NavigationScenario
+from wmas import (
+    DiscoveryScenario,
+    Environment,
+    FlockingScenario,
+    FormationScenario,
+    NavigationScenario,
+    SamplingScenario,
+    TransportScenario,
+)
 from wmas.dynamics.base import ControlMode, DynamicsModel
 
 CUDA = torch.cuda.is_available()
@@ -67,6 +75,47 @@ def test_graph_matches_eager(auto_reset, n_obstacles):
         assert torch.equal(og, oe)
         assert torch.equal(rg, re)
         assert torch.equal(dg, de)
+
+
+@pytest.mark.skipif(not CUDA, reason="CUDA graph capture needs a GPU")
+@pytest.mark.parametrize(
+    "scen_factory",
+    [
+        lambda n: NavigationScenario(n_agents=n),
+        lambda n: FlockingScenario(n_agents=n),
+        lambda n: FormationScenario(n_agents=n),
+        lambda n: DiscoveryScenario(n_agents=n),
+        lambda n: SamplingScenario(n_agents=n),
+        lambda n: TransportScenario(n_agents=n),
+    ],
+    ids=["navigation", "flocking", "formation", "discovery", "sampling", "transport"],
+)
+def test_graph_matches_eager_all_scenarios(scen_factory):
+    # Regression: the physics graph may only bake in neighbor reuse when the
+    # scenario actually refreshes the grid each step; scenarios that don't
+    # (sampling/formation) must have the graph build neighbors itself. All
+    # scenarios must be bit-identical to the eager path.
+    dev = "cuda:0"
+
+    def traj(use_graph):
+        env = Environment(
+            scen_factory(8), n_envs=64, device=dev, dt=0.05, seed=0, use_graph=use_graph
+        )
+        env.reset(seed=0)
+        gen = torch.Generator(device=dev).manual_seed(3)
+        out = []
+        with torch.no_grad():
+            for _ in range(8):
+                a = torch.empty(64, 8, 2, device=dev).uniform_(-1, 1, generator=gen)
+                o, *_ = env.step(a)
+                out.append(o.clone())
+        return out, env
+
+    eager, _ = traj(False)
+    graphed, genv = traj(True)
+    assert genv.graph_mode
+    for oe, og in zip(eager, graphed, strict=True):
+        assert torch.equal(oe, og)
 
 
 @pytest.mark.parametrize("device", DEVICES)

@@ -129,6 +129,13 @@ class StepRuntime:
         if self._graph is not None and self._graph_version == self.stepper.mutation_version:
             return
         stepper = self.stepper
+        # Whether the grid currently holds neighbors for ``state`` (built by the
+        # scenario's reset/post-step). Only then may the graph bake in substep-0
+        # reuse — a scenario that never refreshes the grid must instead have the
+        # graph build neighbors itself, or it would reuse an unpopulated list.
+        grid_valid = (
+            stepper.collisions and stepper.grid(self.n_envs).built_version == stepper.state_version
+        )
         # Warm-up compiles kernels/allocates without mutating state (launch into
         # the scratch output only, no copy-back).
         stepper.launch_substeps(
@@ -140,9 +147,10 @@ class StepRuntime:
             skip_drone=True,
         )
         wp.synchronize_device(stepper.device)
-        # Force the neighbor-reuse branch at capture time (its correctness at
-        # replay is maintained by the eager post-step build each step).
-        if stepper.collisions:
+        # Re-sync built_version after warm-up (which bumped state_version without
+        # touching the grid's contents) so the capture takes the reuse branch iff
+        # the grid was genuinely valid for ``state``.
+        if grid_valid:
             stepper.grid(self.n_envs).built_version = stepper.state_version
         with wp.ScopedCapture(device=stepper.device) as capture:
             stepper.launch_substeps(
