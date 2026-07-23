@@ -133,3 +133,41 @@ class Environment:
         needed — just the one sync to materialize E.
         """
         return self.world.edge_index(rebuild=False)
+
+    # ------------------------------------------------------------- rendering
+
+    def render(
+        self,
+        mode: str = "human",
+        env_index: int = 0,
+        agent_index_focus: int | None = None,
+        visualize_when_rgb: bool = False,  # accepted for VMAS-signature compatibility
+        **viewer_kwargs: Any,
+    ) -> Any:
+        """VMAS-style convenience over :class:`wmas.render.Viewer` (needs the ``viz`` extra).
+
+        ``mode="rgb_array"`` returns an ``(H, W, 3)`` uint8 frame of env ``env_index``;
+        ``mode="human"`` updates a persistent window and returns ``None``. Extra keyword
+        args (``size``, ``overlays``, ``mosaic``, ...) are forwarded to the Viewer, which is
+        created once and reused. Import is lazy so the core has no hard pygame dependency.
+        """
+        if mode not in ("human", "rgb_array"):
+            raise ValueError(f"render mode must be 'human' or 'rgb_array', got {mode!r}")
+        from wmas.render.viewer import Viewer
+
+        if getattr(self, "_viewer", None) is None:
+            self._viewer = Viewer(self, env_index=env_index, **viewer_kwargs)
+        viewer = self._viewer
+        viewer.state.focus_env = env_index
+        if agent_index_focus is not None:
+            viewer.state.hover_agent = agent_index_focus
+        if mode == "rgb_array":
+            return viewer.render_array(hud=False)
+        return viewer.render_human_frame()
+
+    def close_viewer(self) -> None:
+        """Close the persistent render window, if one was opened by ``render``."""
+        viewer = getattr(self, "_viewer", None)
+        if viewer is not None:
+            viewer.close()
+            self._viewer = None

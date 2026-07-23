@@ -37,6 +37,9 @@ but compiled as Warp kernels instead of PyTorch tensor ops.
   `act_dim` is the max over agent models (2 for the current 2D vehicles); models read
   only the slots they use, so a wider action space (e.g. a future drone) drops in without
   touching the geometry.
+- **Interactive viewer** (optional `viz` extra) — a pygame renderer with headless frames,
+  gif/mp4 export, notebook embedding, a batch mosaic, live overlay toggles, and light
+  write-back (drag an agent, right-click to move its goal). See [Visualization](#visualization).
 
 ## Install
 
@@ -47,6 +50,7 @@ git clone <this-repo> wmas && cd wmas
 uv venv
 uv pip install -e . --group dev
 uv run pytest          # dynamics, gradients, neighbors, collisions, determinism, ...
+uv pip install -e '.[viz]'   # optional: interactive viewer + video export
 ```
 
 ## Quickstart
@@ -136,6 +140,51 @@ class MyScenario(Scenario):
 
 Observations and rewards are plain torch ops over `world.state`, so they are
 differentiable together with the Warp step and stay on-device.
+
+## Visualization
+
+An optional pygame-based viewer (install the `viz` extra: `uv pip install -e '.[viz]'`)
+renders one env of the batch — or a mosaic of the whole batch — either headless or in an
+interactive window.
+
+```python
+from wmas import Environment, NavigationScenario
+from wmas.render import Viewer, save_video
+
+env = Environment(NavigationScenario(n_agents=5, n_obstacles=2), n_envs=16, device="cpu")
+env.reset()
+
+# Headless: an (H, W, 3) uint8 frame, or a rollout to gif/mp4 (chosen by extension).
+frame = env.render(mode="rgb_array", env_index=0)   # VMAS-compatible signature
+save_video(env, "nav.mp4", n_steps=200)             # pass action_fn=policy to drive it
+
+# Interactive window: pan/zoom, hover to inspect, toggle overlays live, drag agents.
+Viewer(env, mosaic=True).run()                      # pass action_fn=policy to drive it
+```
+
+Rendering is opt-in, read-only, and off the differentiable hot path — one device→host copy
+per frame. Try it straight away:
+
+```bash
+python -m wmas.render.demo               # interactive window (goal-seeking demo policy)
+python -m wmas.render.demo --mosaic      # grid of all envs + a focus pane
+python -m wmas.render.demo --save nav.gif --steps 200
+```
+
+**Controls** — wheel zoom, middle-drag pan, hover an agent to inspect it, `[` / `]` to step
+through envs (or click a mosaic tile to focus it), space to pause. Overlays toggle by key:
+`g` goals, `n` neighbor graph, `h` heading, `v` velocity, `i` ids, `o` obstacles, `b`
+bounds, `l` lidar (drawn once a sensor supplies rays). Left-drag an agent to reposition it;
+right-click to move its goal (writes into the shown env only).
+
+In a notebook, embed a rollout inline:
+
+```python
+from wmas.render.notebook import animate
+animate(env, n_steps=200)   # returns an HTML5 <video>
+```
+
+Scenarios feed custom drawables to the viewer via `Scenario.render_extras(env_idx) -> dict`.
 
 ## Throughput
 
@@ -231,17 +280,18 @@ for now:
 - **Movable non-circular rigid bodies** — obstacles (box/segment) are *static*. Pushable
   box payloads with rotational rigid-body dynamics and **joints** (VMAS `transport`,
   `balance`) need a rigid-body model that isn't built yet.
-- **Rendering** — no viewer; inspect state tensors / plot yourself.
 - **Discrete or communication action spaces** — actions are continuous real vectors.
 - **Per-env parameter randomization** — agent params are shared across envs
   (`[n_agents, P]`); domain randomization (`[n_envs, n_agents, P]`) is deferred.
 
 ## Roadmap
 
-Done recently: box/segment static collision geometry; arbitrary action arity; host-sync-
-free masked/auto reset; allocation-free no-grad hot path.
+Done recently: interactive pygame viewer (headless frames, gif/mp4 export, mosaic view,
+live overlay toggles, drag/goal write-back); box/segment static collision geometry;
+arbitrary action arity; host-sync-free masked/auto reset; allocation-free no-grad hot path.
 
 Next: TorchRL wrapper and circle-compatible VMAS scenario ports (sampling, discovery,
-flocking, formation); 6-DOF drone dynamics; lidar-style sensors; RK4 integrator; a
+flocking, formation); 6-DOF drone dynamics; lidar-style sensors (their rays plug into the
+viewer's `lidar` overlay); RK4 integrator; a
 batched uniform-grid neighbor backend (radix-sort based) for huge per-env populations;
 then per-env parameter randomization and movable rigid-body payloads for transport/balance.

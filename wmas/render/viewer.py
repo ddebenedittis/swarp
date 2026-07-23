@@ -55,6 +55,7 @@ class Viewer:
         self.state = ViewState(n_envs=env.n_envs, enabled=enabled, focus_env=env_index)
         self._camera: Camera | None = None
         self._layout: MosaicLayout | None = None
+        self._window = None
         self._step_count = 0
 
     # ------------------------------------------------------------------ draw
@@ -172,6 +173,25 @@ class Viewer:
         self._render_onto(pygame, surface, hud=hud)
         arr = pygame.surfarray.array3d(surface)
         return np.ascontiguousarray(np.transpose(arr, (1, 0, 2)))
+
+    def render_human_frame(self) -> None:
+        """Update a persistent window with one frame (VMAS ``render(mode='human')`` style)."""
+        pygame = _ensure_pygame()
+        if self._window is None:
+            pygame.display.init()
+            self._window = pygame.display.set_mode(self.size)
+            pygame.display.set_caption("wmas viewer")
+        for event in pygame.event.get():  # keep the window responsive / closeable
+            if event.type == pygame.QUIT:
+                self.state.quit = True
+        self._render_onto(pygame, self._window, hud=True)
+        pygame.display.flip()
+
+    def close(self) -> None:
+        """Close the window if one is open."""
+        if self._window is not None:
+            _ensure_pygame().display.quit()
+            self._window = None
 
     # ------------------------------------------------------------------- run
 

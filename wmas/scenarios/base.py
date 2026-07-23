@@ -84,3 +84,12 @@ class Scenario(ABC):
 
     def post_step(self) -> None:  # noqa: B027 (optional hook, intentionally empty)
         """Hook called right after the physics step, before obs/rewards."""
+
+    def render_extras(self, env_idx: int) -> dict[str, Any]:
+        """Extra geometry for the viewer to overlay for env ``env_idx`` (default none).
+
+        Override to feed custom drawables into ``RenderGeometry.extras`` (e.g. lidar rays,
+        target zones, communication links) without the core renderer needing to know about
+        them. Keys are overlay names; values are whatever that overlay expects (CPU-friendly).
+        """
+        return {}
