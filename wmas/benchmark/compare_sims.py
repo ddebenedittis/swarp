@@ -45,7 +45,16 @@ import subprocess
 import sys
 
 # wmas is the anchor: it appears in every table, ratios are computed against it.
-ALL_SIMS = ("wmas", "vmas", "jaxmarl", "camar")
+# The three wmas entries are hot-path *configurations* of the same simulator:
+#   wmas        — optimized: fused Warp obs/reward kernels + CUDA-graph capture
+#   wmas-fused  — fused kernels only (no CUDA graph)
+#   wmas-eager  — baseline: torch obs/reward, no fused kernels, no graph
+WMAS_CONFIGS = {
+    "wmas": dict(fused="auto", use_graph=True),
+    "wmas-fused": dict(fused="auto", use_graph=False),
+    "wmas-eager": dict(fused=False, use_graph=False),
+}
+ALL_SIMS = (*WMAS_CONFIGS, "vmas", "jaxmarl", "camar")
 DEFAULT_SIMS = ("wmas", "vmas", "jaxmarl", "camar")
 SCENARIOS = ("navigation",)
 
@@ -55,10 +64,10 @@ SCENARIOS = ("navigation",)
 
 def _build(sim: str, scenario: str, n_envs: int, n_agents: int, device: str):
     """Dispatch to the per-sim adapter (imported lazily, in the child only)."""
-    if sim == "wmas":
+    if sim in WMAS_CONFIGS:
         from wmas.benchmark._adapters import wmas_adapter
 
-        return wmas_adapter.build(scenario, n_envs, n_agents, device)
+        return wmas_adapter.build(scenario, n_envs, n_agents, device, **WMAS_CONFIGS[sim])
     if sim == "vmas":
         from wmas.benchmark._adapters import vmas_adapter
 

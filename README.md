@@ -332,27 +332,51 @@ simulator ever cannot match the requested count, its number is flagged with `*` 
 realized count is listed under the table. You can drop the JaxMARL comparison entirely
 by omitting it from `--sims`.
 
-env-steps/s on the RTX 3070 Laptop GPU (float32, 60 timed steps; JIT/XLA compile
-excluded via warmup at the timed length):
+#### wmas configurations
+
+The three `wmas` entries are hot-path *configurations* of the same simulator, so the
+benchmark doubles as an optimization ablation: `wmas-eager` (torch obs/reward, no
+CUDA graph — the baseline), `wmas-fused` (fused Warp obs/reward kernels), and `wmas`
+(fused **+** CUDA-graph capture — the shipped default). env-steps/s on the RTX 3070
+Laptop GPU (float32, 60 timed steps):
+
+```
+  n_envs  n_agents |  wmas-eager  wmas-fused        wmas |  fused/eager  opt/eager
+    4096         3 |   5,838,664   7,877,854  15,945,297 |       1.35x      2.73x
+   16384         3 |  21,772,740  30,814,526  61,718,330 |       1.42x      2.83x
+    4096        16 |   5,998,275   6,783,331  15,094,932 |       1.13x      2.52x
+   16384        16 |   6,858,433  28,191,165  35,637,271 |       4.11x      5.20x
+```
+
+Fusing the obs/reward layer into Warp kernels is worth ~1.1–1.4× on its own; the
+CUDA graph (which elides per-step kernel-launch overhead) roughly doubles it again,
+for ~2.5–5× end-to-end over the eager baseline. The graph's win grows with batch size,
+where launch overhead is the binding constraint.
+
+#### wmas (optimized) vs the field
+
+env-steps/s, same GPU; `wmas` here is the optimized fused+graph configuration
+(JIT/XLA compile is excluded from the JAX sims via warmup at the timed length):
 
 ```
   n_envs  n_agents |        wmas        vmas     jaxmarl       camar |  vmas/w  jaxmarl/w  camar/w
-    1024         3 |   1,134,353     244,411  18,940,819     351,997 |   0.22x     16.70x    0.31x
-    4096         3 |   4,259,488     947,561  54,698,566     341,561 |   0.22x     12.84x    0.08x
-   16384         3 |  17,046,424   3,183,244  91,936,471     337,328 |   0.19x      5.39x    0.02x
-    1024        16 |     953,204      19,205   3,868,203      69,481 |   0.02x      4.06x    0.07x
-    4096        16 |   4,658,527      61,076   3,737,148      71,692 |   0.01x      0.80x    0.02x
-   16384        16 |   6,784,739     134,018   1,854,292         OOM |   0.02x      0.27x    -
+    1024         3 |   4,552,806     242,285  17,994,572     363,425 |   0.05x      3.95x    0.08x
+    4096         3 |  15,945,297     987,579  57,488,620     347,240 |   0.06x      3.61x    0.02x
+   16384         3 |  61,718,330   3,427,952  88,522,200     337,989 |   0.06x      1.43x    0.01x
+    1024        16 |   3,806,287      18,367   3,781,063      68,824 |   0.00x      0.99x    0.02x
+    4096        16 |  15,094,932      62,263   3,859,284      71,815 |   0.00x      0.26x    0.00x
+   16384        16 |  35,637,271     134,276   1,845,853         OOM |   0.00x      0.05x    -
 ```
 
 Reading it: **JaxMARL is fastest at few agents** — its fully-jitted `lax.scan` over a
-tiny point-particle MPE is hard to beat at 3 agents. But its per-step cost grows with
-agents (O(agents × landmarks) observations + pairwise terms), so **wmas overtakes it by
-16 agents** (wmas's step is a fixed handful of fused Warp kernels, largely insensitive to
-agent count — note wmas barely moves from 3→16 agents while every competitor drops
-sharply). wmas is consistently ~5× faster than VMAS and ~3–50× faster than CAMAR on this
-task; CAMAR's throughput is roughly flat in `n_envs` here (its LIDAR observation /
-map machinery dominates) and OOMs at 16384×16 on the 8 GB card.
+tiny point-particle MPE is hard to beat at 3 agents (still only ~1.4–4× over optimized
+wmas). But its per-step cost grows with agents (O(agents × landmarks) observations +
+pairwise terms), so **wmas overtakes it at 16 agents** (wmas's step is a fixed handful
+of fused Warp kernels, largely insensitive to agent count — it barely moves from 3→16
+agents while every competitor drops sharply; at 4096×16 wmas is ~4× JaxMARL). wmas is
+~20–265× faster than VMAS and ~12–210× faster than CAMAR on this task; CAMAR's
+throughput is roughly flat in `n_envs` here (its LIDAR observation / map machinery
+dominates) and OOMs at 16384×16 on the 8 GB card.
 
 **Parity caveat (same as VMAS above).** This is a raw step-throughput comparison, not a
 task-equivalence one. Observation and reward models differ across all four by design
