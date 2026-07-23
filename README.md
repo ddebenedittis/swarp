@@ -12,10 +12,11 @@ but compiled as Warp kernels instead of PyTorch tensor ops.
 - **Batched worlds** — all state lives on-device as `[n_envs, n_agents]` Warp arrays;
   the hot loop performs no host↔device transfers (tested with an API guard and a CUDA
   profiler check).
-- **Three vehicle models**, mixable per-agent in one world (heterogeneous fleets):
+- **Four dynamics models**, mixable per-agent in one world (heterogeneous fleets):
   holonomic point (velocity or acceleration control), differential drive
-  (velocity or acceleration control), and kinematic bicycle (slip-angle β formulation).
-  A `DronePlaceholder` marks where 6-DOF models plug in.
+  (velocity or acceleration control), kinematic bicycle (slip-angle β formulation),
+  and a **6-DOF quadrotor drone** (quaternion attitude + body-rate dynamics, four
+  rotor-thrust commands). All are differentiable and integrate with Euler or RK4.
 - **Differentiable end-to-end** — the full step (dynamics + soft collisions + walls) runs
   under Warp's adjoint tape and is exposed to PyTorch autograd through a custom
   `torch.autograd.Function` with zero-copy `wp.from_torch`/`wp.to_torch`.
@@ -248,8 +249,10 @@ free masked/auto reset; allocation-free no-grad hot path; per-env parameter rand
 RK4 integrator (`Integrator.RK4`, four evaluations of a pure derivative `@wp.func`); a
 batched uniform-grid neighbor backend (`neighbor_method="uniform_grid"`, radix-sort based)
 that stays linear in `n_envs` and beats brute force past ~512 agents/env (~4x at 1k, ~10x
-at 4k on an RTX 3070).
+at 4k on an RTX 3070); a **6-DOF quadrotor drone** model (quaternion attitude in the unified
+differentiable step; the state SoA grew to carry altitude/vertical-velocity/attitude/body-
+rate fields that the 2D models pass through, ~9% latency cost at tiny per-env batches).
 
 Next: TorchRL wrapper and circle-compatible VMAS scenario ports (sampling, discovery,
-flocking, formation); 6-DOF drone dynamics; lidar-style sensors; then movable rigid-body
-payloads for transport/balance.
+flocking, formation); lidar-style sensors; then movable rigid-body payloads for
+transport/balance.

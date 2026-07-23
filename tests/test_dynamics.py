@@ -335,13 +335,14 @@ def test_float32_matches_float64_loosely():
     np.testing.assert_allclose(t32[-1]["pos"], t64[-1]["pos"], atol=1e-4)
 
 
-def test_drone_placeholder_raises():
-    from wmas.dynamics.drone import DronePlaceholder
+def test_drone_config_builds():
+    """The 6-DOF drone is a first-class model now (see tests/test_drone.py)."""
+    from wmas.dynamics.drone import drone_config
 
-    with pytest.raises(NotImplementedError):
-        DronePlaceholder()
-    with pytest.raises(NotImplementedError):
-        AgentConfig(model=DynamicsModel.DRONE)
+    cfg = drone_config()
+    assert cfg.model == DynamicsModel.DRONE
+    row = cfg.to_row()  # extended parameter matrix packs cleanly
+    assert len(row) == 16
 
 
 # --------------------------------------------------------------------- RK4

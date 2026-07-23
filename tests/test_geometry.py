@@ -16,6 +16,18 @@ from wmas.dynamics.base import AgentConfig, ControlMode, DynamicsModel
 from wmas.interop.autograd import TorchState, warp_step
 
 DEVICES = ["cpu"] + (["cuda:0"] if torch.cuda.is_available() else [])
+
+
+def _core(state):
+    """The five 2D state tensors (drops the optional drone fields)."""
+    return (state.pos, state.theta, state.vel, state.speed, state.ang_vel)
+
+
+def _map5(state, f):
+    """Apply ``f`` to the five 2D fields, leaving the drone fields at default."""
+    return TorchState(*(f(t) for t in _core(state)))
+
+
 K, DT = 100.0, 0.1
 
 
@@ -65,7 +77,7 @@ def stepper_with_obstacle(
 
 
 def step_pos(stepper, device, agent_pos):
-    state = TorchState(*(t.to(device) for t in make_state([agent_pos])))
+    state = _map5(make_state([agent_pos]), lambda t: t.to(device))
     actions = torch.zeros(1, 1, 2, dtype=torch.float64, device=device)
     with torch.no_grad():
         out = warp_step(stepper, state, actions)
@@ -187,12 +199,12 @@ def test_gradcheck_box_and_segment():
         angle=torch.tensor([0.0, 0.0], dtype=torch.float64),
         half_extents=torch.tensor([[0.1, 0.1], [0.2, 0.0]], dtype=torch.float64),
     )
-    state = TorchState(*(t.requires_grad_(True) for t in make_state([[0.05, -0.05]])))
+    state = _map5(make_state([[0.05, -0.05]]), lambda t: t.requires_grad_(True))
     actions = (
         0.05 * torch.randn(1, 1, 2, dtype=torch.float64, generator=torch.Generator().manual_seed(0))
     ).requires_grad_(True)
 
     def fn(pos, theta, vel, speed, ang_vel, act):
-        return tuple(warp_step(st, TorchState(pos, theta, vel, speed, ang_vel), act))
+        return tuple(warp_step(st, TorchState(pos, theta, vel, speed, ang_vel), act))[:5]
 
-    assert torch.autograd.gradcheck(fn, (*state, actions), eps=1e-6, atol=1e-5)
+    assert torch.autograd.gradcheck(fn, (*_core(state), actions), eps=1e-6, atol=1e-5)
