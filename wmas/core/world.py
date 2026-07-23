@@ -106,12 +106,12 @@ class World:
         neighbor_count [n_envs, n_agents] int32)`` views; they are overwritten
         by the next call, so gather from them within the same step.
 
-        This is a separate build from the stepper's per-substep neighbor lists:
-        those are queried on each *intermediate* (pre-integration) substep state
-        to compute collision forces and are discarded, whereas observations and
-        rewards need neighbors on the final post-step state. The two are
-        genuinely different states, so the build here is not redundant with the
-        force-time queries (it is intentionally recomputed once per step).
+        This builds neighbors on the final post-step state (what observations and
+        rewards need). It also stamps ``grid.built_version`` with the stepper's
+        current ``state_version``, so the next step can recognize that its input
+        state already has a matching neighbor list and skip substep 0's rebuild
+        (``WorldConfig.neighbor_reuse``) — turning the two builds per step (this
+        one plus the force-time query) into one.
         """
         if not self.stepper.collisions:
             raise RuntimeError("neighbor lists require WorldConfig.collisions=True")
@@ -122,7 +122,15 @@ class World:
             requires_grad=False,
         )
         grid.build(pos_wp)
+        grid.built_version = self.stepper.state_version
         return grid.torch_views()
+
+    def mark_pos_dirty(self) -> None:
+        """Invalidate any cached neighbor list after writing ``state.pos`` out of
+        band (a reset or an interactive drag), so the next step rebuilds instead
+        of reusing a list that no longer matches the positions."""
+        if self.stepper.collisions:
+            self.stepper.grid(self.n_envs).built_version = -1
 
     def neighbor_overflow(self) -> torch.Tensor:
         """Bool ``[n_envs, n_agents]`` flagging agents whose in-radius neighbor

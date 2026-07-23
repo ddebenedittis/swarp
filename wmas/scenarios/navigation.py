@@ -185,6 +185,7 @@ class NavigationScenario(Scenario):
                 w.obstacle_pos.copy_(torch.where(env_mask.view(-1, 1, 1), obs_pos, w.obstacle_pos))
             w.set_obstacles(w.obstacle_pos, w.obstacle_radius)
 
+        w.mark_pos_dirty()  # positions written out of band; force a fresh build
         self._nbr_cache = None
         self._refresh_step_cache(reset_mask=env_mask)
 

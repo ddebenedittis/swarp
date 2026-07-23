@@ -98,33 +98,28 @@ def _env_supports(kw: str) -> bool:
     return kw in inspect.signature(Environment.__init__).parameters
 
 
-def _stepper_supports(attr: str) -> bool:
-    # Stepper-level flags added by later stages; probe the class (attrs are set
-    # in __init__, so a class-level default or an instance check both work — we
-    # build a throwaway 1x1 env lazily only if the class check is inconclusive).
-    from wmas.core.stepper import Stepper
-
-    return hasattr(Stepper, attr) or attr in _stepper_init_names()
+# Stepper-level flags (neighbor_reuse, enable_slim2d) are set as *instance*
+# attributes by later stages, so availability is probed on a throwaway 1-env
+# stepper (cached per device).
+_PROBE_CACHE: dict[str, set[str]] = {}
 
 
-def _stepper_init_names() -> set[str]:
-    from wmas.core.stepper import Stepper
+def _stepper_attrs(device: str) -> set[str]:
+    attrs = _PROBE_CACHE.get(device)
+    if attrs is None:
+        env = Environment(NavigationScenario(n_agents=2), n_envs=1, device=device, seed=0)
+        attrs = set(vars(env.world.stepper))
+        _PROBE_CACHE[device] = attrs
+    return attrs
 
-    return set(inspect.signature(Stepper.__init__).parameters)
 
-
-def _feature_available(feature: str) -> bool:
+def _feature_available(feature: str, device: str) -> bool:
     if feature == "eager_trims":
         return _scenario_supports("eager_trims")
     if feature == "neighbor_reuse":
-        # WorldConfig field or a Stepper attribute; either is enough to toggle.
-        from wmas.core.config import WorldConfig
-
-        return "neighbor_reuse" in inspect.signature(WorldConfig.__init__).parameters or (
-            _stepper_supports("neighbor_reuse")
-        )
+        return "neighbor_reuse" in _stepper_attrs(device)
     if feature == "slim2d":
-        return _stepper_supports("enable_slim2d")
+        return "enable_slim2d" in _stepper_attrs(device)
     if feature == "fused":
         return _env_supports("fused")
     if feature == "use_graph":
@@ -132,8 +127,8 @@ def _feature_available(feature: str) -> bool:
     return False
 
 
-def _variant_available(v: Variant) -> bool:
-    return all(_feature_available(f) for f in v.features())
+def _variant_available(v: Variant, device: str) -> bool:
+    return all(_feature_available(f, device) for f in v.features())
 
 
 # --------------------------------------------------------------- env construction
@@ -167,9 +162,9 @@ def _build_env(v: Variant, n_envs: int, n_agents: int, device: str) -> Environme
     env = Environment(scenario, **env_kwargs)
 
     stepper = env.world.stepper
-    if _stepper_supports("neighbor_reuse"):
+    if hasattr(stepper, "neighbor_reuse"):
         stepper.neighbor_reuse = v.neighbor_reuse
-    if _stepper_supports("enable_slim2d"):
+    if hasattr(stepper, "enable_slim2d"):
         stepper.enable_slim2d = v.slim2d
     return env
 
@@ -280,7 +275,7 @@ def bench_one(
         "builds_per_step": None,
         "status": "ok",
     }
-    if not _variant_available(variant):
+    if not _variant_available(variant, device):
         row["status"] = "n/a"
         return row
     try:

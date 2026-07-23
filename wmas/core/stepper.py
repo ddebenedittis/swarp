@@ -128,6 +128,12 @@ class Stepper:
         # (obstacle-count change, first per-env param install). Steady-state
         # per-reset updates hit the in-place paths and leave this untouched.
         self.mutation_version: int = 0
+        # Monotonic counter identifying the current state generation; bumped at
+        # the end of every full step. The neighbor grid stamps the version it was
+        # built at so substep 0 can reuse a still-matching list (see
+        # ``launch_substeps`` and ``WorldConfig.neighbor_reuse``).
+        self.state_version: int = 0
+        self.neighbor_reuse: bool = world.neighbor_reuse
 
     # ------------------------------------------------------------------ setup
 
@@ -412,18 +418,40 @@ class Stepper:
         actions: wp.array,
         state_out: WorldState,
         buffers: StepBuffers,
+        reuse_neighbors: bool = False,
     ) -> None:
-        """Advance one full env step. Functional: ``state_in`` is never written."""
+        """Advance one full env step. Functional: ``state_in`` is never written.
+
+        With ``reuse_neighbors=True`` (the no-grad hot path) substep 0 skips its
+        neighbor rebuild and reads the grid's existing lists when they were built
+        on this exact input state (``grid.built_version == state_version``) — the
+        list the previous step's post-step build already produced. The taped path
+        always passes ``False``: it must rebuild into fresh per-substep buffers so
+        the recorded neighbor lists survive until backward (the grid's own lists
+        get overwritten by the next build before then).
+        """
         n_envs = state_in.pos.shape[0]
         chain = [state_in, *buffers.inter_states, state_out]
         world = self.world
+        grid = self.grid(n_envs) if self.collisions else None
+        can_reuse = (
+            reuse_neighbors
+            and self.neighbor_reuse
+            and grid is not None
+            and grid.built_version == self.state_version
+        )
         for k in range(self.substeps):
             st = chain[k]
             forces = buffers.forces[k]
             if self._needs_forces:
                 if self.collisions:
-                    idx, cnt = buffers.nbr_idx[k], buffers.nbr_cnt[k]
-                    self.grid(n_envs).query_into(st.pos, idx, cnt)
+                    if k == 0 and can_reuse:
+                        # Bit-identical to a fresh build on st.pos (same grid,
+                        # radius, positions); read the grid's lists directly.
+                        idx, cnt = grid.neighbor_idx, grid.neighbor_count
+                    else:
+                        idx, cnt = buffers.nbr_idx[k], buffers.nbr_cnt[k]
+                        grid.query_into(st.pos, idx, cnt)
                 else:
                     idx, cnt = self._zero_neighbors(n_envs)
                 launch_collision_forces(
@@ -457,3 +485,5 @@ class Stepper:
                 clamp_bounds=self._clamp_bounds,
                 integrator=world.integrator,
             )
+        # State has advanced; the grid's lists no longer match this generation.
+        self.state_version += 1

@@ -51,6 +51,13 @@ class WorldConfig:
     grid_dim: int = 128
     uniform_bins: int | None = None
     integrator: Integrator = Integrator.EULER
+    # Reuse the neighbor list the previous step's post-step build already
+    # produced (on the state that is now the step input) for substep 0, instead
+    # of rebuilding it — one build/step instead of two at substeps=1. Exact: the
+    # reused list is bit-identical to a fresh build on the same positions. Only
+    # engaged on the no-grad path (the taped path rebuilds so adjoints stay
+    # correct). See :meth:`wmas.core.stepper.Stepper.launch_substeps`.
+    neighbor_reuse: bool = True
 
     def __post_init__(self) -> None:
         if self.bounds_mode not in ("soft", "clamp"):
