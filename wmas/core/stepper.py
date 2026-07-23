@@ -244,6 +244,7 @@ class Stepper:
                 dtype=self.dtype,
                 grid_dim=self.world.grid_dim,
                 method=self.world.neighbor_method,
+                uniform_bins=self.world.uniform_bins,
             )
             self._grids[n_envs] = g
         return g

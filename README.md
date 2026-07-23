@@ -244,9 +244,12 @@ for now:
 ## Roadmap
 
 Done recently: box/segment static collision geometry; arbitrary action arity; host-sync-
-free masked/auto reset; allocation-free no-grad hot path; per-env parameter randomization.
+free masked/auto reset; allocation-free no-grad hot path; per-env parameter randomization;
+RK4 integrator (`Integrator.RK4`, four evaluations of a pure derivative `@wp.func`); a
+batched uniform-grid neighbor backend (`neighbor_method="uniform_grid"`, radix-sort based)
+that stays linear in `n_envs` and beats brute force past ~512 agents/env (~4x at 1k, ~10x
+at 4k on an RTX 3070).
 
 Next: TorchRL wrapper and circle-compatible VMAS scenario ports (sampling, discovery,
-flocking, formation); 6-DOF drone dynamics; lidar-style sensors; RK4 integrator; a
-batched uniform-grid neighbor backend (radix-sort based) for huge per-env populations;
-then movable rigid-body payloads for transport/balance.
+flocking, formation); 6-DOF drone dynamics; lidar-style sensors; then movable rigid-body
+payloads for transport/balance.
