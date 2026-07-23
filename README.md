@@ -261,9 +261,11 @@ ranges against circular agents/obstacles, opt-in as an observation component a s
 concatenates; and four circle-compatible **VMAS-style scenario ports** —
 `SamplingScenario` (consume a batched sum-of-Gaussians field), `DiscoveryScenario`
 (cover targets that each need several agents), `FlockingScenario` (Reynolds boids reward),
-and `FormationScenario` (hold polygon slots); and a first **movable-package**
+and `FormationScenario` (hold polygon slots); a first **movable-package**
 `TransportScenario` (agents push a circular payload to a goal; staggered torch-layer
-coupling, differentiable across a rollout).
+coupling, differentiable across a rollout); and a **torch.compile-compatible step**
+(`wmas.interop.compile.compiled_warp_step`, a `torch.library.custom_op` with fake +
+autograd rules) plus an optional **CUDA-graph capture** of the no-grad hot path
+(`CudaGraphStep`).
 
-Next: TorchRL wrapper; torch.compile / CUDA-graph capture; then in-tape rigid-body
-payloads.
+Next: TorchRL wrapper; then in-tape rigid-body payloads.
