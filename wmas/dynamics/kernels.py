@@ -124,6 +124,89 @@ def _drone_rates(
 
 
 @wp.func
+def _step_2d(
+    # loaded 2D state
+    p: Any,
+    th: Any,
+    v: Any,
+    s: Any,
+    w: Any,
+    # inputs
+    a0: Any,
+    a1: Any,
+    tag: wp.int32,
+    mode: wp.int32,
+    force: Any,
+    # per-agent parameters (scalars)
+    max_speed: Any,
+    max_accel: Any,
+    max_ang_vel: Any,
+    max_ang_accel: Any,
+    l_f: Any,
+    l_r: Any,
+    max_steer: Any,
+    mass: Any,
+    dt: Any,
+):
+    """The 2D semi-implicit-Euler recurrence for the holonomic, diff-drive, and
+    bicycle models. Returns ``(p_new, th_new, v_out, s_out, w_out)`` *before* any
+    position clamp (the caller applies bounds). Extracted verbatim from
+    :func:`_integrate_agent` so the slim 2D kernel and the full kernel produce
+    bit-identical results; unknown tags hold state."""
+    zero = type(dt)(0.0)
+    dv_f = force * (dt / mass)
+    act01 = type(p)(a0, a1)
+    if tag == TAG_HOLONOMIC:
+        if mode == MODE_VELOCITY:
+            v_new = clamp_norm(act01, max_speed)
+        else:
+            acc_vec = clamp_norm(act01, max_accel)
+            v_new = clamp_norm(v + acc_vec * dt, max_speed)
+        v_new = v_new + dv_f
+        p_new = p + v_new * dt
+        th_new = th
+        v_out = v_new
+        s_out = wp.length(v_new)
+        w_out = zero
+    elif tag == TAG_DIFF_DRIVE:
+        if mode == MODE_VELOCITY:
+            s_new = wp.clamp(a0, -max_speed, max_speed)
+            w_new = wp.clamp(a1, -max_ang_vel, max_ang_vel)
+        else:
+            acc = wp.clamp(a0, -max_accel, max_accel)
+            alp = wp.clamp(a1, -max_ang_accel, max_ang_accel)
+            s_new = wp.clamp(s + acc * dt, -max_speed, max_speed)
+            w_new = wp.clamp(w + alp * dt, -max_ang_vel, max_ang_vel)
+        v_trans = type(p)(s_new * wp.cos(th), s_new * wp.sin(th)) + dv_f
+        p_new = p + v_trans * dt
+        th_new = th + w_new * dt
+        v_out = v_trans
+        s_out = s_new
+        w_out = w_new
+    elif tag == TAG_BICYCLE:
+        # Kinematic bicycle with slip angle beta (Polack et al. 2017, eq. 2).
+        acc = wp.clamp(a0, -max_accel, max_accel)
+        delta = wp.clamp(a1, -max_steer, max_steer)
+        s_new = wp.clamp(s + acc * dt, -max_speed, max_speed)
+        wheelbase = l_f + l_r
+        beta = wp.atan(wp.tan(delta) * l_r / wheelbase)
+        v_trans = type(p)(s_new * wp.cos(th + beta), s_new * wp.sin(th + beta)) + dv_f
+        w_new = s_new / wheelbase * wp.cos(beta) * wp.tan(delta)
+        p_new = p + v_trans * dt
+        th_new = th + w_new * dt
+        v_out = v_trans
+        s_out = s_new
+        w_out = w_new
+    else:
+        p_new = p
+        th_new = th
+        v_out = v
+        s_out = s
+        w_out = w
+    return p_new, th_new, v_out, s_out, w_out
+
+
+@wp.func
 def _integrate_agent(
     # cell + loaded state
     e: wp.int32,
@@ -180,59 +263,18 @@ def _integrate_agent(
     """The one-agent semi-implicit-Euler recurrence, shared by the shared-param
     and per-env kernels. It takes the parameters as scalars so the *only*
     difference between the two kernels is how those scalars are indexed out of
-    the ``[n_agents, P]`` vs ``[n_envs, n_agents, P]`` layout. The 2D models
-    ignore and pass through the drone state (z/vz/attitude/body_rates)."""
+    the ``[n_agents, P]`` vs ``[n_envs, n_agents, P]`` layout. The 2D branches
+    live in :func:`_step_2d` (also used by the slim kernel); this kernel adds the
+    6-DOF drone branch and passes the drone state through unchanged for 2D."""
     zero = type(dt)(0.0)
-    dv_f = force * (dt / mass)
-    act01 = type(p)(a0, a1)
     # Drone fields default to passthrough; only the DRONE branch updates them.
     z_new = z
     vz_new = vz
     q_new = q
     br_new = br
 
-    if tag == TAG_HOLONOMIC:
-        if mode == MODE_VELOCITY:
-            v_new = clamp_norm(act01, max_speed)
-        else:
-            acc_vec = clamp_norm(act01, max_accel)
-            v_new = clamp_norm(v + acc_vec * dt, max_speed)
-        v_new = v_new + dv_f
-        p_new = p + v_new * dt
-        th_new = th
-        v_out = v_new
-        s_out = wp.length(v_new)
-        w_out = zero
-    elif tag == TAG_DIFF_DRIVE:
-        if mode == MODE_VELOCITY:
-            s_new = wp.clamp(a0, -max_speed, max_speed)
-            w_new = wp.clamp(a1, -max_ang_vel, max_ang_vel)
-        else:
-            acc = wp.clamp(a0, -max_accel, max_accel)
-            alp = wp.clamp(a1, -max_ang_accel, max_ang_accel)
-            s_new = wp.clamp(s + acc * dt, -max_speed, max_speed)
-            w_new = wp.clamp(w + alp * dt, -max_ang_vel, max_ang_vel)
-        v_trans = type(p)(s_new * wp.cos(th), s_new * wp.sin(th)) + dv_f
-        p_new = p + v_trans * dt
-        th_new = th + w_new * dt
-        v_out = v_trans
-        s_out = s_new
-        w_out = w_new
-    elif tag == TAG_BICYCLE:
-        # Kinematic bicycle with slip angle beta (Polack et al. 2017, eq. 2).
-        acc = wp.clamp(a0, -max_accel, max_accel)
-        delta = wp.clamp(a1, -max_steer, max_steer)
-        s_new = wp.clamp(s + acc * dt, -max_speed, max_speed)
-        wheelbase = l_f + l_r
-        beta = wp.atan(wp.tan(delta) * l_r / wheelbase)
-        v_trans = type(p)(s_new * wp.cos(th + beta), s_new * wp.sin(th + beta)) + dv_f
-        w_new = s_new / wheelbase * wp.cos(beta) * wp.tan(delta)
-        p_new = p + v_trans * dt
-        th_new = th + w_new * dt
-        v_out = v_trans
-        s_out = s_new
-        w_out = w_new
-    elif tag == TAG_DRONE:
+    if tag == TAG_DRONE:
+        dv_f = force * (dt / mass)
         # Semi-implicit Euler: update body rates + linear velocity, then advance
         # attitude (with the new rates) and position (with the new velocities).
         f0 = wp.clamp(a0, zero, thrust_max)
@@ -253,12 +295,28 @@ def _integrate_agent(
         s_out = s
         w_out = w
     else:
-        # Unknown tag (e.g. future models): hold state.
-        p_new = p
-        th_new = th
-        v_out = v
-        s_out = s
-        w_out = w
+        # 2D models (and unknown tags -> hold state); drone fields pass through.
+        p_new, th_new, v_out, s_out, w_out = _step_2d(
+            p,
+            th,
+            v,
+            s,
+            w,
+            a0,
+            a1,
+            tag,
+            mode,
+            force,
+            max_speed,
+            max_accel,
+            max_ang_vel,
+            max_ang_accel,
+            l_f,
+            l_r,
+            max_steer,
+            mass,
+            dt,
+        )
 
     if clamp_bounds == 1:
         p_new = type(p)(
@@ -941,6 +999,150 @@ def integrate_kernel_per_env(
         )
 
 
+@wp.kernel
+def integrate2d_kernel(
+    # 2D state in
+    pos: wp.array2d(dtype=Any),
+    theta: wp.array2d(dtype=Any),
+    vel: wp.array2d(dtype=Any),
+    speed: wp.array2d(dtype=Any),
+    ang_vel: wp.array2d(dtype=Any),
+    # inputs
+    actions: wp.array3d(dtype=Any),
+    forces: wp.array2d(dtype=Any),
+    params: wp.array2d(dtype=Any),  # [n_agents, NUM_PARAMS] shared across envs
+    model_tag: wp.array(dtype=wp.int32),
+    ctrl_mode: wp.array(dtype=wp.int32),
+    dt: Any,
+    bounds_min: Any,
+    bounds_max: Any,
+    clamp_bounds: wp.int32,
+    # 2D state out
+    pos_out: wp.array2d(dtype=Any),
+    theta_out: wp.array2d(dtype=Any),
+    vel_out: wp.array2d(dtype=Any),
+    speed_out: wp.array2d(dtype=Any),
+    ang_vel_out: wp.array2d(dtype=Any),
+):
+    """Slim Euler kernel: 2D fleets only (no drone fields), no RK4 branch. Reads
+    and writes five state arrays instead of nine. Uses :func:`_step_2d`, so the
+    live fields are bit-identical to the full kernel."""
+    e, a = wp.tid()
+    p_new, th_new, v_out, s_out, w_out = _step_2d(
+        pos[e, a],
+        theta[e, a],
+        vel[e, a],
+        speed[e, a],
+        ang_vel[e, a],
+        actions[e, a, 0],
+        actions[e, a, 1],
+        model_tag[a],
+        ctrl_mode[a],
+        forces[e, a],
+        params[a, P_MAX_SPEED],
+        params[a, P_MAX_ACCEL],
+        params[a, P_MAX_ANG_VEL],
+        params[a, P_MAX_ANG_ACCEL],
+        params[a, P_LF],
+        params[a, P_LR],
+        params[a, P_MAX_STEER],
+        params[a, P_MASS],
+        dt,
+    )
+    if clamp_bounds == 1:
+        radius = params[a, P_RADIUS]
+        p_new = type(p_new)(
+            wp.clamp(p_new[0], bounds_min[0] + radius, bounds_max[0] - radius),
+            wp.clamp(p_new[1], bounds_min[1] + radius, bounds_max[1] - radius),
+        )
+    pos_out[e, a] = p_new
+    theta_out[e, a] = th_new
+    vel_out[e, a] = v_out
+    speed_out[e, a] = s_out
+    ang_vel_out[e, a] = w_out
+
+
+@wp.kernel
+def integrate2d_kernel_per_env(
+    pos: wp.array2d(dtype=Any),
+    theta: wp.array2d(dtype=Any),
+    vel: wp.array2d(dtype=Any),
+    speed: wp.array2d(dtype=Any),
+    ang_vel: wp.array2d(dtype=Any),
+    actions: wp.array3d(dtype=Any),
+    forces: wp.array2d(dtype=Any),
+    params: wp.array3d(dtype=Any),  # [n_envs, n_agents, NUM_PARAMS] per-env
+    model_tag: wp.array(dtype=wp.int32),
+    ctrl_mode: wp.array(dtype=wp.int32),
+    dt: Any,
+    bounds_min: Any,
+    bounds_max: Any,
+    clamp_bounds: wp.int32,
+    pos_out: wp.array2d(dtype=Any),
+    theta_out: wp.array2d(dtype=Any),
+    vel_out: wp.array2d(dtype=Any),
+    speed_out: wp.array2d(dtype=Any),
+    ang_vel_out: wp.array2d(dtype=Any),
+):
+    """Per-env-parameter variant of :func:`integrate2d_kernel`."""
+    e, a = wp.tid()
+    p_new, th_new, v_out, s_out, w_out = _step_2d(
+        pos[e, a],
+        theta[e, a],
+        vel[e, a],
+        speed[e, a],
+        ang_vel[e, a],
+        actions[e, a, 0],
+        actions[e, a, 1],
+        model_tag[a],
+        ctrl_mode[a],
+        forces[e, a],
+        params[e, a, P_MAX_SPEED],
+        params[e, a, P_MAX_ACCEL],
+        params[e, a, P_MAX_ANG_VEL],
+        params[e, a, P_MAX_ANG_ACCEL],
+        params[e, a, P_LF],
+        params[e, a, P_LR],
+        params[e, a, P_MAX_STEER],
+        params[e, a, P_MASS],
+        dt,
+    )
+    if clamp_bounds == 1:
+        radius = params[e, a, P_RADIUS]
+        p_new = type(p_new)(
+            wp.clamp(p_new[0], bounds_min[0] + radius, bounds_max[0] - radius),
+            wp.clamp(p_new[1], bounds_min[1] + radius, bounds_max[1] - radius),
+        )
+    pos_out[e, a] = p_new
+    theta_out[e, a] = th_new
+    vel_out[e, a] = v_out
+    speed_out[e, a] = s_out
+    ang_vel_out[e, a] = w_out
+
+
+def _signature2d(dtype, per_env: bool = False) -> list:
+    vec2 = VEC2[dtype]
+    a2v = wp.array2d(dtype=vec2)
+    a2s = wp.array2d(dtype=dtype)
+    a3s = wp.array3d(dtype=dtype)
+    a1i = wp.array(dtype=wp.int32)
+    params = wp.array3d(dtype=dtype) if per_env else a2s
+    state = [a2v, a2s, a2v, a2s, a2s]  # pos, theta, vel, speed, ang_vel
+    return [
+        *state,
+        a3s,
+        a2v,
+        params,
+        a1i,
+        a1i,
+        dtype,
+        vec2,
+        vec2,
+        wp.int32,
+        *state,
+    ]
+
+
 def _signature(dtype, per_env: bool = False) -> list:
     vec2 = VEC2[dtype]
     a2v = wp.array2d(dtype=vec2)
@@ -972,6 +1174,8 @@ def _signature(dtype, per_env: bool = False) -> list:
 for _T in (wp.float32, wp.float64):
     wp.overload(integrate_kernel, _signature(_T))
     wp.overload(integrate_kernel_per_env, _signature(_T, per_env=True))
+    wp.overload(integrate2d_kernel, _signature2d(_T))
+    wp.overload(integrate2d_kernel_per_env, _signature2d(_T, per_env=True))
 
 
 #: Integrator enum value -> kernel tag (must match the INT_* constants above).
@@ -987,12 +1191,22 @@ def launch_integrate(
     dt: float,
     clamp_bounds: tuple[float, float, float, float] | None = None,
     integrator: Integrator = Integrator.EULER,
+    slim: bool = False,
+    skip_drone: bool = False,
 ) -> None:
     """Launch one integration sub-step. Functional: never writes to ``state_in``.
 
     ``clamp_bounds=(x_min, x_max, y_min, y_max)`` hard-clamps positions inside
     the rectangle (inset by each agent's radius). ``integrator`` selects the
     semi-implicit Euler recurrence (default) or classic RK4.
+
+    ``slim=True`` launches the 2D-only Euler kernel that computes five state
+    arrays instead of nine (no drone math, no RK4 branch). The caller must
+    guarantee this is valid (no drone agents, Euler, not taped). The four drone
+    fields are passed through unchanged so the result stays bit-identical to the
+    full kernel for arbitrary inputs; pass ``skip_drone=True`` (graph/Environment
+    context, where the drone state is known-zero and never read) to elide that
+    passthrough entirely.
     """
     dtype = state_in.theta.dtype
     vec2 = VEC2[dtype]
@@ -1002,10 +1216,49 @@ def launch_integrate(
     else:
         x_min, x_max, y_min, y_max = clamp_bounds
         b_min, b_max, do_clamp = vec2(x_min, y_min), vec2(x_max, y_max), 1
-    if params.floats_per_env is None:
-        kernel, floats = integrate_kernel, params.floats
-    else:
-        kernel, floats = integrate_kernel_per_env, params.floats_per_env
+    per_env = params.floats_per_env is not None
+    floats = params.floats_per_env if per_env else params.floats
+    if slim:
+        kernel2d = integrate2d_kernel_per_env if per_env else integrate2d_kernel
+        wp.launch(
+            kernel2d,
+            dim=(n_envs, n_agents),
+            inputs=[
+                state_in.pos,
+                state_in.theta,
+                state_in.vel,
+                state_in.speed,
+                state_in.ang_vel,
+                actions,
+                forces,
+                floats,
+                params.model_tag,
+                params.ctrl_mode,
+                dtype(dt),
+                b_min,
+                b_max,
+                wp.int32(do_clamp),
+            ],
+            outputs=[
+                state_out.pos,
+                state_out.theta,
+                state_out.vel,
+                state_out.speed,
+                state_out.ang_vel,
+            ],
+            device=state_in.pos.device,
+        )
+        if not skip_drone:
+            # The full kernel passes the 6-DOF drone state through unchanged for
+            # 2D agents; mirror that so the slim result is bit-identical for any
+            # input. Callers whose drone state is known-zero-and-unread (the
+            # graph copy-back) pass skip_drone=True to elide these copies.
+            wp.copy(state_out.z, state_in.z)
+            wp.copy(state_out.vz, state_in.vz)
+            wp.copy(state_out.attitude, state_in.attitude)
+            wp.copy(state_out.body_rates, state_in.body_rates)
+        return
+    kernel = integrate_kernel_per_env if per_env else integrate_kernel
     wp.launch(
         kernel,
         dim=(n_envs, n_agents),

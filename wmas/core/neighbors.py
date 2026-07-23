@@ -339,6 +339,13 @@ class NeighborGrid:
         # grid-owned buffer shared by every query_into call — it is not taped
         # and only read after build()/neighbors(), so sharing is safe.
         self.neighbor_true_count = wp.zeros((n_envs, n_agents), dtype=wp.int32, device=device)
+        # Dedupe instrumentation: ``build_count`` is the number of actual neighbor
+        # queries launched (any backend, any target buffer) — the ablation reads
+        # its per-step delta. ``built_version`` is the ``Stepper.state_version``
+        # the internal lists were last built at (stamped by ``World.neighbors``);
+        # ``launch_substeps`` reuses them for substep 0 when it still matches.
+        self.build_count: int = 0
+        self.built_version: int = -1
 
     def build(self, pos: wp.array) -> None:
         """Refresh the padded lists from positions [n_envs, n_agents] (vec2)."""
@@ -350,6 +357,7 @@ class NeighborGrid:
         Launches use ``record_tape=False``: neighbor construction is a discrete,
         non-differentiable pass and must not be replayed by tape adjoints.
         """
+        self.build_count += 1
         if self.method == "grid":
             self._query_grid_into(pos, neighbor_idx, neighbor_count)
         elif self.method == "uniform_grid":

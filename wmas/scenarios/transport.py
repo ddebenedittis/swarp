@@ -23,11 +23,18 @@ from __future__ import annotations
 from typing import Any
 
 import torch
+import warp as wp
 
 from wmas.core.config import WorldConfig
+from wmas.core.state import VEC2
 from wmas.core.world import World
 from wmas.dynamics.base import AgentConfig, ControlMode, DynamicsModel
 from wmas.scenarios.base import Scenario
+from wmas.scenarios.transport_kernels import (
+    transport_body_kernel,
+    transport_obs_kernel,
+    transport_reward_kernel,
+)
 
 
 class TransportScenario(Scenario):
@@ -105,7 +112,16 @@ class TransportScenario(Scenario):
         self.goal: torch.Tensor | None = None  # [n_envs, n_packages, 2]
         self._prev_dist: torch.Tensor | None = None
         self._cache: dict[str, torch.Tensor] | None = None
+        self._fused_ready = False
         return self.world
+
+    def fused_available(self) -> bool:
+        """Transport ships fused Warp obs/reward + movable-body kernels."""
+        return True
+
+    @property
+    def obs_dim(self) -> int:
+        return 4 + 4 * self.n_packages
 
     # ------------------------------------------------------------------ reset
 
@@ -149,8 +165,20 @@ class TransportScenario(Scenario):
             self.goal = torch.where(m3p, goal, self.goal)
 
         self._install_obstacles()
-        self._prev_dist = None
-        self._refresh(reset_mask=env_mask, integrate=False)
+        if self._fused_active:
+            self._ensure_fused(w.n_envs)
+            if env_mask is None:
+                self._f_resetmask.fill_(1)
+            else:
+                self._f_resetmask.copy_(env_mask)  # bool -> uint8
+            full = 0 if self._fused_obs_only else 1
+            # No body integration on reset (integrate=False): recompute obs and
+            # rebase the shaping baseline only. reset_hit rebases prev_dist.
+            self._launch_obs()
+            self._launch_reward(advance_prev=0, full_pass=full)
+        else:
+            self._prev_dist = None
+            self._refresh(reset_mask=env_mask, integrate=False)
 
     def _install_obstacles(self) -> None:
         self.world.set_obstacles(self.pkg_pos.detach(), self._pkg_radius)
@@ -158,7 +186,149 @@ class TransportScenario(Scenario):
     # -------------------------------------------------------- package physics
 
     def post_step(self) -> None:
-        self._refresh(integrate=True)
+        if self._fused_active:
+            self._ensure_fused(self.world.n_envs)
+            self._f_resetmask.zero_()  # a normal step resets no env
+            self._launch_body()
+            self._install_obstacles()  # updated package pose for the next step
+            self._launch_obs()
+            self._launch_reward(advance_prev=1, full_pass=1)
+        else:
+            self._refresh(integrate=True)
+
+    # --------------------------------------------------------- fused fast path
+
+    def _ensure_fused(self, n_envs: int) -> None:
+        """Allocate the persistent fused OUTPUT buffers + wp handles.
+
+        Package state (pkg_pos/vel/theta/ang_vel/goal) and prev_dist are NOT
+        cached here — they are re-wrapped fresh each launch (the torch/grad path
+        may reassign them), mirroring how navigation re-wraps its state."""
+        if self._fused_ready:
+            return
+        w = self.world
+        na, dev, dt = self.n_agents, w.device, w.dtype
+
+        def z(*shape, d=dt):
+            return torch.zeros(*shape, device=dev, dtype=d)
+
+        self._f_obs = z(n_envs, na, self.obs_dim)
+        self._f_reward = z(n_envs, na)
+        self._f_dist = z(n_envs, self.n_packages)
+        self._f_done = z(n_envs, d=torch.uint8)
+        self._f_resetmask = z(n_envs, d=torch.uint8)
+        scalar = w.wp_dtype
+        self._wp = {
+            "obs": wp.from_torch(self._f_obs, dtype=scalar),
+            "reward": wp.from_torch(self._f_reward, dtype=scalar),
+            "dist": wp.from_torch(self._f_dist, dtype=scalar),
+            "done": wp.from_torch(self._f_done, dtype=wp.uint8),
+            "resetmask": wp.from_torch(self._f_resetmask, dtype=wp.uint8),
+        }
+        self._f_done_bool = self._f_done.view(torch.bool)
+        self._fused_ready = True
+
+    def _state_wp(self):
+        """(pos, vel) agent state as Warp arrays for the fused kernels."""
+        w = self.world
+        vec2 = VEC2[w.wp_dtype]
+        if w._persistent and not w._detached:
+            s = w.runtime.state
+            return s.pos, s.vel
+        st = w.state
+        return (
+            wp.from_torch(st.pos.contiguous(), dtype=vec2),
+            wp.from_torch(st.vel.contiguous(), dtype=vec2),
+        )
+
+    def _pkg_wp(self) -> dict:
+        """Fresh Warp handles over the (possibly reassigned) package tensors.
+
+        The body kernel writes pkg_pos/vel/theta/ang_vel in place; these tensors
+        stay contiguous (torch.where / arithmetic / clone), so the fresh wrap
+        aliases them and the writes propagate."""
+        scalar = self.world.wp_dtype
+        vec2 = VEC2[scalar]
+        return {
+            "pkg_pos": wp.from_torch(self.pkg_pos.contiguous(), dtype=vec2),
+            "pkg_vel": wp.from_torch(self.pkg_vel.contiguous(), dtype=vec2),
+            "pkg_theta": wp.from_torch(self.pkg_theta.contiguous(), dtype=scalar),
+            "pkg_ang_vel": wp.from_torch(self.pkg_ang_vel.contiguous(), dtype=scalar),
+            "goal": wp.from_torch(self.goal.contiguous(), dtype=vec2),
+        }
+
+    def _launch_body(self) -> None:
+        w = self.world
+        scalar = w.wp_dtype
+        pos, vel = self._state_wp()
+        pk = self._pkg_wp()
+        bound = self.world_size - self.package_radius
+        wp.launch(
+            transport_body_kernel,
+            dim=(w.n_envs, self.n_packages),
+            inputs=[
+                pos,
+                vel,
+                wp.int32(self.n_agents),
+                scalar(self.agent_radius),
+                scalar(self.package_radius),
+                scalar(self.contact_margin),
+                scalar(self.contact_k),
+                scalar(self.contact_c),
+                scalar(self.package_mass),
+                scalar(self.package_inertia),
+                scalar(self.linear_damping),
+                scalar(self.angular_damping),
+                scalar(self.dt),
+                scalar(bound),
+            ],
+            outputs=[pk["pkg_pos"], pk["pkg_vel"], pk["pkg_theta"], pk["pkg_ang_vel"]],
+            device=w.device,
+            record_tape=False,
+        )
+
+    def _launch_obs(self) -> None:
+        w = self.world
+        self._ensure_fused(w.n_envs)
+        pos, vel = self._state_wp()
+        pk = self._pkg_wp()
+        wp.launch(
+            transport_obs_kernel,
+            dim=(w.n_envs, self.n_agents),
+            inputs=[pos, vel, pk["pkg_pos"], pk["goal"], wp.int32(self.n_packages)],
+            outputs=[self._wp["obs"]],
+            device=w.device,
+            record_tape=False,
+        )
+
+    def _launch_reward(self, advance_prev: int, full_pass: int) -> None:
+        w = self.world
+        scalar = w.wp_dtype
+        if self._prev_dist is None:
+            self._prev_dist = torch.zeros(
+                w.n_envs, self.n_packages, device=w.device, dtype=w.dtype
+            )
+        pk = self._pkg_wp()
+        prev = wp.from_torch(self._prev_dist.contiguous(), dtype=scalar)
+        wp.launch(
+            transport_reward_kernel,
+            dim=w.n_envs,
+            inputs=[
+                pk["pkg_pos"],
+                pk["goal"],
+                self._wp["resetmask"],
+                wp.int32(self.n_agents),
+                wp.int32(self.n_packages),
+                scalar(self.pos_shaping_factor),
+                scalar(self.goal_tolerance),
+                scalar(self.goal_reward),
+                wp.int32(advance_prev),
+                wp.int32(full_pass),
+            ],
+            outputs=[prev, self._wp["reward"], self._wp["done"], self._wp["dist"]],
+            device=w.device,
+            record_tape=False,
+        )
 
     def _refresh(self, reset_mask: torch.Tensor | None = None, integrate: bool = True) -> None:
         w = self.world
@@ -220,6 +390,8 @@ class TransportScenario(Scenario):
     # ------------------------------------------------------------ obs/rewards
 
     def observations(self) -> torch.Tensor:
+        if self._fused_active:
+            return self._f_obs
         w = self.world
         s = w.state
         pkg_to_goal = (
@@ -236,8 +408,17 @@ class TransportScenario(Scenario):
         c = self._cache
         return c["shaping"] + self.goal_reward * c["on_goal"].all(dim=-1).to(self.world.dtype)
 
+    def rewards(self) -> torch.Tensor:
+        if self._fused_active:
+            return self._f_reward
+        return super().rewards()
+
     def done(self) -> torch.Tensor:
+        if self._fused_active:
+            return self._f_done_bool
         return self._cache["on_goal"].all(dim=-1)
 
     def info(self) -> dict[str, Any]:
+        if self._fused_active:
+            return {"package_dist_to_goal": self._f_dist}
         return {"package_dist_to_goal": self._cache["dist_to_goal"]}

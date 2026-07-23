@@ -115,6 +115,7 @@ class WmasEnv(EnvBase):
             obs = self._env.reset_at(mask)
         else:
             obs = self._env.reset()
+        obs = obs.clone()  # fused/graph obs is a view into a reused buffer
         ne = self._env.n_envs
         out = TensorDict(
             {
@@ -135,6 +136,9 @@ class WmasEnv(EnvBase):
     def _step(self, tensordict: TensorDict) -> TensorDict:
         action = tensordict.get("action")
         obs, reward, done, info = self._env.step(action)
+        # Fused / graph-mode outputs are zero-copy views into persistent buffers
+        # overwritten next step; collectors hold refs across steps, so clone.
+        obs, reward, done = obs.clone(), reward.clone(), done.clone()
         done = done.reshape(-1, 1)
         out = TensorDict(
             {
@@ -153,7 +157,7 @@ class WmasEnv(EnvBase):
     def _info_td(self, info: dict[str, torch.Tensor]) -> TensorDict:
         """Pack the scenario info dict into a nested TensorDict (tensors kept on-device)."""
         return TensorDict(
-            {key: info[key] for key in self._info_keys},
+            {key: info[key].clone() for key in self._info_keys},
             batch_size=self.batch_size,
             device=self.device,
         )

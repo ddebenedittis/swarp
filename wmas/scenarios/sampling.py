@@ -13,11 +13,17 @@ from __future__ import annotations
 from typing import Any
 
 import torch
+import warp as wp
 
 from wmas.core.config import WorldConfig
+from wmas.core.state import VEC2
 from wmas.core.world import World
 from wmas.dynamics.base import AgentConfig, ControlMode, DynamicsModel
 from wmas.scenarios.base import Scenario
+from wmas.scenarios.sampling_kernels import (
+    sampling_obs_reward_kernel,
+    sampling_scatter_kernel,
+)
 
 
 class SamplingScenario(Scenario):
@@ -66,10 +72,19 @@ class SamplingScenario(Scenario):
         self.centers: torch.Tensor | None = None  # [n_envs, n_gaussians, 2]
         self.consumed: torch.Tensor | None = None  # [n_envs, grid_res*grid_res] bool
         self._cache: dict[str, torch.Tensor] | None = None
+        self._fused_ready = False
         # Cell-centre coordinates in world units, per axis: (i+0.5)/res * 2W - W.
         i = torch.arange(self.grid_res, device=device, dtype=dtype)
         self._cell_coord = (i + 0.5) / self.grid_res * 2.0 * self.world_size - self.world_size
         return self.world
+
+    def fused_available(self) -> bool:
+        """Sampling ships fused Warp obs/reward kernels (2D holonomic)."""
+        return True
+
+    @property
+    def obs_dim(self) -> int:
+        return 4 + 9  # pos, vel, 3x3 field samples
 
     # ------------------------------------------------------------------ field
 
@@ -118,12 +133,104 @@ class SamplingScenario(Scenario):
             )
             self.centers.copy_(torch.where(m3, centers, self.centers))
             self.consumed.copy_(torch.where(env_mask.view(-1, 1), consumed, self.consumed))
-        self._refresh()
+        if self._fused_active:
+            self._ensure_fused(w.n_envs)
+            # full_pass=0 on the mid-step auto-reset obs-only pass (don't clobber
+            # the reward/field already returned this step); 1 on a standalone
+            # reset. The scatter always runs (mirrors the reference _refresh,
+            # which marks the current cells consumed on every reset too).
+            self._launch_obs_reward(full_pass=0 if self._fused_obs_only else 1)
+            self._launch_scatter()
+        else:
+            self._refresh()
 
     # -------------------------------------------------------- per-step caching
 
     def post_step(self) -> None:
-        self._refresh()
+        if self._fused_active:
+            self._launch_obs_reward(full_pass=1)
+            self._launch_scatter()
+        else:
+            self._refresh()
+
+    # --------------------------------------------------------- fused fast path
+
+    def _ensure_fused(self, n_envs: int) -> None:
+        """Allocate the persistent fused output buffers + cached wp handles.
+
+        ``centers``/``consumed`` are allocated by ``reset_world`` before this runs
+        and only ever updated in place (``copy_``), so their data_ptr is stable
+        and can be wrapped once."""
+        if self._fused_ready:
+            return
+        w = self.world
+        na, dev, dt = self.n_agents, w.device, w.dtype
+
+        def z(*shape):
+            return torch.zeros(*shape, device=dev, dtype=dt)
+
+        self._f_obs = z(n_envs, na, self.obs_dim)
+        self._f_reward = z(n_envs, na)
+        self._f_field = z(n_envs, na)
+        scalar = w.wp_dtype
+        self._wp = {
+            "obs": wp.from_torch(self._f_obs, dtype=scalar),
+            "reward": wp.from_torch(self._f_reward, dtype=scalar),
+            "field": wp.from_torch(self._f_field, dtype=scalar),
+            "centers": wp.from_torch(self.centers, dtype=VEC2[scalar]),
+            "consumed": wp.from_torch(self.consumed.view(torch.uint8), dtype=wp.uint8),
+        }
+        self._fused_ready = True
+
+    def _state_wp(self):
+        """(pos, vel) as Warp arrays for the fused kernels."""
+        w = self.world
+        vec2 = VEC2[w.wp_dtype]
+        if w._persistent and not w._detached:
+            s = w.runtime.state
+            return s.pos, s.vel
+        st = w.state
+        return (
+            wp.from_torch(st.pos.contiguous(), dtype=vec2),
+            wp.from_torch(st.vel.contiguous(), dtype=vec2),
+        )
+
+    def _launch_obs_reward(self, full_pass: int) -> None:
+        w = self.world
+        self._ensure_fused(w.n_envs)
+        scalar = w.wp_dtype
+        pos, vel = self._state_wp()
+        wp.launch(
+            sampling_obs_reward_kernel,
+            dim=(w.n_envs, self.n_agents),
+            inputs=[
+                pos,
+                vel,
+                self._wp["centers"],
+                self._wp["consumed"],
+                scalar(self.world_size),
+                wp.int32(self.grid_res),
+                wp.int32(self.n_gaussians),
+                scalar(2.0 * self.field_std**2),
+                wp.int32(full_pass),
+            ],
+            outputs=[self._wp["obs"], self._wp["reward"], self._wp["field"]],
+            device=w.device,
+            record_tape=False,
+        )
+
+    def _launch_scatter(self) -> None:
+        w = self.world
+        scalar = w.wp_dtype
+        pos, _ = self._state_wp()
+        wp.launch(
+            sampling_scatter_kernel,
+            dim=(w.n_envs, self.n_agents),
+            inputs=[pos, scalar(self.world_size), wp.int32(self.grid_res)],
+            outputs=[self._wp["consumed"]],
+            device=w.device,
+            record_tape=False,
+        )
 
     def _refresh(self) -> None:
         w = self.world
@@ -158,6 +265,8 @@ class SamplingScenario(Scenario):
     # ------------------------------------------------------------ obs/rewards
 
     def observations(self) -> torch.Tensor:
+        if self._fused_active:
+            return self._f_obs
         w = self.world
         s = w.state
         return torch.cat([s.pos, s.vel, self._cache["samples"]], dim=-1)
@@ -168,5 +277,12 @@ class SamplingScenario(Scenario):
     def agent_reward(self, agent_idx: int) -> torch.Tensor:
         return self._cache["reward"][:, agent_idx]
 
+    def rewards(self) -> torch.Tensor:
+        if self._fused_active:
+            return self._f_reward
+        return super().rewards()
+
     def info(self) -> dict[str, Any]:
+        if self._fused_active:
+            return {"field": self._f_field, "consumed_frac": self.consumed.float().mean(-1)}
         return {"field": self._cache["field"], "consumed_frac": self.consumed.float().mean(-1)}

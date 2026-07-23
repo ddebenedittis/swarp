@@ -102,6 +102,8 @@ class Viewer:
             s.vel[e, agent_idx] = 0
             s.speed[e, agent_idx] = 0
             s.ang_vel[e, agent_idx] = 0
+            # Positions changed out of band; drop any reusable neighbor list.
+            self.env.world.mark_pos_dirty()
 
     def _write_goal(self, agent_idx: int, world_xy) -> None:
         """Move an agent's goal in the focus env (no-op if the scenario has no goals)."""

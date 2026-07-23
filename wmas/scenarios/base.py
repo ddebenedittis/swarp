@@ -21,9 +21,25 @@ from wmas.core.world import World
 
 
 class Scenario(ABC):
-    """Base class for scenarios. Subclasses must set ``self.world`` in make_world."""
+    """Base class for scenarios. Subclasses must set ``self.world`` in make_world.
+
+    Fused fast path
+    ---------------
+    A scenario may provide fused Warp obs/reward/done kernels for the no-grad hot
+    path. When :meth:`fused_available` returns True and the Environment turns it
+    on, it sets ``self._fused_active = True`` (and False in grad mode, where the
+    torch reference path runs so autograd works). Fused implementations return
+    zero-copy views of persistent buffers that are overwritten by the next step;
+    callers that must retain them across steps clone (the Environment's
+    ``copy_outputs`` flag and the TorchRL wrapper do this).
+    """
 
     world: World
+    _fused_active: bool = False
+
+    def fused_available(self) -> bool:
+        """True if this scenario provides fused obs/reward kernels (default no)."""
+        return False
 
     @abstractmethod
     def make_world(
