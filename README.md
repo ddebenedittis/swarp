@@ -255,6 +255,112 @@ not lidar) differ by design, so identical actions do **not** reproduce VMAS traj
 The comparison above measures throughput/memory on the shared navigation task, nothing
 more.
 
+### vs. JaxMARL & CAMAR
+
+`python -m wmas.benchmark.compare_sims` broadens the head-to-head to the JAX-based field:
+wmas vs [VMAS](https://github.com/proroklab/VectorizedMultiAgentSimulator),
+[JaxMARL](https://github.com/flairox/jaxmarl) (`MPE_simple_spread_v3`, continuous
+cooperative navigation), and [CAMAR](https://github.com/AIRI-Institute/CAMAR)
+(`random_grid` + `HolonomicDynamic` continuous navigation). All four run the same
+env-steps/s measurement on the one scenario they share — continuous 2D
+navigation-to-goal with collision avoidance — anchored on wmas.
+
+VMAS pins `numpy < 2` while JaxMARL/CAMAR are JAX (recent numpy), so the four cannot
+share one venv; JaxMARL and CAMAR also pin different jax versions. Each simulator is
+therefore installed into its own Python 3.12 venv and benchmarked in its own
+subprocess (JAX and torch never share a process, so they don't fight over VRAM):
+
+```bash
+for v in .venv .venv-jaxmarl .venv-camar; do uv venv --python 3.12 $v; done
+VIRTUAL_ENV=.venv         uv pip install -e . --group dev --group bench     # wmas + vmas
+VIRTUAL_ENV=.venv-jaxmarl uv pip install -e . --group bench-jaxmarl         # jaxmarl
+VIRTUAL_ENV=.venv-camar   uv pip install -e . --group bench-camar           # camar
+```
+
+#### Getting JaxMARL onto the GPU (do this — it silently runs on CPU otherwise)
+
+JaxMARL pins an older `jax`, and its dependency resolution pulls the **CPU-only**
+`jaxlib`. If you skip this step JAX falls back to CPU and the JaxMARL column is a
+CPU number that is meaningless next to the GPU sims — so `compare_sims.py` **refuses
+to report it**: the adapter asserts a GPU device and the cell prints `CPU-only`
+instead of a bogus figure.
+
+The fix is to install the CUDA build of `jaxlib` *at the exact `jax` version JaxMARL
+already pinned* (a different version would break JaxMARL). Find that version, then
+install the matching CUDA wheels into the JaxMARL venv only:
+
+```bash
+# 1. discover the jax version JaxMARL installed (e.g. 0.4.38)
+.venv-jaxmarl/bin/python -c "import jax; print(jax.__version__)"
+
+# 2. install the CUDA-enabled build at that same version (adjust cuda12 -> your CUDA)
+VIRTUAL_ENV=.venv-jaxmarl uv pip install "jax[cuda12]==0.4.38"
+
+# 3. verify JAX now sees the GPU (must print a CudaDevice, not CpuDevice)
+XLA_PYTHON_CLIENT_PREALLOCATE=false .venv-jaxmarl/bin/python -c "import jax; print(jax.devices())"
+```
+
+`compare_sims.py` sets `XLA_PYTHON_CLIENT_PREALLOCATE=false` in each JAX child so JAX
+grows VRAM on demand instead of grabbing ~75% up front; CAMAR (`bench-camar`) ships a
+CUDA `jaxlib` already and needs no such fix.
+
+One combined command drives all three subprocesses via a per-sim interpreter map and
+prints a single table (the numpy split lives entirely at the subprocess boundary):
+
+```bash
+.venv/bin/python -m wmas.benchmark.compare_sims --device cuda:0 \
+    --envs 1024 4096 16384 --agents 3 16 \
+    --python jaxmarl=.venv-jaxmarl/bin/python \
+    --python camar=.venv-camar/bin/python
+```
+
+The launching interpreter (`.venv/bin/python` here) runs `wmas` and `vmas` in-process
+by default; `--python SIM=PATH` overrides the interpreter for a given simulator, and
+any sim without an override uses the launcher (or `--python-default PATH`). To compare
+**just wmas vs JaxMARL**, restrict the sims and point JaxMARL at its venv:
+
+```bash
+.venv/bin/python -m wmas.benchmark.compare_sims --device cuda:0 \
+    --sims wmas jaxmarl --agents 3 16 \
+    --python jaxmarl=.venv-jaxmarl/bin/python
+```
+
+`--sims` picks which simulators to run (`wmas` is the anchor and should stay in);
+`--agents`/`--envs` set the sweep. JaxMARL's `MPE_simple_spread_v3` honors any agent
+count (`num_agents` is configurable), so no cell is skipped for an agent mismatch; if a
+simulator ever cannot match the requested count, its number is flagged with `*` and the
+realized count is listed under the table. You can drop the JaxMARL comparison entirely
+by omitting it from `--sims`.
+
+env-steps/s on the RTX 3070 Laptop GPU (float32, 60 timed steps; JIT/XLA compile
+excluded via warmup at the timed length):
+
+```
+  n_envs  n_agents |        wmas        vmas     jaxmarl       camar |  vmas/w  jaxmarl/w  camar/w
+    1024         3 |   1,134,353     244,411  18,940,819     351,997 |   0.22x     16.70x    0.31x
+    4096         3 |   4,259,488     947,561  54,698,566     341,561 |   0.22x     12.84x    0.08x
+   16384         3 |  17,046,424   3,183,244  91,936,471     337,328 |   0.19x      5.39x    0.02x
+    1024        16 |     953,204      19,205   3,868,203      69,481 |   0.02x      4.06x    0.07x
+    4096        16 |   4,658,527      61,076   3,737,148      71,692 |   0.01x      0.80x    0.02x
+   16384        16 |   6,784,739     134,018   1,854,292         OOM |   0.02x      0.27x    -
+```
+
+Reading it: **JaxMARL is fastest at few agents** — its fully-jitted `lax.scan` over a
+tiny point-particle MPE is hard to beat at 3 agents. But its per-step cost grows with
+agents (O(agents × landmarks) observations + pairwise terms), so **wmas overtakes it by
+16 agents** (wmas's step is a fixed handful of fused Warp kernels, largely insensitive to
+agent count — note wmas barely moves from 3→16 agents while every competitor drops
+sharply). wmas is consistently ~5× faster than VMAS and ~3–50× faster than CAMAR on this
+task; CAMAR's throughput is roughly flat in `n_envs` here (its LIDAR observation /
+map machinery dominates) and OOMs at 16384×16 on the 8 GB card.
+
+**Parity caveat (same as VMAS above).** This is a raw step-throughput comparison, not a
+task-equivalence one. Observation and reward models differ across all four by design
+(wmas padded neighbor lists; VMAS lidar; JaxMARL full-state MPE; CAMAR local LIDAR
+windows), agent dynamics and collision constants differ, and identical actions do not
+produce matching trajectories. The number measured is only how fast each engine advances
+a batch of navigation environments.
+
 ## Layout
 
 ```
