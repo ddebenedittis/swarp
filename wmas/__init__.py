@@ -17,7 +17,11 @@ from wmas.dynamics.base import (
 )
 from wmas.interop.autograd import TorchState, rollout, warp_step
 from wmas.scenarios.base import Scenario
+from wmas.scenarios.discovery import DiscoveryScenario
+from wmas.scenarios.flocking import FlockingScenario
+from wmas.scenarios.formation import FormationScenario
 from wmas.scenarios.navigation import NavigationScenario
+from wmas.scenarios.sampling import SamplingScenario
 from wmas.sensors.lidar import Lidar, lidar_scan
 
 __version__ = "0.1.0"
@@ -25,12 +29,16 @@ __version__ = "0.1.0"
 __all__ = [
     "AgentConfig",
     "ControlMode",
+    "DiscoveryScenario",
     "DynamicsModel",
     "Environment",
+    "FlockingScenario",
+    "FormationScenario",
     "Integrator",
     "Lidar",
     "NavigationScenario",
     "ObstacleShape",
+    "SamplingScenario",
     "Scenario",
     "Stepper",
     "TorchState",

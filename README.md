@@ -256,7 +256,9 @@ rate fields that the 2D models pass through, ~9% latency cost at tiny per-env ba
 
 a **lidar sensor** (`wmas.Lidar`): a differentiable, vectorized ray-cast returning per-ray
 ranges against circular agents/obstacles, opt-in as an observation component a scenario
-concatenates.
+concatenates; and four circle-compatible **VMAS-style scenario ports** —
+`SamplingScenario` (consume a batched sum-of-Gaussians field), `DiscoveryScenario`
+(cover targets that each need several agents), `FlockingScenario` (Reynolds boids reward),
+and `FormationScenario` (hold polygon slots).
 
-Next: TorchRL wrapper and circle-compatible VMAS scenario ports (sampling, discovery,
-flocking, formation); then movable rigid-body payloads for transport/balance.
+Next: TorchRL wrapper; then movable rigid-body payloads for transport/balance.
