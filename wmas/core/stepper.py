@@ -115,6 +115,19 @@ class Stepper:
         self._cached_buffers: dict[int, StepBuffers] = {}
         self._out_states: dict[int, list[WorldState]] = {}
         self._out_idx: dict[int, int] = {}
+        # Cached zero-copy torch views of each ping-pong output slot (stable
+        # tensor objects, so a returned state re-entering the step is recognized
+        # by identity) and the reverse map id(view.pos) -> wrapped WorldState.
+        self._slot_views: dict[int, list[torch.Tensor]] = {}
+        self._wrapped_by_pos: dict[int, WorldState] = {}
+        # Single-slot cache for the wrapped action array (the hot loop reuses one
+        # action buffer); keyed on (data_ptr, shape, dtype) with the contiguous
+        # source held alive so the pointer cannot be recycled under us.
+        self._action_wrap: tuple | None = None
+        # Bumped whenever a change requires a Stage-4 CUDA-graph recapture
+        # (obstacle-count change, first per-env param install). Steady-state
+        # per-reset updates hit the in-place paths and leave this untouched.
+        self.mutation_version: int = 0
 
     # ------------------------------------------------------------------ setup
 
@@ -140,11 +153,41 @@ class Stepper:
         """
         vec2 = VEC2[self.dtype]
         n_obs = pos.shape[1]
+        dev = self.device
+
+        # In-place refresh when the obstacle *count* is unchanged: no realloc, no
+        # buffer clear, no version bump — so a scenario that re-samples obstacle
+        # positions every reset (NavigationScenario) does not force a graph
+        # recapture in steady state. Only a count change reallocates.
+        same_count = n_obs == self.n_obstacles and self._obs_pos.shape[1] == n_obs and n_obs > 0
+        if same_count:
+            wp.copy(self._obs_pos, wp.from_torch(pos.detach().contiguous(), dtype=vec2))
+            wp.copy(self._obs_radius, wp.from_torch(radius.detach().contiguous(), dtype=self.dtype))
+            if shape is None:
+                self._obs_type.zero_()
+            else:
+                wp.copy(
+                    self._obs_type,
+                    wp.from_torch(shape.detach().to(torch.int32).contiguous(), dtype=wp.int32),
+                )
+            if angle is None:
+                self._obs_angle.zero_()
+            else:
+                wp.copy(
+                    self._obs_angle, wp.from_torch(angle.detach().contiguous(), dtype=self.dtype)
+                )
+            if half_extents is None:
+                self._obs_half.zero_()
+            else:
+                wp.copy(
+                    self._obs_half, wp.from_torch(half_extents.detach().contiguous(), dtype=vec2)
+                )
+            return
+
         self.n_obstacles = n_obs
         self._obs_pos = wp.clone(wp.from_torch(pos.detach().contiguous(), dtype=vec2))
         self._obs_radius = wp.clone(wp.from_torch(radius.detach().contiguous(), dtype=self.dtype))
 
-        dev = self.device
         if shape is None:
             self._obs_type = wp.zeros(n_obs, dtype=wp.int32, device=dev)
         else:
@@ -160,8 +203,10 @@ class Stepper:
         else:
             self._obs_half = wp.clone(wp.from_torch(half_extents.detach().contiguous(), dtype=vec2))
         # _needs_forces may have flipped: cached buffers could alias the shared
-        # zero-force buffer, which the force pass would then overwrite.
+        # zero-force buffer, which the force pass would then overwrite. A shape
+        # change also invalidates any captured CUDA graph.
         self._cached_buffers.clear()
+        self.mutation_version += 1
 
     def set_agent_params_per_env(self, floats: torch.Tensor | np.ndarray) -> None:
         """Install a per-env parameter override for domain randomization.
@@ -178,14 +223,18 @@ class Stepper:
                 :func:`wmas.dynamics.base.per_env_float_template` for a template.
                 ``n_envs`` must match the batch size passed to the step.
         """
-        arr = floats.detach().cpu().numpy() if hasattr(floats, "detach") else np.asarray(floats)
-        if arr.ndim != 3 or arr.shape[1:] != (self.n_agents, NUM_PARAMS):
+        is_torch = hasattr(floats, "detach")
+        shape = tuple(floats.shape)
+        if len(shape) != 3 or shape[1:] != (self.n_agents, NUM_PARAMS):
             raise ValueError(
                 f"per-env params must have shape [n_envs, n_agents={self.n_agents}, "
-                f"NUM_PARAMS={NUM_PARAMS}]; got {tuple(arr.shape)}"
+                f"NUM_PARAMS={NUM_PARAMS}]; got {shape}"
             )
         if self.collisions:
-            max_r = float(arr[..., P_RADIUS].max())
+            if is_torch:
+                max_r = float(floats[..., P_RADIUS].max())
+            else:
+                max_r = float(np.asarray(floats)[..., P_RADIUS].max())
             reach = 2.0 * max_r + self.world.collision_margin
             if self.neighbor_radius < reach:
                 raise ValueError(
@@ -193,10 +242,30 @@ class Stepper:
                     f"(= 2 * max per-env radius + margin), but neighbor_radius="
                     f"{self.neighbor_radius}; set WorldConfig.neighbor_radius accordingly."
                 )
-        npdt = np.float64 if self.dtype == wp.float64 else np.float32
-        self.params.floats_per_env = wp.array(
-            np.ascontiguousarray(arr, dtype=npdt), dtype=self.dtype, device=self.device
-        )
+        torch_dt = torch.float64 if self.dtype == wp.float64 else torch.float32
+        existing = self.params.floats_per_env
+        # In-place refresh (no numpy round-trip, no realloc, no version bump) when
+        # an on-device torch buffer of the matching shape/dtype is already
+        # installed — the per-reset re-randomization path in graph mode.
+        if (
+            is_torch
+            and existing is not None
+            and tuple(existing.shape) == shape
+            and floats.dtype == torch_dt
+            and str(floats.device) == str(self.device)
+        ):
+            wp.copy(existing, wp.from_torch(floats.contiguous(), dtype=self.dtype))
+            return
+        # (Re)allocate. Build on-device from torch when possible to avoid a host
+        # round-trip; numpy inputs go through torch once.
+        if is_torch:
+            t = floats.detach().to(device=self.device, dtype=torch_dt).contiguous()
+        else:
+            t = torch.as_tensor(np.asarray(floats), dtype=torch_dt, device=self.device)
+        first_install = existing is None
+        self.params.floats_per_env = wp.clone(wp.from_torch(t, dtype=self.dtype))
+        if first_install:
+            self.mutation_version += 1
 
     # ------------------------------------------------------------- allocation
 
@@ -304,9 +373,36 @@ class Stepper:
             states = [self.alloc_state(n_envs), self.alloc_state(n_envs)]
             self._out_states[n_envs] = states
             self._out_idx[n_envs] = 0
+            for st in states:
+                views = [wp.to_torch(a, requires_grad=False) for a in st.arrays()]
+                self._slot_views[id(st)] = views
+                self._wrapped_by_pos[id(views[0])] = st  # views[0] is pos
         i = self._out_idx[n_envs]
         self._out_idx[n_envs] = 1 - i
         return states[i]
+
+    def wrapped_views(self, state: WorldState) -> list[torch.Tensor]:
+        """Cached, stable zero-copy torch views of an output slot's arrays."""
+        return self._slot_views[id(state)]
+
+    def lookup_wrapped(self, state) -> WorldState | None:
+        """The wrapped :class:`WorldState` backing ``state`` if it is one of the
+        cached output slots (O(1) identity check on ``state.pos``), else None."""
+        return self._wrapped_by_pos.get(id(state.pos))
+
+    def wrap_actions(self, actions: torch.Tensor, scalar) -> wp.array:
+        """Zero-copy Warp view of the action tensor, reusing the wrap when the
+        underlying buffer is unchanged (the hot loop re-fills one buffer)."""
+        ac = actions.contiguous()
+        key = (ac.data_ptr(), tuple(ac.shape), scalar)
+        cached = self._action_wrap
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        arr = wp.from_torch(ac, dtype=scalar, requires_grad=False)
+        # Hold ``ac`` alive so its storage (and thus data_ptr) cannot be recycled
+        # into a different tensor that would then spuriously hit this cache.
+        self._action_wrap = (key, arr, ac)
+        return arr
 
     # ---------------------------------------------------------------- stepping
 

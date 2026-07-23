@@ -97,9 +97,21 @@ def _wrap_actions(actions: torch.Tensor, scalar, with_grad: bool):
     return arr, grad
 
 
+# Wrapping a torch stream into a Warp stream is not free (a handle alloc + a few
+# attribute reads); the torch current stream is stable across steps, so cache the
+# wrapped ``wp.Stream`` keyed by (device, cudaStream_t pointer).
+_STREAM_CACHE: dict[tuple[str, int], object] = {}
+
+
 def _torch_stream_scope(device: str):
     if device.startswith("cuda"):
-        return wp.ScopedStream(wp.stream_from_torch(torch.cuda.current_stream()))
+        ts = torch.cuda.current_stream()
+        key = (device, ts.cuda_stream)
+        wp_stream = _STREAM_CACHE.get(key)
+        if wp_stream is None:
+            wp_stream = wp.stream_from_torch(ts)
+            _STREAM_CACHE[key] = wp_stream
+        return wp.ScopedStream(wp_stream)
     return wp.ScopedDevice(device)
 
 
@@ -169,14 +181,21 @@ def warp_step(stepper: Stepper, state: TorchState, actions: torch.Tensor) -> Tor
     scalar = _WP_SCALAR[actions.dtype]
     n_envs = actions.shape[0]
     with _torch_stream_scope(stepper.device):
-        state_wp, _ = _wrap_input_state(state, scalar, with_grad=False)
-        actions_wp, _ = _wrap_actions(actions, scalar, with_grad=False)
+        # When ``state`` is the previous step's cached output (the common hot-loop
+        # case), its tensors already back a wrapped WorldState — reuse it instead
+        # of re-running ``wp.from_torch`` on all nine fields.
+        cached_in = stepper.lookup_wrapped(state)
+        if cached_in is not None:
+            state_wp = cached_in
+        else:
+            state_wp, _ = _wrap_input_state(state, scalar, with_grad=False)
+        actions_wp = stepper.wrap_actions(actions, scalar)
         # Recycled ping-pong output (zero steady-state allocation); input and
         # output never alias. Returned tensors are valid until this batch size
         # is stepped twice more (documented on Stepper.output_state).
         out_wp = stepper.output_state(n_envs)
         stepper.launch_substeps(state_wp, actions_wp, out_wp, stepper.cached_buffers(n_envs))
-        return TorchState(*(wp.to_torch(a, requires_grad=False) for a in out_wp.arrays()))
+        return TorchState(*stepper.wrapped_views(out_wp))
 
 
 def rollout(

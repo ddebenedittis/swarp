@@ -43,6 +43,7 @@ class NavigationScenario(Scenario):
         goal_tolerance: float | None = None,
         min_spawn_separation: float | None = None,
         neighbor_method: str = "auto",
+        eager_trims: bool = True,
     ) -> None:
         self.n_agents = n_agents
         self.agent_radius = agent_radius
@@ -63,6 +64,12 @@ class NavigationScenario(Scenario):
             min_spawn_separation if min_spawn_separation is not None else 3.0 * agent_radius
         )
         self.neighbor_method = neighbor_method
+        # When True (default) the per-step obs/reward cache reuses persistent
+        # scratch buffers (arange, int64 index, gathered neighbor pos/vel,
+        # cos/sin) and writes the position-shaping baseline in place, cutting the
+        # eager-torch layer's per-step allocations. Bit-exact vs the untrimmed
+        # path; set False (used by the ablation baseline) to measure the churn.
+        self.eager_trims = eager_trims
 
     # ------------------------------------------------------------------ world
 
@@ -101,6 +108,9 @@ class NavigationScenario(Scenario):
         )
         self._nbr_cache: dict[str, torch.Tensor] | None = None
         self._prev_dist: torch.Tensor | None = None
+        # Persistent eager-trim scratch (allocated lazily on first refresh).
+        self._eager_k_all: int = -1
+        self._eager_k: int = -1
         return self.world
 
     def _sample_separated(self, n_envs: int, n_points: int, min_dist: float, tries: int = 16):
@@ -183,6 +193,21 @@ class NavigationScenario(Scenario):
     def post_step(self) -> None:
         self._refresh_step_cache()
 
+    def _ensure_eager_buffers(self, k_all: int, k: int) -> None:
+        """Allocate the persistent eager-trim scratch (once per shape)."""
+        if self._eager_k_all == k_all and self._eager_k == k:
+            return
+        w = self.world
+        ne, na, dev, dt = w.n_envs, w.n_agents, w.device, w.dtype
+        self._arange_k = torch.arange(k_all, device=dev)
+        self._idx_long = torch.empty((ne, na, k_all), dtype=torch.int64, device=dev)
+        self._npos_flat = torch.empty((ne, na * k_all, 2), dtype=dt, device=dev)
+        self._cosbuf = torch.empty((ne, na), dtype=dt, device=dev)
+        self._sinbuf = torch.empty((ne, na), dtype=dt, device=dev)
+        self._nvel_flat = torch.empty((ne, na * k, 2), dtype=dt, device=dev) if k > 0 else None
+        self._eager_k_all = k_all
+        self._eager_k = k
+
     def _refresh_step_cache(self, reset_mask: torch.Tensor | None = None) -> None:
         """Neighbor features, distances, and reward terms for the current state.
 
@@ -195,28 +220,50 @@ class NavigationScenario(Scenario):
         w = self.world
         pos, vel = w.state.pos, w.state.vel
         idx, cnt = w.neighbors()
-        idx = idx.long()
         k_all = idx.shape[-1]
-        valid = torch.arange(k_all, device=w.device).view(1, 1, -1) < cnt.long().unsqueeze(
-            -1
-        )  # [n_envs, n_agents, k_all]
+        k = min(self.neighbor_obs, k_all)
+        eager = self.eager_trims
+        # ``gather(out=)`` is not autograd-compatible, so the out= fast path is
+        # only taken when no grad is being recorded; the persistent int64 index,
+        # arange, and in-place shaping baseline are grad-safe and always used.
+        fast = eager and not torch.is_grad_enabled()
+
+        if eager:
+            self._ensure_eager_buffers(k_all, k)
+            idx_long = self._idx_long
+            idx_long.copy_(idx)
+            arange_k = self._arange_k
+        else:
+            idx_long = idx.long()
+            arange_k = torch.arange(k_all, device=w.device)
+
+        valid = arange_k.view(1, 1, -1) < cnt.long().unsqueeze(-1)  # [n_envs, n_agents, k_all]
         # neighbor positions (all slots: needed for touching counts)
-        flat = idx.reshape(w.n_envs, -1)
-        npos = torch.gather(pos, 1, flat.unsqueeze(-1).expand(-1, -1, 2))
+        flat = idx_long.reshape(w.n_envs, -1)
+        idx_exp = flat.unsqueeze(-1).expand(-1, -1, 2)
+        npos = (
+            torch.gather(pos, 1, idx_exp, out=self._npos_flat)
+            if fast
+            else torch.gather(pos, 1, idx_exp)
+        )
         npos = npos.view(w.n_envs, w.n_agents, k_all, 2)
         rel_pos_all = npos - pos.unsqueeze(2)
 
         # touching pairs -> per-agent collision counts (non-differentiable count)
         ndist = rel_pos_all.norm(dim=-1)
         r = w.agent_radius  # [n_agents]
-        min_dist = r.view(1, -1, 1) + r[idx]  # r_i + r_j
+        min_dist = r.view(1, -1, 1) + r[idx_long]  # r_i + r_j
         touching = ((ndist < min_dist) & valid).sum(dim=-1).to(w.dtype)
 
         # observation features only need the first `neighbor_obs` slots
-        k = min(self.neighbor_obs, k_all)
         rel_pos = rel_pos_all[:, :, :k] * valid[:, :, :k].unsqueeze(-1)
-        flat_k = idx[:, :, :k].reshape(w.n_envs, -1)
-        nvel = torch.gather(vel, 1, flat_k.unsqueeze(-1).expand(-1, -1, 2))
+        flat_k = idx_long[:, :, :k].reshape(w.n_envs, -1)
+        vidx_exp = flat_k.unsqueeze(-1).expand(-1, -1, 2)
+        nvel = (
+            torch.gather(vel, 1, vidx_exp, out=self._nvel_flat)
+            if (fast and k > 0)
+            else torch.gather(vel, 1, vidx_exp)
+        )
         nvel = nvel.view(w.n_envs, w.n_agents, k, 2)
         rel_vel = (nvel - vel.unsqueeze(2)) * valid[:, :, :k].unsqueeze(-1)
 
@@ -225,15 +272,19 @@ class NavigationScenario(Scenario):
             self._prev_dist = dist_to_goal.detach().clone()
         pos_shaping = (self._prev_dist - dist_to_goal) * self.pos_shaping_factor
         if reset_mask is None:
-            self._prev_dist = dist_to_goal.detach().clone()
+            if eager:
+                self._prev_dist.copy_(dist_to_goal.detach())
+            else:
+                self._prev_dist = dist_to_goal.detach().clone()
         else:
             # Rebase only reset envs; others keep their continuous baseline.
-            pos_shaping = torch.where(
-                reset_mask.unsqueeze(-1), torch.zeros_like(pos_shaping), pos_shaping
-            )
-            self._prev_dist = torch.where(
-                reset_mask.unsqueeze(-1), dist_to_goal.detach(), self._prev_dist
-            )
+            m = reset_mask.unsqueeze(-1)
+            pos_shaping = torch.where(m, torch.zeros_like(pos_shaping), pos_shaping)
+            new_prev = torch.where(m, dist_to_goal.detach(), self._prev_dist)
+            if eager:
+                self._prev_dist.copy_(new_prev)
+            else:
+                self._prev_dist = new_prev
 
         self._nbr_cache = {
             "rel_pos": rel_pos,
@@ -254,11 +305,18 @@ class NavigationScenario(Scenario):
         w = self.world
         s = w.state
         cache = self._nbr_cache
+        fast = self.eager_trims and not torch.is_grad_enabled()
+        if fast:
+            cos = torch.cos(s.theta, out=self._cosbuf).unsqueeze(-1)
+            sin = torch.sin(s.theta, out=self._sinbuf).unsqueeze(-1)
+        else:
+            cos = torch.cos(s.theta).unsqueeze(-1)
+            sin = torch.sin(s.theta).unsqueeze(-1)
         feats = [
             s.pos,
             s.vel,
-            torch.cos(s.theta).unsqueeze(-1),
-            torch.sin(s.theta).unsqueeze(-1),
+            cos,
+            sin,
             s.ang_vel.unsqueeze(-1),
             w.goals - s.pos,
         ]
