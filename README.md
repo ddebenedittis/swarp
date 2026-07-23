@@ -353,58 +353,68 @@ CUDA graph (which elides per-step kernel-launch overhead) roughly doubles it aga
 for ~2.5–5× end-to-end over the eager baseline. The graph's win grows with batch size,
 where launch overhead is the binding constraint.
 
-#### wmas (optimized) vs the field
+#### wmas (optimized) vs the field — matched task & observations
 
-env-steps/s, same GPU; `wmas` here is the optimized fused+graph configuration
-(JIT/XLA compile is excluded from the JAX sims via warmup at the timed length; the
-JAX sims fold obs+reward into the scan carry so XLA cannot dead-code-eliminate them):
+To make it as apples-to-apples as a four-engine comparison can be, the **default**
+`--sims` set controls for the two biggest asymmetries: all four run **obstacle-free**
+open-field navigation with **raycasting-free, relative-position observations**:
+
+| sim | config for the matched comparison |
+|-----|-----------------------------------|
+| `wmas` | optimized (fused Warp kernels + CUDA graph); neighbor-list obs, no obstacles |
+| `vmas-nolidar` | VMAS navigation, `collisions=False` → no 12-ray lidar, relative-position obs |
+| `jaxmarl` | `MPE_simple_spread_v3` continuous — relative-position obs (already raycast-free) |
+| `camar` | **open arena** (`string_grid`, no obstacles, `frameskip=1`) instead of the default ~800-obstacle `random_grid` |
+
+The JAX sims fold obs+reward into the scan carry so XLA cannot dead-code-eliminate
+them, and JIT/XLA compile is excluded via warmup at the timed length. Both
+`env-steps/s` and `agent-steps/s` (= env-steps/s × agents) are reported:
 
 ```
-  n_envs  n_agents |        wmas        vmas     jaxmarl       camar |  vmas/w  jaxmarl/w  camar/w
-    1024         3 |   4,301,720     255,280  13,556,004     286,984 |   0.06x      3.15x    0.07x
-    4096         3 |  16,636,071     971,047  38,653,890     280,132 |   0.06x      2.32x    0.02x
-   16384         3 |  67,239,007   3,333,441  65,176,914     276,344 |   0.05x      0.97x    0.00x
-    1024        16 |   4,139,245      18,846   2,215,540      57,080 |   0.00x      0.54x    0.01x
-    4096        16 |  16,330,955      64,185   2,454,928      58,446 |   0.00x      0.15x    0.00x
-   16384        16 |  34,997,949     137,913   1,419,798         OOM |   0.00x      0.04x    -
+metric: env-steps/s
+  n_envs  n_agents |         wmas  vmas-nolidar      jaxmarl        camar | vnl/w   jax/w  camar/w
+    1024         3 |    4,717,415       633,305   13,731,386   11,644,687 | 0.13x   2.91x    2.47x
+    4096         3 |   16,942,170     2,489,270   38,760,087   33,327,778 | 0.15x   2.29x    1.97x
+   16384         3 |   63,640,378     9,946,801   65,213,783   67,508,356 | 0.16x   1.02x    1.06x
+    1024        16 |    3,868,680       141,767    2,218,927    2,615,686 | 0.04x   0.57x    0.68x
+    4096        16 |   15,595,567       549,767    2,231,675    3,353,155 | 0.04x   0.14x    0.22x
+   16384        16 |   35,647,177     2,122,258    1,423,262    3,682,337 | 0.06x   0.04x    0.10x
+
+metric: agent-steps/s
+  n_envs  n_agents |         wmas  vmas-nolidar      jaxmarl        camar | vnl/w   jax/w  camar/w
+    1024         3 |   14,152,244     1,899,916   41,194,157   34,934,061 | 0.13x   2.91x    2.47x
+    4096         3 |   50,826,510     7,467,809  116,280,262   99,983,333 | 0.15x   2.29x    1.97x
+   16384         3 |  190,921,134    29,840,404  195,641,349  202,525,067 | 0.16x   1.02x    1.06x
+    1024        16 |   61,898,884     2,268,278   35,502,837   41,850,981 | 0.04x   0.57x    0.68x
+    4096        16 |  249,529,074     8,796,274   35,706,801   53,650,474 | 0.04x   0.14x    0.22x
+   16384        16 |  570,354,838    33,956,129   22,772,199   58,917,397 | 0.06x   0.04x    0.10x
 ```
+(Ratios are identical in both tables — with agent counts matched across sims, the
+`×agents` factor cancels. `agent-steps/s` is there for the absolute magnitudes.)
 
-Reading it: **JaxMARL leads only at low env counts with few agents** (~2–3× at 3 agents,
-1024–4096 envs), ties wmas by 16384 envs, and loses at 16 agents. Its fully-jitted
-`lax.scan` over a tiny 3-particle MPE has no per-step launch floor, which is the edge at
-low occupancy; but its per-step cost grows with agents (O(agents × landmarks)
-observations + pairwise terms), so wmas pulls ahead as agents rise. wmas is ~17–255×
-over VMAS and ~15–280× over CAMAR here — **but read the caveats below before taking
-those multipliers at face value; the four are not solving the same problem.**
+Reading it, once the task and obs are matched:
 
-#### This is not an apples-to-apples task comparison
+- **The two JAX sims (JaxMARL, CAMAR) win at few agents + low envs** (~2–3× at 3 agents,
+  1024–4096 envs), because they run the whole rollout as one jitted `lax.scan` with no
+  per-step launch floor. **wmas is latency-bound there** — its step floors at ~0.24 ms
+  regardless of `n_envs` (1024→16384) *or* agent count (3→16), a Python-per-step-loop cost
+  the JAX fused rollout doesn't pay. This is the real reason JAX leads at low occupancy.
+- **They converge by 16384 envs** at 3 agents (all within ~6% — wmas 63.6 M, JaxMARL 65.2 M,
+  CAMAR 67.5 M) as wmas's launch floor amortizes across more work.
+- **wmas dominates at 16 agents** (JAX sims fall to 0.04–0.68×). wmas's step is a fixed
+  handful of fused Warp kernels, nearly insensitive to agent count — its `agent-steps/s`
+  climbs from ~14 M (3 agents) to ~570 M (16 agents), ~40×, doing far more work in about
+  the same wall time — whereas MPE/CAMAR per-step cost grows with agents.
+- **`vmas-nolidar` is consistently slowest** (0.04–0.16×): a Python per-entity step loop
+  that neither the JAX scan nor Warp kernels have to pay.
 
-It measures raw step throughput of each engine *in its own default navigation setup*, so
-several asymmetries matter as much as the numbers:
-
-- **Task difficulty differs.** wmas `NavigationScenario` and VMAS/JaxMARL navigation are
-  effectively **obstacle-free** open-field goal-reaching. CAMAR's default `random_grid`
-  spawns **~800 obstacles** and runs `frameskip=2`, so it does *orders of magnitude* more
-  collision/LIDAR work per agent — a genuinely harder task, not a slower engine. (Notably
-  CAMAR still beats VMAS in most cells here — 1024×3 and both 16-agent rows — consistent
-  with the CAMAR paper's VMAS comparison. It only looks "slow" against wmas because wmas
-  is doing far less physics.)
-- **Observation/reward models differ by design** — wmas padded neighbor lists; VMAS 12-ray
-  lidar; JaxMARL 18-dim full-state MPE; CAMAR local LIDAR windows.
-- **Execution model differs.** The JAX sims run the whole rollout as one jitted `lax.scan`
-  (a single launch); wmas/VMAS run a Python per-step loop. At low `n_envs`, wmas is
-  **latency-bound** — its step floors at ~0.24 ms regardless of `n_envs` (1024→16384) *or*
-  agent count (3→16) — so JAX's fused-rollout model wins there simply by having no per-step
-  launch floor. This is the main reason JaxMARL leads at low env counts.
-- **`env-steps/s` flatters the overhead-bound sim.** wmas looking "insensitive to agent
-  count" is that latency floor hiding the agent work, *not* agents being free: in
-  `agent-steps/s` wmas rises from ~13 M (3 agents) to ~560 M (16 agents), ~43×, doing far
-  more actual work in nearly the same wall time. Only at 16384×16 does wmas become
-  compute-bound (step ~0.47 ms). Different agent counts across sims make any single metric
-  imperfect — compare rows, not just headline multipliers.
-- Identical actions do not reproduce trajectories across sims (dynamics/collision constants
-  differ). The number measured is only how fast each engine advances a batch of its own
-  navigation environments.
+**The default set is now genuinely comparable; the earlier "CAMAR is ~200× slower"
+result was almost entirely CAMAR's ~800-obstacle default map** — the same open-arena
+CAMAR here is 20–120× faster than that (`--sims camar-grid` reproduces the heavy native
+task). Residual, deliberate differences: exact obs dimensionality still differs per sim;
+`vmas-nolidar` also loses agent-agent collision physics (VMAS gates collisions and lidar
+on one flag); dynamics/collision constants differ so trajectories won't match. Use
+`--sims wmas vmas jaxmarl camar-grid` to compare each engine in its *native* setup instead.
 
 ## Layout
 

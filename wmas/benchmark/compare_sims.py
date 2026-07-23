@@ -1,13 +1,18 @@
 """Cross-simulator throughput benchmark: wmas vs VMAS, JaxMARL, and CAMAR.
 
-Compares raw simulator **env-steps/s** on the one environment all four
-implement: continuous 2D navigation-to-goal with collision avoidance
-(wmas ``NavigationScenario`` / VMAS ``navigation`` / JaxMARL
-``MPE_simple_spread_v3`` continuous / CAMAR ``random_grid`` + ``HolonomicDynamic``).
-Only the simulator step is measured — not RL algorithms, wrappers, or task
-equivalence. Observation and reward models differ across sims by design, exactly
-as in ``compare_vmas.py``; this measures how fast each engine advances a batch of
-environments, nothing more.
+Compares raw simulator **env-steps/s** and **agent-steps/s** on the one
+environment all four implement: continuous 2D navigation-to-goal with collision
+avoidance. Only the simulator step is measured — not RL algorithms, wrappers, or
+task equivalence.
+
+The default ``--sims`` set is chosen to be as apples-to-apples as possible — all
+four run obstacle-free navigation with raycasting-free, relative-position
+observations: ``wmas`` (fused kernels + CUDA graph), ``vmas-nolidar`` (VMAS
+navigation with ``collisions=False``, so no 12-ray lidar), ``jaxmarl``
+(``MPE_simple_spread_v3`` continuous), and ``camar`` (an open ``string_grid``
+arena, ``frameskip=1``). Each sim's *native* setup is also available:
+``vmas`` (collisions + lidar) and ``camar-grid`` (~800-obstacle ``random_grid``),
+plus wmas hot-path ablation configs ``wmas-fused`` / ``wmas-eager``.
 
 Why subprocesses. VMAS pins ``numpy < 2`` (torch stack) while JaxMARL and CAMAR
 are JAX-based and want recent numpy/jax — the four cannot coexist in one venv,
@@ -54,8 +59,14 @@ WMAS_CONFIGS = {
     "wmas-fused": dict(fused="auto", use_graph=False),
     "wmas-eager": dict(fused=False, use_graph=False),
 }
-ALL_SIMS = (*WMAS_CONFIGS, "vmas", "jaxmarl", "camar")
-DEFAULT_SIMS = ("wmas", "vmas", "jaxmarl", "camar")
+# vmas/camar each have a native and an obs-aligned variant:
+#   vmas          native navigation (collision physics + 12-ray lidar obs)
+#   vmas-nolidar  collisions+lidar off -> relative-position obs (raycasting-free)
+#   camar         open arena (no obstacles, frameskip=1) -> matches wmas navigation
+#   camar-grid    native random_grid (~800 obstacles, frameskip=2) -> maze task
+ALL_SIMS = (*WMAS_CONFIGS, "vmas", "vmas-nolidar", "jaxmarl", "camar", "camar-grid")
+# Default is the obs-aligned, obstacle-free set: same task + raycasting-free obs.
+DEFAULT_SIMS = ("wmas", "vmas-nolidar", "jaxmarl", "camar")
 SCENARIOS = ("navigation",)
 
 
@@ -68,18 +79,22 @@ def _build(sim: str, scenario: str, n_envs: int, n_agents: int, device: str):
         from wmas.benchmark._adapters import wmas_adapter
 
         return wmas_adapter.build(scenario, n_envs, n_agents, device, **WMAS_CONFIGS[sim])
-    if sim == "vmas":
+    if sim in ("vmas", "vmas-nolidar"):
         from wmas.benchmark._adapters import vmas_adapter
 
-        return vmas_adapter.build(scenario, n_envs, n_agents, device)
+        return vmas_adapter.build(
+            scenario, n_envs, n_agents, device, collisions=(sim == "vmas")
+        )
     if sim == "jaxmarl":
         from wmas.benchmark._adapters import jaxmarl_adapter
 
         return jaxmarl_adapter.build(scenario, n_envs, n_agents, device)
-    if sim == "camar":
+    if sim in ("camar", "camar-grid"):
         from wmas.benchmark._adapters import camar_adapter
 
-        return camar_adapter.build(scenario, n_envs, n_agents, device)
+        return camar_adapter.build(
+            scenario, n_envs, n_agents, device, obstacles=(sim == "camar-grid")
+        )
     raise ValueError(f"unknown sim {sim!r}")
 
 
@@ -152,60 +167,76 @@ def _run_child(python: str, sim, scenario, ne, na, steps, warmup, device) -> dic
     return {"status": "ERR"}
 
 
-def _fmt_cell(r: dict, requested_agents: int) -> str:
+def _value(r: dict, per_agent: bool) -> float | None:
+    """The metric value for a result cell: env-steps/s, or agent-steps/s."""
+    if "eps" not in r:
+        return None
+    return r["eps"] * r["agents"] if per_agent else r["eps"]
+
+
+def _fmt_cell(r: dict, requested_agents: int, per_agent: bool) -> str:
     if "status" in r:
         return r["status"]
-    s = f"{r['eps']:,.0f}"
+    s = f"{_value(r, per_agent):,.0f}"
     return s + "*" if r["agents"] != requested_agents else s
+
+
+def _print_table(label: str, per_agent: bool, sims, grid, configs, _w) -> None:
+    comps = [s for s in sims if s != "wmas"]
+    has_anchor = "wmas" in sims and bool(comps)
+    print(f"metric: {label} (higher is better)" + ("   anchor: wmas" if has_anchor else ""))
+    head = f"{'n_envs':>8} {'n_agents':>9} | " + " ".join(f"{s:>{_w}}" for s in sims)
+    if has_anchor:
+        head += " | " + " ".join(f"{s + '/w':>{_w}}" for s in comps)
+    print(head)
+    print("-" * len(head))
+    for na, ne in configs:
+        cells = grid[(na, ne)]
+        row = f"{ne:>8} {na:>9} | " + " ".join(
+            f"{_fmt_cell(cells[s], na, per_agent):>{_w}}" for s in sims
+        )
+        if has_anchor:
+            w = _value(cells["wmas"], per_agent)
+            ratios = []
+            for s in comps:
+                v = _value(cells[s], per_agent)
+                ratios.append(f"{v / w:.2f}x" if (v and w) else "-")
+            row += " | " + " ".join(f"{x:>{_w}}" for x in ratios)
+        print(row)
+    print()
 
 
 def run(args) -> None:
     py = dict(args.python or [])
     default_py = args.python_default or sys.executable
     sims = list(args.sims)
+    _w = max(11, max(len(s) for s in sims) + 2)  # +2 so the "<sim>/w" ratio headers fit
 
-    print("metric: env-steps/s (higher is better)")
     print("anchor: wmas (Warp).  ratios = competitor / wmas")
     print(f"device: {args.device}  steps {args.steps}  warmup {args.warmup}")
     for sim in sims:
-        print(f"  {sim:<11} -> {py.get(sim, default_py)}")
+        print(f"  {sim:<12} -> {py.get(sim, default_py)}")
     print()
 
     mism: dict[str, int] = {}  # sim -> realized agents, when != requested
+    configs = [(na, ne) for na in args.agents for ne in args.envs]
     for scenario in args.scenarios:
-        _w = max(11, max(len(s) for s in sims))
-        head = f"{'n_envs':>8} {'n_agents':>9} | " + " ".join(f"{s:>{_w}}" for s in sims)
-        comps = [s for s in sims if s != "wmas"]
-        if "wmas" in sims and comps:
-            head += " | " + " ".join(f"{s + '/w':>{_w}}" for s in comps)
-        print(f"[{scenario}]")
-        print(head)
-        print("-" * len(head))
-
-        for na in args.agents:
-            for ne in args.envs:
-                cells: dict[str, dict] = {}
-                for sim in sims:
-                    r = _run_child(
-                        py.get(sim, default_py), sim, scenario, ne, na,
-                        args.steps, args.warmup, args.device,
-                    )
-                    cells[sim] = r
-                    if "agents" in r and r["agents"] != na:
-                        mism[sim] = r["agents"]
-
-                row = f"{ne:>8} {na:>9} | " + " ".join(
-                    f"{_fmt_cell(cells[s], na):>{_w}}" for s in sims
+        grid: dict[tuple[int, int], dict[str, dict]] = {}
+        for na, ne in configs:
+            cells: dict[str, dict] = {}
+            for sim in sims:
+                r = _run_child(
+                    py.get(sim, default_py), sim, scenario, ne, na,
+                    args.steps, args.warmup, args.device,
                 )
-                if "wmas" in sims and comps:
-                    w = cells["wmas"].get("eps")
-                    ratios = []
-                    for s in comps:
-                        e = cells[s].get("eps")
-                        ratios.append(f"{e / w:.2f}x" if (e and w) else "-")
-                    row += " | " + " ".join(f"{x:>{_w}}" for x in ratios)
-                print(row)
-        print()
+                cells[sim] = r
+                if "agents" in r and r["agents"] != na:
+                    mism[sim] = r["agents"]
+            grid[(na, ne)] = cells
+
+        print(f"[{scenario}]")
+        _print_table("env-steps/s", False, sims, grid, configs, _w)
+        _print_table("agent-steps/s", True, sims, grid, configs, _w)
 
     if mism:
         print("* realized agent count differs from requested (sim-fixed):")

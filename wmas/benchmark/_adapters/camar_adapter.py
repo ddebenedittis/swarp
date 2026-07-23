@@ -1,10 +1,16 @@
 """CAMAR adapter: continuous multi-agent navigation with collision avoidance.
 
 CAMAR is the closest sibling to wmas — a JAX continuous-action navigation /
-collision-avoidance sim. The ``random_grid`` map with ``HolonomicDynamic`` maps
-directly to wmas ``NavigationScenario`` (holonomic point agents driving to goals
-amid obstacles). ``num_agents`` is set via ``map_kwargs``; actions are a single
-``(n_agents, action_size)`` array per env (holonomic: a 2D force vector).
+collision-avoidance sim. Two configurations:
+
+* ``obstacles=False`` (default) — an **open arena** (``string_grid`` of all-free
+  cells, no border), matching wmas ``NavigationScenario``'s obstacle-free space.
+  Observations reduce to goal + neighbour features (no obstacle raycasting), and
+  ``frameskip=1`` matches wmas ``substeps=1`` — an apples-to-apples navigation task.
+* ``obstacles=True`` (``camar-grid``) — CAMAR's native ``random_grid`` (~800
+  obstacles, ``frameskip=2``): a cluttered-maze task, far heavier per step.
+
+``HolonomicDynamic`` (a 2D force vector) maps to wmas's holonomic point agents.
 """
 
 from __future__ import annotations
@@ -12,9 +18,13 @@ from __future__ import annotations
 from wmas.benchmark._adapters import Runner, assert_jax_gpu, make_jax_runner
 
 _SUPPORTED = {"navigation"}
+# All-free 12x12 arena (no border) -> zero obstacles, ~1.2x1.2 world (≈ wmas's).
+_OPEN_GRID = "\n".join(["." * 12 for _ in range(12)])
 
 
-def build(scenario: str, n_envs: int, n_agents: int, device: str, seed: int = 0) -> Runner:
+def build(
+    scenario: str, n_envs: int, n_agents: int, device: str, seed: int = 0, obstacles: bool = False
+) -> Runner:
     if scenario not in _SUPPORTED:
         raise ValueError(
             f"camar adapter has no analogue for scenario {scenario!r}; "
@@ -25,11 +35,19 @@ def build(scenario: str, n_envs: int, n_agents: int, device: str, seed: int = 0)
     from camar import camar_v0
     from jax import random
 
-    env = camar_v0(
-        map_generator="random_grid",
-        dynamic="HolonomicDynamic",
-        map_kwargs={"num_agents": n_agents},
-    )
+    if obstacles:
+        env = camar_v0(
+            map_generator="random_grid",
+            dynamic="HolonomicDynamic",
+            map_kwargs={"num_agents": n_agents},
+        )
+    else:
+        env = camar_v0(
+            map_generator="string_grid",
+            dynamic="HolonomicDynamic",
+            frameskip=1,
+            map_kwargs={"map_str": _OPEN_GRID, "num_agents": n_agents, "add_border": False},
+        )
     na = env.num_agents
     act_dim = env.action_size
 
