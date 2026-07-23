@@ -34,6 +34,8 @@ from wmas.dynamics.base import (
     P_RADIUS,
     AgentConfig,
     AgentParams,
+    DynamicsModel,
+    Integrator,
     build_agent_params,
 )
 from wmas.dynamics.kernels import launch_integrate
@@ -47,6 +49,7 @@ class StepBuffers:
     forces: list[wp.array]  # one per substep (shared zero buffer if unused)
     nbr_idx: list[wp.array]  # one per substep (empty if collisions off)
     nbr_cnt: list[wp.array]
+    taped: bool = False  # True when allocated for a taped (grad) step
 
 
 class Stepper:
@@ -134,6 +137,12 @@ class Stepper:
         # ``launch_substeps`` and ``WorldConfig.neighbor_reuse``).
         self.state_version: int = 0
         self.neighbor_reuse: bool = world.neighbor_reuse
+        # The slim 2D Euler kernel is eligible only for an all-2D fleet under the
+        # Euler integrator on the no-grad path (the grad path uses the full
+        # kernel, whose drone passthrough carries the identity adjoints the slim
+        # kernel would drop). ``enable_slim2d`` lets the ablation disable it.
+        self.has_drone: bool = any(c.model == DynamicsModel.DRONE for c in configs)
+        self.enable_slim2d: bool = True
 
     # ------------------------------------------------------------------ setup
 
@@ -354,7 +363,13 @@ class Stepper:
             ]
         else:
             nbr_idx, nbr_cnt = [], []
-        return StepBuffers(inter_states=inter, forces=forces, nbr_idx=nbr_idx, nbr_cnt=nbr_cnt)
+        return StepBuffers(
+            inter_states=inter,
+            forces=forces,
+            nbr_idx=nbr_idx,
+            nbr_cnt=nbr_cnt,
+            taped=requires_grad,
+        )
 
     def cached_buffers(self, n_envs: int) -> StepBuffers:
         """Recycled scratch for the tape-free hot path (zero steady-state allocs)."""
@@ -433,6 +448,12 @@ class Stepper:
         n_envs = state_in.pos.shape[0]
         chain = [state_in, *buffers.inter_states, state_out]
         world = self.world
+        slim = (
+            self.enable_slim2d
+            and not self.has_drone
+            and not buffers.taped
+            and world.integrator == Integrator.EULER
+        )
         grid = self.grid(n_envs) if self.collisions else None
         can_reuse = (
             reuse_neighbors
@@ -484,6 +505,7 @@ class Stepper:
                 self.sub_dt,
                 clamp_bounds=self._clamp_bounds,
                 integrator=world.integrator,
+                slim=slim,
             )
         # State has advanced; the grid's lists no longer match this generation.
         self.state_version += 1
