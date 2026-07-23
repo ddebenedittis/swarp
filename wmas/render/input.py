@@ -67,10 +67,12 @@ class InteractionController:
         state: ViewState,
         camera: Camera,
         geometry_getter: Callable[[], RenderGeometry] | None = None,
+        tile_resolver: Callable[[tuple], int | None] | None = None,
     ) -> None:
         self.state = state
         self.camera = camera
         self._geometry_getter = geometry_getter
+        self._tile_resolver = tile_resolver
         self._panning = False
         self._last_mouse = (0.0, 0.0)
 
@@ -82,12 +84,23 @@ class InteractionController:
             self.camera.zoom_at(_ZOOM_STEP**event.y, self._last_mouse)
         elif et == pygame.MOUSEMOTION:
             self._on_motion(event)
-        elif et == pygame.MOUSEBUTTONDOWN and event.button == _PAN_BUTTON:
-            self._panning = True
+        elif et == pygame.MOUSEBUTTONDOWN:
+            if event.button == _PAN_BUTTON:
+                self._panning = True
+            elif event.button == 1:
+                self._on_left_down(event)
         elif et == pygame.MOUSEBUTTONUP and event.button == _PAN_BUTTON:
             self._panning = False
         elif et == pygame.QUIT:
             self.state.quit = True
+
+    def _on_left_down(self, event) -> None:
+        # A left click on a mosaic tile focuses that env. (Focus-pane left clicks are
+        # reserved for write-back in a later milestone.)
+        if self._tile_resolver is not None:
+            env_idx = self._tile_resolver(event.pos)
+            if env_idx is not None:
+                self.state.focus_env = env_idx
 
     def _on_keydown(self, event) -> None:
         s = self.state

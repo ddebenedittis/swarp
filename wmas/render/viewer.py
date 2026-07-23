@@ -20,7 +20,8 @@ from wmas.render.camera import Camera
 from wmas.render.geometry import extract_geometry
 from wmas.render.hud import draw_hover_panel, draw_hud
 from wmas.render.input import InteractionController, ViewState
-from wmas.render.overlays import DEFAULT_ENABLED
+from wmas.render.layout import MosaicLayout, compute_mosaic_layout, tile_at
+from wmas.render.overlays import DEFAULT_ENABLED, _p, _r_px
 from wmas.render.renderer import _bounds_from_geometry, _ensure_pygame, draw_scene
 from wmas.render.style import Style
 
@@ -36,41 +37,109 @@ class Viewer:
         style: Style | None = None,
         scenario=None,
         fps: int = 30,
+        mosaic: bool = False,
+        max_tiles: int = 16,
+        focus_frac: float = 0.68,
     ) -> None:
         self.env = env
         self.scenario = scenario if scenario is not None else getattr(env, "scenario", None)
         self.size = (int(size[0]), int(size[1]))
         self.style = style or Style()
         self.fps = fps
+        self.mosaic = mosaic
+        self.max_tiles = max_tiles
+        self.focus_frac = focus_frac
         enabled = set(overlays) if overlays is not None else set(DEFAULT_ENABLED)
         self.state = ViewState(n_envs=env.n_envs, enabled=enabled, focus_env=env_index)
         self._camera: Camera | None = None
+        self._layout: MosaicLayout | None = None
         self._step_count = 0
 
     # ------------------------------------------------------------------ draw
 
-    def _geometry(self):
-        return extract_geometry(self.env.world, self.state.focus_env, scenario=self.scenario)
+    def _geometry(self, env_idx: int | None = None):
+        idx = self.state.focus_env if env_idx is None else env_idx
+        return extract_geometry(self.env.world, idx, scenario=self.scenario)
+
+    def _ensure_layout(self) -> MosaicLayout:
+        if self._layout is None:
+            self._layout = compute_mosaic_layout(
+                self.size, self.env.n_envs, focus_frac=self.focus_frac, max_tiles=self.max_tiles
+            )
+        return self._layout
+
+    def _focus_viewport(self):
+        return (
+            self._ensure_layout().focus_rect if self.mosaic else (0, 0, self.size[0], self.size[1])
+        )
 
     def _camera_for(self, geometry) -> Camera:
         if self._camera is None:
             bounds = geometry.bounds or _bounds_from_geometry(geometry)
-            self._camera = Camera(bounds, viewport=(0, 0, self.size[0], self.size[1]))
+            self._camera = Camera(bounds, viewport=self._focus_viewport())
         return self._camera
 
-    def _draw(self, surface, geometry, camera, *, hud: bool, fps: float | None = None) -> None:
-        draw_scene(surface, geometry, camera, self.state.enabled, self.style)
+    def _tile_env_at(self, screen_xy) -> int | None:
+        return tile_at(self._ensure_layout(), screen_xy) if self.mosaic else None
+
+    def _draw(self, surface, geometry, camera, *, hud: bool, fps=None, clear: bool = True) -> None:
+        draw_scene(surface, geometry, camera, self.state.enabled, self.style, clear=clear)
         if hud:
             draw_hud(surface, self.state, self.style, step=self._step_count, fps=fps)
             draw_hover_panel(surface, geometry, self.state.hover_agent, self.style)
 
+    def _draw_tile(self, pygame, surface, geometry, camera, rect, *, focused: bool) -> None:
+        r = pygame.Rect(*rect)
+        surface.fill((236, 236, 240), r)
+        prev = surface.get_clip()
+        surface.set_clip(r)
+        if geometry.bounds is not None:
+            x0, x1, y0, y1 = geometry.bounds
+            corners = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+            pygame.draw.lines(
+                surface, self.style.bounds_color, True, [_p(camera, c) for c in corners], 1
+            )
+        for i in range(geometry.n_agents):
+            pygame.draw.circle(
+                surface,
+                self.style.agent_color(i),
+                _p(camera, geometry.pos[i]),
+                _r_px(camera, geometry.radius[i], floor=2),
+            )
+        surface.set_clip(prev)
+        border = self.style.velocity_color if focused else (185, 185, 190)
+        pygame.draw.rect(surface, border, r, 2 if focused else 1)
+
+    def _draw_mosaic(self, pygame, surface, *, hud: bool, fps=None) -> None:
+        layout = self._ensure_layout()
+        surface.fill(self.style.background)
+        for tile_rect, env_idx in zip(layout.tiles, layout.tile_envs, strict=True):
+            g = self._geometry(env_idx)
+            cam = Camera(g.bounds or _bounds_from_geometry(g), viewport=tile_rect)
+            self._draw_tile(
+                pygame, surface, g, cam, tile_rect, focused=env_idx == self.state.focus_env
+            )
+        focus = pygame.Rect(*layout.focus_rect)
+        surface.fill(self.style.background, focus)
+        prev = surface.get_clip()
+        surface.set_clip(focus)
+        gf = self._geometry()
+        self._draw(surface, gf, self._camera_for(gf), hud=hud, fps=fps, clear=False)
+        surface.set_clip(prev)
+        pygame.draw.rect(surface, self.style.bounds_color, focus, 1)
+
+    def _render_onto(self, pygame, surface, *, hud: bool, fps=None) -> None:
+        if self.mosaic:
+            self._draw_mosaic(pygame, surface, hud=hud, fps=fps)
+        else:
+            g = self._geometry()
+            self._draw(surface, g, self._camera_for(g), hud=hud, fps=fps)
+
     def render_array(self, *, hud: bool = False) -> np.ndarray:
-        """Render the focus env to an ``(H, W, 3)`` uint8 array, headless."""
+        """Render the current view (single env or mosaic) to an ``(H, W, 3)`` uint8 array."""
         pygame = _ensure_pygame()
-        geometry = self._geometry()
-        camera = self._camera_for(geometry)
         surface = pygame.Surface(self.size)
-        self._draw(surface, geometry, camera, hud=hud)
+        self._render_onto(pygame, surface, hud=hud)
         arr = pygame.surfarray.array3d(surface)
         return np.ascontiguousarray(np.transpose(arr, (1, 0, 2)))
 
@@ -104,7 +173,9 @@ class Viewer:
         pygame.display.set_caption("wmas viewer")
         clock = pygame.time.Clock()
         camera = self._camera_for(self._geometry())
-        controller = InteractionController(self.state, camera, geometry_getter=self._geometry)
+        controller = InteractionController(
+            self.state, camera, geometry_getter=self._geometry, tile_resolver=self._tile_env_at
+        )
         obs = self.scenario.observations() if self.scenario is not None else None
         try:
             while not self.state.quit:
@@ -115,7 +186,7 @@ class Viewer:
                     with torch.no_grad():
                         obs, *_ = self.env.step(self._actions(action_fn, obs))
                     self._step_count += 1
-                self._draw(window, self._geometry(), camera, hud=True, fps=clock.get_fps())
+                self._render_onto(pygame, window, hud=True, fps=clock.get_fps())
                 pygame.display.flip()
                 clock.tick(self.fps)
                 if done and close_when_done:

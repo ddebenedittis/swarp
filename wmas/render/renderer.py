@@ -43,9 +43,16 @@ def _bounds_from_geometry(g: RenderGeometry) -> tuple[float, float, float, float
     return (float(x0 - pad), float(x1 + pad), float(y0 - pad), float(y1 + pad))
 
 
-def draw_scene(surface, geometry: RenderGeometry, camera: Camera, enabled, style: Style) -> None:
-    """Fill the background and draw every enabled overlay in registry (=draw) order."""
-    surface.fill(style.background)
+def draw_scene(
+    surface, geometry: RenderGeometry, camera: Camera, enabled, style: Style, *, clear: bool = True
+) -> None:
+    """Draw every enabled overlay in registry (=draw) order.
+
+    ``clear`` fills the whole surface with the background first; pass ``clear=False`` when the
+    caller has already prepared the region (e.g. a clipped focus pane inside a mosaic).
+    """
+    if clear:
+        surface.fill(style.background)
     for overlay in OVERLAYS:
         if overlay.name in enabled:
             overlay.draw(surface, geometry, camera, style)
