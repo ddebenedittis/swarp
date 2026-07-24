@@ -22,6 +22,8 @@ import math
 
 import torch
 
+from wmas.sensors.lidar_kernels import lidar_scan_warp
+
 
 def lidar_scan(
     pos: torch.Tensor,  # [n_envs, n_agents, 2]
@@ -85,6 +87,17 @@ class Lidar:
 
         lidar = Lidar(n_rays=12, max_range=1.0)
         obs = torch.cat([base_obs, lidar.scan(self.world)], dim=-1)
+
+    Two interchangeable backends, selected by ``backend``:
+
+    * ``"torch"`` (default) — the pure-torch broadcast :func:`lidar_scan`.
+      Differentiable, but materializes an ``[E, A, R, T, 2]`` intermediate, so
+      memory grows with the target count ``T``.
+    * ``"warp"`` — the Warp kernel :func:`~wmas.sensors.lidar_kernels.lidar_scan_warp`.
+      Numerically equivalent ranges with no dense intermediate (flat memory in
+      ``T``), which keeps high ray counts affordable. **Inference-only**: when
+      gradients are required the scan transparently falls back to the torch path,
+      so ``backend="warp"`` means "warp for inference, torch for grad."
     """
 
     def __init__(
@@ -96,23 +109,34 @@ class Lidar:
         angle_start: float = 0.0,
         include_agents: bool = True,
         include_obstacles: bool = True,
+        backend: str = "torch",
     ) -> None:
         if n_rays < 1:
             raise ValueError("n_rays must be >= 1")
         if max_range <= 0.0:
             raise ValueError("max_range must be positive")
+        if backend not in ("torch", "warp"):
+            raise ValueError('backend must be "torch" or "warp"')
         self.n_rays = n_rays
         self.max_range = max_range
         self.body_frame = body_frame
         self.angle_start = angle_start
         self.include_agents = include_agents
         self.include_obstacles = include_obstacles
+        self.backend = backend
 
     def scan(self, world) -> torch.Tensor:
         obs_pos = world.obstacle_pos if self.include_obstacles else None
         obs_rad = world.obstacle_radius if self.include_obstacles else None
-        return lidar_scan(
-            world.state.pos,
+        pos = world.state.pos
+        # The Warp backend is inference-only; fall back to the differentiable
+        # torch path whenever a gradient is actually being tracked.
+        grad = torch.is_grad_enabled() and (
+            pos.requires_grad or (obs_pos is not None and obs_pos.requires_grad)
+        )
+        scan_fn = lidar_scan_warp if (self.backend == "warp" and not grad) else lidar_scan
+        return scan_fn(
+            pos,
             world.state.theta,
             world.agent_radius,
             n_rays=self.n_rays,
