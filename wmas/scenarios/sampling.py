@@ -148,10 +148,33 @@ class SamplingScenario(Scenario):
 
     def post_step(self) -> None:
         if self._fused_active:
-            self._launch_obs_reward(full_pass=1)
-            self._launch_scatter()
+            # Same sequence the whole-step graph runs (keeps non-graph fused mode
+            # and CPU eager-persistent bit-identical).
+            self._pre_graph_step()
+            self._graph_post_physics()
         else:
             self._refresh()
+
+    # ----------------------------------------------------- whole-step graph
+
+    def graph_capturable(self) -> bool:
+        return True
+
+    def graph_recapture_token(self) -> int:
+        # centers/consumed are allocated once and updated in place; state/grid
+        # buffers are stable — nothing re-wrapped per launch, so no recapture.
+        return 0
+
+    def _graph_warmup_carries(self) -> list[torch.Tensor]:
+        # The consumed-cell latch is advanced in place by _launch_scatter.
+        return [self.consumed]
+
+    def _pre_graph_step(self) -> None:
+        self._ensure_fused(self.world.n_envs)
+
+    def _graph_post_physics(self) -> None:
+        self._launch_obs_reward(full_pass=1)
+        self._launch_scatter()
 
     # --------------------------------------------------------- fused fast path
 

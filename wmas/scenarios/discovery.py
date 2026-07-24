@@ -124,12 +124,34 @@ class DiscoveryScenario(Scenario):
 
     def post_step(self) -> None:
         if self._fused_active:
-            self._ensure_fused(self.world.n_envs)
-            self._launch_cover()
-            self._launch_obs()
-            self._launch_reward()
+            # Same sequence the whole-step graph runs (keeps non-graph fused mode
+            # and CPU eager-persistent bit-identical).
+            self._pre_graph_step()
+            self._graph_post_physics()
         else:
             self._refresh()
+
+    # ----------------------------------------------------- whole-step graph
+
+    def graph_capturable(self) -> bool:
+        return True
+
+    def graph_recapture_token(self) -> int:
+        # targets/covered are allocated once and updated in place; state/grid
+        # buffers are stable — nothing re-wrapped per launch, so no recapture.
+        return 0
+
+    def _graph_warmup_carries(self) -> list[torch.Tensor]:
+        # The coverage latch is advanced in place by _launch_cover.
+        return [self.covered]
+
+    def _pre_graph_step(self) -> None:
+        self._ensure_fused(self.world.n_envs)
+
+    def _graph_post_physics(self) -> None:
+        self._launch_cover()
+        self._launch_obs()
+        self._launch_reward()
 
     def _refresh(self) -> None:
         w = self.world

@@ -20,6 +20,7 @@ offset is not capture-safe. (This mirrors :class:`wmas.interop.compile.CudaGraph
 from __future__ import annotations
 
 import warnings
+from collections.abc import Callable
 
 import torch
 import warp as wp
@@ -83,7 +84,16 @@ class StepRuntime:
                 stacklevel=2,
             )
         self._graph = None
-        self._graph_version: int | None = None
+        self._graph_version: tuple[int, int] | None = None
+
+        # Optional whole-step hook: a capture-safe, zero-arg closure (neighbor
+        # query + fused obs/reward into persistent buffers) run right after the
+        # physics copy-back, inside both the captured graph and the eager
+        # fallback. Wired by ``Environment`` for graph-capturable fused scenarios.
+        self._post_physics: Callable[[], None] | None = None
+        self._post_physics_version: Callable[[], int] | None = None
+        self._post_physics_carries: Callable[[], list[torch.Tensor]] | None = None
+        self._ran_post = False
 
     # ------------------------------------------------------------------ state
 
@@ -100,6 +110,35 @@ class StepRuntime:
     @property
     def graph_active(self) -> bool:
         return self._graph is not None
+
+    def set_post_physics(
+        self,
+        hook: Callable[[], None] | None,
+        version_fn: Callable[[], int] | None = None,
+        carries_fn: Callable[[], list[torch.Tensor]] | None = None,
+    ) -> None:
+        """Register the whole-step hook + its recapture-token fn.
+
+        ``hook`` must be capture-safe: only ``wp.launch`` / grid builds against
+        stable persistent buffers, no torch ops and no allocation. ``version_fn``
+        returns a monotonically bumped token whenever the hook's cached buffer
+        handles change (e.g. a ``_prev_dist`` reallocation) so the graph is
+        recaptured. ``carries_fn`` returns the hook's persistent carry buffers
+        (position-shaping baseline, coverage latches, movable-body state) that a
+        real step advances in place; they are snapshotted and restored around the
+        warm-up launch so warm-up — which runs the hook on the *input* state just
+        to compile kernels — never advances them. Registering invalidates any
+        existing graph.
+        """
+        self._post_physics = hook
+        self._post_physics_version = version_fn
+        self._post_physics_carries = carries_fn
+        self._graph = None
+        self._graph_version = None
+
+    @property
+    def ran_post_physics(self) -> bool:
+        return self._ran_post
 
     # ------------------------------------------------------------------ step
 
@@ -122,11 +161,22 @@ class StepRuntime:
             skip_drone=True,
         )
         self._copy_back()
+        if self._post_physics is not None:
+            self._post_physics()
+
+    def _graph_key(self) -> tuple[int, int]:
+        """Recapture key: physics mutation version + the hook's handle token."""
+        post_ver = self._post_physics_version() if self._post_physics_version is not None else 0
+        return (self.stepper.mutation_version, post_ver)
 
     def _ensure_graph(self) -> None:
-        """(Re)capture the physics graph when missing or stale (a mutation bumped
-        ``stepper.mutation_version`` — e.g. an obstacle-count change)."""
-        if self._graph is not None and self._graph_version == self.stepper.mutation_version:
+        """(Re)capture the whole-step graph when missing or stale.
+
+        Recapture fires on a physics mutation (``stepper.mutation_version`` — e.g.
+        an obstacle-count change) or when the post-physics hook's buffer handles
+        change (its ``version_fn`` token — e.g. a ``_prev_dist`` reallocation)."""
+        key = self._graph_key()
+        if self._graph is not None and self._graph_version == key:
             return
         stepper = self.stepper
         # Whether the grid currently holds neighbors for ``state`` (built by the
@@ -146,6 +196,18 @@ class StepRuntime:
             reuse_neighbors=True,
             skip_drone=True,
         )
+        # Warm-up the hook too (on the input state, no copy-back): compiles the
+        # obs/reward kernels and allocates any scratch (uniform-grid radix, JIT)
+        # before ScopedCapture, which forbids allocation. Its obs/reward writes
+        # are transient (overwritten by the first real capture_launch), but it
+        # advances the hook's persistent carries in place — snapshot & restore
+        # them so warm-up leaves the pre-step baseline intact for the replay.
+        if self._post_physics is not None:
+            carries = self._post_physics_carries() if self._post_physics_carries else []
+            saved = [c.clone() for c in carries]
+            self._post_physics()
+            for c, s in zip(carries, saved, strict=True):
+                c.copy_(s)
         wp.synchronize_device(stepper.device)
         # Re-sync built_version after warm-up (which bumped state_version without
         # touching the grid's contents) so the capture takes the reuse branch iff
@@ -162,8 +224,10 @@ class StepRuntime:
                 skip_drone=True,
             )
             self._copy_back()
+            if self._post_physics is not None:
+                self._post_physics()
         self._graph = capture.graph
-        self._graph_version = stepper.mutation_version
+        self._graph_version = key
 
     def step(self, actions: torch.Tensor) -> TorchState:
         """Advance the persistent state one step; returns the stable views.
@@ -177,4 +241,7 @@ class StepRuntime:
             wp.capture_launch(self._graph)
         else:
             self._run_eager()
+        # Both paths run the hook when one is registered (captured into the graph
+        # or invoked eagerly); Environment reads this to skip a redundant post_step.
+        self._ran_post = self._post_physics is not None
         return self.state_views

@@ -113,6 +113,8 @@ class TransportScenario(Scenario):
         self._prev_dist: torch.Tensor | None = None
         self._cache: dict[str, torch.Tensor] | None = None
         self._fused_ready = False
+        # Bumped by _sync_fused_handles when a cached buffer handle is rebuilt.
+        self._handle_version = 0
         return self.world
 
     def fused_available(self) -> bool:
@@ -143,14 +145,18 @@ class TransportScenario(Scenario):
             self.pkg_ang_vel = zeros_p.clone()
             self.goal = zeros_p2.clone()
 
+        # In-place package updates (copy_) so the fused path's cached wp handles
+        # and the whole-step graph stay valid across resets; the grad path's
+        # _refresh still reassigns them (fresh tensors for the tape), which
+        # _sync_fused_handles catches on the next no-grad step.
         if env_mask is None:
             w.state.pos.data.copy_(spawn)
             w.state.vel.data.zero_()
-            self.pkg_pos = pkg
-            self.pkg_vel = zeros_p2.clone()
-            self.pkg_theta = zeros_p.clone()
-            self.pkg_ang_vel = zeros_p.clone()
-            self.goal = goal
+            self.pkg_pos.copy_(pkg)
+            self.pkg_vel.zero_()
+            self.pkg_theta.zero_()
+            self.pkg_ang_vel.zero_()
+            self.goal.copy_(goal)
         else:
             m3 = env_mask.view(-1, 1, 1)
             m3p = env_mask.view(-1, 1, 1)
@@ -158,15 +164,16 @@ class TransportScenario(Scenario):
             w.state.vel.data.copy_(
                 torch.where(m3, torch.zeros_like(w.state.vel.data), w.state.vel.data)
             )
-            self.pkg_pos = torch.where(m3p, pkg, self.pkg_pos)
-            self.pkg_vel = torch.where(m3p, zeros_p2, self.pkg_vel)
-            self.pkg_theta = torch.where(env_mask.view(-1, 1), zeros_p, self.pkg_theta)
-            self.pkg_ang_vel = torch.where(env_mask.view(-1, 1), zeros_p, self.pkg_ang_vel)
-            self.goal = torch.where(m3p, goal, self.goal)
+            self.pkg_pos.copy_(torch.where(m3p, pkg, self.pkg_pos))
+            self.pkg_vel.copy_(torch.where(m3p, zeros_p2, self.pkg_vel))
+            self.pkg_theta.copy_(torch.where(env_mask.view(-1, 1), zeros_p, self.pkg_theta))
+            self.pkg_ang_vel.copy_(torch.where(env_mask.view(-1, 1), zeros_p, self.pkg_ang_vel))
+            self.goal.copy_(torch.where(m3p, goal, self.goal))
 
         self._install_obstacles()
         if self._fused_active:
             self._ensure_fused(w.n_envs)
+            self._sync_fused_handles()  # this eager _launch_* uses cached handles
             if env_mask is None:
                 self._f_resetmask.fill_(1)
             else:
@@ -187,23 +194,23 @@ class TransportScenario(Scenario):
 
     def post_step(self) -> None:
         if self._fused_active:
-            self._ensure_fused(self.world.n_envs)
-            self._f_resetmask.zero_()  # a normal step resets no env
-            self._launch_body()
-            self._install_obstacles()  # updated package pose for the next step
-            self._launch_obs()
-            self._launch_reward(advance_prev=1, full_pass=1)
+            # Same sequence the whole-step graph runs (keeps non-graph fused mode
+            # and CPU eager-persistent bit-identical).
+            self._pre_graph_step()
+            self._graph_post_physics()
         else:
             self._refresh(integrate=True)
 
     # --------------------------------------------------------- fused fast path
 
-    def _ensure_fused(self, n_envs: int) -> None:
-        """Allocate the persistent fused OUTPUT buffers + wp handles.
+    _PKG_ATTRS = ("pkg_pos", "pkg_vel", "pkg_theta", "pkg_ang_vel", "goal")
 
-        Package state (pkg_pos/vel/theta/ang_vel/goal) and prev_dist are NOT
-        cached here — they are re-wrapped fresh each launch (the torch/grad path
-        may reassign them), mirroring how navigation re-wraps its state."""
+    def _ensure_fused(self, n_envs: int) -> None:
+        """Allocate the persistent fused OUTPUT buffers + cached wp handles.
+
+        Package state (pkg_pos/vel/theta/ang_vel/goal) and prev_dist ARE cached
+        here (reset now updates them in place); the grad path reassigns them, and
+        _sync_fused_handles rebuilds any handle whose data_ptr moves."""
         if self._fused_ready:
             return
         w = self.world
@@ -217,6 +224,8 @@ class TransportScenario(Scenario):
         self._f_dist = z(n_envs, self.n_packages)
         self._f_done = z(n_envs, d=torch.uint8)
         self._f_resetmask = z(n_envs, d=torch.uint8)
+        if self._prev_dist is None:
+            self._prev_dist = z(n_envs, self.n_packages)
         scalar = w.wp_dtype
         self._wp = {
             "obs": wp.from_torch(self._f_obs, dtype=scalar),
@@ -226,7 +235,67 @@ class TransportScenario(Scenario):
             "resetmask": wp.from_torch(self._f_resetmask, dtype=wp.uint8),
         }
         self._f_done_bool = self._f_done.view(torch.bool)
+        vec2 = VEC2[scalar]
+        self._pkg_dtype = {
+            "pkg_pos": vec2, "pkg_vel": vec2,
+            "pkg_theta": scalar, "pkg_ang_vel": scalar, "goal": vec2,
+        }
+        self._wp_pkg = {
+            k: wp.from_torch(getattr(self, k).contiguous(), dtype=self._pkg_dtype[k])
+            for k in self._PKG_ATTRS
+        }
+        self._wp_prev = wp.from_torch(self._prev_dist.contiguous(), dtype=scalar)
+        self._pkg_ptrs = {k: getattr(self, k).data_ptr() for k in self._PKG_ATTRS}
+        self._prev_ptr = self._prev_dist.data_ptr()
         self._fused_ready = True
+
+    def _sync_fused_handles(self) -> None:
+        """Rebuild any cached package/prev handle whose backing tensor was
+        reallocated (grad-path reassignment); bumps ``_handle_version`` to force
+        recapture. Cheap pointer compare in steady state; runs outside capture."""
+        scalar = self.world.wp_dtype
+        changed = False
+        for k in self._PKG_ATTRS:
+            t = getattr(self, k)
+            if t.data_ptr() != self._pkg_ptrs[k]:
+                self._wp_pkg[k] = wp.from_torch(t.contiguous(), dtype=self._pkg_dtype[k])
+                self._pkg_ptrs[k] = t.data_ptr()
+                changed = True
+        if self._prev_dist.data_ptr() != self._prev_ptr:
+            self._wp_prev = wp.from_torch(self._prev_dist.contiguous(), dtype=scalar)
+            self._prev_ptr = self._prev_dist.data_ptr()
+            changed = True
+        if changed:
+            self._handle_version += 1
+
+    # ----------------------------------------------------- whole-step graph
+
+    def graph_capturable(self) -> bool:
+        return True
+
+    def graph_recapture_token(self) -> int:
+        return self._handle_version
+
+    def _graph_warmup_carries(self) -> list[torch.Tensor]:
+        # _launch_body advances the movable-body state in place; _launch_reward
+        # advances _prev_dist; _install_obstacles overwrites the stepper's
+        # obstacle-position buffer (read by the next step's physics) — snapshot a
+        # torch view of it so warm-up leaves step 0's obstacles correct.
+        return [
+            self.pkg_pos, self.pkg_vel, self.pkg_theta, self.pkg_ang_vel,
+            self._prev_dist, wp.to_torch(self.world.stepper._obs_pos),
+        ]
+
+    def _pre_graph_step(self) -> None:
+        self._ensure_fused(self.world.n_envs)
+        self._f_resetmask.zero_()  # a normal step resets no env
+        self._sync_fused_handles()
+
+    def _graph_post_physics(self) -> None:
+        self._launch_body()
+        self._install_obstacles()  # updated package pose for the next step
+        self._launch_obs()
+        self._launch_reward(advance_prev=1, full_pass=1)
 
     def _state_wp(self):
         """(pos, vel) agent state as Warp arrays for the fused kernels."""
@@ -242,20 +311,9 @@ class TransportScenario(Scenario):
         )
 
     def _pkg_wp(self) -> dict:
-        """Fresh Warp handles over the (possibly reassigned) package tensors.
-
-        The body kernel writes pkg_pos/vel/theta/ang_vel in place; these tensors
-        stay contiguous (torch.where / arithmetic / clone), so the fresh wrap
-        aliases them and the writes propagate."""
-        scalar = self.world.wp_dtype
-        vec2 = VEC2[scalar]
-        return {
-            "pkg_pos": wp.from_torch(self.pkg_pos.contiguous(), dtype=vec2),
-            "pkg_vel": wp.from_torch(self.pkg_vel.contiguous(), dtype=vec2),
-            "pkg_theta": wp.from_torch(self.pkg_theta.contiguous(), dtype=scalar),
-            "pkg_ang_vel": wp.from_torch(self.pkg_ang_vel.contiguous(), dtype=scalar),
-            "goal": wp.from_torch(self.goal.contiguous(), dtype=vec2),
-        }
+        """Cached Warp handles over the package tensors (rebuilt by
+        _sync_fused_handles when the grad path reassigns them)."""
+        return self._wp_pkg
 
     def _launch_body(self) -> None:
         w = self.world
@@ -304,12 +362,8 @@ class TransportScenario(Scenario):
     def _launch_reward(self, advance_prev: int, full_pass: int) -> None:
         w = self.world
         scalar = w.wp_dtype
-        if self._prev_dist is None:
-            self._prev_dist = torch.zeros(
-                w.n_envs, self.n_packages, device=w.device, dtype=w.dtype
-            )
         pk = self._pkg_wp()
-        prev = wp.from_torch(self._prev_dist.contiguous(), dtype=scalar)
+        prev = self._wp_prev
         wp.launch(
             transport_reward_kernel,
             dim=w.n_envs,

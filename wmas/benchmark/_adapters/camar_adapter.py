@@ -5,8 +5,11 @@ collision-avoidance sim. Two configurations:
 
 * ``obstacles=False`` (default) — an **open arena** (``string_grid`` of all-free
   cells, no border), matching wmas ``NavigationScenario``'s obstacle-free space.
-  Observations reduce to goal + neighbour features (no obstacle raycasting), and
-  ``frameskip=1`` matches wmas ``substeps=1`` — an apples-to-apples navigation task.
+  Observations reduce to goal + neighbour features (no obstacle raycasting).
+  CAMAR integrates ``frameskip + 1`` world steps per ``env.step``, so
+  ``frameskip=0`` runs exactly one world step, matching wmas ``substeps=1`` —
+  an apples-to-apples navigation task (``frameskip=1`` would double CAMAR's
+  per-step physics work).
 * ``obstacles=True`` (``camar-grid``) — CAMAR's native ``random_grid`` (~800
   obstacles, ``frameskip=2``): a cluttered-maze task, far heavier per step.
 
@@ -45,7 +48,7 @@ def build(
         env = camar_v0(
             map_generator="string_grid",
             dynamic="HolonomicDynamic",
-            frameskip=1,
+            frameskip=0,  # frameskip+1 world steps/step -> 0 = one step, == wmas substeps=1
             map_kwargs={"map_str": _OPEN_GRID, "num_agents": n_agents, "add_border": False},
         )
     na = env.num_agents

@@ -9,7 +9,10 @@ so the benchmark can compare wmas *configurations*:
   kernel launch overhead.
 
 The world/action setup mirrors ``compare_vmas._make_wmas`` (same ``world_size``,
-seeded on-device action buffer) so numbers are directly comparable.
+seeded on-device action buffer) so numbers are directly comparable, except that
+the cross-sim benchmark uses ``neighbor_obs=3`` (vs the scenario default of 2) so
+the observation encodes the same number of nearest neighbours as CAMAR's obs at
+higher agent counts — an apples-to-apples observation size across the sims.
 """
 
 from __future__ import annotations
@@ -32,7 +35,9 @@ def build(
 
     from wmas import Environment, NavigationScenario
 
-    sc = NavigationScenario(n_agents=n_agents, world_size=max(1.0, n_agents**0.5 / 4))
+    sc = NavigationScenario(
+        n_agents=n_agents, world_size=max(1.0, n_agents**0.5 / 4), neighbor_obs=3
+    )
     env = Environment(
         sc, n_envs=n_envs, device=device, dt=0.05, substeps=1, seed=seed,
         use_graph=use_graph, fused=fused,
