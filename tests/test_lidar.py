@@ -7,9 +7,15 @@ import pytest
 import torch
 
 from wmas.sensors.lidar import Lidar, lidar_scan
+from wmas.sensors.lidar_kernels import lidar_scan_warp
 
 DEVICES = ["cpu"] + (["cuda:0"] if torch.cuda.is_available() else [])
 MAXR = 2.0
+
+# Warp vs torch differ only at transcendental ULP level (own sin/cos/sqrt),
+# amplified on near-tangent rays where t = proj - sqrt(rad^2 - perp2) is stiff.
+# float64 stays ~1e-10; float32 lands at float32 epsilon.
+_TOL = {torch.float64: dict(atol=1e-9, rtol=1e-6), torch.float32: dict(atol=1e-4, rtol=1e-4)}
 
 
 def _scan(pos, theta, agent_radius, **kw):
@@ -122,16 +128,83 @@ def test_lidar_gradcheck():
     assert torch.autograd.gradcheck(fn, (pos, obs_pos), eps=1e-6, atol=1e-5)
 
 
-def test_lidar_component_on_world():
-    """The Lidar component scans a real World and concatenates into an observation."""
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("body_frame", [True, False])
+@pytest.mark.parametrize("include_agents", [True, False])
+@pytest.mark.parametrize("with_obstacles", [True, False])
+def test_warp_matches_torch(device, dtype, body_frame, include_agents, with_obstacles):
+    """The Warp backend produces the same ranges as the torch broadcast (exactness
+    oracle). Includes the motivating 256-ray case."""
+    gen = torch.Generator(device="cpu").manual_seed(0)
+    e, a, t, n_rays = 3, 5, 4, 256
+    pos = (torch.rand(e, a, 2, generator=gen) * 2 - 1).to(device=device, dtype=dtype)
+    theta = (torch.rand(e, a, generator=gen) * 6.28).to(device=device, dtype=dtype)
+    rad = (torch.rand(a, generator=gen) * 0.2 + 0.05).to(device=device, dtype=dtype)
+    if with_obstacles:
+        opos = (torch.rand(e, t, 2, generator=gen) * 2 - 1).to(device=device, dtype=dtype)
+        orad = (torch.rand(t, generator=gen) * 0.2 + 0.05).to(device=device, dtype=dtype)
+    else:
+        opos = orad = None
+
+    kw = dict(
+        n_rays=n_rays,
+        max_range=2.0,
+        body_frame=body_frame,
+        angle_start=0.3,
+        include_agents=include_agents,
+        obstacle_pos=opos,
+        obstacle_radius=orad,
+    )
+    ref = lidar_scan(pos, theta, rad, **kw)
+    got = lidar_scan_warp(pos, theta, rad, **kw)
+    assert got.shape == (e, a, n_rays)
+    torch.testing.assert_close(got, ref, **_TOL[dtype])
+
+
+def test_lidar_backend_validation():
+    with pytest.raises(ValueError, match="backend"):
+        Lidar(backend="bogus")
+
+
+def _tiny_world(dtype=torch.float32):
     from wmas.core.config import WorldConfig
     from wmas.core.world import World
     from wmas.dynamics.base import AgentConfig, DynamicsModel
 
     cfgs = [AgentConfig(model=DynamicsModel.HOLONOMIC, radius=0.05) for _ in range(3)]
-    world = World(cfgs, WorldConfig(collisions=True), n_envs=4, device="cpu", dtype=torch.float32)
+    return World(cfgs, WorldConfig(collisions=True), n_envs=4, device="cpu", dtype=dtype)
+
+
+def test_warp_grad_fallback():
+    """backend='warp' uses the warp path for inference but falls back to the
+    differentiable torch path whenever a gradient is being tracked."""
+    world = _tiny_world(dtype=torch.float64)
+    lidar = Lidar(n_rays=6, max_range=1.0, backend="warp")
+
+    # No grad: warp path -> detached output (no grad_fn).
+    world.state = world.state._replace(
+        pos=torch.rand(4, 3, 2, dtype=torch.float64) * 0.4 - 0.2,
+        theta=torch.zeros(4, 3, dtype=torch.float64),
+    )
+    assert lidar.scan(world).grad_fn is None
+
+    # Grad tracked: torch fallback -> differentiable output.
+    with torch.enable_grad():
+        p = (torch.rand(4, 3, 2, dtype=torch.float64) * 0.4 - 0.2).requires_grad_(True)
+        world.state = world.state._replace(pos=p, theta=torch.zeros(4, 3, dtype=torch.float64))
+        out = lidar.scan(world)
+        assert out.grad_fn is not None
+        out.sum().backward()
+        assert p.grad is not None
+
+
+@pytest.mark.parametrize("backend", ["torch", "warp"])
+def test_lidar_component_on_world(backend):
+    """The Lidar component scans a real World and concatenates into an observation."""
+    world = _tiny_world()
     world.state = world.state._replace(pos=torch.rand(4, 3, 2) * 0.4 - 0.2, theta=torch.zeros(4, 3))
-    lidar = Lidar(n_rays=6, max_range=1.0)
+    lidar = Lidar(n_rays=6, max_range=1.0, backend=backend)
     ranges = lidar.scan(world)
     assert ranges.shape == (4, 3, 6)
     assert torch.isfinite(ranges).all()
