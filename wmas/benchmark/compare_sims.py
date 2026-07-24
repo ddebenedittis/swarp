@@ -10,7 +10,8 @@ four run obstacle-free navigation with raycasting-free, relative-position
 observations: ``wmas`` (fused kernels + whole-step CUDA graph), ``vmas-nolidar`` (VMAS
 navigation with ``collisions=False``, so no 12-ray lidar), ``jaxmarl``
 (``MPE_simple_spread_v3`` continuous), and ``camar`` (an open ``string_grid``
-arena, ``frameskip=1``). Each sim's *native* setup is also available:
+arena, ``frameskip=0`` — one world step per env-step, == wmas substeps=1). Each
+sim's *native* setup is also available:
 ``vmas`` (collisions + lidar) and ``camar-grid`` (~800-obstacle ``random_grid``),
 plus wmas hot-path ablation configs ``wmas-fused`` / ``wmas-eager``.
 
@@ -65,7 +66,7 @@ WMAS_CONFIGS = {
 # vmas/camar each have a native and an obs-aligned variant:
 #   vmas          native navigation (collision physics + 12-ray lidar obs)
 #   vmas-nolidar  collisions+lidar off -> relative-position obs (raycasting-free)
-#   camar         open arena (no obstacles, frameskip=1) -> matches wmas navigation
+#   camar         open arena (no obstacles, frameskip=0 = one world step) -> wmas navigation
 #   camar-grid    native random_grid (~800 obstacles, frameskip=2) -> maze task
 ALL_SIMS = (*WMAS_CONFIGS, "vmas", "vmas-nolidar", "jaxmarl", "camar", "camar-grid")
 # Default is the obs-aligned, obstacle-free set: same task + raycasting-free obs.
