@@ -95,6 +95,7 @@ class Environment:
             self._seed(seed)
         self._set_fused_active()
         self.scenario._fused_obs_only = False
+        self.world.action = None  # no action applied yet this episode
         with torch.no_grad():
             self.world.reset_state()
             self.scenario.reset_world(None)
@@ -146,6 +147,9 @@ class Environment:
         # zero, handle sync) eagerly on the default stream before the replay.
         if self._whole_step and self.scenario._fused_active:
             self.scenario._pre_graph_step()
+        # Expose the applied action to the scenario reward path (post_step reads
+        # world.action for control-input shaping, e.g. action-smoothness).
+        self.world.action = actions
         self.world.step(actions)
         # The graph (or the CPU eager hook) already filled the obs/reward buffers;
         # skip the redundant torch post_step. Grad steps still take the torch path.

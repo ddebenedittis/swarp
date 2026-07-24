@@ -29,6 +29,7 @@ class Style:
     heading_color: RGB = (30, 30, 35)
     velocity_color: RGB = (200, 60, 60)
     lidar_color: RGB = (60, 170, 200)
+    comm_line_color: RGB = (120, 190, 140)
     text_color: RGB = (40, 40, 45)
     palette: tuple[RGB, ...] = field(default_factory=lambda: _PALETTE)
 

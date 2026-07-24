@@ -58,6 +58,10 @@ class World:
         # True after a persistent no-grad step whose runtime ran the whole-step
         # post-physics hook (obs/reward) — Environment then skips a redundant post_step.
         self.ran_post_physics = False
+        # Last applied action, exposed for scenarios that shape reward on the
+        # control input (e.g. action-smoothness). Set by Environment.step before
+        # the post-physics reward path; cleared to None on reset.
+        self.action: torch.Tensor | None = None  # [n_envs, n_agents, act_dim]
         self.goals: torch.Tensor | None = None  # [n_envs, n_agents, 2]
         self.obstacle_pos: torch.Tensor | None = None  # [n_envs, n_obstacles, 2]
         self.obstacle_radius: torch.Tensor | None = None  # [n_obstacles]

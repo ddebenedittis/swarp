@@ -121,6 +121,24 @@ def _draw_ids(surface, g, camera, style):
         surface.blit(label, (cx + 4, cy - style.font_size))
 
 
+def _draw_comm_lines(surface, g, camera, style):
+    """Draw inter-agent communication lines from ``extras['comm_lines']``.
+
+    Expected format: world-space segments with shape ``(n_pairs, 2, 2)`` —
+    ``[endpoint_a_xy, endpoint_b_xy]`` per pair. Absent/empty -> no-op. Restores
+    the VMAS comm-line visual (agent pairs within a communication range).
+    """
+    segs = g.extras.get("comm_lines")
+    if segs is None:
+        return
+    segs = np.asarray(segs, dtype=np.float64)
+    if segs.size == 0:
+        return
+    color = getattr(style, "comm_line_color", style.edge_color)
+    for start, end in segs.reshape(-1, 2, 2):
+        pygame.draw.line(surface, color, _p(camera, start), _p(camera, end), style.edge_width)
+
+
 def _draw_lidar(surface, g, camera, style):
     """Draw lidar rays if a sensor supplied them via ``extras['lidar']``.
 
@@ -158,6 +176,7 @@ OVERLAYS: tuple[Overlay, ...] = (
     Overlay("heading", _draw_heading, "h", True),
     Overlay("velocity", _draw_velocity, "v", False),
     Overlay("ids", _draw_ids, "i", False),
+    Overlay("comm_lines", _draw_comm_lines, "c", False),
     Overlay("lidar", _draw_lidar, "l", True),
 )
 
