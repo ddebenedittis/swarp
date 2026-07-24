@@ -370,6 +370,15 @@ The JAX sims fold obs+reward into the scan carry so XLA cannot dead-code-elimina
 them, and JIT/XLA compile is excluded via warmup at the timed length. Both
 `env-steps/s` and `agent-steps/s` (= env-steps/s × agents) are reported:
 
+> **What this measures.** These figures are the *simulator* step only — physics +
+> obs + reward — not a full RL loop. wmas folds that whole step (physics, neighbor
+> query, and fused obs/reward) into a single CUDA graph, so a step is one graph
+> replay with no per-launch host floor. In policy-in-the-loop RL the JAX sims
+> `jit` the policy *and* env together into one XLA program, whereas wmas replays
+> the env graph and runs the policy as separate launches; the end-to-end training
+> throughput of each therefore depends on how the policy is compiled alongside the
+> simulator, which this benchmark does not capture.
+
 ```
 metric: env-steps/s
   n_envs  n_agents |         wmas  vmas-nolidar      jaxmarl        camar | vnl/w   jax/w  camar/w

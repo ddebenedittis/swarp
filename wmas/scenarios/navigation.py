@@ -117,6 +117,9 @@ class NavigationScenario(Scenario):
         # Fused-kernel obs width and lazy-allocation flag.
         self._k_obs = min(self.neighbor_obs, world_config.max_neighbors)
         self._fused_ready = False
+        # Bumped by _sync_fused_handles when a cached buffer handle is rebuilt;
+        # the whole-step graph recaptures when this token changes.
+        self._handle_version = 0
         return self.world
 
     def fused_available(self) -> bool:
@@ -203,6 +206,7 @@ class NavigationScenario(Scenario):
         self._nbr_cache = None
         if self._fused_active:
             self._ensure_fused(w.n_envs)
+            self._sync_fused_handles()  # this eager _launch_obs uses cached handles
             if env_mask is None:
                 self._f_resetmask.fill_(1)
             else:
@@ -256,7 +260,61 @@ class NavigationScenario(Scenario):
         self._f_ongoal_bool = self._f_ongoal.view(torch.bool)
         self._f_overflow_bool = self._f_overflow.view(torch.bool)
         self._f_done_bool = self._f_done.view(torch.bool)
+        # Stable wp handles for the two buffers otherwise re-wrapped per launch.
+        # w.goals is updated in place (copy_) after its one-time alloc; _prev_dist
+        # is written in place by the fused kernel but reassigned on the torch/grad
+        # path — _sync_fused_handles rebuilds either if its data_ptr moves.
+        vec2 = VEC2[scalar]
+        self._wp_goals = wp.from_torch(w.goals.contiguous(), dtype=vec2)
+        self._wp_prev = wp.from_torch(self._prev_dist.contiguous(), dtype=scalar)
+        self._goals_ptr = w.goals.data_ptr()
+        self._prev_ptr = self._prev_dist.data_ptr()
         self._fused_ready = True
+
+    def _sync_fused_handles(self) -> None:
+        """Rebuild any cached wp handle whose backing tensor was reallocated
+        (grad-path ``_prev_dist`` reassignment; goals realloc). Cheap pointer
+        compare in steady state; bumps ``_handle_version`` to force recapture.
+        Runs outside capture (eager prep)."""
+        w = self.world
+        scalar = w.wp_dtype
+        vec2 = VEC2[scalar]
+        changed = False
+        if w.goals.data_ptr() != self._goals_ptr:
+            self._wp_goals = wp.from_torch(w.goals.contiguous(), dtype=vec2)
+            self._goals_ptr = w.goals.data_ptr()
+            changed = True
+        if self._prev_dist.data_ptr() != self._prev_ptr:
+            self._wp_prev = wp.from_torch(self._prev_dist.contiguous(), dtype=scalar)
+            self._prev_ptr = self._prev_dist.data_ptr()
+            changed = True
+        if changed:
+            self._handle_version += 1
+
+    # ----------------------------------------------------- whole-step graph
+
+    def graph_capturable(self) -> bool:
+        return True
+
+    def graph_recapture_token(self) -> int:
+        return self._handle_version
+
+    def _graph_warmup_carries(self) -> list[torch.Tensor]:
+        return [self._prev_dist]
+
+    def _pre_graph_step(self) -> None:
+        """Capture-unsafe prep, run eagerly before the physics step: ensure the
+        fused buffers, clear the reset mask (a normal step resets no env), and
+        refresh any moved handle."""
+        self._ensure_fused(self.world.n_envs)
+        self._f_resetmask.zero_()
+        self._sync_fused_handles()
+
+    def _graph_post_physics(self) -> None:
+        """Capture-safe obs+reward launch sequence (assumes ``resetmask==0`` and
+        fresh handles from ``_pre_graph_step``). Pure ``wp.launch`` + grid build."""
+        self._launch_obs(advance_prev=1, full_pass=1)
+        self._launch_reward()
 
     def _state_wp(self):
         """(pos, vel, theta, ang_vel) as Warp arrays for the fused kernels."""
@@ -281,10 +339,9 @@ class NavigationScenario(Scenario):
         w.neighbors()  # build the grid on the current state (fills grid buffers)
         grid = w.stepper.grid(n_envs)
         scalar = w.wp_dtype
-        vec2 = VEC2[scalar]
         pos, vel, theta, ang_vel = self._state_wp()
-        goals = wp.from_torch(w.goals.contiguous(), dtype=vec2)
-        prev = wp.from_torch(self._prev_dist.contiguous(), dtype=scalar)
+        goals = self._wp_goals
+        prev = self._wp_prev
         # Touching uses the static per-agent radius (matches the torch reference's
         # World.agent_radius); per-env randomization affects forces, not this count.
         params = w.stepper.params.floats
@@ -345,10 +402,10 @@ class NavigationScenario(Scenario):
 
     def post_step(self) -> None:
         if self._fused_active:
-            self._ensure_fused(self.world.n_envs)
-            self._f_resetmask.zero_()  # a normal step resets no env
-            self._launch_obs(advance_prev=1, full_pass=1)
-            self._launch_reward()
+            # Same sequence the whole-step graph runs; delegating keeps non-graph
+            # fused mode and CPU eager-persistent bit-identical to graph mode.
+            self._pre_graph_step()
+            self._graph_post_physics()
         else:
             self._refresh_step_cache()
 

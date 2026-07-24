@@ -59,6 +59,20 @@ class Environment:
         # path. Zero-copy views are returned by default; copy_outputs clones them.
         if use_graph:
             self.world.enable_persistent(use_graph=True)
+        # Fold the fused obs/reward launches into the whole-step CUDA graph when
+        # the scenario is fused + capture-safe and a persistent runtime exists.
+        self._whole_step = False
+        self._maybe_wire_whole_step_graph()
+
+    def _maybe_wire_whole_step_graph(self) -> None:
+        runtime = self.world.runtime
+        if self._fused and runtime is not None and self.scenario.graph_capturable():
+            runtime.set_post_physics(
+                self.scenario._graph_post_physics,
+                self.scenario.graph_recapture_token,
+                self.scenario._graph_warmup_carries,
+            )
+            self._whole_step = True
 
     def _set_fused_active(self) -> None:
         """Fused kernels run only on the no-grad path (grad uses the torch ref)."""
@@ -128,8 +142,15 @@ class Environment:
 
         self._set_fused_active()
         self.scenario._fused_obs_only = False
+        # Whole-step graph: run capture-unsafe prep (buffer ensure, resetmask
+        # zero, handle sync) eagerly on the default stream before the replay.
+        if self._whole_step and self.scenario._fused_active:
+            self.scenario._pre_graph_step()
         self.world.step(actions)
-        self.scenario.post_step()
+        # The graph (or the CPU eager hook) already filled the obs/reward buffers;
+        # skip the redundant torch post_step. Grad steps still take the torch path.
+        if not self.world.ran_post_physics:
+            self.scenario.post_step()
 
         # Reward/done/info describe the transition just taken (terminal state).
         reward = self.scenario.rewards()

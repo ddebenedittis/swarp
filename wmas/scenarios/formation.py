@@ -78,6 +78,8 @@ class FormationScenario(Scenario):
         self._prev_dist: torch.Tensor | None = None
         self._cache: dict[str, torch.Tensor] | None = None
         self._fused_ready = False
+        # Bumped by _sync_fused_handles when a cached buffer handle is rebuilt.
+        self._handle_version = 0
         return self.world
 
     def fused_available(self) -> bool:
@@ -112,6 +114,7 @@ class FormationScenario(Scenario):
             w.goals.copy_(torch.where(m3, goals, w.goals))
         if self._fused_active:
             self._ensure_fused(w.n_envs)
+            self._sync_fused_handles()  # this eager _launch_obs uses cached handles
             if env_mask is None:
                 self._f_resetmask.fill_(1)
             else:
@@ -123,10 +126,10 @@ class FormationScenario(Scenario):
 
     def post_step(self) -> None:
         if self._fused_active:
-            self._ensure_fused(self.world.n_envs)
-            self._f_resetmask.zero_()  # a normal step resets no env
-            self._launch_obs(advance_prev=1, full_pass=1)
-            self._launch_reward()
+            # Same sequence the whole-step graph runs (keeps non-graph fused mode
+            # and CPU eager-persistent bit-identical).
+            self._pre_graph_step()
+            self._graph_post_physics()
         else:
             self._refresh()
 
@@ -169,13 +172,61 @@ class FormationScenario(Scenario):
         }
         self._f_inform_bool = self._f_inform.view(torch.bool)
         self._f_done_bool = self._f_done.view(torch.bool)
+        # Stable wp handles for the two buffers otherwise re-wrapped per launch.
+        # w.goals is updated in place (copy_) after its one-time alloc; _prev_dist
+        # is written in place by the fused kernel but reassigned on the torch/grad
+        # path — _sync_fused_handles rebuilds either if its data_ptr moves.
+        vec2 = VEC2[scalar]
+        self._wp_goals = wp.from_torch(w.goals.contiguous(), dtype=vec2)
+        self._wp_prev = wp.from_torch(self._prev_dist.contiguous(), dtype=scalar)
+        self._goals_ptr = w.goals.data_ptr()
+        self._prev_ptr = self._prev_dist.data_ptr()
         self._fused_ready = True
+
+    def _sync_fused_handles(self) -> None:
+        """Rebuild any cached wp handle whose backing tensor was reallocated
+        (grad-path ``_prev_dist`` reassignment; goals realloc); bumps
+        ``_handle_version`` to force recapture. Runs outside capture."""
+        w = self.world
+        scalar = w.wp_dtype
+        vec2 = VEC2[scalar]
+        changed = False
+        if w.goals.data_ptr() != self._goals_ptr:
+            self._wp_goals = wp.from_torch(w.goals.contiguous(), dtype=vec2)
+            self._goals_ptr = w.goals.data_ptr()
+            changed = True
+        if self._prev_dist.data_ptr() != self._prev_ptr:
+            self._wp_prev = wp.from_torch(self._prev_dist.contiguous(), dtype=scalar)
+            self._prev_ptr = self._prev_dist.data_ptr()
+            changed = True
+        if changed:
+            self._handle_version += 1
+
+    # ----------------------------------------------------- whole-step graph
+
+    def graph_capturable(self) -> bool:
+        return True
+
+    def graph_recapture_token(self) -> int:
+        return self._handle_version
+
+    def _graph_warmup_carries(self) -> list[torch.Tensor]:
+        return [self._prev_dist]
+
+    def _pre_graph_step(self) -> None:
+        self._ensure_fused(self.world.n_envs)
+        self._f_resetmask.zero_()  # a normal step resets no env
+        self._sync_fused_handles()
+
+    def _graph_post_physics(self) -> None:
+        self._launch_obs(advance_prev=1, full_pass=1)
+        self._launch_reward()
 
     def _state_wp(self):
         """(pos, vel, goals) as Warp arrays for the fused kernels."""
         w = self.world
         vec2 = VEC2[w.wp_dtype]
-        goals = wp.from_torch(w.goals.contiguous(), dtype=vec2)
+        goals = self._wp_goals
         if w._persistent and not w._detached:
             s = w.runtime.state
             return s.pos, s.vel, goals
@@ -191,7 +242,7 @@ class FormationScenario(Scenario):
         self._ensure_fused(w.n_envs)
         scalar = w.wp_dtype
         pos, vel, goals = self._state_wp()
-        prev = wp.from_torch(self._prev_dist.contiguous(), dtype=scalar)
+        prev = self._wp_prev
         wp.launch(
             formation_obs_kernel,
             dim=(w.n_envs, self.n_agents),

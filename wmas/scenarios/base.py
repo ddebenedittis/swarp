@@ -101,6 +101,22 @@ class Scenario(ABC):
     def post_step(self) -> None:  # noqa: B027 (optional hook, intentionally empty)
         """Hook called right after the physics step, before obs/rewards."""
 
+    def graph_capturable(self) -> bool:
+        """Whether the fused obs/reward launches are safe to fold into the
+        whole-step CUDA graph (capture-safe ``_graph_post_physics`` implemented).
+
+        Default off; fused scenarios opt in once they cache stable buffer handles."""
+        return False
+
+    def _graph_warmup_carries(self) -> list[torch.Tensor]:
+        """Persistent carry buffers the whole-step hook advances in place (e.g.
+        the position-shaping baseline, coverage latches, movable-body state).
+
+        Snapshotted & restored around the graph warm-up so warm-up (which runs the
+        hook on the input state only to compile kernels) never advances them.
+        Empty by default; capturable scenarios list their carries."""
+        return []
+
     def render_extras(self, env_idx: int) -> dict[str, Any]:
         """Extra geometry for the viewer to overlay for env ``env_idx`` (default none).
 

@@ -108,9 +108,28 @@ class FlockingScenario(Scenario):
 
     def post_step(self) -> None:
         if self._fused_active:
-            self._launch(full_pass=1)
+            # Same sequence the whole-step graph runs (keeps non-graph fused mode
+            # and CPU eager-persistent bit-identical).
+            self._pre_graph_step()
+            self._graph_post_physics()
         else:
             self._refresh()
+
+    # ----------------------------------------------------- whole-step graph
+
+    def graph_capturable(self) -> bool:
+        return True
+
+    def graph_recapture_token(self) -> int:
+        # No per-launch re-wrapped handles and no persistent carry — the single
+        # kernel reads stable state + grid buffers, so the graph never recaptures.
+        return 0
+
+    def _pre_graph_step(self) -> None:
+        self._ensure_fused(self.world.n_envs)
+
+    def _graph_post_physics(self) -> None:
+        self._launch(full_pass=1)
 
     # --------------------------------------------------------- fused fast path
 

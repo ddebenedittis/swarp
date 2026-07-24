@@ -55,6 +55,9 @@ class World:
         self.runtime = None
         self._persistent = False
         self._detached = False
+        # True after a persistent no-grad step whose runtime ran the whole-step
+        # post-physics hook (obs/reward) — Environment then skips a redundant post_step.
+        self.ran_post_physics = False
         self.goals: torch.Tensor | None = None  # [n_envs, n_agents, 2]
         self.obstacle_pos: torch.Tensor | None = None  # [n_envs, n_obstacles, 2]
         self.obstacle_radius: torch.Tensor | None = None  # [n_obstacles]
@@ -88,14 +91,17 @@ class World:
                 self.state = self.runtime.state_views
                 self._detached = False
             self.state = self.runtime.step(actions)
+            self.ran_post_physics = self.runtime.ran_post_physics
         elif self._persistent:
             # Grad step: detach+clone so the tape references fresh arrays, never
             # the persistent buffers (which the no-grad path overwrites in place).
             detached = TorchState(*(t.detach().clone() for t in self.state))
             self._detached = True
             self.state = warp_step(self.stepper, detached, actions)
+            self.ran_post_physics = False
         else:
             self.state = warp_step(self.stepper, self.state, actions)
+            self.ran_post_physics = False
 
     def enable_persistent(self, use_graph: bool = True) -> None:
         """Switch to persistent-buffer execution (optionally CUDA-graph-backed).

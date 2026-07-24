@@ -7,7 +7,7 @@ task equivalence.
 
 The default ``--sims`` set is chosen to be as apples-to-apples as possible — all
 four run obstacle-free navigation with raycasting-free, relative-position
-observations: ``wmas`` (fused kernels + CUDA graph), ``vmas-nolidar`` (VMAS
+observations: ``wmas`` (fused kernels + whole-step CUDA graph), ``vmas-nolidar`` (VMAS
 navigation with ``collisions=False``, so no 12-ray lidar), ``jaxmarl``
 (``MPE_simple_spread_v3`` continuous), and ``camar`` (an open ``string_grid``
 arena, ``frameskip=1``). Each sim's *native* setup is also available:
@@ -51,7 +51,10 @@ import sys
 
 # wmas is the anchor: it appears in every table, ratios are computed against it.
 # The three wmas entries are hot-path *configurations* of the same simulator:
-#   wmas        — optimized: fused Warp obs/reward kernels + CUDA-graph capture
+#   wmas        — optimized: fused Warp obs/reward kernels folded into a
+#                 whole-step CUDA graph (physics + neighbor query + obs/reward
+#                 captured together, so each step is one graph replay with no
+#                 per-launch host floor)
 #   wmas-fused  — fused kernels only (no CUDA graph)
 #   wmas-eager  — baseline: torch obs/reward, no fused kernels, no graph
 WMAS_CONFIGS = {
