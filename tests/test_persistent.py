@@ -9,6 +9,7 @@ from wmas import (
     FlockingScenario,
     FormationScenario,
     NavigationScenario,
+    PushTScenario,
     SamplingScenario,
     TransportScenario,
 )
@@ -87,8 +88,9 @@ def test_graph_matches_eager(auto_reset, n_obstacles):
         lambda n: DiscoveryScenario(n_agents=n),
         lambda n: SamplingScenario(n_agents=n),
         lambda n: TransportScenario(n_agents=n),
+        lambda n: PushTScenario(n_agents=n),
     ],
-    ids=["navigation", "flocking", "formation", "discovery", "sampling", "transport"],
+    ids=["navigation", "flocking", "formation", "discovery", "sampling", "transport", "pusht"],
 )
 def test_graph_matches_eager_all_scenarios(scen_factory):
     # Regression: the physics graph may only bake in neighbor reuse when the

@@ -42,6 +42,7 @@ from wmas import (
     FormationScenario,
     Lidar,
     NavigationScenario,
+    PushTScenario,
     SamplingScenario,
     TransportScenario,
 )
@@ -56,6 +57,7 @@ SCENARIO_FACTORIES: dict[str, type] = {
     "discovery": DiscoveryScenario,
     "sampling": SamplingScenario,
     "transport": TransportScenario,
+    "pusht": PushTScenario,
 }
 
 MODELS: dict[str, DynamicsModel] = {

@@ -187,6 +187,72 @@ def test_no_activation_outside_reach(device):
     np.testing.assert_allclose(step_pos(st, device, p), p, atol=1e-14)
 
 
+@pytest.mark.parametrize("device", DEVICES)
+def test_per_env_box_angle(device):
+    """``angle`` may be per-env ``[n_envs, n_obs]``: the same box at the same centre
+    rotated differently in each env produces each env's own analytic contact."""
+    angles = [0.0, np.pi / 4.0]
+    center, half, p = [0.0, 0.0], (0.1, 0.2), [0.16, 0.0]
+    world = WorldConfig(collision_k=K, collision_c=0.0, collision_margin=0.02)
+    st = Stepper(holo(1, 0.1), dt=DT, device=device, dtype=wp.float64, world=world)
+    st.set_obstacles(
+        pos=torch.tensor([[center], [center]], dtype=torch.float64, device=device),
+        radius=torch.zeros(1, dtype=torch.float64, device=device),
+        shape=torch.tensor([int(ObstacleShape.BOX)], dtype=torch.int32, device=device),
+        angle=torch.tensor([[angles[0]], [angles[1]]], dtype=torch.float64, device=device),
+        half_extents=torch.tensor([half], dtype=torch.float64, device=device),
+    )
+    state = _map5(
+        TorchState(
+            pos=torch.tensor([[p], [p]], dtype=torch.float64),
+            theta=torch.zeros(2, 1, dtype=torch.float64),
+            vel=torch.zeros(2, 1, 2, dtype=torch.float64),
+            speed=torch.zeros(2, 1, dtype=torch.float64),
+            ang_vel=torch.zeros(2, 1, dtype=torch.float64),
+        ),
+        lambda t: t.to(device),
+    )
+    with torch.no_grad():
+        out = warp_step(st, state, torch.zeros(2, 1, 2, dtype=torch.float64, device=device))
+
+    for e, angle in enumerate(angles):
+        np.testing.assert_allclose(
+            out.pos[e, 0].cpu().numpy(), expect_box(p, center, angle, half, 0.12), atol=1e-12
+        )
+    # the two envs really did see different geometry
+    assert not np.allclose(out.pos[0, 0].cpu().numpy(), out.pos[1, 0].cpu().numpy())
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_shared_angle_broadcasts_across_envs(device):
+    """A 1D ``[n_obs]`` angle is shared by every env (the pre-existing contract)."""
+    angle, center, half, p = 0.3, [0.0, 0.0], (0.1, 0.2), [0.16, 0.0]
+    world = WorldConfig(collision_k=K, collision_c=0.0, collision_margin=0.02)
+    st = Stepper(holo(1, 0.1), dt=DT, device=device, dtype=wp.float64, world=world)
+    st.set_obstacles(
+        pos=torch.tensor([[center], [center]], dtype=torch.float64, device=device),
+        radius=torch.zeros(1, dtype=torch.float64, device=device),
+        shape=torch.tensor([int(ObstacleShape.BOX)], dtype=torch.int32, device=device),
+        angle=torch.tensor([angle], dtype=torch.float64, device=device),  # 1D
+        half_extents=torch.tensor([half], dtype=torch.float64, device=device),
+    )
+    state = _map5(
+        TorchState(
+            pos=torch.tensor([[p], [p]], dtype=torch.float64),
+            theta=torch.zeros(2, 1, dtype=torch.float64),
+            vel=torch.zeros(2, 1, 2, dtype=torch.float64),
+            speed=torch.zeros(2, 1, dtype=torch.float64),
+            ang_vel=torch.zeros(2, 1, dtype=torch.float64),
+        ),
+        lambda t: t.to(device),
+    )
+    with torch.no_grad():
+        out = warp_step(st, state, torch.zeros(2, 1, 2, dtype=torch.float64, device=device))
+    want = expect_box(p, center, angle, half, 0.12)
+    for e in range(2):
+        np.testing.assert_allclose(out.pos[e, 0].cpu().numpy(), want, atol=1e-12)
+
+
 def test_gradcheck_box_and_segment():
     """Full pipeline is differentiable with box + segment obstacles (f64 CPU,
     contact comfortably in the exterior region, away from the corner kink)."""

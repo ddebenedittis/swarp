@@ -66,7 +66,8 @@ class World:
         self.obstacle_pos: torch.Tensor | None = None  # [n_envs, n_obstacles, 2]
         self.obstacle_radius: torch.Tensor | None = None  # [n_obstacles]
         self.obstacle_shape: torch.Tensor | None = None  # [n_obstacles]
-        self.obstacle_angle: torch.Tensor | None = None  # [n_obstacles]
+        # [n_obstacles] (shared) or [n_envs, n_obstacles] (per-env, rotating body)
+        self.obstacle_angle: torch.Tensor | None = None
         self.obstacle_half_extents: torch.Tensor | None = None  # [n_obstacles, 2]
         self.generator: torch.Generator | None = None  # installed by Environment
         self.agent_radius = torch.tensor(
@@ -152,7 +153,8 @@ class World:
         angle: torch.Tensor | None = None,
         half_extents: torch.Tensor | None = None,
     ) -> None:
-        """Install static obstacles (circle/box/segment). See
+        """Install static obstacles (circle/box/segment). ``angle`` may be
+        ``[n_obstacles]`` or per-env ``[n_envs, n_obstacles]``. See
         :meth:`wmas.core.stepper.Stepper.set_obstacles` for shape semantics."""
         self.obstacle_pos = pos
         self.obstacle_radius = radius

@@ -21,6 +21,7 @@ from wmas.scenarios.discovery import DiscoveryScenario
 from wmas.scenarios.flocking import FlockingScenario
 from wmas.scenarios.formation import FormationScenario
 from wmas.scenarios.navigation import NavigationScenario
+from wmas.scenarios.pusht import PushTScenario
 from wmas.scenarios.sampling import SamplingScenario
 from wmas.scenarios.transport import TransportScenario
 from wmas.sensors.lidar import Lidar, lidar_scan
@@ -39,6 +40,7 @@ __all__ = [
     "Lidar",
     "NavigationScenario",
     "ObstacleShape",
+    "PushTScenario",
     "SamplingScenario",
     "Scenario",
     "Stepper",

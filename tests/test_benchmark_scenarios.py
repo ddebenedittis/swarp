@@ -23,6 +23,7 @@ def test_registry_has_all_scenarios():
         "discovery",
         "sampling",
         "transport",
+        "pusht",
     }
 
 
@@ -47,7 +48,7 @@ def test_resolve_scenarios_unknown_lists_valid():
 
 def test_only_navigation_supports_model():
     assert _supports_model(SCENARIO_FACTORIES["navigation"])
-    for name in ("flocking", "formation", "discovery", "sampling", "transport"):
+    for name in ("flocking", "formation", "discovery", "sampling", "transport", "pusht"):
         assert not _supports_model(SCENARIO_FACTORIES[name])
 
 

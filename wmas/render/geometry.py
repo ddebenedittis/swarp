@@ -108,9 +108,12 @@ def extract_geometry_batch(
     agent_params = np.array([c.to_row() for c in world.agent_configs], dtype=np.float64)
     bounds = world.config.bounds if world.config is not None else None
     edges = _extract_edges_batch(world, idx) if with_edges else [_no_edges()] * len(idx)
-    # Obstacle shape/angle/half-extents are per-obstacle, so no env indexing here.
+    # Obstacle shape/half-extents are per-obstacle, so no env indexing here.
     obs_shape = _shape_tags(world)
-    obs_angle = _to_np(world.obstacle_angle) if world.obstacle_angle is not None else None
+    # Angle may be per-obstacle [n_obs] (shared) or per-env [n_envs, n_obs] — a
+    # body that rotates independently per env. Env-index the latter so each
+    # RenderGeometry still carries a flat (n_obstacles,) angle array.
+    obs_angle = _obstacle_angles(world, sel)
     obs_half = (
         _to_np(world.obstacle_half_extents) if world.obstacle_half_extents is not None else None
     )
@@ -134,7 +137,7 @@ def extract_geometry_batch(
                 bounds=bounds,
                 edges=edges[k],
                 obstacle_shape=obs_shape,
-                obstacle_angle=obs_angle,
+                obstacle_angle=None if obs_angle is None else obs_angle[k],
                 obstacle_half_extents=obs_half,
                 action=None if action is None else action[k],
                 ctrl_mode=ctrl_mode,
@@ -143,6 +146,19 @@ def extract_geometry_batch(
             )
         )
     return out
+
+
+def _obstacle_angles(world, sel) -> np.ndarray | None:
+    """Obstacle angles as ``(len(sel), n_obstacles)``, broadcasting the shared
+    ``[n_obstacles]`` layout so callers index one row per selected env."""
+    if world.obstacle_angle is None:
+        return None
+    a = world.obstacle_angle
+    if a.dim() == 1:
+        a = a.unsqueeze(0).expand(len(sel), -1)
+    else:
+        a = a.index_select(0, sel)
+    return _to_np(a)
 
 
 def _shape_tags(world) -> np.ndarray | None:

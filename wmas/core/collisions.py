@@ -121,7 +121,7 @@ def _static_forces(
     obs_pos: wp.array2d(dtype=Any),
     obs_radius: wp.array(dtype=Any),
     obs_type: wp.array(dtype=wp.int32),
-    obs_angle: wp.array(dtype=Any),
+    obs_angle: wp.array2d(dtype=Any),
     obs_half: wp.array(dtype=Any),
     n_obstacles: wp.int32,
     k: Any,
@@ -143,9 +143,9 @@ def _static_forces(
         st = obs_type[o]
         if st == SHAPE_BOX:
             # box surface is the boundary itself; agent inflated by ra + margin
-            f += _box_force(p, v, center, obs_angle[o], obs_half[o], ra + margin, k, c)
+            f += _box_force(p, v, center, obs_angle[e, o], obs_half[o], ra + margin, k, c)
         elif st == SHAPE_SEGMENT:
-            cp = _closest_on_segment(p, center, obs_angle[o], obs_half[o][0])
+            cp = _closest_on_segment(p, center, obs_angle[e, o], obs_half[o][0])
             f += _pair_force(p - cp, v, ra + obs_radius[o] + margin, k, c)
         else:  # SHAPE_CIRCLE
             f += _pair_force(p - center, v, ra + obs_radius[o] + margin, k, c)
@@ -181,7 +181,7 @@ def collision_forces_kernel(
     obs_pos: wp.array2d(dtype=Any),
     obs_radius: wp.array(dtype=Any),
     obs_type: wp.array(dtype=wp.int32),
-    obs_angle: wp.array(dtype=Any),
+    obs_angle: wp.array2d(dtype=Any),
     obs_half: wp.array(dtype=Any),
     n_obstacles: wp.int32,
     k: Any,
@@ -234,7 +234,7 @@ def collision_forces_kernel_per_env(
     obs_pos: wp.array2d(dtype=Any),
     obs_radius: wp.array(dtype=Any),
     obs_type: wp.array(dtype=wp.int32),
-    obs_angle: wp.array(dtype=Any),
+    obs_angle: wp.array2d(dtype=Any),
     obs_half: wp.array(dtype=Any),
     n_obstacles: wp.int32,
     k: Any,
@@ -287,11 +287,11 @@ def _signature(dtype, per_env: bool = False) -> list:
         params,
         wp.array3d(dtype=wp.int32),
         wp.array2d(dtype=wp.int32),
-        wp.array2d(dtype=vec2),
-        wp.array(dtype=dtype),
-        wp.array(dtype=wp.int32),
-        wp.array(dtype=dtype),
-        wp.array(dtype=vec2),
+        wp.array2d(dtype=vec2),  # obs_pos [n_envs, n_obs]
+        wp.array(dtype=dtype),  # obs_radius [n_obs]
+        wp.array(dtype=wp.int32),  # obs_type [n_obs]
+        wp.array2d(dtype=dtype),  # obs_angle [n_envs, n_obs] (per-env: rotating bodies)
+        wp.array(dtype=vec2),  # obs_half [n_obs]
         wp.int32,
         dtype,
         dtype,
@@ -317,7 +317,7 @@ def launch_collision_forces(
     obs_pos: wp.array,
     obs_radius: wp.array,
     obs_type: wp.array,
-    obs_angle: wp.array,
+    obs_angle: wp.array,  # 2d [n_envs, n_obs]
     obs_half: wp.array,
     n_obstacles: int,
     k: float,

@@ -103,13 +103,16 @@ class Stepper:
             self._bounds_max = vec2(0.0, 0.0)
 
         # Obstacles (static per episode); dummies keep kernel signatures fixed.
-        # obs_pos is per-env [n_envs, n_obs]; shape attributes (type/angle/half)
-        # are env-independent [n_obs]. Default shape is a circle (type 0).
+        # Pose is per-env — obs_pos [n_envs, n_obs] and obs_angle [n_envs, n_obs]
+        # — so a body that moves and *rotates* independently in each env (a
+        # scenario-layer movable body, e.g. PushTScenario's T) can be installed
+        # as obstacles. Extent attributes (type/radius/half) are env-independent
+        # [n_obs]. Default shape is a circle (type 0).
         self.n_obstacles = 0
         self._obs_pos = wp.zeros((1, 1), dtype=vec2, device=device)
         self._obs_radius = wp.zeros(1, dtype=dtype, device=device)
         self._obs_type = wp.zeros(1, dtype=wp.int32, device=device)
-        self._obs_angle = wp.zeros(1, dtype=dtype, device=device)
+        self._obs_angle = wp.zeros((1, 1), dtype=dtype, device=device)
         self._obs_half = wp.zeros(1, dtype=vec2, device=device)
 
         self._zero_forces: dict[int, wp.array] = {}
@@ -162,13 +165,23 @@ class Stepper:
                 ignores it (its surface is the box boundary).
             shape: ``[n_obstacles]`` int tensor of :class:`ObstacleShape` tags
                 (0=circle, 1=box, 2=segment). Defaults to all circles.
-            angle: ``[n_obstacles]`` orientation (rad) for box/segment. Default 0.
+            angle: orientation (rad) for box/segment, either ``[n_obstacles]``
+                (shared by every env) or ``[n_envs, n_obstacles]`` (per-env, for
+                a body that rotates independently in each env). Stored per-env
+                either way. Default 0.
             half_extents: ``[n_obstacles, 2]`` box half-extents; for a segment
                 the ``[:, 0]`` column is the half-length. Default 0.
         """
         vec2 = VEC2[self.dtype]
-        n_obs = pos.shape[1]
+        n_envs, n_obs = pos.shape[0], pos.shape[1]
         dev = self.device
+
+        def angle_2d() -> torch.Tensor:
+            """``angle`` as a contiguous per-env ``[n_envs, n_obs]`` tensor."""
+            a = angle.detach()
+            if a.dim() == 1:
+                a = a.unsqueeze(0).expand(n_envs, -1)
+            return a.contiguous()
 
         # In-place refresh when the obstacle *count* is unchanged: no realloc, no
         # buffer clear, no version bump — so a scenario that re-samples obstacle
@@ -188,9 +201,7 @@ class Stepper:
             if angle is None:
                 self._obs_angle.zero_()
             else:
-                wp.copy(
-                    self._obs_angle, wp.from_torch(angle.detach().contiguous(), dtype=self.dtype)
-                )
+                wp.copy(self._obs_angle, wp.from_torch(angle_2d(), dtype=self.dtype))
             if half_extents is None:
                 self._obs_half.zero_()
             else:
@@ -210,9 +221,9 @@ class Stepper:
                 wp.from_torch(shape.detach().to(torch.int32).contiguous(), dtype=wp.int32)
             )
         if angle is None:
-            self._obs_angle = wp.zeros(n_obs, dtype=self.dtype, device=dev)
+            self._obs_angle = wp.zeros((n_envs, n_obs), dtype=self.dtype, device=dev)
         else:
-            self._obs_angle = wp.clone(wp.from_torch(angle.detach().contiguous(), dtype=self.dtype))
+            self._obs_angle = wp.clone(wp.from_torch(angle_2d(), dtype=self.dtype))
         if half_extents is None:
             self._obs_half = wp.zeros(n_obs, dtype=vec2, device=dev)
         else:
