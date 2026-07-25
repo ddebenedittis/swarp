@@ -18,6 +18,7 @@ from dataclasses import dataclass
 import numpy as np
 import pygame
 
+from wmas.dynamics.base import P_MAX_STEER, P_THRUST_MAX
 from wmas.render.camera import Camera
 from wmas.render.geometry import RenderGeometry
 from wmas.render.style import Style
@@ -85,16 +86,62 @@ def _draw_bounds(surface, g, camera, style):
     )
 
 
+SHAPE_CIRCLE, SHAPE_BOX, SHAPE_SEGMENT = 0, 1, 2  # mirrors core.config.ObstacleShape
+
+
+def _rotated_rect(center, angle: float, half_x: float, half_y: float) -> np.ndarray:
+    """World-space corners of a box centered at ``center``, rotated by ``angle``."""
+    corners = np.array([(1.0, 1.0), (-1.0, 1.0), (-1.0, -1.0), (1.0, -1.0)]) * (half_x, half_y)
+    c, s = math.cos(angle), math.sin(angle)
+    rot = np.array([[c, -s], [s, c]])
+    return np.asarray(center, dtype=np.float64) + corners @ rot.T
+
+
 def _draw_obstacles(surface, g, camera, style):
+    """Obstacles as the simulator actually collides with them: circle, box or capsule.
+
+    Mirrors the shape dispatch in ``core.collisions._static_forces`` — a box's boundary *is*
+    its collision surface (the radius is unused), and a segment is a capsule of
+    ``obstacle_radius`` around a spine of half-length ``half_extents[:, 0]``.
+    """
     if g.obstacle_pos is None:
         return
     for i in range(g.obstacle_pos.shape[0]):
-        pygame.draw.circle(
-            surface,
-            style.obstacle_color,
-            _p(camera, g.obstacle_pos[i]),
-            _r_px(camera, g.obstacle_radius[i]),
-        )
+        center = g.obstacle_pos[i]
+        shape = SHAPE_CIRCLE if g.obstacle_shape is None else int(g.obstacle_shape[i])
+        angle = 0.0 if g.obstacle_angle is None else float(g.obstacle_angle[i])
+        radius = float(g.obstacle_radius[i])
+
+        if shape == SHAPE_BOX and g.obstacle_half_extents is not None:
+            hx, hy = (float(v) for v in g.obstacle_half_extents[i])
+            _filled_polygon(surface, style, _pts(camera, _rotated_rect(center, angle, hx, hy)))
+        elif shape == SHAPE_SEGMENT and g.obstacle_half_extents is not None:
+            half_len = float(g.obstacle_half_extents[i, 0])
+            spine = np.array([(half_len, 0.0), (-half_len, 0.0)])
+            c, s = math.cos(angle), math.sin(angle)
+            ends = center + spine @ np.array([[c, -s], [s, c]]).T
+            r_px = _r_px(camera, radius, floor=0)
+            if r_px < 1:  # a zero-radius spine still has to be visible
+                pts = _pts(camera, ends)
+                pygame.draw.line(surface, style.obstacle_color, pts[0], pts[1], style.line_width)
+                continue
+            _filled_polygon(
+                surface, style, _pts(camera, _rotated_rect(center, angle, half_len, radius))
+            )
+            for end in _pts(camera, ends):
+                pygame.draw.circle(surface, style.obstacle_color, end, r_px)
+        else:
+            center_px = _p(camera, center)
+            r_px = _r_px(camera, radius)
+            pygame.draw.circle(surface, style.obstacle_color, center_px, r_px)
+            pygame.draw.circle(
+                surface, style.obstacle_outline, center_px, r_px, style.obstacle_outline_width
+            )
+
+
+def _filled_polygon(surface, style, pts) -> None:
+    pygame.draw.polygon(surface, style.obstacle_color, pts)
+    pygame.draw.polygon(surface, style.obstacle_outline, pts, style.obstacle_outline_width)
 
 
 def _draw_neighbor_graph(surface, g, camera, style):
@@ -329,6 +376,99 @@ def _draw_heading(surface, g, camera, style):
         pygame.draw.line(surface, style.heading_color, starts[i], tips[i], style.line_width)
 
 
+def _arrow(surface, style, p0, p1, color, width: int, *, filled: bool = True) -> None:
+    """A line from ``p0`` to ``p1`` with an arrowhead at ``p1``, in screen pixels."""
+    a = np.asarray(p0, dtype=np.float64)
+    b = np.asarray(p1, dtype=np.float64)
+    span = b - a
+    length = float(np.hypot(span[0], span[1]))
+    pygame.draw.line(surface, color, a.astype(int).tolist(), b.astype(int).tolist(), width)
+    head = float(style.action_arrow_px)
+    if length < head:
+        return
+    unit = span / length
+    normal = np.array([-unit[1], unit[0]])
+    tri = np.rint(
+        np.stack((b, b - head * unit + 0.5 * head * normal, b - head * unit - 0.5 * head * normal))
+    ).astype(np.int64)
+    pygame.draw.polygon(surface, color, tri.tolist(), 0 if filled else max(1, width))
+
+
+def _draw_action(surface, g, camera, style):
+    """Draw the last applied action per agent, interpreted by its dynamics model.
+
+    Reads ``geometry.action`` (``World.action``, set by ``Environment.step``), so this shows
+    the action that produced the *drawn* state — i.e. one step older than the state itself.
+    A no-op before the first step, or for an agent whose action vector is too short.
+    """
+    if g.action is None or g.ctrl_mode is None:
+        return
+    act = np.asarray(g.action, dtype=np.float64)
+    if act.ndim != 2 or act.shape[1] < 2:
+        return
+    params = g.agent_params
+    centers = _pts(camera, g.pos)
+
+    for i in range(min(g.n_agents, act.shape[0])):
+        model = int(g.model[i])
+        radius = float(g.radius[i])
+        theta = float(g.theta[i])
+        r_px = _r_px(camera, radius, floor=style.agent_min_px)
+
+        if model == 0:  # holonomic: (vx, vy) or (ax, ay) — an arrow from the body center
+            gain = style.action_scale if int(g.ctrl_mode[i]) == 0 else style.action_accel_scale
+            tip = _p(camera, g.pos[i] + act[i, :2] * gain)
+            # An open head distinguishes an acceleration command from a velocity one.
+            _arrow(
+                surface,
+                style,
+                centers[i],
+                tip,
+                style.action_color,
+                style.line_width,
+                filled=int(g.ctrl_mode[i]) == 0,
+            )
+        elif model == 1:  # diff-drive: per-track bars, at the offsets the sprite's tracks use
+            v, omega = float(act[i, 0]), float(act[i, 1])
+            for y, wheel_v in ((-1.05, v - omega * radius), (1.05, v + omega * radius)):
+                reach = wheel_v * style.action_scale
+                bar = _pts(camera, _agent_points(g.pos[i], theta, radius, [(0.0, y)]))
+                tip = _p(
+                    camera,
+                    _agent_points(g.pos[i], theta, radius, [(0.0, y)])[0]
+                    + reach * np.array([math.cos(theta), math.sin(theta)]),
+                )
+                color = style.action_color if wheel_v >= 0.0 else style.action_brake_color
+                pygame.draw.line(surface, color, bar[0], tip, style.action_bar_px)
+        elif model == 2:  # bicycle: steered front wheels + a longitudinal accel arrow
+            accel, steer = float(act[i, 0]), float(act[i, 1])
+            if params is not None:
+                max_steer = float(params[i, P_MAX_STEER])
+                if max_steer > 0.0:  # a bad policy must not draw a 90-degree wheel
+                    steer = max(-max_steer, min(max_steer, steer))
+            for y in (-0.82, 0.82):
+                hub = _agent_points(g.pos[i], theta, radius, [(0.95, y)])[0]
+                span = 0.25 * radius * np.array([math.cos(theta + steer), math.sin(theta + steer)])
+                wheel = _pts(camera, np.stack((hub + span, hub - span)))
+                pygame.draw.line(surface, style.action_color, wheel[0], wheel[1], max(2, r_px // 2))
+            reach = accel * style.action_accel_scale
+            tip = _p(camera, g.pos[i] + reach * np.array([math.cos(theta), math.sin(theta)]))
+            color = style.action_color if accel >= 0.0 else style.action_brake_color
+            _arrow(surface, style, centers[i], tip, color, style.line_width)
+        elif model == 3 and act.shape[1] >= 4:  # drone: per-rotor thrust dots at the arm tips
+            thrust_max = 1.0
+            if params is not None and params[i, P_THRUST_MAX] > 0.0:
+                thrust_max = float(params[i, P_THRUST_MAX])
+            tips = []
+            for a in (0.0, math.pi / 2):
+                tips.extend(_agent_points(g.pos[i], theta + a, radius, [(1.5, 0.0), (-1.5, 0.0)]))
+            for k, tip in enumerate(_pts(camera, np.asarray(tips))):
+                frac = min(1.0, abs(float(act[i, k])) / thrust_max)
+                pygame.draw.circle(
+                    surface, style.action_color, tip, max(1, int(round(frac * r_px)))
+                )
+
+
 def _draw_trajectories(surface, g, camera, style):
     if style.trajectory_mode == "none":
         return
@@ -461,6 +601,7 @@ OVERLAYS: tuple[Overlay, ...] = (
     Overlay("goals", _draw_goals, "g", True),
     Overlay("agents", _draw_agents, None, True),
     Overlay("heading", _draw_heading, "h", True),
+    Overlay("action", _draw_action, "a", False),
     Overlay("velocity", _draw_velocity, "v", False),
     Overlay("ids", _draw_ids, "i", False),
     Overlay("comm_lines", _draw_comm_lines, "c", False),

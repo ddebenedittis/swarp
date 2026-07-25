@@ -39,6 +39,7 @@ class Style:
     background: RGB = (245, 245, 247)
     bounds_color: RGB = (120, 120, 130)
     obstacle_color: RGB = (150, 150, 155)
+    obstacle_outline: RGB = (110, 110, 118)
     edge_color: RGB = (175, 175, 185)
     agent_outline: RGB = (30, 30, 35)
     heading_color: RGB = (30, 30, 35)
@@ -55,6 +56,8 @@ class Style:
     agent_halo: RGB = (245, 245, 247)  # depth_cue="halo"; defaults to the light background
     agent_shadow: RGBA = (0, 0, 0, 70)  # depth_cue="shadow"
     contact_color: RGB = (220, 50, 40)
+    action_color: RGB = (20, 120, 210)
+    action_brake_color: RGB = (200, 60, 60)
     goal_reached_color: RGB = (0, 158, 115)
     palette: tuple[RGB, ...] = field(default_factory=lambda: _PALETTE)
     model_palette: dict[int, RGB] = field(
@@ -84,9 +87,12 @@ class Style:
     agent_min_px: int = 3
     goal_min_px: int = 5
     agent_outline_width: int = 1
+    obstacle_outline_width: int = 1
     agent_halo_px: int = 3
     agent_shadow_offset_px: int = 3
     contact_outline_width: int = 3
+    action_bar_px: int = 3
+    action_arrow_px: int = 6
     goal_dash_px: int = 6
     goal_gap_px: int = 4
     tile_border_width: int = 1
@@ -113,6 +119,8 @@ class Style:
     supersample: int = 2  # 1 disables; >1 renders NxN offscreen and downscales
     goal_connector_alpha: int = 90
     goal_reached_factor: float = 1.0  # goal counts as reached within this many agent radii
+    action_scale: float = 0.3  # world units per commanded (m/s)
+    action_accel_scale: float = 0.15  # world units per commanded (m/s^2)
     contact_tol: float = 0.0  # slack on (r_i + r_j) before an overlap counts as contact
 
     # ------------------------------------------------------------------ colors
@@ -176,9 +184,12 @@ _PX_FIELDS: frozenset[str] = frozenset(
         "agent_min_px",
         "goal_min_px",
         "agent_outline_width",
+        "obstacle_outline_width",
         "agent_halo_px",
         "agent_shadow_offset_px",
         "contact_outline_width",
+        "action_bar_px",
+        "action_arrow_px",
         "goal_dash_px",
         "goal_gap_px",
         "tile_border_width",
@@ -200,6 +211,7 @@ _UNSCALED_FIELDS: frozenset[str] = frozenset(
         "background",
         "bounds_color",
         "obstacle_color",
+        "obstacle_outline",
         "edge_color",
         "agent_outline",
         "heading_color",
@@ -216,6 +228,8 @@ _UNSCALED_FIELDS: frozenset[str] = frozenset(
         "agent_halo",
         "agent_shadow",
         "contact_color",
+        "action_color",
+        "action_brake_color",
         "goal_reached_color",
         "palette",
         "model_palette",
@@ -228,6 +242,8 @@ _UNSCALED_FIELDS: frozenset[str] = frozenset(
         "goal_connector_alpha",
         "goal_reached_factor",
         "contact_tol",
+        "action_scale",
+        "action_accel_scale",
         "font_scale",
         "heading_len_factor",
         "velocity_scale",
@@ -243,6 +259,7 @@ _DARK: dict[str, object] = {
     "background": (18, 18, 22),
     "bounds_color": (90, 90, 100),
     "obstacle_color": (78, 78, 86),
+    "obstacle_outline": (105, 105, 115),
     "edge_color": (70, 70, 80),
     "agent_outline": (235, 235, 240),
     "heading_color": (235, 235, 240),

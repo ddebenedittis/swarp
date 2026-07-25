@@ -60,6 +60,19 @@ def test_pick_obstacle_hits_center_and_misses_empty_space():
     assert pick_obstacle(g, cam, (-100.0, -100.0)) is None
 
 
+def test_pick_obstacle_hits_a_zero_radius_box_by_its_extents():
+    """A box's collision radius is legitimately 0, so radius-only picking made boxes undraggable."""
+    env, scenario = make_env(n_obstacles=1)
+    g = extract_geometry(env.world, 0, scenario=scenario)
+    g.obstacle_radius = np.zeros(1)
+    g.obstacle_shape = np.array([1], dtype=np.int32)  # ObstacleShape.BOX
+    g.obstacle_angle = np.zeros(1)
+    g.obstacle_half_extents = np.array([[0.3, 0.2]])
+    cam = Camera(g.bounds, (0, 0, 400, 400))
+    assert pick_obstacle(g, cam, cam.world_to_screen(g.obstacle_pos[0])) == 0
+    assert pick_obstacle(g, cam, (-100.0, -100.0)) is None
+
+
 def test_supersampling_does_not_disturb_picking_or_the_viewers_camera():
     """The Viewer's camera must stay window-space; only per-frame copies are scaled.
 

@@ -295,6 +295,108 @@ def test_render_frame_trajectory_overlay_changes_pixels():
     assert not np.array_equal(without, with_trail)
 
 
+# ------------------------------------------------------- obstacle shapes
+
+
+def _shaped_obstacle_env(shape, angle=0.4, half=(0.25, 0.12), radius=0.05):
+    """An env whose single obstacle is a BOX/SEGMENT rather than a circle."""
+    from wmas.core.config import ObstacleShape
+
+    env, scenario = make_env(n_agents=2, n_obstacles=1)
+    world = env.world
+    n_obs = 1
+    env.world.set_obstacles(
+        torch.zeros(env.n_envs, n_obs, 2, dtype=env.dtype, device=env.device),
+        torch.full((n_obs,), radius, dtype=env.dtype, device=env.device),
+        shape=torch.full((n_obs,), int(shape), dtype=torch.int32, device=env.device),
+        angle=torch.full((n_obs,), angle, dtype=env.dtype, device=env.device),
+        half_extents=torch.tensor([half], dtype=env.dtype, device=env.device),
+    )
+    assert world.obstacle_shape is not None and ObstacleShape.CIRCLE == 0
+    return env, scenario
+
+
+def test_extract_geometry_carries_obstacle_shape_angle_and_extents():
+    from wmas.core.config import ObstacleShape
+
+    env, scenario = _shaped_obstacle_env(ObstacleShape.BOX)
+    g = extract_geometry(env.world, 0, scenario=scenario)
+    assert g.obstacle_shape.shape == (1,) and int(g.obstacle_shape[0]) == int(ObstacleShape.BOX)
+    assert g.obstacle_angle.shape == (1,)
+    assert g.obstacle_half_extents.shape == (1, 2)
+    np.testing.assert_allclose(g.obstacle_half_extents[0], [0.25, 0.12])
+
+
+def test_extract_geometry_leaves_shape_fields_none_for_circle_only_scenarios():
+    env, scenario = make_env(n_obstacles=2)
+    g = extract_geometry(env.world, 0, scenario=scenario)
+    assert g.obstacle_shape is None
+    assert g.obstacle_angle is None
+    assert g.obstacle_half_extents is None
+
+
+def test_box_and_segment_obstacles_render_differently_from_circles():
+    from wmas.core.config import ObstacleShape
+
+    circles = render_frame(_geometry(n_obstacles=1), size=(240, 240), overlays={"obstacles"})
+    for shape in (ObstacleShape.BOX, ObstacleShape.SEGMENT):
+        env, scenario = _shaped_obstacle_env(shape)
+        g = extract_geometry(env.world, 0, scenario=scenario)
+        frame = render_frame(g, size=(240, 240), overlays={"obstacles"})
+        assert not np.array_equal(frame, circles), shape
+        assert len(np.unique(frame.reshape(-1, 3), axis=0)) > 1  # something was actually drawn
+
+
+def test_circle_only_obstacle_rendering_ignores_absent_shape_arrays():
+    """A geometry with obstacle_shape=None must render exactly like the circle branch."""
+    g = _geometry(n_obstacles=2)
+    with_none = render_frame(g, size=(200, 200), overlays={"obstacles"})
+    g.obstacle_shape = np.zeros(g.obstacle_pos.shape[0], dtype=np.int32)  # explicit CIRCLE
+    g.obstacle_angle = np.zeros(g.obstacle_pos.shape[0])
+    g.obstacle_half_extents = np.zeros((g.obstacle_pos.shape[0], 2))
+    assert np.array_equal(with_none, render_frame(g, size=(200, 200), overlays={"obstacles"}))
+
+
+# -------------------------------------------------------------- action overlay
+
+
+def test_extract_geometry_exposes_the_applied_action_and_agent_params():
+    from wmas.dynamics.base import NUM_PARAMS
+
+    env, scenario = make_env(n_agents=3)
+    g = extract_geometry(env.world, 0, scenario=scenario)
+    assert g.action is None  # nothing applied yet
+    assert g.ctrl_mode.shape == (3,)
+    assert g.agent_params.shape == (3, NUM_PARAMS)
+
+    actions = torch.randn(env.n_envs, 3, env.world.act_dim, dtype=env.dtype)
+    env.step(actions)
+    g = extract_geometry(env.world, 1, scenario=scenario)
+    np.testing.assert_allclose(g.action, actions[1].numpy())
+
+
+def test_action_overlay_is_noop_before_the_first_step():
+    g = _geometry()
+    assert g.action is None
+    base = render_frame(g, size=(200, 200), overlays={"agents"})
+    with_action = render_frame(g, size=(200, 200), overlays={"agents", "action"})
+    assert np.array_equal(base, with_action)
+
+
+def test_action_overlay_draws_for_every_dynamics_model():
+    from wmas.render.demo import build_env, goal_seeking_policy
+
+    for model in ("holonomic", "diff-drive", "bicycle", "mixed"):
+        env = build_env(2, 3, 1, "cpu", model=model)
+        policy = goal_seeking_policy(env)
+        env.step(policy(None))
+        g = extract_geometry(env.world, 0, scenario=env.scenario)
+        assert g.action is not None
+        without = render_frame(g, size=(240, 240), overlays={"agents"})
+        with_action = render_frame(g, size=(240, 240), overlays={"agents", "action"})
+        assert not np.array_equal(without, with_action), model
+
+
 # ------------------------------------------------------------ agent visuals
 
 

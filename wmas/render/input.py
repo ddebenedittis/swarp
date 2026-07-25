@@ -38,16 +38,33 @@ def pick_agent(
     return int(hits[np.argmin(dist[hits])])
 
 
+def _obstacle_extent(geometry: RenderGeometry) -> np.ndarray:
+    """Per-obstacle pick radius in world units, honoring non-circular shapes.
+
+    A box's collision radius is unused by the simulator and is legitimately 0, so picking on
+    ``obstacle_radius`` alone would make boxes undraggable. Derived only from the geometry.
+    """
+    extent = np.asarray(geometry.obstacle_radius, dtype=np.float64).copy()
+    shape, half = geometry.obstacle_shape, geometry.obstacle_half_extents
+    if shape is None or half is None:
+        return extent
+    is_box = shape == 1  # ObstacleShape.BOX
+    is_seg = shape == 2  # ObstacleShape.SEGMENT
+    extent[is_box] = np.hypot(half[is_box, 0], half[is_box, 1])
+    extent[is_seg] = half[is_seg, 0] + extent[is_seg]
+    return extent
+
+
 def pick_obstacle(
     geometry: RenderGeometry, camera: Camera, screen_xy, extra_px: float = 4.0
 ) -> int | None:
-    """Index of the obstacle whose drawn disk covers ``screen_xy``, else None."""
+    """Index of the obstacle whose drawn shape covers ``screen_xy``, else None."""
     if geometry.obstacle_pos is None or geometry.obstacle_radius is None:
         return None
     centers = camera.world_to_screen(geometry.obstacle_pos)
     sx, sy = float(screen_xy[0]), float(screen_xy[1])
     dist = np.hypot(centers[:, 0] - sx, centers[:, 1] - sy)
-    hit_radius = np.maximum(geometry.obstacle_radius * camera.scale, 1.0) + extra_px
+    hit_radius = np.maximum(_obstacle_extent(geometry) * camera.scale, 1.0) + extra_px
     hits = np.nonzero(dist <= hit_radius)[0]
     if hits.size == 0:
         return None

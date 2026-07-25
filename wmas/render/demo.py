@@ -211,7 +211,7 @@ def main(argv=None):
     )
     policy = goal_seeking_policy(env)
     size = (args.size, args.size)
-    overlays = set(DEFAULT_ENABLED) | {"comm_lines", "lidar", "trajectories"}
+    overlays = set(DEFAULT_ENABLED) | {"comm_lines", "lidar", "trajectories", "action"}
     style = THEMES[args.theme](
         color_mode=args.color_mode,
         lidar_mode=args.lidar_mode,

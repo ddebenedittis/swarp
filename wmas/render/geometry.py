@@ -40,6 +40,15 @@ class RenderGeometry:
     obstacle_radius: np.ndarray | None  # (n_obstacles,) or None
     bounds: tuple[float, float, float, float] | None  # (x_min, x_max, y_min, y_max)
     edges: np.ndarray  # (E, 2) int64, local (i, j) neighbor pairs
+    # Obstacle geometry beyond a radius. Per-obstacle (not per-env), mirroring the simulator;
+    # None means "every obstacle is a circle", which is how Stepper.set_obstacles zero-fills.
+    obstacle_shape: np.ndarray | None = None  # (n_obstacles,) int ObstacleShape tags
+    obstacle_angle: np.ndarray | None = None  # (n_obstacles,) rad
+    obstacle_half_extents: np.ndarray | None = None  # (n_obstacles, 2); [:, 0] = SEGMENT half-len
+    # Last action applied to each agent — one step older than the state drawn alongside it.
+    action: np.ndarray | None = None  # (n_agents, act_dim) or None before the first step
+    ctrl_mode: np.ndarray | None = None  # (n_agents,) int ControlMode tags
+    agent_params: np.ndarray | None = None  # (n_agents, NUM_PARAMS) AgentConfig.to_row() rows
     extras: dict[str, Any] = field(default_factory=dict)
 
 
@@ -83,6 +92,8 @@ def extract_geometry_batch(
     vel = _to_np(s.vel.index_select(0, sel))
     goals = _to_np(world.goals.index_select(0, sel)) if world.goals is not None else None
 
+    action = _to_np(world.action.index_select(0, sel)) if world.action is not None else None
+
     if world.obstacle_pos is not None:
         obstacle_pos = _to_np(world.obstacle_pos.index_select(0, sel))
         obstacle_radius = _to_np(world.obstacle_radius)
@@ -93,8 +104,16 @@ def extract_geometry_batch(
     # Env-independent: extracted once, shared by every geometry below.
     radius = _to_np(world.agent_radius)
     model = np.array([int(c.model) for c in world.agent_configs], dtype=np.int32)
+    ctrl_mode = np.array([int(c.ctrl_mode) for c in world.agent_configs], dtype=np.int32)
+    agent_params = np.array([c.to_row() for c in world.agent_configs], dtype=np.float64)
     bounds = world.config.bounds if world.config is not None else None
     edges = _extract_edges_batch(world, idx) if with_edges else [_no_edges()] * len(idx)
+    # Obstacle shape/angle/half-extents are per-obstacle, so no env indexing here.
+    obs_shape = _shape_tags(world)
+    obs_angle = _to_np(world.obstacle_angle) if world.obstacle_angle is not None else None
+    obs_half = (
+        _to_np(world.obstacle_half_extents) if world.obstacle_half_extents is not None else None
+    )
 
     out: list[RenderGeometry] = []
     for k, env_idx in enumerate(idx):
@@ -114,10 +133,22 @@ def extract_geometry_batch(
                 obstacle_radius=obstacle_radius,
                 bounds=bounds,
                 edges=edges[k],
+                obstacle_shape=obs_shape,
+                obstacle_angle=obs_angle,
+                obstacle_half_extents=obs_half,
+                action=None if action is None else action[k],
+                ctrl_mode=ctrl_mode,
+                agent_params=agent_params,
                 extras=extras,
             )
         )
     return out
+
+
+def _shape_tags(world) -> np.ndarray | None:
+    if world.obstacle_shape is None:
+        return None
+    return _to_np(world.obstacle_shape).astype(np.int32)
 
 
 def _no_edges() -> np.ndarray:
