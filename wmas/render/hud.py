@@ -10,7 +10,7 @@ import pygame
 
 from wmas.render.geometry import RenderGeometry
 from wmas.render.input import ViewState
-from wmas.render.overlays import _get_font
+from wmas.render.overlays import OVERLAYS, _get_font
 from wmas.render.style import Style
 
 
@@ -39,8 +39,52 @@ def draw_hud(
     lines = [header]
     if state.paused:
         lines.append("PAUSED (space)")
+    lines.append("F1/? help")
+    lines.append(
+        f"color {style.color_mode}   lidar {style.lidar_mode}   trail {style.trajectory_mode}"
+    )
     lines.append("on: " + ",".join(sorted(state.enabled)))
-    _blit_lines(surface, font, lines, style.text_color, (8, 6))
+    clip = surface.get_clip()
+    _blit_lines(surface, font, lines, style.text_color, (clip.left + 8, clip.top + 6))
+
+
+def draw_help(surface, state: ViewState, style: Style) -> None:
+    """Top-right controls legend for the interactive viewer."""
+    if not state.show_help:
+        return
+    font = _get_font(style.font_size)
+    overlay_lines = [f"{o.key}: {o.name}" for o in OVERLAYS if o.key]
+    lines = [
+        "Controls",
+        "space: pause/resume",
+        "r: reset simulation",
+        "left drag agent/obstacle: move it",
+        "right click: move selected goal",
+        "t: cycle trajectory mode",
+        "l: cycle lidar mode",
+        "k: cycle color mode",
+        "mouse wheel: zoom",
+        "middle drag: pan",
+        "[ / ]: focus env",
+        "F1 or ?: toggle help",
+        "q/esc: quit",
+        "",
+        "Overlays",
+        *overlay_lines,
+    ]
+    pad = 8
+    line_h = font.get_height()
+    width = max(font.size(line)[0] for line in lines) + 2 * pad
+    height = len(lines) * line_h + 2 * pad
+    clip = surface.get_clip()
+    x = clip.right - width - 8
+    y = clip.top + 8
+
+    panel = pygame.Surface((width, height), pygame.SRCALPHA)
+    panel.fill((255, 255, 255, 225))
+    pygame.draw.rect(panel, style.text_color, panel.get_rect(), 1)
+    surface.blit(panel, (x, y))
+    _blit_lines(surface, font, lines, style.text_color, (x + pad, y + pad))
 
 
 def draw_hover_panel(
@@ -58,6 +102,7 @@ def draw_hover_panel(
         f"pos ({p[0]:+.2f}, {p[1]:+.2f})",
         f"vel ({v[0]:+.2f}, {v[1]:+.2f})",
         f"spd {speed:.2f}",
+        f"model {int(geometry.model[agent_idx])}",
     ]
     pad = 6
     line_h = font.get_height()

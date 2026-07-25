@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 RGB = tuple[int, int, int]
+RGBA = tuple[int, int, int, int]
 
 # Okabe-Ito colorblind-safe qualitative palette (per-agent cycling).
 _PALETTE: tuple[RGB, ...] = (
@@ -32,15 +33,34 @@ class Style:
     comm_line_color: RGB = (120, 190, 140)
     text_color: RGB = (40, 40, 45)
     palette: tuple[RGB, ...] = field(default_factory=lambda: _PALETTE)
+    model_palette: dict[int, RGB] = field(
+        default_factory=lambda: {
+            0: (0, 114, 178),
+            1: (213, 94, 0),
+            2: (0, 158, 115),
+            3: (204, 121, 167),
+        }
+    )
+
+    color_mode: str = "agent"  # agent | model
+    lidar_mode: str = "rays"  # none | rays | area | both
+    trajectory_mode: str = "none"  # none | trail | fade
 
     line_width: int = 2
     edge_width: int = 1
+    lidar_hit_px: int = 2
     goal_ring_width: int = 3
     agent_min_px: int = 3
     goal_min_px: int = 5
     heading_len_factor: float = 1.6  # relative to agent radius
     velocity_scale: float = 0.3  # world units per (m/s)
     font_size: int = 15
+    lidar_area_alpha: int = 34
+    trajectory_alpha: int = 125
+    trajectory_fade_min_alpha: int = 20
+    trajectory_len: int = 80
 
-    def agent_color(self, i: int) -> RGB:
+    def agent_color(self, i: int, model: int | None = None) -> RGB:
+        if self.color_mode == "model" and model is not None:
+            return self.model_palette.get(int(model), self.palette[i % len(self.palette)])
         return self.palette[i % len(self.palette)]

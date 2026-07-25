@@ -38,14 +38,50 @@ def pick_agent(
     return int(hits[np.argmin(dist[hits])])
 
 
+def pick_obstacle(
+    geometry: RenderGeometry, camera: Camera, screen_xy, extra_px: float = 4.0
+) -> int | None:
+    """Index of the obstacle whose drawn disk covers ``screen_xy``, else None."""
+    if geometry.obstacle_pos is None or geometry.obstacle_radius is None:
+        return None
+    centers = camera.world_to_screen(geometry.obstacle_pos)
+    sx, sy = float(screen_xy[0]), float(screen_xy[1])
+    dist = np.hypot(centers[:, 0] - sx, centers[:, 1] - sy)
+    hit_radius = np.maximum(geometry.obstacle_radius * camera.scale, 1.0) + extra_px
+    hits = np.nonzero(dist <= hit_radius)[0]
+    if hits.size == 0:
+        return None
+    return int(hits[np.argmin(dist[hits])])
+
+
+def _is_help_key(event) -> bool:
+    if event.key == pygame.K_F1:
+        return True
+    if hasattr(pygame, "K_HELP") and event.key == pygame.K_HELP:
+        return True
+    if hasattr(pygame, "K_QUESTION") and event.key == pygame.K_QUESTION:
+        return True
+    if getattr(event, "unicode", "") == "?":
+        return True
+    if event.key == pygame.K_SLASH and (getattr(event, "mod", 0) & pygame.KMOD_SHIFT):
+        return True
+    try:
+        return pygame.key.name(event.key).lower() in {"f1", "?"}
+    except Exception:
+        return False
+
+
 @dataclass
 class ViewState:
     n_envs: int
     enabled: set[str]
     focus_env: int = 0
     paused: bool = False
+    show_help: bool = False
+    reset_requested: bool = False
     hover_agent: int | None = None
     selected_agent: int | None = None
+    selected_obstacle: int | None = None
     quit: bool = False
 
 
@@ -70,22 +106,33 @@ class InteractionController:
         geometry_getter: Callable[[], RenderGeometry] | None = None,
         tile_resolver: Callable[[tuple], int | None] | None = None,
         on_drag_agent: Callable[[int, tuple[float, float]], None] | None = None,
+        on_drag_obstacle: Callable[[int, tuple[float, float]], None] | None = None,
         on_place_goal: Callable[[int, tuple[float, float]], None] | None = None,
+        on_cycle_trajectory: Callable[[], None] | None = None,
+        on_cycle_lidar: Callable[[], None] | None = None,
+        on_cycle_color: Callable[[], None] | None = None,
     ) -> None:
         self.state = state
         self.camera = camera
         self._geometry_getter = geometry_getter
         self._tile_resolver = tile_resolver
         self._on_drag_agent = on_drag_agent
+        self._on_drag_obstacle = on_drag_obstacle
         self._on_place_goal = on_place_goal
+        self._on_cycle_trajectory = on_cycle_trajectory
+        self._on_cycle_lidar = on_cycle_lidar
+        self._on_cycle_color = on_cycle_color
         self._panning = False
         self._dragging_agent: int | None = None
+        self._dragging_obstacle: int | None = None
         self._last_mouse = (0.0, 0.0)
 
     def handle_event(self, event) -> None:
         et = event.type
         if et == pygame.KEYDOWN:
             self._on_keydown(event)
+        elif et == pygame.TEXTINPUT and getattr(event, "text", "") == "?":
+            self.state.show_help = not self.state.show_help
         elif et == pygame.MOUSEWHEEL:
             self.camera.zoom_at(_ZOOM_STEP**event.y, self._last_mouse)
         elif et == pygame.MOUSEMOTION:
@@ -102,6 +149,7 @@ class InteractionController:
                 self._panning = False
             elif event.button == 1:
                 self._dragging_agent = None
+                self._dragging_obstacle = None
         elif et == pygame.QUIT:
             self.state.quit = True
 
@@ -114,7 +162,7 @@ class InteractionController:
         if self._tile_resolver is not None and self._tile_resolver(event.pos) is not None:
             self.state.focus_env = self._tile_resolver(event.pos)
             return
-        # Otherwise (focus pane) select the agent under the cursor and begin a drag.
+        # Otherwise (focus pane) select the item under the cursor and begin a drag.
         if self._geometry_getter is None:
             return
         geometry = self._geometry_getter()
@@ -123,8 +171,16 @@ class InteractionController:
         idx = pick_agent(geometry, self.camera, event.pos)
         if idx is not None:
             self.state.selected_agent = idx
+            self.state.selected_obstacle = None
             if self._on_drag_agent is not None:
                 self._dragging_agent = idx
+            return
+        obs_idx = pick_obstacle(geometry, self.camera, event.pos)
+        if obs_idx is not None:
+            self.state.selected_obstacle = obs_idx
+            self.state.selected_agent = None
+            if self._on_drag_obstacle is not None:
+                self._dragging_obstacle = obs_idx
 
     def _on_right_down(self, event) -> None:
         # Right click moves the selected agent's goal to the clicked point.
@@ -135,7 +191,13 @@ class InteractionController:
         s = self.state
         key = event.key
         overlays = _overlay_keys()
-        if key in overlays:
+        if key == pygame.K_t and self._on_cycle_trajectory is not None:
+            self._on_cycle_trajectory()
+        elif key == pygame.K_l and self._on_cycle_lidar is not None:
+            self._on_cycle_lidar()
+        elif key == pygame.K_k and self._on_cycle_color is not None:
+            self._on_cycle_color()
+        elif key in overlays:
             name = overlays[key]
             s.enabled.discard(name) if name in s.enabled else s.enabled.add(name)
         elif key == pygame.K_LEFTBRACKET:
@@ -144,6 +206,10 @@ class InteractionController:
             s.focus_env = (s.focus_env + 1) % s.n_envs
         elif key == pygame.K_SPACE:
             s.paused = not s.paused
+        elif key == pygame.K_r:
+            s.reset_requested = True
+        elif _is_help_key(event):
+            s.show_help = not s.show_help
         elif key in (pygame.K_ESCAPE, pygame.K_q):
             s.quit = True
 
@@ -156,6 +222,8 @@ class InteractionController:
             self.camera.pan(float(rel[0]), float(rel[1]))
         elif self._dragging_agent is not None and self._on_drag_agent is not None:
             self._on_drag_agent(self._dragging_agent, self._world_at(pos))
+        elif self._dragging_obstacle is not None and self._on_drag_obstacle is not None:
+            self._on_drag_obstacle(self._dragging_obstacle, self._world_at(pos))
         elif self._geometry_getter is not None:
             geometry = self._geometry_getter()
             if geometry is not None:

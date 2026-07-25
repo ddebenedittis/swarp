@@ -36,6 +36,33 @@ def test_render_extras_override_flows_into_geometry():
     assert "lidar" in g.extras and np.asarray(g.extras["lidar"]).shape == (1, 2, 2)
 
 
+def test_demo_visualization_scenario_emits_lidar_and_comm_lines():
+    from wmas.render.demo import build_env
+
+    env = build_env(1, 3, 1, "cpu", lidar_rays=4, lidar_range=1.0)
+    extras = env.scenario.render_extras(0)
+    assert np.asarray(extras["lidar"]).shape == (12, 2, 2)
+    assert np.asarray(extras["lidar_by_agent"]).shape == (3, 4, 2, 2)
+    assert np.asarray(extras["comm_lines"]).ndim == 3
+    assert np.asarray(extras["comm_lines"]).shape[1:] == (2, 2)
+
+
+def test_demo_mixed_model_env_exposes_distinct_agent_models():
+    from wmas.dynamics.base import DynamicsModel
+    from wmas.render.demo import build_env, goal_seeking_policy
+    from wmas.render.geometry import extract_geometry
+
+    env = build_env(1, 4, 0, "cpu", model="mixed")
+    g = extract_geometry(env.world, 0, scenario=env.scenario)
+    assert set(g.model.tolist()) == {
+        int(DynamicsModel.HOLONOMIC),
+        int(DynamicsModel.DIFF_DRIVE),
+        int(DynamicsModel.KINEMATIC_BICYCLE),
+    }
+    actions = goal_seeking_policy(env)(None)
+    assert actions.shape == (1, 4, env.world.act_dim)
+
+
 # ---------------------------------------------------- Environment.render (VMAS)
 
 

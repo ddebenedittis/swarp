@@ -6,7 +6,7 @@ import pygame
 from wmas import Environment, NavigationScenario
 from wmas.render.camera import Camera
 from wmas.render.geometry import extract_geometry
-from wmas.render.input import InteractionController, ViewState, pick_agent
+from wmas.render.input import InteractionController, ViewState, pick_agent, pick_obstacle
 from wmas.render.overlays import DEFAULT_ENABLED
 from wmas.render.viewer import Viewer
 
@@ -51,6 +51,15 @@ def test_pick_agent_hits_center_and_misses_empty_space():
     assert pick_agent(g, cam, (-100.0, -100.0)) is None
 
 
+def test_pick_obstacle_hits_center_and_misses_empty_space():
+    env, scenario = make_env(n_obstacles=1)
+    g = extract_geometry(env.world, 0, scenario=scenario)
+    cam = Camera(g.bounds, (0, 0, 400, 400))
+    center = cam.world_to_screen(g.obstacle_pos[0])
+    assert pick_obstacle(g, cam, center) == 0
+    assert pick_obstacle(g, cam, (-100.0, -100.0)) is None
+
+
 # --------------------------------------------------------- event controller
 
 
@@ -91,6 +100,18 @@ def test_space_pauses_and_escape_quits():
     assert state.paused is True
     ctrl.handle_event(_key(pygame.K_ESCAPE))
     assert state.quit is True
+
+
+def test_reset_and_help_keys_update_view_state():
+    state, ctrl, _ = _controller()
+    ctrl.handle_event(_key("r"))
+    assert state.reset_requested is True
+    ctrl.handle_event(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_F1))
+    assert state.show_help is True
+    ctrl.handle_event(pygame.event.Event(pygame.TEXTINPUT, text="?"))
+    assert state.show_help is False
+    ctrl.handle_event(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_SLASH, mod=pygame.KMOD_SHIFT))
+    assert state.show_help is True
 
 
 def test_mouse_wheel_zooms_in():
@@ -137,6 +158,31 @@ def test_viewer_hover_panel_changes_pixels():
     viewer.state.hover_agent = 0
     hovered = viewer.render_array(hud=True)
     assert not np.array_equal(base, hovered)
+
+
+def test_viewer_help_panel_changes_pixels():
+    env, _ = make_env(n_agents=3)
+    viewer = Viewer(env, size=(420, 320))
+    base = viewer.render_array(hud=True)
+    viewer.state.show_help = True
+    helped = viewer.render_array(hud=True)
+    assert not np.array_equal(base, helped)
+
+
+def test_viewer_help_panel_changes_pixels_in_mosaic():
+    env, _ = make_env(n_envs=4, n_agents=3)
+    viewer = Viewer(env, size=(520, 360), mosaic=True)
+    base = viewer.render_array(hud=True)
+    viewer.state.show_help = True
+    helped = viewer.render_array(hud=True)
+    assert not np.array_equal(base, helped)
+
+
+def test_viewer_write_obstacle_pos_moves_obstacle():
+    env, _ = make_env(n_obstacles=1)
+    viewer = Viewer(env, size=(320, 320))
+    viewer._write_obstacle_pos(0, (0.25, -0.25))
+    np.testing.assert_allclose(env.world.obstacle_pos[0, 0].cpu().numpy(), [0.25, -0.25])
 
 
 def test_viewer_focus_env_selects_that_env():

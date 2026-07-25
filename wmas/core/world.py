@@ -65,6 +65,9 @@ class World:
         self.goals: torch.Tensor | None = None  # [n_envs, n_agents, 2]
         self.obstacle_pos: torch.Tensor | None = None  # [n_envs, n_obstacles, 2]
         self.obstacle_radius: torch.Tensor | None = None  # [n_obstacles]
+        self.obstacle_shape: torch.Tensor | None = None  # [n_obstacles]
+        self.obstacle_angle: torch.Tensor | None = None  # [n_obstacles]
+        self.obstacle_half_extents: torch.Tensor | None = None  # [n_obstacles, 2]
         self.generator: torch.Generator | None = None  # installed by Environment
         self.agent_radius = torch.tensor(
             [c.radius for c in agent_configs], device=device, dtype=dtype
@@ -153,6 +156,9 @@ class World:
         :meth:`wmas.core.stepper.Stepper.set_obstacles` for shape semantics."""
         self.obstacle_pos = pos
         self.obstacle_radius = radius
+        self.obstacle_shape = shape
+        self.obstacle_angle = angle
+        self.obstacle_half_extents = half_extents
         self.stepper.set_obstacles(pos, radius, shape=shape, angle=angle, half_extents=half_extents)
 
     # -------------------------------------------------------------- neighbors

@@ -41,6 +41,7 @@ def test_extract_geometry_shapes_and_is_cpu_numpy():
         (g.theta, (3,)),
         (g.vel, (3, 2)),
         (g.radius, (3,)),
+        (g.model, (3,)),
         (g.goals, (3, 2)),
         (g.obstacle_pos, (2, 2)),
         (g.obstacle_radius, (2,)),
@@ -52,6 +53,7 @@ def test_extract_geometry_shapes_and_is_cpu_numpy():
     # values match the source env for the requested env index
     np.testing.assert_allclose(g.pos, env.world.state.pos[1].cpu().numpy())
     np.testing.assert_allclose(g.goals, env.world.goals[1].cpu().numpy())
+    np.testing.assert_array_equal(g.model, np.zeros(3, dtype=np.int32))
 
 
 def test_extract_geometry_handles_absent_obstacles():
@@ -143,6 +145,42 @@ def test_render_frame_lidar_overlay_is_noop_without_data():
     base = render_frame(g, size=(200, 200), overlays={"agents"})
     with_lidar = render_frame(g, size=(200, 200), overlays={"agents", "lidar"})
     assert np.array_equal(base, with_lidar)
+
+
+def test_render_frame_lidar_endpoint_dot_changes_pixels():
+    g = _geometry()
+    g.extras["lidar"] = np.asarray([[[0.0, 0.0], [0.4, 0.0]]])
+    without = render_frame(g, size=(200, 200), overlays={"agents"})
+    with_lidar = render_frame(g, size=(200, 200), overlays={"agents", "lidar"})
+    assert not np.array_equal(without, with_lidar)
+
+
+def test_render_frame_lidar_area_mode_changes_pixels():
+    from wmas.render.style import Style
+
+    g = _geometry(n_agents=1)
+    g.extras["lidar"] = np.asarray([[[0.0, 0.0], [0.4, 0.0]], [[0.0, 0.0], [0.0, 0.4]]])
+    g.extras["lidar_by_agent"] = g.extras["lidar"].reshape(1, 2, 2, 2)
+    without = render_frame(g, size=(200, 200), overlays={"agents"})
+    with_area = render_frame(
+        g, size=(200, 200), overlays={"agents", "lidar"}, style=Style(lidar_mode="area")
+    )
+    assert not np.array_equal(without, with_area)
+
+
+def test_render_frame_trajectory_overlay_changes_pixels():
+    from wmas.render.style import Style
+
+    g = _geometry(n_agents=1)
+    g.extras["trajectories"] = np.asarray([[[0.0, 0.0], [0.2, 0.0], [0.3, 0.2]]])
+    without = render_frame(g, size=(200, 200), overlays={"agents"})
+    with_trail = render_frame(
+        g,
+        size=(200, 200),
+        overlays={"agents", "trajectories"},
+        style=Style(trajectory_mode="fade"),
+    )
+    assert not np.array_equal(without, with_trail)
 
 
 # ------------------------------------------------------------------ video

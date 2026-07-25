@@ -28,6 +28,7 @@ class RenderGeometry:
     theta: np.ndarray  # (n_agents,)
     vel: np.ndarray  # (n_agents, 2)
     radius: np.ndarray  # (n_agents,)
+    model: np.ndarray  # (n_agents,) int DynamicsModel tags
     goals: np.ndarray | None  # (n_agents, 2) or None
     obstacle_pos: np.ndarray | None  # (n_obstacles, 2) or None
     obstacle_radius: np.ndarray | None  # (n_obstacles,) or None
@@ -67,6 +68,7 @@ def extract_geometry(world, env_idx: int, scenario=None) -> RenderGeometry:
         theta=_to_np(s.theta[env_idx]),
         vel=_to_np(s.vel[env_idx]),
         radius=_to_np(world.agent_radius),
+        model=np.array([int(c.model) for c in world.agent_configs], dtype=np.int32),
         goals=goals,
         obstacle_pos=obstacle_pos,
         obstacle_radius=obstacle_radius,

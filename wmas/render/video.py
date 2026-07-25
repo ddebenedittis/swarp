@@ -73,11 +73,18 @@ def iter_rollout_frames(
     ``[n_envs, n_agents, world.act_dim]``; ``None`` means zero actions.
     """
     obs = env.reset() if reset else env.scenario.observations()
+    trail_history: list[np.ndarray] = []
     for _ in range(n_steps):
         with torch.no_grad():
             actions = _zero_actions(env) if action_fn is None else action_fn(obs)
             obs, *_ = env.step(actions)
             geometry = extract_geometry(env.world, env_index, scenario=env.scenario)
+            if style is not None and style.trajectory_mode != "none":
+                trail_history.append(geometry.pos.copy())
+                trail_len = int(getattr(style, "trajectory_len", 80))
+                if len(trail_history) > trail_len:
+                    del trail_history[: len(trail_history) - trail_len]
+                geometry.extras["trajectories"] = np.stack(trail_history, axis=1)
             frame = render_frame(geometry, size=size, overlays=overlays, style=style)
         yield frame
 

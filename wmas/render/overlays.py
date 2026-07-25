@@ -76,22 +76,125 @@ def _draw_goals(surface, g, camera, style):
         return
     for i in range(g.n_agents):
         center = _p(camera, g.goals[i])
-        color = style.agent_color(i)
+        color = style.agent_color(i, g.model[i])
         r = _r_px(camera, g.radius[i], floor=style.goal_min_px)
         pygame.draw.circle(surface, color, center, r, style.goal_ring_width)
         pygame.draw.circle(surface, color, center, 2)  # center dot
+
+
+def _agent_points(pos, theta: float, radius: float, factors):
+    c = math.cos(theta)
+    s = math.sin(theta)
+    pts = []
+    for fx, fy in factors:
+        pts.append((pos[0] + radius * (fx * c - fy * s), pos[1] + radius * (fx * s + fy * c)))
+    return pts
 
 
 def _draw_agents(surface, g, camera, style):
     for i in range(g.n_agents):
         center = _p(camera, g.pos[i])
         r = _r_px(camera, g.radius[i], floor=style.agent_min_px)
-        pygame.draw.circle(surface, style.agent_color(i), center, r)
+        wheel_w = max(2, r // 2)
+        color = style.agent_color(i, g.model[i])
+        model = int(g.model[i])
+        if model == 1:  # diff-drive: compact body with two side tracks.
+            body = _agent_points(
+                g.pos[i],
+                float(g.theta[i]),
+                float(g.radius[i]),
+                [
+                    (0.95, 0.55),
+                    (0.55, 0.9),
+                    (-0.65, 0.9),
+                    (-0.95, 0.55),
+                    (-0.95, -0.55),
+                    (-0.65, -0.9),
+                    (0.55, -0.9),
+                    (0.95, -0.55),
+                ],
+            )
+            pygame.draw.polygon(surface, color, [_p(camera, p) for p in body])
+            for y in (-1.05, 1.05):
+                track = _agent_points(
+                    g.pos[i], float(g.theta[i]), float(g.radius[i]), [(0.65, y), (-0.65, y)]
+                )
+                pygame.draw.line(
+                    surface,
+                    style.agent_outline,
+                    _p(camera, track[0]),
+                    _p(camera, track[1]),
+                    wheel_w,
+                )
+            nose = _agent_points(g.pos[i], float(g.theta[i]), float(g.radius[i]), [(0.55, 0.0)])
+            pygame.draw.circle(surface, style.agent_outline, _p(camera, nose[0]), max(1, r // 5))
+        elif model == 2:  # kinematic bicycle: stylized car with wheels and cabin.
+            body = _agent_points(
+                g.pos[i],
+                float(g.theta[i]),
+                float(g.radius[i]),
+                [
+                    (1.75, 0.0),
+                    (1.25, 0.65),
+                    (0.25, 0.8),
+                    (-1.25, 0.65),
+                    (-1.55, 0.4),
+                    (-1.55, -0.4),
+                    (-1.25, -0.65),
+                    (0.25, -0.8),
+                    (1.25, -0.65),
+                ],
+            )
+            pygame.draw.polygon(surface, color, [_p(camera, p) for p in body])
+            cabin = _agent_points(
+                g.pos[i],
+                float(g.theta[i]),
+                float(g.radius[i]),
+                [(0.55, 0.38), (-0.35, 0.42), (-0.6, -0.42), (0.55, -0.38)],
+            )
+            pygame.draw.polygon(surface, style.background, [_p(camera, p) for p in cabin])
+            pygame.draw.polygon(surface, style.agent_outline, [_p(camera, p) for p in cabin], 1)
+            for x in (-0.95, 0.95):
+                for y in (-0.82, 0.82):
+                    wheel = _agent_points(
+                        g.pos[i],
+                        float(g.theta[i]),
+                        float(g.radius[i]),
+                        [(x + 0.25, y), (x - 0.25, y)],
+                    )
+                    pygame.draw.line(
+                        surface,
+                        style.agent_outline,
+                        _p(camera, wheel[0]),
+                        _p(camera, wheel[1]),
+                        wheel_w,
+                    )
+            pygame.draw.polygon(surface, style.agent_outline, [_p(camera, p) for p in body], 1)
+            front = _agent_points(g.pos[i], float(g.theta[i]), float(g.radius[i]), [(1.2, 0.0)])
+            pygame.draw.circle(surface, style.background, _p(camera, front[0]), max(1, r // 5))
+        elif model == 3:  # drone placeholder: quadrotor cross.
+            pygame.draw.circle(surface, color, center, max(2, r // 2))
+            for a in (0.0, math.pi / 2):
+                arm = _agent_points(
+                    g.pos[i],
+                    float(g.theta[i]) + a,
+                    float(g.radius[i]),
+                    [(1.5, 0.0), (-1.5, 0.0)],
+                )
+                pygame.draw.line(
+                    surface, color, _p(camera, arm[0]), _p(camera, arm[1]), style.line_width
+                )
+                pygame.draw.circle(surface, color, _p(camera, arm[0]), max(2, r // 3), 1)
+                pygame.draw.circle(surface, color, _p(camera, arm[1]), max(2, r // 3), 1)
+        else:
+            pygame.draw.circle(surface, color, center, r)
         pygame.draw.circle(surface, style.agent_outline, center, r, 1)
 
 
 def _draw_heading(surface, g, camera, style):
     for i in range(g.n_agents):
+        if int(g.model[i]) == 0:  # holonomic agents have no meaningful body heading.
+            continue
         pos = g.pos[i]
         theta = float(g.theta[i])
         reach = float(g.radius[i]) * style.heading_len_factor
@@ -99,6 +202,34 @@ def _draw_heading(surface, g, camera, style):
         pygame.draw.line(
             surface, style.heading_color, _p(camera, pos), _p(camera, tip), style.line_width
         )
+
+
+def _draw_trajectories(surface, g, camera, style):
+    if style.trajectory_mode == "none":
+        return
+    trails = g.extras.get("trajectories")
+    if trails is None:
+        return
+    trails = np.asarray(trails, dtype=np.float64)
+    if trails.ndim != 3 or trails.shape[1] < 2:
+        return
+    overlay = pygame.Surface(surface.get_size(), pygame.SRCALPHA)
+    for i in range(min(g.n_agents, trails.shape[0])):
+        pts = [_p(camera, p) for p in trails[i]]
+        color = style.agent_color(i, g.model[i])
+        if style.trajectory_mode == "fade":
+            n = max(1, len(pts) - 1)
+            for k in range(n):
+                alpha = int(
+                    style.trajectory_fade_min_alpha
+                    + (style.trajectory_alpha - style.trajectory_fade_min_alpha) * (k + 1) / n
+                )
+                pygame.draw.line(overlay, (*color, alpha), pts[k], pts[k + 1], style.line_width)
+        else:
+            pygame.draw.lines(
+                overlay, (*color, style.trajectory_alpha), False, pts, style.line_width
+            )
+    surface.blit(overlay, (0, 0))
 
 
 def _draw_velocity(surface, g, camera, style):
@@ -145,14 +276,42 @@ def _draw_lidar(surface, g, camera, style):
     Expected (tentative) format: an array of world-space segments with shape
     ``(n_rays, 2, 2)`` — ``[start_xy, end_xy]`` per ray. Absent/empty -> no-op.
     """
+    if style.lidar_mode == "none":
+        return
+    by_agent = g.extras.get("lidar_by_agent")
+    if by_agent is not None and style.lidar_mode in {"area", "both"}:
+        grouped = np.asarray(by_agent, dtype=np.float64)
+        if grouped.size:
+            overlay = pygame.Surface(surface.get_size(), pygame.SRCALPHA)
+            for i in range(min(g.n_agents, grouped.shape[0])):
+                endpoints = grouped[i, :, 1, :]
+                if endpoints.shape[0] < 2:
+                    continue
+                color = style.agent_color(i, g.model[i])
+                poly = [_p(camera, g.pos[i]), *[_p(camera, p) for p in endpoints]]
+                pygame.draw.polygon(overlay, (*color, style.lidar_area_alpha), poly)
+            surface.blit(overlay, (0, 0))
+
+    if style.lidar_mode == "area":
+        return
+
     rays = g.extras.get("lidar")
     if rays is None:
         return
     rays = np.asarray(rays, dtype=np.float64)
     if rays.size == 0:
         return
+    grouped = np.asarray(by_agent, dtype=np.float64) if by_agent is not None else None
+    if grouped is not None and grouped.size:
+        for i in range(min(g.n_agents, grouped.shape[0])):
+            color = style.agent_color(i, g.model[i])
+            for start, end in grouped[i].reshape(-1, 2, 2):
+                pygame.draw.line(surface, color, _p(camera, start), _p(camera, end), 1)
+                pygame.draw.circle(surface, color, _p(camera, end), style.lidar_hit_px)
+        return
     for start, end in rays.reshape(-1, 2, 2):
         pygame.draw.line(surface, style.lidar_color, _p(camera, start), _p(camera, end), 1)
+        pygame.draw.circle(surface, style.lidar_color, _p(camera, end), style.lidar_hit_px)
 
 
 _FONT_CACHE: dict[int, pygame.font.Font] = {}
@@ -171,6 +330,7 @@ OVERLAYS: tuple[Overlay, ...] = (
     Overlay("bounds", _draw_bounds, "b", True),
     Overlay("obstacles", _draw_obstacles, "o", True),
     Overlay("neighbor_graph", _draw_neighbor_graph, "n", False),
+    Overlay("trajectories", _draw_trajectories, None, True),
     Overlay("goals", _draw_goals, "g", True),
     Overlay("agents", _draw_agents, None, True),
     Overlay("heading", _draw_heading, "h", True),

@@ -18,7 +18,7 @@ import torch
 
 from wmas.render.camera import Camera
 from wmas.render.geometry import extract_geometry
-from wmas.render.hud import draw_hover_panel, draw_hud
+from wmas.render.hud import draw_help, draw_hover_panel, draw_hud
 from wmas.render.input import InteractionController, ViewState
 from wmas.render.layout import MosaicLayout, compute_mosaic_layout, tile_at
 from wmas.render.overlays import DEFAULT_ENABLED, _p, _r_px
@@ -56,13 +56,18 @@ class Viewer:
         self._camera: Camera | None = None
         self._layout: MosaicLayout | None = None
         self._window = None
+        self._controller: InteractionController | None = None
         self._step_count = 0
+        self._trail_history: list[np.ndarray] = []
 
     # ------------------------------------------------------------------ draw
 
     def _geometry(self, env_idx: int | None = None):
         idx = self.state.focus_env if env_idx is None else env_idx
-        return extract_geometry(self.env.world, idx, scenario=self.scenario)
+        g = extract_geometry(self.env.world, idx, scenario=self.scenario)
+        if env_idx is None and self.style.trajectory_mode != "none" and self._trail_history:
+            g.extras["trajectories"] = np.stack(self._trail_history, axis=1)
+        return g
 
     def _ensure_layout(self) -> MosaicLayout:
         if self._layout is None:
@@ -85,6 +90,55 @@ class Viewer:
     def _tile_env_at(self, screen_xy) -> int | None:
         return tile_at(self._ensure_layout(), screen_xy) if self.mosaic else None
 
+    def _interaction_controller(self, camera: Camera) -> InteractionController:
+        if self._controller is None:
+            self._controller = InteractionController(
+                self.state,
+                camera,
+                geometry_getter=self._geometry,
+                tile_resolver=self._tile_env_at,
+                on_drag_agent=self._write_agent_pos if self.allow_write_back else None,
+                on_drag_obstacle=self._write_obstacle_pos if self.allow_write_back else None,
+                on_place_goal=self._write_goal if self.allow_write_back else None,
+                on_cycle_trajectory=self._cycle_trajectory,
+                on_cycle_lidar=self._cycle_lidar,
+                on_cycle_color=self._cycle_color,
+            )
+        return self._controller
+
+    def _cycle_trajectory(self) -> None:
+        modes = ("none", "trail", "fade")
+        self.style.trajectory_mode = modes[
+            (modes.index(self.style.trajectory_mode) + 1) % len(modes)
+        ]
+        if self.style.trajectory_mode == "none":
+            self._trail_history.clear()
+
+    def _cycle_lidar(self) -> None:
+        modes = ("none", "rays", "area", "both")
+        self.style.lidar_mode = modes[(modes.index(self.style.lidar_mode) + 1) % len(modes)]
+
+    def _cycle_color(self) -> None:
+        modes = ("agent", "model")
+        self.style.color_mode = modes[(modes.index(self.style.color_mode) + 1) % len(modes)]
+
+    def _append_trail_sample(self) -> None:
+        if self.style.trajectory_mode == "none":
+            return
+        pos = self.env.world.state.pos[self.state.focus_env].detach().to("cpu").numpy().copy()
+        self._trail_history.append(pos)
+        if len(self._trail_history) > self.style.trajectory_len:
+            del self._trail_history[: len(self._trail_history) - self.style.trajectory_len]
+
+    def _apply_reset_request(self):
+        if not self.state.reset_requested:
+            return None
+        obs = self.env.reset()
+        self._step_count = 0
+        self._trail_history.clear()
+        self.state.reset_requested = False
+        return obs
+
     # ------------------------------------------------------------ write-back
 
     def _write_agent_pos(self, agent_idx: int, world_xy) -> None:
@@ -102,6 +156,8 @@ class Viewer:
             s.vel[e, agent_idx] = 0
             s.speed[e, agent_idx] = 0
             s.ang_vel[e, agent_idx] = 0
+            if self._trail_history:
+                self._trail_history[-1][agent_idx] = np.asarray(world_xy, dtype=np.float64)
             # Positions changed out of band; drop any reusable neighbor list.
             self.env.world.mark_pos_dirty()
 
@@ -115,11 +171,29 @@ class Viewer:
                 world_xy, dtype=self.env.dtype, device=self.env.device
             )
 
+    def _write_obstacle_pos(self, obstacle_idx: int, world_xy) -> None:
+        """Move an obstacle in the focus env and refresh the stepper obstacle buffers."""
+        world = self.env.world
+        if world.obstacle_pos is None or world.obstacle_radius is None:
+            return
+        with torch.no_grad():
+            world.obstacle_pos[self.state.focus_env, obstacle_idx] = torch.tensor(
+                world_xy, dtype=self.env.dtype, device=self.env.device
+            )
+            world.set_obstacles(
+                world.obstacle_pos,
+                world.obstacle_radius,
+                shape=world.obstacle_shape,
+                angle=world.obstacle_angle,
+                half_extents=world.obstacle_half_extents,
+            )
+
     def _draw(self, surface, geometry, camera, *, hud: bool, fps=None, clear: bool = True) -> None:
         draw_scene(surface, geometry, camera, self.state.enabled, self.style, clear=clear)
         if hud:
             draw_hud(surface, self.state, self.style, step=self._step_count, fps=fps)
             draw_hover_panel(surface, geometry, self.state.hover_agent, self.style)
+            draw_help(surface, self.state, self.style)
 
     def _draw_tile(self, pygame, surface, geometry, camera, rect, *, focused: bool) -> None:
         r = pygame.Rect(*rect)
@@ -183,9 +257,12 @@ class Viewer:
             pygame.display.init()
             self._window = pygame.display.set_mode(self.size)
             pygame.display.set_caption("wmas viewer")
+        camera = self._camera_for(self._geometry())
+        controller = self._interaction_controller(camera)
         for event in pygame.event.get():  # keep the window responsive / closeable
-            if event.type == pygame.QUIT:
-                self.state.quit = True
+            controller.handle_event(event)
+        self._apply_reset_request()
+        self._append_trail_sample()
         self._render_onto(pygame, self._window, hud=True)
         pygame.display.flip()
 
@@ -225,24 +302,21 @@ class Viewer:
         pygame.display.set_caption("wmas viewer")
         clock = pygame.time.Clock()
         camera = self._camera_for(self._geometry())
-        controller = InteractionController(
-            self.state,
-            camera,
-            geometry_getter=self._geometry,
-            tile_resolver=self._tile_env_at,
-            on_drag_agent=self._write_agent_pos if self.allow_write_back else None,
-            on_place_goal=self._write_goal if self.allow_write_back else None,
-        )
+        controller = self._interaction_controller(camera)
         obs = self.scenario.observations() if self.scenario is not None else None
         try:
             while not self.state.quit:
                 for event in pygame.event.get():
                     controller.handle_event(event)
+                reset_obs = self._apply_reset_request()
+                if reset_obs is not None:
+                    obs = reset_obs
                 done = max_steps is not None and self._step_count >= max_steps
                 if not self.state.paused and not done:
                     with torch.no_grad():
                         obs, *_ = self.env.step(self._actions(action_fn, obs))
                     self._step_count += 1
+                    self._append_trail_sample()
                 self._render_onto(pygame, window, hud=True, fps=clock.get_fps())
                 pygame.display.flip()
                 clock.tick(self.fps)
