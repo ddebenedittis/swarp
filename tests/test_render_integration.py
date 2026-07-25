@@ -63,6 +63,32 @@ def test_demo_mixed_model_env_exposes_distinct_agent_models():
     assert actions.shape == (1, 4, env.world.act_dim)
 
 
+def test_demo_drone_env_flies_to_its_goal_and_holds_altitude():
+    """The demo's drone controller must be stable: `--model drone` has to be watchable."""
+    import torch
+
+    from wmas.dynamics.base import DynamicsModel
+    from wmas.render.demo import _DRONE_HOVER_Z, build_env, goal_seeking_policy
+    from wmas.render.geometry import extract_geometry
+    from wmas.render.renderer import render_frame
+
+    env = build_env(2, 3, 1, "cpu", model="drone")
+    assert env.world.act_dim == 4  # four per-rotor thrusts
+    policy = goal_seeking_policy(env)
+    start = torch.linalg.norm(env.world.goals - env.world.state.pos, dim=-1).mean().item()
+    for _ in range(120):
+        env.step(policy(None))
+
+    state = env.world.state
+    assert torch.isfinite(state.pos).all() and torch.isfinite(state.attitude).all()
+    assert torch.linalg.norm(env.world.goals - state.pos, dim=-1).mean().item() < 0.1 * start
+    assert abs(state.z.mean().item() - _DRONE_HOVER_Z) < 0.05
+
+    g = extract_geometry(env.world, 0, scenario=env.scenario)
+    assert set(g.model.tolist()) == {int(DynamicsModel.DRONE)}
+    assert render_frame(g, size=(160, 160), overlays={"agents"}).shape == (160, 160, 3)
+
+
 # ---------------------------------------------------- Environment.render (VMAS)
 
 

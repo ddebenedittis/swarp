@@ -18,7 +18,7 @@ from dataclasses import dataclass
 import numpy as np
 import pygame
 
-from wmas.dynamics.base import P_MAX_STEER, P_THRUST_MAX
+from wmas.dynamics.base import P_LF, P_LR, P_MAX_STEER, P_THRUST_MAX
 from wmas.render.camera import Camera
 from wmas.render.geometry import RenderGeometry
 from wmas.render.style import Style
@@ -210,35 +210,65 @@ def _agent_points(pos, theta: float, radius: float, factors) -> np.ndarray:
     return np.asarray(pos, dtype=np.float64) + radius * (f @ rot.T)
 
 
-# Body-frame silhouettes, in units of agent radius. Keyed by DynamicsModel tag; a model with no
-# entry falls back to a plain circle of the agent radius.
-_BODY_SHAPES: dict[int, np.ndarray] = {
-    1: np.array(  # diff-drive: compact body with two side tracks
+def _rounded_rect_factors(hx: float, hy: float, corner: float, arc: int = 4) -> np.ndarray:
+    """Body-frame polygon of a rounded box, in units of agent radius, CCW from the +x face.
+
+    ``corner`` is clamped to fit the box, so an oversized value degrades to a stadium instead
+    of self-intersecting. Four samples per quarter turn is plenty: the viewer has no
+    anti-aliased primitives, so smooth corners come from the supersample downscale in
+    :func:`renderer.draw_supersampled`, not from vertex count.
+    """
+    c = max(0.0, min(corner, hx, hy))
+    ax, ay = hx - c, hy - c
+    if c == 0.0:
+        return np.array([(hx, hy), (-hx, hy), (-hx, -hy), (hx, -hy)], dtype=np.float64)
+    sweep = np.linspace(0.0, 0.5 * math.pi, arc + 2)
+    quarters = ((ax, ay, 0.0), (-ax, ay, 0.5), (-ax, -ay, 1.0), (ax, -ay, 1.5))
+    return np.concatenate(
         [
-            (0.95, 0.55),
-            (0.55, 0.9),
-            (-0.65, 0.9),
-            (-0.95, 0.55),
-            (-0.95, -0.55),
-            (-0.65, -0.9),
-            (0.55, -0.9),
-            (0.95, -0.55),
+            np.stack(
+                (
+                    cx + c * np.cos(phase * math.pi + sweep),
+                    cy + c * np.sin(phase * math.pi + sweep),
+                ),
+                axis=-1,
+            )
+            for cx, cy, phase in quarters
         ]
-    ),
-    2: np.array(  # kinematic bicycle: stylized car
-        [
-            (1.75, 0.0),
-            (1.25, 0.65),
-            (0.25, 0.8),
-            (-1.25, 0.65),
-            (-1.55, 0.4),
-            (-1.55, -0.4),
-            (-1.25, -0.65),
-            (0.25, -0.8),
-            (1.25, -0.65),
-        ]
-    ),
+    )
+
+
+# Body boxes as (half_length, half_width, corner_radius) in units of agent radius, keyed by
+# DynamicsModel tag. Holonomic (0) has no entry: an omnidirectional agent *is* its circle.
+_BODY_BOX: dict[int, tuple[float, float, float]] = {
+    1: (1.05, 0.72, 0.26),  # diff-drive: rounded rectangle, wheels at the rear
+    2: (1.70, 0.70, 0.34),  # kinematic bicycle: longer chassis, wheels front and rear
+    3: (0.85, 0.85, 0.30),  # drone: rounded square frame carrying four rotors
 }
+
+# Body-frame silhouettes, in units of agent radius. A model with no entry falls back to a plain
+# circle of the agent radius.
+_BODY_SHAPES: dict[int, np.ndarray] = {
+    tag: _rounded_rect_factors(*box) for tag, box in _BODY_BOX.items()
+}
+
+# Wheels straddle the chassis edge — half the tread's width falls outside the body, so they read
+# as wheels rather than as stripes painted on it. All four numbers are in units of agent radius.
+_DIFF_WHEEL = (-0.58, 0.86, 0.36, 0.17)  # (hub x, |y|, half length, half width) of a rear wheel
+_BICYCLE_WHEEL_Y = 0.84
+_BICYCLE_WHEEL_HALF_LEN = 0.42
+_BICYCLE_WHEEL_HALF_W = 0.16
+_BICYCLE_AXLE_SPAN = 2.5  # drawn front-to-rear axle distance, in units of agent radius
+_DRONE_ARM = 1.5  # rotor distance from the hub, in units of agent radius
+
+
+def _chevron_factors(hx: float) -> np.ndarray:
+    """Forward-pointing triangle in the front third of a body of half-length ``hx``."""
+    return np.array([(hx - 0.22, 0.0), (hx - 0.78, 0.40), (hx - 0.78, -0.40)], dtype=np.float64)
+
+
+# The front cue: which end of the chassis is the nose, for the models that have one.
+_CHEVRONS: dict[int, np.ndarray] = {tag: _chevron_factors(box[0]) for tag, box in _BODY_BOX.items()}
 
 
 def _body_polygon(g, i: int) -> np.ndarray | None:
@@ -249,40 +279,111 @@ def _body_polygon(g, i: int) -> np.ndarray | None:
     return _agent_points(g.pos[i], float(g.theta[i]), float(g.radius[i]), shape)
 
 
-def _draw_agent_decorations(surface, g, camera, style, i: int, r: int, color) -> None:
-    """Per-model detail drawn on top of an agent's filled body (tracks, cabin, wheels, arms)."""
-    pos, theta, radius = g.pos[i], float(g.theta[i]), float(g.radius[i])
+def _body_pts(camera: Camera, g, i: int, factors) -> list[list[int]]:
+    """Screen points of body-frame ``factors`` on agent ``i`` — the decoration workhorse."""
+    return _pts(camera, _agent_points(g.pos[i], float(g.theta[i]), float(g.radius[i]), factors))
+
+
+def _steer_angle(g, i: int) -> float:
+    """Commanded steering angle of bicycle agent ``i``, clamped to its ``max_steer``.
+
+    Zero before the first step or when the action vector is too short: a straight wheel is the
+    honest default when no command has been applied yet.
+    """
+    if g.action is None:
+        return 0.0
+    act = np.asarray(g.action, dtype=np.float64)
+    if act.ndim != 2 or act.shape[1] < 2 or i >= act.shape[0]:
+        return 0.0
+    steer = float(act[i, 1])
+    if g.agent_params is not None:
+        max_steer = float(g.agent_params[i, P_MAX_STEER])
+        if max_steer > 0.0:  # a bad policy must not draw a 90-degree wheel
+            steer = max(-max_steer, min(max_steer, steer))
+    return steer
+
+
+def _bicycle_axles(g, i: int) -> tuple[float, float]:
+    """Body-frame ``(front_x, rear_x)`` of the two axles, from the agent's own ``l_f``/``l_r``.
+
+    The CoG sits at the body origin exactly as in the kinematic bicycle kernel, so the axles
+    are placed at ``+l_f`` / ``-l_r`` rescaled to :data:`_BICYCLE_AXLE_SPAN` — the *ratio* is
+    faithful, the absolute size stays tied to the collision radius. Both are clamped inside the
+    chassis so a lopsided CoG cannot push an axle off the body.
+    """
+    hx = _BODY_BOX[2][0]
+    l_f = l_r = 1.0
+    if g.agent_params is not None:
+        l_f, l_r = float(g.agent_params[i, P_LF]), float(g.agent_params[i, P_LR])
+    total = l_f + l_r
+    if total <= 0.0:  # AgentConfig forbids this, but the renderer must never divide by zero
+        l_f = l_r = 1.0
+        total = 2.0
+    scale = _BICYCLE_AXLE_SPAN / total
+    limit = hx - 0.20
+    return min(limit, scale * l_f), -min(limit, scale * l_r)
+
+
+def _draw_wheel(surface, camera, g, i: int, hub, angle, half_len, half_w, color) -> None:
+    """A wheel as a *rectangle* centered on body-frame ``hub``, ``angle`` off the body heading.
+
+    A polygon, not a thick line: ``pygame.draw.line`` thickens a line by extending it along one
+    screen axis, so a rotated bar rasterizes as a parallelogram with axis-aligned end caps —
+    visibly trapezoidal on a turned wheel. Lengths are in units of agent radius, so a wheel
+    scales with zoom and supersampling like the rest of the sprite. Below a pixel of tread width
+    it falls back to a hairline, where the shape can no longer resolve anyway.
+    """
+    theta, radius = float(g.theta[i]), float(g.radius[i])
+    center = _agent_points(g.pos[i], theta, radius, [hub])[0]
+    if _r_px(camera, half_w * radius, floor=0) < 1:
+        span = half_len * radius * np.array([math.cos(theta + angle), math.sin(theta + angle)])
+        pts = _pts(camera, np.stack((center + span, center - span)))
+        pygame.draw.line(surface, color, pts[0], pts[1], 1)
+        return
+    corners = _rotated_rect(center, theta + angle, half_len * radius, half_w * radius)
+    pygame.draw.polygon(surface, color, _pts(camera, corners))
+
+
+def _draw_agent_decorations(surface, g, camera, style, i: int, r: int) -> None:
+    """Per-model detail on top of an agent's filled body (wheels, front chevron, rotors)."""
     model = int(g.model[i])
-    wheel_w = max(2, r // 2)
-    if model == 1:  # diff-drive: two side tracks and a nose dot
-        for y in (-1.05, 1.05):
-            track = _pts(camera, _agent_points(pos, theta, radius, [(0.65, y), (-0.65, y)]))
-            pygame.draw.line(surface, style.agent_outline, track[0], track[1], wheel_w)
-        nose = _pts(camera, _agent_points(pos, theta, radius, [(0.55, 0.0)]))
-        pygame.draw.circle(surface, style.agent_outline, nose[0], max(1, r // 5))
-    elif model == 2:  # kinematic bicycle: cabin, four wheels, headlight
-        cabin = _pts(
-            camera,
-            _agent_points(
-                pos, theta, radius, [(0.55, 0.38), (-0.35, 0.42), (-0.6, -0.42), (0.55, -0.38)]
-            ),
-        )
-        pygame.draw.polygon(surface, style.background, cabin)
-        pygame.draw.polygon(surface, style.agent_outline, cabin, style.agent_outline_width)
-        for x in (-0.95, 0.95):
-            for y in (-0.82, 0.82):
-                wheel = _pts(
-                    camera, _agent_points(pos, theta, radius, [(x + 0.25, y), (x - 0.25, y)])
+    if model == 1:  # diff-drive: two rear wheels and a forward chevron
+        hub_x, wheel_y, half_len, half_w = _DIFF_WHEEL
+        for y in (-wheel_y, wheel_y):
+            _draw_wheel(
+                surface, camera, g, i, (hub_x, y), 0.0, half_len, half_w, style.agent_outline
+            )
+        pygame.draw.polygon(surface, style.agent_outline, _body_pts(camera, g, i, _CHEVRONS[1]))
+    elif model == 2:  # bicycle: rear axle, steered front axle, forward chevron
+        front_x, rear_x = _bicycle_axles(g, i)
+        steer = _steer_angle(g, i)
+        for x, angle in ((rear_x, 0.0), (front_x, steer)):
+            for y in (-_BICYCLE_WHEEL_Y, _BICYCLE_WHEEL_Y):
+                _draw_wheel(
+                    surface,
+                    camera,
+                    g,
+                    i,
+                    (x, y),
+                    angle,
+                    _BICYCLE_WHEEL_HALF_LEN,
+                    _BICYCLE_WHEEL_HALF_W,
+                    style.agent_outline,
                 )
-                pygame.draw.line(surface, style.agent_outline, wheel[0], wheel[1], wheel_w)
-        front = _pts(camera, _agent_points(pos, theta, radius, [(1.2, 0.0)]))
-        pygame.draw.circle(surface, style.background, front[0], max(1, r // 5))
-    elif model == 3:  # drone placeholder: quadrotor cross
-        for a in (0.0, math.pi / 2):
-            arm = _pts(camera, _agent_points(pos, theta + a, radius, [(1.5, 0.0), (-1.5, 0.0)]))
-            pygame.draw.line(surface, color, arm[0], arm[1], style.line_width)
-            for tip in arm:
-                pygame.draw.circle(surface, color, tip, max(2, r // 3), style.agent_outline_width)
+        pygame.draw.polygon(surface, style.agent_outline, _body_pts(camera, g, i, _CHEVRONS[2]))
+    elif model == 3:  # drone: quadrotor cross, front rotor filled
+        # No chevron: the drone branch holds `theta` fixed (yaw lives in the attitude quaternion,
+        # which RenderGeometry does not carry), so a rotating front cue would be misleading. The
+        # filled +x rotor is a body-frame fact and stays honest.
+        rotor = max(style.agent_min_px, r // 3)
+        a = _DRONE_ARM
+        tips = _body_pts(camera, g, i, [(a, 0.0), (0.0, a), (-a, 0.0), (0.0, -a)])
+        center = _p(camera, g.pos[i])
+        for tip in tips:
+            pygame.draw.line(surface, style.agent_outline, center, tip, style.line_width)
+        pygame.draw.circle(surface, style.agent_outline, tips[0], rotor)  # +x rotor: the front
+        for tip in tips[1:]:
+            pygame.draw.circle(surface, style.agent_outline, tip, rotor, style.agent_outline_width)
 
 
 def _contact_mask(g, style) -> np.ndarray:
@@ -349,14 +450,12 @@ def _draw_agents(surface, g, camera, style):
             else:
                 pygame.draw.polygon(surface, style.agent_halo, pts, w)
 
-        if int(g.model[i]) == 3:  # drone: a hub, the arms are decorations
-            pygame.draw.circle(surface, color, center, max(2, r // 2))
-        elif pts is None:
+        if pts is None:
             pygame.draw.circle(surface, color, center, r)
         else:
             pygame.draw.polygon(surface, color, pts)
 
-        _draw_agent_decorations(surface, g, camera, style, i, r, color)
+        _draw_agent_decorations(surface, g, camera, style, i, r)
 
         outline = style.contact_color if contact[i] else style.agent_outline
         width = style.contact_outline_width if contact[i] else style.agent_outline_width
@@ -428,9 +527,10 @@ def _draw_action(surface, g, camera, style):
                 style.line_width,
                 filled=int(g.ctrl_mode[i]) == 0,
             )
-        elif model == 1:  # diff-drive: per-track bars, at the offsets the sprite's tracks use
+        elif model == 1:  # diff-drive: per-wheel bars, at the offsets the sprite's wheels use
             v, omega = float(act[i, 0]), float(act[i, 1])
-            for y, wheel_v in ((-1.05, v - omega * radius), (1.05, v + omega * radius)):
+            wheel_y = _DIFF_WHEEL[1]
+            for y, wheel_v in ((-wheel_y, v - omega * radius), (wheel_y, v + omega * radius)):
                 reach = wheel_v * style.action_scale
                 bar = _pts(camera, _agent_points(g.pos[i], theta, radius, [(0.0, y)]))
                 tip = _p(
@@ -440,17 +540,23 @@ def _draw_action(surface, g, camera, style):
                 )
                 color = style.action_color if wheel_v >= 0.0 else style.action_brake_color
                 pygame.draw.line(surface, color, bar[0], tip, style.action_bar_px)
-        elif model == 2:  # bicycle: steered front wheels + a longitudinal accel arrow
-            accel, steer = float(act[i, 0]), float(act[i, 1])
-            if params is not None:
-                max_steer = float(params[i, P_MAX_STEER])
-                if max_steer > 0.0:  # a bad policy must not draw a 90-degree wheel
-                    steer = max(-max_steer, min(max_steer, steer))
-            for y in (-0.82, 0.82):
-                hub = _agent_points(g.pos[i], theta, radius, [(0.95, y)])[0]
-                span = 0.25 * radius * np.array([math.cos(theta + steer), math.sin(theta + steer)])
-                wheel = _pts(camera, np.stack((hub + span, hub - span)))
-                pygame.draw.line(surface, style.action_color, wheel[0], wheel[1], max(2, r_px // 2))
+        elif model == 2:  # bicycle: the steered front wheels, highlighted, + an accel arrow
+            accel, steer = float(act[i, 0]), _steer_angle(g, i)
+            front_x, _ = _bicycle_axles(g, i)
+            for y in (-_BICYCLE_WHEEL_Y, _BICYCLE_WHEEL_Y):
+                # Repaint the sprite's own front wheels in the action color: same geometry, so
+                # the command reads as a highlight rather than as a second pair of wheels.
+                _draw_wheel(
+                    surface,
+                    camera,
+                    g,
+                    i,
+                    (front_x, y),
+                    steer,
+                    _BICYCLE_WHEEL_HALF_LEN,
+                    _BICYCLE_WHEEL_HALF_W,
+                    style.action_color,
+                )
             reach = accel * style.action_accel_scale
             tip = _p(camera, g.pos[i] + reach * np.array([math.cos(theta), math.sin(theta)]))
             color = style.action_color if accel >= 0.0 else style.action_brake_color

@@ -16,7 +16,7 @@ class DynamicsModel(IntEnum):
     HOLONOMIC = 0
     DIFF_DRIVE = 1
     KINEMATIC_BICYCLE = 2
-    DRONE = 3  # placeholder, see wmas.dynamics.drone
+    DRONE = 3  # 6-DOF quadrotor, see wmas.dynamics.drone
 
 
 #: Number of scalar action slots each model reads from the action vector. All
@@ -26,7 +26,7 @@ MODEL_ACTION_DIM = {
     "HOLONOMIC": 2,
     "DIFF_DRIVE": 2,
     "KINEMATIC_BICYCLE": 2,
-    "DRONE": 4,  # reserved for the 6-DOF drone slot (rotor commands)
+    "DRONE": 4,  # the 6-DOF drone's four per-rotor thrust commands
 }
 
 
@@ -41,6 +41,7 @@ class ControlMode(IntEnum):
     HOLONOMIC: VELOCITY -> (vx, vy), ACCELERATION -> (ax, ay).
     DIFF_DRIVE: VELOCITY -> (v, omega), ACCELERATION -> (a, alpha).
     KINEMATIC_BICYCLE: always (acceleration, steering angle); the flag is ignored.
+    DRONE: always four per-rotor thrusts; the flag is ignored.
     """
 
     VELOCITY = 0
@@ -48,7 +49,7 @@ class ControlMode(IntEnum):
 
 
 class Integrator(Enum):
-    """Time integrator for the dynamics. RK4 is a hook for a follow-up release."""
+    """Time integrator for the dynamics: semi-implicit Euler, or classical RK4."""
 
     EULER = "euler"
     RK4 = "rk4"

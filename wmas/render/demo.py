@@ -21,12 +21,19 @@ from wmas.render.overlays import DEFAULT_ENABLED
 from wmas.render.style import THEMES
 from wmas.sensors import Lidar
 
-MODEL_CHOICES = ("holonomic", "diff-drive", "bicycle", "mixed")
+MODEL_CHOICES = ("holonomic", "diff-drive", "bicycle", "drone", "mixed")
 MODEL_BY_NAME = {
     "holonomic": DynamicsModel.HOLONOMIC,
     "diff-drive": DynamicsModel.DIFF_DRIVE,
     "bicycle": DynamicsModel.KINEMATIC_BICYCLE,
+    "drone": DynamicsModel.DRONE,
 }
+
+# The drone's attitude loop is far stiffer than the 2D models': with inertia ~1e-2 kg m^2 a
+# 10 Hz control step diverges. Substepping the physics keeps the demo's dt while integrating
+# the quadrotor at 100 Hz.
+_DRONE_SUBSTEPS = 10
+_DRONE_HOVER_Z = 1.0  # altitude the demo controller holds, in metres
 
 
 class VisualizationScenario(NavigationScenario):
@@ -137,9 +144,66 @@ def build_env(
         lidar_range=lidar_range,
         model=MODEL_BY_NAME.get(model, DynamicsModel.HOLONOMIC),
     )
-    env = Environment(scenario, n_envs=n_envs, device=device, dt=0.1, seed=0)
+    substeps = _DRONE_SUBSTEPS if model == "drone" else 1
+    env = Environment(scenario, n_envs=n_envs, device=device, dt=0.1, substeps=substeps, seed=0)
     env.reset()
     return env
+
+
+def _drone_hover_action(world: World, i: int, cfg: AgentConfig, to_goal) -> torch.Tensor:
+    """Cascaded position -> tilt -> rotor-thrust controller for one drone agent.
+
+    Near-hover linearization: a horizontal acceleration ``a`` needs a tilt of ``a / g``, tracked
+    by a PD on (desired angle, body rate). The resulting body torques are inverted through the
+    "+"-layout mixer of ``dynamics.kernels._drone_rates`` — rotors 0/2 on the body x-axis, 1/3
+    on y — and clamped to the per-rotor thrust limit the kernel enforces anyway.
+    """
+    st = world.state
+    opts = {"device": to_goal.device, "dtype": to_goal.dtype}
+    zeros = torch.zeros(to_goal.shape[0], **opts)
+    # The drone fields are None until the first step materializes them (fill_state_defaults).
+    z = st.z[:, i] if st.z is not None else zeros
+    vz = st.vz[:, i] if st.vz is not None else zeros
+    rates = st.body_rates[:, i] if st.body_rates is not None else zeros[:, None].expand(-1, 3)
+    if st.attitude is not None:
+        qx, qy, qz, qw = (st.attitude[:, i, k] for k in range(4))
+    else:
+        qx, qy, qz, qw = zeros, zeros, zeros, torch.ones_like(zeros)  # identity attitude
+
+    roll = torch.atan2(2.0 * (qw * qx + qy * qz), 1.0 - 2.0 * (qx * qx + qy * qy))
+    pitch = torch.asin(torch.clamp(2.0 * (qw * qy - qz * qx), -1.0, 1.0))
+
+    # Position -> desired horizontal acceleration -> desired tilt (small angle, yaw ~ 0).
+    accel = torch.clamp(2.0 * to_goal - 3.0 * st.vel[:, i], -0.5 * cfg.gravity, 0.5 * cfg.gravity)
+    max_tilt = 0.35
+    pitch_des = torch.clamp(accel[:, 0] / cfg.gravity, -max_tilt, max_tilt)
+    roll_des = torch.clamp(-accel[:, 1] / cfg.gravity, -max_tilt, max_tilt)
+
+    kp_att, kd_att = 40.0, 8.0  # stiff, hence _DRONE_SUBSTEPS
+    tau_x = cfg.inertia_xx * (kp_att * (roll_des - roll) - kd_att * rates[:, 0])
+    tau_y = cfg.inertia_yy * (kp_att * (pitch_des - pitch) - kd_att * rates[:, 1])
+    tau_z = cfg.inertia_zz * (-kd_att * rates[:, 2])  # no yaw target: just damp it
+
+    # Altitude hold, divided back out by the lean that tilts thrust away from world +z.
+    lean = torch.clamp(torch.cos(roll) * torch.cos(pitch), min=0.5)
+    thrust = cfg.mass * (cfg.gravity + 4.0 * (_DRONE_HOVER_Z - z) - 3.0 * vz) / lean
+
+    # Invert the mixer: T = sum(f), tau_x = arm(f1 - f3), tau_y = arm(f2 - f0),
+    # tau_z = kappa(f0 - f1 + f2 - f3).
+    quarter = 0.25 * thrust
+    roll_pair = tau_x / (2.0 * cfg.arm_length)
+    pitch_pair = tau_y / (2.0 * cfg.arm_length)
+    yaw_quarter = tau_z / (4.0 * cfg.torque_coeff)
+    rotors = torch.stack(
+        (
+            quarter - pitch_pair + yaw_quarter,
+            quarter + roll_pair - yaw_quarter,
+            quarter + pitch_pair + yaw_quarter,
+            quarter - roll_pair - yaw_quarter,
+        ),
+        dim=-1,
+    )
+    return rotors.clamp(0.0, cfg.thrust_max)
 
 
 def goal_seeking_policy(env: Environment):
@@ -169,6 +233,8 @@ def goal_seeking_policy(env: Environment):
                     dist[:, i] - world.state.speed[:, i], -cfg.max_accel, cfg.max_accel
                 )
                 actions[:, i, 1] = torch.clamp(heading_err[:, i], -cfg.max_steer, cfg.max_steer)
+            elif cfg.model == DynamicsModel.DRONE:
+                actions[:, i, :4] = _drone_hover_action(world, i, cfg, to_goal[:, i])
         return actions
 
     return policy

@@ -444,6 +444,124 @@ def test_contact_highlight_changes_pixels():
     assert not np.array_equal(off, on)
 
 
+# ------------------------------------------------------- per-model agent sprites
+
+
+def _single_agent_geometry(model: int):
+    """One centered agent of ``model``, isolated from goals/obstacles/neighbors."""
+    g = _geometry(n_agents=1, n_obstacles=0)
+    g.pos[0] = (0.0, 0.0)
+    g.theta[0] = 0.0
+    g.model[0] = model
+    g.goals = None
+    g.obstacle_pos = None
+    g.edges = np.empty((0, 2), dtype=np.int64)
+    return g
+
+
+_SPRITE_STYLE = Style(depth_cue="none", supersample=1)
+
+
+def _sprite_frame(g):
+    return render_frame(g, size=(240, 240), overlays={"agents"}, style=_SPRITE_STYLE)
+
+
+def test_holonomic_body_is_orientation_free():
+    """An omnidirectional agent is a circle: rotating it must not change a single pixel."""
+    g = _single_agent_geometry(0)
+    base = _sprite_frame(g)
+    for theta in (0.3, 1.0, -2.2, np.pi):
+        g.theta[0] = theta
+        assert np.array_equal(base, _sprite_frame(g)), theta
+
+
+@pytest.mark.parametrize("model", [1, 2, 3])
+def test_oriented_bodies_rotate_with_theta(model):
+    g = _single_agent_geometry(model)
+    base = _sprite_frame(g)
+    for theta in (0.4, 1.2, -2.0):
+        g.theta[0] = theta
+        assert not np.array_equal(base, _sprite_frame(g)), theta
+
+
+@pytest.mark.parametrize("model", [1, 2, 3])
+def test_non_holonomic_bodies_differ_from_a_plain_circle(model):
+    """Each non-holonomic model draws its own silhouette, not the holonomic circle fallback."""
+    circle = _sprite_frame(_single_agent_geometry(0))
+    g = _single_agent_geometry(model)
+    assert not np.array_equal(circle, _sprite_frame(g))
+
+
+def test_bicycle_front_wheel_follows_the_commanded_steering():
+    from wmas.dynamics.base import P_MAX_STEER
+
+    g = _single_agent_geometry(2)
+    max_steer = float(g.agent_params[0, P_MAX_STEER])
+    assert max_steer > 0.0
+    frames = []
+    for steer in (-max_steer, 0.0, max_steer):
+        g.action = np.array([[0.0, steer]])
+        frames.append(_sprite_frame(g))
+    assert not np.array_equal(frames[0], frames[1])
+    assert not np.array_equal(frames[1], frames[2])
+    assert not np.array_equal(frames[0], frames[2])
+
+
+def test_bicycle_axles_follow_l_f_over_l_r():
+    from wmas.dynamics.base import P_LF, P_LR
+    from wmas.render.overlays import _BICYCLE_AXLE_SPAN, _bicycle_axles
+
+    g = _single_agent_geometry(2)
+    g.agent_params[0, P_LF] = g.agent_params[0, P_LR] = 0.1
+    front, rear = _bicycle_axles(g, 0)
+    assert front == pytest.approx(-rear)  # symmetric CoG -> symmetric axles
+    assert front - rear == pytest.approx(_BICYCLE_AXLE_SPAN)
+
+    g.agent_params[0, P_LF] = 0.3  # CoG pushed toward the rear axle
+    front_biased, rear_biased = _bicycle_axles(g, 0)
+    assert front_biased > front and rear_biased > rear
+
+    g.agent_params[0, P_LF] = g.agent_params[0, P_LR] = 0.0  # never divide by zero
+    assert _bicycle_axles(g, 0) == pytest.approx((front, rear))
+
+
+def test_steer_angle_is_clamped_and_zero_without_an_action():
+    from wmas.dynamics.base import P_MAX_STEER
+    from wmas.render.overlays import _steer_angle
+
+    g = _single_agent_geometry(2)
+    max_steer = float(g.agent_params[0, P_MAX_STEER])
+    assert _steer_angle(g, 0) == 0.0  # no action applied yet
+    g.action = np.array([[0.0, 10.0 * max_steer]])
+    assert _steer_angle(g, 0) == pytest.approx(max_steer)
+    g.action = np.array([[0.0]])  # too narrow to carry a steering column
+    assert _steer_angle(g, 0) == 0.0
+
+
+def test_rounded_rect_factors_stay_inside_the_box_and_smooth_the_corners():
+    from wmas.render.overlays import _rounded_rect_factors
+
+    pts = _rounded_rect_factors(1.6, 0.75, 0.45)
+    assert len(pts) > 4  # corners are sampled, not cut
+    assert np.abs(pts[:, 0]).max() == pytest.approx(1.6)
+    assert np.abs(pts[:, 1]).max() == pytest.approx(0.75)
+    assert not np.any((np.abs(pts[:, 0]) > 1.6 + 1e-9) | (np.abs(pts[:, 1]) > 0.75 + 1e-9))
+    # No vertex lands on a sharp corner of the enclosing box.
+    assert np.min(np.hypot(np.abs(pts[:, 0]) - 1.6, np.abs(pts[:, 1]) - 0.75)) > 1e-3
+    # An oversized corner radius degrades to a stadium instead of self-intersecting.
+    stadium = _rounded_rect_factors(1.0, 0.5, 10.0)
+    assert np.abs(stadium[:, 1]).max() == pytest.approx(0.5)
+
+
+def test_hover_panel_names_the_dynamics_model():
+    from wmas.render.hud import _model_name
+
+    assert _model_name(0) == "holonomic"
+    assert _model_name(2) == "kinematic_bicycle"
+    assert _model_name(3) == "drone"
+    assert _model_name(99) == "99"  # an unknown tag degrades to the raw int, never raises
+
+
 def test_dashed_segments_cover_the_line_in_periodic_pieces():
     from wmas.render.overlays import _dashed_segments
 

@@ -9,10 +9,19 @@ from __future__ import annotations
 import numpy as np
 import pygame
 
+from wmas.dynamics.base import DynamicsModel
 from wmas.render.geometry import RenderGeometry
 from wmas.render.input import ViewState
 from wmas.render.overlays import OVERLAYS, _get_font
 from wmas.render.style import Style
+
+
+def _model_name(tag: int) -> str:
+    """``DynamicsModel`` tag as a readable name, falling back to the raw int if unknown."""
+    try:
+        return DynamicsModel(int(tag)).name.lower()
+    except ValueError:
+        return str(int(tag))
 
 
 def _blit_lines(surface, font, lines, color, origin) -> None:
@@ -161,7 +170,7 @@ def draw_hover_panel(
         f"pos ({p[0]:+.2f}, {p[1]:+.2f})",
         f"vel ({v[0]:+.2f}, {v[1]:+.2f})",
         f"spd {speed:.2f}",
-        f"model {int(geometry.model[agent_idx])}",
+        f"model {_model_name(geometry.model[agent_idx])}",
     ]
     pad = style.hover_pad
     line_h = font.get_height()
