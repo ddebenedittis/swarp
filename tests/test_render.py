@@ -106,6 +106,60 @@ def test_camera_world_to_screen_is_vectorized():
     np.testing.assert_allclose(out[0], [200.0, 200.0], atol=1e-6)
 
 
+def test_camera_scaled_is_an_exact_magnification():
+    cam = Camera(bounds=(-2.0, 1.0, -1.0, 3.0), viewport=(10, 20, 640, 480), zoom=1.7)
+    cam.pan(37.0, -19.0)
+    pts = np.array([[0.5, -0.3], [-1.9, 2.9], [0.0, 0.0]])
+    for f in (2, 3):
+        np.testing.assert_allclose(cam.scaled(f).world_to_screen(pts), f * cam.world_to_screen(pts))
+    assert cam.scaled(1) is cam
+    # the original must be untouched: the interaction controller holds this exact object
+    assert (cam.pan_x, cam.pan_y, cam.zoom) == (37.0, -19.0, 1.7)
+
+
+def test_batch_extraction_matches_per_env_extraction():
+    from wmas.render.geometry import extract_geometry_batch
+
+    env, scenario = make_env(n_envs=5, n_agents=4)
+    idx = [0, 2, 4]
+    batch = extract_geometry_batch(env.world, idx, scenario=scenario)
+    assert len(batch) == 3
+    for k, env_idx in enumerate(idx):
+        one = extract_geometry(env.world, env_idx, scenario=scenario)
+        for name in ("pos", "theta", "vel", "radius", "model", "goals", "obstacle_pos", "edges"):
+            np.testing.assert_array_equal(
+                getattr(batch[k], name), getattr(one, name), err_msg=f"{name} @ env {env_idx}"
+            )
+        assert batch[k].bounds == one.bounds
+
+
+def test_batch_extraction_can_skip_edges_and_extras():
+    from wmas.render.geometry import extract_geometry_batch
+
+    env, scenario = make_env(n_envs=4, n_agents=4)
+    calls = 0
+    real = env.world.neighbors
+
+    def counting(*a, **kw):
+        nonlocal calls
+        calls += 1
+        return real(*a, **kw)
+
+    env.world.neighbors = counting
+    out = extract_geometry_batch(
+        env.world, [0, 1, 2], scenario=scenario, with_edges=False, with_extras=False
+    )
+    assert calls == 0  # no neighbor-grid rebuild
+    assert all(g.edges.shape == (0, 2) and g.extras == {} for g in out)
+
+
+def test_batch_extraction_of_empty_index_list():
+    env, scenario = make_env()
+    from wmas.render.geometry import extract_geometry_batch
+
+    assert extract_geometry_batch(env.world, [], scenario=scenario) == []
+
+
 # --------------------------------------------------------------- renderer
 
 
@@ -239,6 +293,60 @@ def test_render_frame_trajectory_overlay_changes_pixels():
         style=Style(trajectory_mode="fade"),
     )
     assert not np.array_equal(without, with_trail)
+
+
+# ----------------------------------------------------------- supersampling
+
+
+def test_pts_is_pixel_identical_to_the_scalar_transform():
+    from wmas.render.overlays import _p, _pts
+
+    cam = Camera(bounds=(-1.0, 2.0, -1.0, 1.0), viewport=(5, 7, 333, 211), zoom=1.3)
+    cam.pan(11.0, -23.0)
+    rng = np.random.default_rng(0)
+    pts = rng.uniform(-1.5, 1.5, size=(64, 2))
+    assert _pts(cam, pts) == [list(_p(cam, p)) for p in pts]
+
+
+def test_supersampled_frame_keeps_shape_and_antialiases():
+    g = _geometry()
+    plain = render_frame(g, size=(200, 200), style=Style(supersample=1))
+    aa = render_frame(g, size=(200, 200), style=Style(supersample=2))
+    assert aa.shape == plain.shape == (200, 200, 3)
+    assert not np.array_equal(aa, plain)
+    # AA blends edge pixels, so the palette grows well beyond the flat-fill colour count
+    assert len(np.unique(aa.reshape(-1, 3), axis=0)) > len(np.unique(plain.reshape(-1, 3), axis=0))
+
+
+def test_supersampled_frame_is_deterministic():
+    g = _geometry()
+    style = Style(supersample=2)
+    assert np.array_equal(
+        render_frame(g, size=(160, 160), style=style),
+        render_frame(g, size=(160, 160), style=style),
+    )
+
+
+def test_alpha_layer_is_reused_and_cleared():
+    import pygame
+
+    from wmas.render.overlays import _alpha_layer
+
+    first = _alpha_layer("t", (16, 16))
+    pygame.draw.rect(first, (255, 0, 0, 255), pygame.Rect(0, 0, 8, 8))
+    again = _alpha_layer("t", (16, 16))
+    assert again is first  # reused, not reallocated
+    assert again.get_at((1, 1)) == (0, 0, 0, 0)  # and cleared on handout
+    assert _alpha_layer("other", (16, 16)) is not first  # tags do not share a live layer
+
+
+def test_cached_alpha_layer_keeps_trajectory_rendering_deterministic():
+    g = _geometry(n_agents=1)
+    g.extras["trajectories"] = np.asarray([[[0.0, 0.0], [0.2, 0.0], [0.3, 0.2]]])
+    style = Style(trajectory_mode="fade")
+    a = render_frame(g, size=(200, 200), overlays={"agents", "trajectories"}, style=style)
+    b = render_frame(g, size=(200, 200), overlays={"agents", "trajectories"}, style=style)
+    assert np.array_equal(a, b)  # a stale, uncleared layer would leak into the second frame
 
 
 # ------------------------------------------------------------------ video

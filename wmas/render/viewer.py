@@ -17,12 +17,17 @@ import numpy as np
 import torch
 
 from wmas.render.camera import Camera
-from wmas.render.geometry import extract_geometry
+from wmas.render.geometry import extract_geometry, extract_geometry_batch
 from wmas.render.hud import draw_help, draw_hover_panel, draw_hud
 from wmas.render.input import InteractionController, ViewState
 from wmas.render.layout import MosaicLayout, compute_mosaic_layout, tile_at
 from wmas.render.overlays import DEFAULT_ENABLED, _p, _r_px
-from wmas.render.renderer import _bounds_from_geometry, _ensure_pygame, draw_scene
+from wmas.render.renderer import (
+    _bounds_from_geometry,
+    _ensure_pygame,
+    draw_scene,
+    draw_supersampled,
+)
 from wmas.render.style import Style
 
 
@@ -188,15 +193,16 @@ class Viewer:
                 half_extents=world.obstacle_half_extents,
             )
 
-    def _draw(self, surface, geometry, camera, *, hud: bool, fps=None, clear: bool = True) -> None:
-        draw_scene(surface, geometry, camera, self.state.enabled, self.style, clear=clear)
+    def _draw(
+        self, surface, geometry, camera, style, *, hud: bool, fps=None, clear: bool = True
+    ) -> None:
+        draw_scene(surface, geometry, camera, self.state.enabled, style, clear=clear)
         if hud:
-            draw_hud(surface, self.state, self.style, step=self._step_count, fps=fps)
-            draw_hover_panel(surface, geometry, self.state.hover_agent, self.style)
-            draw_help(surface, self.state, self.style)
+            draw_hud(surface, self.state, style, step=self._step_count, fps=fps)
+            draw_hover_panel(surface, geometry, self.state.hover_agent, style)
+            draw_help(surface, self.state, style)
 
-    def _draw_tile(self, pygame, surface, geometry, camera, rect, *, focused: bool) -> None:
-        style = self.style
+    def _draw_tile(self, pygame, surface, geometry, camera, rect, style, *, focused: bool) -> None:
         r = pygame.Rect(*rect)
         surface.fill(style.tile_background, r)
         prev = surface.get_clip()
@@ -223,30 +229,46 @@ class Viewer:
         width = style.tile_focus_border_width if focused else style.tile_border_width
         pygame.draw.rect(surface, border, r, width)
 
-    def _draw_mosaic(self, pygame, surface, *, hud: bool, fps=None) -> None:
-        layout = self._ensure_layout()
-        surface.fill(self.style.background)
-        for tile_rect, env_idx in zip(layout.tiles, layout.tile_envs, strict=True):
-            g = self._geometry(env_idx)
+    def _draw_mosaic(self, pygame, surface, scale: int, style, *, hud: bool, fps=None) -> None:
+        # Rects come from the *scaled* layout; self._layout stays window-space for tile_at().
+        layout = self._ensure_layout().scaled(scale)
+        surface.fill(style.background)
+        # Tiles draw only bounds/pos/radius, so skip the neighbor rebuild and the sensor hook.
+        tiles = extract_geometry_batch(
+            self.env.world, layout.tile_envs, with_edges=False, with_extras=False
+        )
+        for tile_rect, env_idx, g in zip(layout.tiles, layout.tile_envs, tiles, strict=True):
             cam = Camera(g.bounds or _bounds_from_geometry(g), viewport=tile_rect)
             self._draw_tile(
-                pygame, surface, g, cam, tile_rect, focused=env_idx == self.state.focus_env
+                pygame, surface, g, cam, tile_rect, style, focused=env_idx == self.state.focus_env
             )
         focus = pygame.Rect(*layout.focus_rect)
-        surface.fill(self.style.background, focus)
+        surface.fill(style.background, focus)
         prev = surface.get_clip()
         surface.set_clip(focus)
         gf = self._geometry()
-        self._draw(surface, gf, self._camera_for(gf), hud=hud, fps=fps, clear=False)
+        self._draw(
+            surface, gf, self._camera_for(gf).scaled(scale), style, hud=hud, fps=fps, clear=False
+        )
         surface.set_clip(prev)
-        pygame.draw.rect(surface, self.style.bounds_color, focus, self.style.tile_border_width)
+        pygame.draw.rect(surface, style.bounds_color, focus, style.tile_border_width)
 
     def _render_onto(self, pygame, surface, *, hud: bool, fps=None) -> None:
+        """Render the current view onto ``surface``, supersampling when the style asks for it."""
+        draw_supersampled(
+            pygame,
+            surface,
+            self.style.supersample,
+            lambda surf, s: self._render_onto_scaled(pygame, surf, s, hud=hud, fps=fps),
+        )
+
+    def _render_onto_scaled(self, pygame, surface, scale: int, *, hud: bool, fps=None) -> None:
+        style = self.style.scaled(scale)
         if self.mosaic:
-            self._draw_mosaic(pygame, surface, hud=hud, fps=fps)
+            self._draw_mosaic(pygame, surface, scale, style, hud=hud, fps=fps)
         else:
             g = self._geometry()
-            self._draw(surface, g, self._camera_for(g), hud=hud, fps=fps)
+            self._draw(surface, g, self._camera_for(g).scaled(scale), style, hud=hud, fps=fps)
 
     def render_array(self, *, hud: bool = False) -> np.ndarray:
         """Render the current view (single env or mosaic) to an ``(H, W, 3)`` uint8 array."""

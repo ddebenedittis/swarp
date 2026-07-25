@@ -66,6 +66,43 @@ def test_viewer_mosaic_render_shape_and_focus_change_differs():
     assert not np.array_equal(f0, f4)  # focus pane + highlighted tile both move
 
 
+def test_mosaic_layout_scaled_multiplies_every_rect():
+    lay = compute_mosaic_layout((800, 600), n_envs=5)
+    big = lay.scaled(3)
+    assert big.focus_rect == tuple(3 * v for v in lay.focus_rect)
+    assert big.tiles == [tuple(3 * v for v in t) for t in lay.tiles]
+    assert big.tile_envs == lay.tile_envs and big.n_hidden == lay.n_hidden
+    assert lay.scaled(1) is lay
+
+
+def test_mosaic_render_rebuilds_neighbor_grid_at_most_once_per_frame():
+    """Tiles must not each trigger world.neighbors() — that rebuilds the grid per tile."""
+    env, scenario = make_env(n_envs=6, n_agents=3)
+    viewer = Viewer(env, size=(480, 360), mosaic=True, max_tiles=6, scenario=scenario)
+    calls = 0
+    real = env.world.neighbors
+
+    def counting_neighbors(*a, **kw):
+        nonlocal calls
+        calls += 1
+        return real(*a, **kw)
+
+    env.world.neighbors = counting_neighbors
+    viewer.render_array()
+    assert calls <= 1, f"{calls} neighbor rebuilds for 6 tiles + 1 focus pane"
+
+
+def test_mosaic_supersampled_render_keeps_shape_and_changes_pixels():
+    from wmas.render.style import Style
+
+    env, _ = make_env(n_envs=6, n_agents=3)
+    plain = Viewer(env, size=(240, 180), mosaic=True, max_tiles=6, style=Style(supersample=1))
+    aa = Viewer(env, size=(240, 180), mosaic=True, max_tiles=6, style=Style(supersample=2))
+    f1, f2 = plain.render_array(hud=True), aa.render_array(hud=True)
+    assert f1.shape == f2.shape == (180, 240, 3)
+    assert not np.array_equal(f1, f2)
+
+
 def test_click_on_tile_sets_focus_env():
     from wmas.render.input import InteractionController
 

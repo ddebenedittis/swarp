@@ -1,13 +1,19 @@
-"""Device->host geometry extraction: pull ONE env's renderable state to CPU numpy.
+"""Device->host geometry extraction: pull renderable state to CPU numpy.
 
 This is the single synchronization boundary between the GPU-resident simulator and the
 (CPU, pygame) renderer. It is deliberately backend-agnostic — it knows nothing about
 pygame — so any renderer can consume a :class:`RenderGeometry`. Extraction is read-only
 and never runs on the differentiable hot path.
+
+:func:`extract_geometry_batch` is the primitive; :func:`extract_geometry` is the single-env
+case, so there is exactly one place that touches device memory. Batching matters for the
+mosaic view, which would otherwise pay a neighbor-grid rebuild and a full set of transfers
+per tile.
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -15,7 +21,7 @@ import numpy as np
 import torch
 
 
-@dataclass
+@dataclass(kw_only=True)
 class RenderGeometry:
     """One env's renderable state, as plain CPU numpy arrays.
 
@@ -47,52 +53,98 @@ def extract_geometry(world, env_idx: int, scenario=None) -> RenderGeometry:
     ``scenario`` is optional; if it defines ``render_extras(env_idx) -> dict`` the
     result is merged into :attr:`RenderGeometry.extras` for custom overlays.
     """
+    return extract_geometry_batch(world, (env_idx,), scenario)[0]
+
+
+def extract_geometry_batch(
+    world,
+    env_indices: Sequence[int],
+    scenario=None,
+    *,
+    with_edges: bool = True,
+    with_extras: bool = True,
+) -> list[RenderGeometry]:
+    """Extract several envs with ONE device->host transfer per tensor field.
+
+    Env-independent data (radii, dynamics tags, obstacle radii, bounds) is read once and
+    shared by every returned geometry. ``with_edges=False`` skips ``world.neighbors()``
+    entirely — that call rebuilds the neighbor grid, so a caller that does not draw edges
+    (e.g. mosaic tiles) should switch it off. ``with_extras=False`` likewise skips the
+    scenario hook, which may run real sensors.
+    """
+    idx = list(int(i) for i in env_indices)
+    if not idx:
+        return []
+
     s = world.state
-    goals = _to_np(world.goals[env_idx]) if world.goals is not None else None
+    sel = torch.as_tensor(idx, dtype=torch.long, device=s.pos.device)
+    pos = _to_np(s.pos.index_select(0, sel))
+    theta = _to_np(s.theta.index_select(0, sel))
+    vel = _to_np(s.vel.index_select(0, sel))
+    goals = _to_np(world.goals.index_select(0, sel)) if world.goals is not None else None
+
     if world.obstacle_pos is not None:
-        obstacle_pos = _to_np(world.obstacle_pos[env_idx])
+        obstacle_pos = _to_np(world.obstacle_pos.index_select(0, sel))
         obstacle_radius = _to_np(world.obstacle_radius)
     else:
         obstacle_pos = None
         obstacle_radius = None
 
+    # Env-independent: extracted once, shared by every geometry below.
+    radius = _to_np(world.agent_radius)
+    model = np.array([int(c.model) for c in world.agent_configs], dtype=np.int32)
     bounds = world.config.bounds if world.config is not None else None
+    edges = _extract_edges_batch(world, idx) if with_edges else [_no_edges()] * len(idx)
 
-    extras: dict[str, Any] = {}
-    if scenario is not None and hasattr(scenario, "render_extras"):
-        extras = scenario.render_extras(env_idx) or {}
+    out: list[RenderGeometry] = []
+    for k, env_idx in enumerate(idx):
+        extras: dict[str, Any] = {}
+        if with_extras and scenario is not None and hasattr(scenario, "render_extras"):
+            extras = scenario.render_extras(env_idx) or {}
+        out.append(
+            RenderGeometry(
+                n_agents=world.n_agents,
+                pos=pos[k],
+                theta=theta[k],
+                vel=vel[k],
+                radius=radius,
+                model=model,
+                goals=None if goals is None else goals[k],
+                obstacle_pos=None if obstacle_pos is None else obstacle_pos[k],
+                obstacle_radius=obstacle_radius,
+                bounds=bounds,
+                edges=edges[k],
+                extras=extras,
+            )
+        )
+    return out
 
-    return RenderGeometry(
-        n_agents=world.n_agents,
-        pos=_to_np(s.pos[env_idx]),
-        theta=_to_np(s.theta[env_idx]),
-        vel=_to_np(s.vel[env_idx]),
-        radius=_to_np(world.agent_radius),
-        model=np.array([int(c.model) for c in world.agent_configs], dtype=np.int32),
-        goals=goals,
-        obstacle_pos=obstacle_pos,
-        obstacle_radius=obstacle_radius,
-        bounds=bounds,
-        edges=_extract_edges(world, env_idx),
-        extras=extras,
-    )
+
+def _no_edges() -> np.ndarray:
+    return np.empty((0, 2), dtype=np.int64)
 
 
-def _extract_edges(world, env_idx: int) -> np.ndarray:
-    """Within-radius neighbor pairs of one env as (E, 2) local (i, j) indices.
+def _extract_edges_batch(world, env_indices: Sequence[int]) -> list[np.ndarray]:
+    """Within-radius neighbor pairs per env, as (E, 2) local (i, j) indices.
 
-    Uses ``World.neighbors()`` (per-env local indices; see neighbors.py) rather than
-    the batch-global ``edge_index()``. Returns an empty (0, 2) array when collisions
-    (hence neighbor lists) are disabled.
+    Uses ``World.neighbors()`` (per-env local indices; see neighbors.py) rather than the
+    batch-global ``edge_index()``, and calls it **once** for the whole batch: it rebuilds the
+    grid and returns views that a later call overwrites. Empty when collisions (hence
+    neighbor lists) are disabled.
     """
     if not getattr(world.stepper, "collisions", False):
-        return np.empty((0, 2), dtype=np.int64)
+        return [_no_edges() for _ in env_indices]
 
     neighbor_idx, neighbor_count = world.neighbors()
-    idx = neighbor_idx[env_idx].to("cpu").numpy()  # (n_agents, K)
-    cnt = neighbor_count[env_idx].to("cpu").numpy()  # (n_agents,)
+    sel = torch.as_tensor(list(env_indices), dtype=torch.long, device=neighbor_idx.device)
+    idx = _to_np(neighbor_idx.index_select(0, sel))  # (T, n_agents, K)
+    cnt = _to_np(neighbor_count.index_select(0, sel))  # (T, n_agents)
+    return [_pairs_from_lists(idx[k], cnt[k]) for k in range(len(env_indices))]
 
+
+def _pairs_from_lists(idx: np.ndarray, cnt: np.ndarray) -> np.ndarray:
+    """One env's (n_agents, K) neighbor lists + counts as an (E, 2) pair array."""
     pairs = [(i, int(idx[i, k])) for i in range(idx.shape[0]) for k in range(int(cnt[i]))]
     if not pairs:
-        return np.empty((0, 2), dtype=np.int64)
+        return _no_edges()
     return np.array(pairs, dtype=np.int64)

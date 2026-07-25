@@ -60,6 +60,28 @@ def test_pick_obstacle_hits_center_and_misses_empty_space():
     assert pick_obstacle(g, cam, (-100.0, -100.0)) is None
 
 
+def test_supersampling_does_not_disturb_picking_or_the_viewers_camera():
+    """The Viewer's camera must stay window-space; only per-frame copies are scaled.
+
+    The interaction controller holds that exact object and feeds it raw window pixels, so a
+    scaled camera leaking back would break picking, panning and zoom-under-cursor.
+    """
+    from wmas.render.style import Style
+
+    env, scenario = make_env(n_agents=3)
+    viewer = Viewer(env, size=(300, 300), scenario=scenario, style=Style(supersample=3))
+    g = viewer._geometry()
+    cam = viewer._camera_for(g)
+    before = cam.world_to_screen(g.pos)
+
+    viewer.render_array(hud=True)  # renders at 3x internally
+
+    assert viewer._camera_for(g) is cam
+    np.testing.assert_allclose(cam.world_to_screen(g.pos), before)
+    for k in range(g.n_agents):
+        assert pick_agent(g, cam, cam.world_to_screen(g.pos[k])) == k
+
+
 # --------------------------------------------------------- event controller
 
 
