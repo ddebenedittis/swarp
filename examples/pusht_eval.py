@@ -7,6 +7,12 @@ Three views of "performance", any combination:
 * always              — a numeric score over ``--n-envs`` parallel envs, next to a
   random-action baseline on the *same* seed, so the number means something.
 
+The rendered rollout runs ``--render-steps`` frames and respawns the T and its goal
+every ``--episode-steps``, so it plays as a continuous run of episodes rather than
+one clip that freezes once the T is parked. The *scored* rollout is separate and
+stays a single un-reset episode (``--steps``), since it measures start-to-end
+displacement.
+
 Also plots ``metrics.csv`` written by the trainer::
 
     python examples/pusht_eval.py --curve runs/pusht/metrics.csv
@@ -15,6 +21,8 @@ Run with::
 
     python examples/pusht_eval.py runs/pusht/pusht_final.pt [--video pusht.mp4]
     python examples/pusht_eval.py runs/pusht/pusht_iter00100.pt --window
+    python examples/pusht_eval.py runs/pusht/pusht_final.pt --video long.mp4 \
+        --render-steps 1800 --episode-steps 400        # 60s, respawns every 400
 """
 
 from __future__ import annotations
@@ -123,6 +131,16 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--video", help="write an mp4/webm of one env's rollout")
     parser.add_argument("--window", action="store_true", help="live pygame window")
+    parser.add_argument(
+        "--render-steps", type=int, default=900, help="total frames to render (900 = 30s @ 30fps)"
+    )
+    parser.add_argument(
+        "--episode-steps",
+        type=int,
+        default=300,
+        help="steps before the T and goal respawn; the rollout keeps going",
+    )
+    parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--curve", help="metrics.csv to plot as ASCII curves")
     args = parser.parse_args()
 
@@ -146,18 +164,31 @@ def main() -> None:
         )
 
     if args.video or args.window:
+        # auto_reset + max_steps makes the episode respawn in place when the T reaches
+        # the goal or the time limit hits, so a long rollout plays as a continuous
+        # sequence of episodes instead of one clip that freezes at the end.
         scen = PushTScenario(n_agents=n_agents)
-        env = Environment(scen, n_envs=1, device=args.device, dt=0.05, seed=args.seed)
+        env = Environment(
+            scen,
+            n_envs=1,
+            device=args.device,
+            dt=0.05,
+            seed=args.seed,
+            max_steps=args.episode_steps,
+            auto_reset=True,
+        )
         env.reset(seed=args.seed)
         act = _greedy(policy, 1, args.device)
+        n = args.render_steps
+        print(f"  rendering {n} steps, respawning every {args.episode_steps}")
         if args.video:
             from wmas.render.video import save_video
 
-            path = save_video(env, args.video, action_fn=act, n_steps=args.steps, fps=30)
-            print(f"  wrote {path}")
+            path = save_video(env, args.video, action_fn=act, n_steps=n, fps=args.fps)
+            print(f"  wrote {path} ({n / args.fps:.0f}s)")
         if args.window:
             env.reset(seed=args.seed)
-            for _ in range(args.steps):
+            for _ in range(n):
                 env.step(act(scen.observations()))
                 env.render(mode="human")
             env.close_viewer()
