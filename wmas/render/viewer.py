@@ -196,26 +196,32 @@ class Viewer:
             draw_help(surface, self.state, self.style)
 
     def _draw_tile(self, pygame, surface, geometry, camera, rect, *, focused: bool) -> None:
+        style = self.style
         r = pygame.Rect(*rect)
-        surface.fill((236, 236, 240), r)
+        surface.fill(style.tile_background, r)
         prev = surface.get_clip()
         surface.set_clip(r)
         if geometry.bounds is not None:
             x0, x1, y0, y1 = geometry.bounds
             corners = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
             pygame.draw.lines(
-                surface, self.style.bounds_color, True, [_p(camera, c) for c in corners], 1
+                surface,
+                style.bounds_color,
+                True,
+                [_p(camera, c) for c in corners],
+                style.tile_border_width,
             )
         for i in range(geometry.n_agents):
             pygame.draw.circle(
                 surface,
-                self.style.agent_color(i),
+                style.agent_color(i, geometry.model[i]),
                 _p(camera, geometry.pos[i]),
-                _r_px(camera, geometry.radius[i], floor=2),
+                _r_px(camera, geometry.radius[i], floor=style.tile_agent_min_px),
             )
         surface.set_clip(prev)
-        border = self.style.velocity_color if focused else (185, 185, 190)
-        pygame.draw.rect(surface, border, r, 2 if focused else 1)
+        border = style.tile_focus_border if focused else style.tile_border
+        width = style.tile_focus_border_width if focused else style.tile_border_width
+        pygame.draw.rect(surface, border, r, width)
 
     def _draw_mosaic(self, pygame, surface, *, hud: bool, fps=None) -> None:
         layout = self._ensure_layout()
@@ -233,7 +239,7 @@ class Viewer:
         gf = self._geometry()
         self._draw(surface, gf, self._camera_for(gf), hud=hud, fps=fps, clear=False)
         surface.set_clip(prev)
-        pygame.draw.rect(surface, self.style.bounds_color, focus, 1)
+        pygame.draw.rect(surface, self.style.bounds_color, focus, self.style.tile_border_width)
 
     def _render_onto(self, pygame, surface, *, hud: bool, fps=None) -> None:
         if self.mosaic:

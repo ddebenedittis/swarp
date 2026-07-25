@@ -18,7 +18,7 @@ from wmas.core.config import WorldConfig
 from wmas.core.world import World
 from wmas.dynamics.base import AgentConfig, ControlMode, DynamicsModel
 from wmas.render.overlays import DEFAULT_ENABLED
-from wmas.render.style import Style
+from wmas.render.style import THEMES
 from wmas.sensors import Lidar
 
 MODEL_CHOICES = ("holonomic", "diff-drive", "bicycle", "mixed")
@@ -59,9 +59,7 @@ class VisualizationScenario(NavigationScenario):
             if pairs.numel() == 0:
                 comm_lines = np.empty((0, 2, 2), dtype=np.float64)
             else:
-                comm_lines = torch.stack(
-                    (pos[pairs[:, 0]], pos[pairs[:, 1]]), dim=1
-                ).cpu().numpy()
+                comm_lines = torch.stack((pos[pairs[:, 0]], pos[pairs[:, 1]]), dim=1).cpu().numpy()
         return {
             "lidar": lidar,
             "lidar_by_agent": lidar.reshape(self.n_agents, self.lidar.n_rays, 2, 2),
@@ -196,6 +194,10 @@ def main(argv=None):
     parser.add_argument("--lidar-mode", choices=("none", "rays", "area", "both"), default="rays")
     parser.add_argument("--trajectory", choices=("none", "trail", "fade"), default="none")
     parser.add_argument("--trail-len", type=int, default=80)
+    parser.add_argument("--theme", choices=tuple(THEMES), default="light")
+    parser.add_argument(
+        "--supersample", type=int, default=2, help="offscreen AA factor (1 disables)"
+    )
     args = parser.parse_args(argv)
 
     env = build_env(
@@ -210,11 +212,12 @@ def main(argv=None):
     policy = goal_seeking_policy(env)
     size = (args.size, args.size)
     overlays = set(DEFAULT_ENABLED) | {"comm_lines", "lidar", "trajectories"}
-    style = Style(
+    style = THEMES[args.theme](
         color_mode=args.color_mode,
         lidar_mode=args.lidar_mode,
         trajectory_mode=args.trajectory,
         trajectory_len=args.trail_len,
+        supersample=args.supersample,
     )
 
     if args.save:

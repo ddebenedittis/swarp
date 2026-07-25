@@ -79,7 +79,7 @@ def _draw_goals(surface, g, camera, style):
         color = style.agent_color(i, g.model[i])
         r = _r_px(camera, g.radius[i], floor=style.goal_min_px)
         pygame.draw.circle(surface, color, center, r, style.goal_ring_width)
-        pygame.draw.circle(surface, color, center, 2)  # center dot
+        pygame.draw.circle(surface, color, center, style.goal_dot_px)  # center dot
 
 
 def _agent_points(pos, theta: float, radius: float, factors):
@@ -153,7 +153,12 @@ def _draw_agents(surface, g, camera, style):
                 [(0.55, 0.38), (-0.35, 0.42), (-0.6, -0.42), (0.55, -0.38)],
             )
             pygame.draw.polygon(surface, style.background, [_p(camera, p) for p in cabin])
-            pygame.draw.polygon(surface, style.agent_outline, [_p(camera, p) for p in cabin], 1)
+            pygame.draw.polygon(
+                surface,
+                style.agent_outline,
+                [_p(camera, p) for p in cabin],
+                style.agent_outline_width,
+            )
             for x in (-0.95, 0.95):
                 for y in (-0.82, 0.82):
                     wheel = _agent_points(
@@ -169,7 +174,12 @@ def _draw_agents(surface, g, camera, style):
                         _p(camera, wheel[1]),
                         wheel_w,
                     )
-            pygame.draw.polygon(surface, style.agent_outline, [_p(camera, p) for p in body], 1)
+            pygame.draw.polygon(
+                surface,
+                style.agent_outline,
+                [_p(camera, p) for p in body],
+                style.agent_outline_width,
+            )
             front = _agent_points(g.pos[i], float(g.theta[i]), float(g.radius[i]), [(1.2, 0.0)])
             pygame.draw.circle(surface, style.background, _p(camera, front[0]), max(1, r // 5))
         elif model == 3:  # drone placeholder: quadrotor cross.
@@ -184,11 +194,23 @@ def _draw_agents(surface, g, camera, style):
                 pygame.draw.line(
                     surface, color, _p(camera, arm[0]), _p(camera, arm[1]), style.line_width
                 )
-                pygame.draw.circle(surface, color, _p(camera, arm[0]), max(2, r // 3), 1)
-                pygame.draw.circle(surface, color, _p(camera, arm[1]), max(2, r // 3), 1)
+                pygame.draw.circle(
+                    surface,
+                    color,
+                    _p(camera, arm[0]),
+                    max(2, r // 3),
+                    style.agent_outline_width,
+                )
+                pygame.draw.circle(
+                    surface,
+                    color,
+                    _p(camera, arm[1]),
+                    max(2, r // 3),
+                    style.agent_outline_width,
+                )
         else:
             pygame.draw.circle(surface, color, center, r)
-        pygame.draw.circle(surface, style.agent_outline, center, r, 1)
+        pygame.draw.circle(surface, style.agent_outline, center, r, style.agent_outline_width)
 
 
 def _draw_heading(surface, g, camera, style):
@@ -245,11 +267,12 @@ def _draw_velocity(surface, g, camera, style):
 
 
 def _draw_ids(surface, g, camera, style):
-    font = _get_font(style.font_size)
+    size = style.font_px(camera.vh)
+    font = _get_font(size)
     for i in range(g.n_agents):
         label = font.render(str(i), True, style.text_color)
         cx, cy = _p(camera, g.pos[i])
-        surface.blit(label, (cx + 4, cy - style.font_size))
+        surface.blit(label, (cx + style.id_offset_px, cy - size))
 
 
 def _draw_comm_lines(surface, g, camera, style):
@@ -306,11 +329,15 @@ def _draw_lidar(surface, g, camera, style):
         for i in range(min(g.n_agents, grouped.shape[0])):
             color = style.agent_color(i, g.model[i])
             for start, end in grouped[i].reshape(-1, 2, 2):
-                pygame.draw.line(surface, color, _p(camera, start), _p(camera, end), 1)
+                pygame.draw.line(
+                    surface, color, _p(camera, start), _p(camera, end), style.lidar_ray_width
+                )
                 pygame.draw.circle(surface, color, _p(camera, end), style.lidar_hit_px)
         return
     for start, end in rays.reshape(-1, 2, 2):
-        pygame.draw.line(surface, style.lidar_color, _p(camera, start), _p(camera, end), 1)
+        pygame.draw.line(
+            surface, style.lidar_color, _p(camera, start), _p(camera, end), style.lidar_ray_width
+        )
         pygame.draw.circle(surface, style.lidar_color, _p(camera, end), style.lidar_hit_px)
 
 

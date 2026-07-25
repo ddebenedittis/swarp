@@ -21,6 +21,15 @@ def _blit_lines(surface, font, lines, color, origin) -> None:
         surface.blit(font.render(line, True, color), (x, y + i * line_h))
 
 
+def _blit_panel(pygame, surface, rect, bg, style: Style) -> None:
+    """Translucent framed panel at ``rect`` — the shared chrome of every HUD box."""
+    x, y, width, height = rect
+    panel = pygame.Surface((width, height), pygame.SRCALPHA)
+    panel.fill(bg)
+    pygame.draw.rect(panel, style.panel_border, panel.get_rect(), style.tile_border_width)
+    surface.blit(panel, (x, y))
+
+
 def draw_hud(
     surface,
     state: ViewState,
@@ -30,7 +39,8 @@ def draw_hud(
     fps: float | None = None,
 ) -> None:
     """Top-left status: focus env, step, fps, pause flag, and active overlays."""
-    font = _get_font(style.font_size)
+    clip = surface.get_clip()
+    font = _get_font(style.font_px(clip.height))
     header = f"env {state.focus_env}/{state.n_envs - 1}"
     if step is not None:
         header += f"   step {step}"
@@ -44,15 +54,16 @@ def draw_hud(
         f"color {style.color_mode}   lidar {style.lidar_mode}   trail {style.trajectory_mode}"
     )
     lines.append("on: " + ",".join(sorted(state.enabled)))
-    clip = surface.get_clip()
-    _blit_lines(surface, font, lines, style.text_color, (clip.left + 8, clip.top + 6))
+    origin = (clip.left + style.hud_margin, clip.top + max(1, style.hud_margin - 2))
+    _blit_lines(surface, font, lines, style.text_color, origin)
 
 
 def draw_help(surface, state: ViewState, style: Style) -> None:
     """Top-right controls legend for the interactive viewer."""
     if not state.show_help:
         return
-    font = _get_font(style.font_size)
+    clip = surface.get_clip()
+    font = _get_font(style.font_px(clip.height))
     overlay_lines = [f"{o.key}: {o.name}" for o in OVERLAYS if o.key]
     lines = [
         "Controls",
@@ -72,18 +83,14 @@ def draw_help(surface, state: ViewState, style: Style) -> None:
         "Overlays",
         *overlay_lines,
     ]
-    pad = 8
+    pad = style.panel_pad
     line_h = font.get_height()
     width = max(font.size(line)[0] for line in lines) + 2 * pad
     height = len(lines) * line_h + 2 * pad
-    clip = surface.get_clip()
-    x = clip.right - width - 8
-    y = clip.top + 8
+    x = clip.right - width - style.hud_margin
+    y = clip.top + style.hud_margin
 
-    panel = pygame.Surface((width, height), pygame.SRCALPHA)
-    panel.fill((255, 255, 255, 225))
-    pygame.draw.rect(panel, style.text_color, panel.get_rect(), 1)
-    surface.blit(panel, (x, y))
+    _blit_panel(pygame, surface, (x, y, width, height), style.help_panel_bg, style)
     _blit_lines(surface, font, lines, style.text_color, (x + pad, y + pad))
 
 
@@ -93,7 +100,7 @@ def draw_hover_panel(
     """Bottom-left inspector for the hovered agent (read-only state)."""
     if agent_idx is None or agent_idx >= geometry.n_agents:
         return
-    font = _get_font(style.font_size)
+    font = _get_font(style.font_px(surface.get_height()))
     p = geometry.pos[agent_idx]
     v = geometry.vel[agent_idx]
     speed = float((v[0] ** 2 + v[1] ** 2) ** 0.5)
@@ -104,15 +111,12 @@ def draw_hover_panel(
         f"spd {speed:.2f}",
         f"model {int(geometry.model[agent_idx])}",
     ]
-    pad = 6
+    pad = style.hover_pad
     line_h = font.get_height()
     width = max(font.size(line)[0] for line in lines) + 2 * pad
     height = len(lines) * line_h + 2 * pad
-    x = 8
-    y = surface.get_height() - height - 8
+    x = style.hud_margin
+    y = surface.get_height() - height - style.hud_margin
 
-    panel = pygame.Surface((width, height), pygame.SRCALPHA)
-    panel.fill((255, 255, 255, 210))
-    pygame.draw.rect(panel, style.text_color, panel.get_rect(), 1)
-    surface.blit(panel, (x, y))
+    _blit_panel(pygame, surface, (x, y, width, height), style.hover_panel_bg, style)
     _blit_lines(surface, font, lines, style.text_color, (x + pad, y + pad))

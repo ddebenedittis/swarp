@@ -8,6 +8,7 @@ from wmas import Environment, NavigationScenario
 from wmas.render.camera import Camera
 from wmas.render.geometry import RenderGeometry, extract_geometry
 from wmas.render.renderer import render_frame
+from wmas.render.style import Style
 from wmas.render.video import frames_to_video, save_video
 
 
@@ -111,6 +112,63 @@ def test_camera_world_to_screen_is_vectorized():
 def _geometry(n_agents=4, n_obstacles=2):
     env, scenario = make_env(n_agents=n_agents, n_obstacles=n_obstacles)
     return extract_geometry(env.world, env_idx=0, scenario=scenario)
+
+
+# ------------------------------------------------------------------ style
+
+
+def test_style_font_px_scales_with_viewport_and_clamps():
+    s = Style()
+    assert s.font_px(700) == s.font_size  # default ratio reproduces the fixed size exactly
+    assert s.font_px(150) == s.font_min
+    assert s.font_px(5000) == s.font_max
+    assert s.font_px(None) == s.font_size
+    assert s.font_px(350) < s.font_px(700) < s.font_px(1400)
+    assert Style(font_scale=0.0).font_px(1400) == s.font_size  # scaling opt-out
+
+
+def test_style_field_partition_is_exhaustive():
+    """Every Style field must be classified as pixel-valued or not.
+
+    Guards Style.scaled(): an unclassified size would stay 1px in a supersampled buffer
+    and downscale to a washed-out pixel, so adding a field must force the decision.
+    """
+    from wmas.render.style import _PX_FIELDS, _UNSCALED_FIELDS, style_field_names
+
+    assert _PX_FIELDS.isdisjoint(_UNSCALED_FIELDS)
+    assert style_field_names() == _PX_FIELDS | _UNSCALED_FIELDS
+
+
+def test_style_scaled_multiplies_pixel_fields_only():
+    from wmas.render.style import _PX_FIELDS, _UNSCALED_FIELDS
+
+    base = Style()
+    big = base.scaled(3)
+    for name in _PX_FIELDS:
+        assert getattr(big, name) == 3 * getattr(base, name), name
+    for name in _UNSCALED_FIELDS:
+        assert getattr(big, name) == getattr(base, name), name
+    assert base.scaled(1) is base
+    # font_scale is unscaled, so a 3x viewport yields ~3x text via the ratio alone
+    assert big.font_px(3 * 700) == 3 * base.font_px(700)
+
+
+def test_style_themes_differ_and_accept_overrides():
+    from wmas.render.style import THEMES
+
+    light, dark = Style.light(), Style.dark()
+    assert light == Style()
+    assert dark.background != light.background
+    assert dark.text_color != light.text_color
+    assert Style.dark(color_mode="model").color_mode == "model"
+    assert set(THEMES) == {"light", "dark"}
+
+
+def test_dark_theme_changes_rendered_pixels():
+    g = _geometry()
+    light = render_frame(g, size=(200, 200), style=Style.light())
+    dark = render_frame(g, size=(200, 200), style=Style.dark())
+    assert not np.array_equal(light, dark)
 
 
 def test_render_frame_shape_and_dtype():
