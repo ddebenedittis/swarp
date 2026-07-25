@@ -52,6 +52,10 @@ class Style:
     help_panel_bg: RGBA = (255, 255, 255, 225)
     hover_panel_bg: RGBA = (255, 255, 255, 210)
     panel_border: RGB = (40, 40, 45)
+    agent_halo: RGB = (245, 245, 247)  # depth_cue="halo"; defaults to the light background
+    agent_shadow: RGBA = (0, 0, 0, 70)  # depth_cue="shadow"
+    contact_color: RGB = (220, 50, 40)
+    goal_reached_color: RGB = (0, 158, 115)
     palette: tuple[RGB, ...] = field(default_factory=lambda: _PALETTE)
     model_palette: dict[int, RGB] = field(
         default_factory=lambda: {
@@ -66,6 +70,9 @@ class Style:
     color_mode: str = "agent"  # agent | model
     lidar_mode: str = "rays"  # none | rays | area | both
     trajectory_mode: str = "none"  # none | trail | fade
+    depth_cue: str = "halo"  # none | halo | shadow
+    goal_connector: str = "dashed"  # none | solid | dashed
+    contact_highlight: bool = True
 
     # ------------------------------------------------------------ pixel sizes
     line_width: int = 2
@@ -77,6 +84,11 @@ class Style:
     agent_min_px: int = 3
     goal_min_px: int = 5
     agent_outline_width: int = 1
+    agent_halo_px: int = 3
+    agent_shadow_offset_px: int = 3
+    contact_outline_width: int = 3
+    goal_dash_px: int = 6
+    goal_gap_px: int = 4
     tile_border_width: int = 1
     tile_focus_border_width: int = 2
     tile_agent_min_px: int = 2
@@ -99,6 +111,9 @@ class Style:
     trajectory_fade_min_alpha: int = 20
     trajectory_len: int = 80
     supersample: int = 2  # 1 disables; >1 renders NxN offscreen and downscales
+    goal_connector_alpha: int = 90
+    goal_reached_factor: float = 1.0  # goal counts as reached within this many agent radii
+    contact_tol: float = 0.0  # slack on (r_i + r_j) before an overlap counts as contact
 
     # ------------------------------------------------------------------ colors
     def agent_color(self, i: int, model: int | None = None) -> RGB:
@@ -161,6 +176,11 @@ _PX_FIELDS: frozenset[str] = frozenset(
         "agent_min_px",
         "goal_min_px",
         "agent_outline_width",
+        "agent_halo_px",
+        "agent_shadow_offset_px",
+        "contact_outline_width",
+        "goal_dash_px",
+        "goal_gap_px",
         "tile_border_width",
         "tile_focus_border_width",
         "tile_agent_min_px",
@@ -193,11 +213,21 @@ _UNSCALED_FIELDS: frozenset[str] = frozenset(
         "help_panel_bg",
         "hover_panel_bg",
         "panel_border",
+        "agent_halo",
+        "agent_shadow",
+        "contact_color",
+        "goal_reached_color",
         "palette",
         "model_palette",
         "color_mode",
         "lidar_mode",
         "trajectory_mode",
+        "depth_cue",
+        "goal_connector",
+        "contact_highlight",
+        "goal_connector_alpha",
+        "goal_reached_factor",
+        "contact_tol",
         "font_scale",
         "heading_len_factor",
         "velocity_scale",
@@ -224,6 +254,7 @@ _DARK: dict[str, object] = {
     "help_panel_bg": (26, 26, 32, 230),
     "hover_panel_bg": (26, 26, 32, 215),
     "panel_border": (120, 120, 130),
+    "agent_halo": (18, 18, 22),
 }
 
 THEMES: dict[str, object] = {"light": Style.light, "dark": Style.dark}

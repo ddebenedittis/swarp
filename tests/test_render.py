@@ -295,6 +295,80 @@ def test_render_frame_trajectory_overlay_changes_pixels():
     assert not np.array_equal(without, with_trail)
 
 
+# ------------------------------------------------------------ agent visuals
+
+
+def test_depth_cue_modes_change_pixels_for_overlapping_agents():
+    g = _geometry(n_agents=2)
+    g.pos[1] = g.pos[0] + [0.6 * float(g.radius[0]), 0.0]  # deliberate overlap
+    frames = {
+        mode: render_frame(
+            g, size=(240, 240), overlays={"agents"}, style=Style(depth_cue=mode, supersample=1)
+        )
+        for mode in ("none", "halo", "shadow")
+    }
+    assert not np.array_equal(frames["none"], frames["halo"])
+    assert not np.array_equal(frames["none"], frames["shadow"])
+    assert not np.array_equal(frames["halo"], frames["shadow"])
+
+
+def test_contact_mask_flags_both_endpoints_of_an_overlapping_pair():
+    from wmas.render.overlays import _contact_mask
+
+    g = _geometry(n_agents=3)
+    style = Style()
+    g.edges = np.array([[0, 1]], dtype=np.int64)
+    g.pos[1] = g.pos[0] + [0.5 * (g.radius[0] + g.radius[1]), 0.0]  # overlapping
+    mask = _contact_mask(g, style)
+    assert mask.tolist() == [True, True, False]
+
+    g.pos[1] = g.pos[0] + [5.0 * (g.radius[0] + g.radius[1]), 0.0]  # far apart
+    assert not _contact_mask(g, style).any()
+
+    g.edges = np.empty((0, 2), dtype=np.int64)  # collisions disabled
+    assert not _contact_mask(g, style).any()
+
+
+def test_contact_highlight_changes_pixels():
+    g = _geometry(n_agents=2)
+    g.edges = np.array([[0, 1]], dtype=np.int64)
+    g.pos[1] = g.pos[0] + [0.5 * (g.radius[0] + g.radius[1]), 0.0]
+    off = render_frame(
+        g, size=(240, 240), overlays={"agents"}, style=Style(contact_highlight=False)
+    )
+    on = render_frame(g, size=(240, 240), overlays={"agents"}, style=Style(contact_highlight=True))
+    assert not np.array_equal(off, on)
+
+
+def test_dashed_segments_cover_the_line_in_periodic_pieces():
+    from wmas.render.overlays import _dashed_segments
+
+    segs = _dashed_segments((0, 0), (100, 0), dash_px=6, gap_px=4)
+    assert len(segs) == 10  # period 10 over a 100px span
+    assert segs[0].tolist() == [[0, 0], [6, 0]]
+    assert segs[-1][1][0] <= 100  # the final dash is clipped, never overshoots
+    assert _dashed_segments((5, 5), (5, 5), 6, 4).shape == (0, 2, 2)  # degenerate
+
+
+def test_goal_connector_modes_change_pixels():
+    g = _geometry(n_agents=2)
+    frames = {
+        mode: render_frame(g, size=(240, 240), overlays={"goals"}, style=Style(goal_connector=mode))
+        for mode in ("none", "solid", "dashed")
+    }
+    assert not np.array_equal(frames["none"], frames["solid"])
+    assert not np.array_equal(frames["none"], frames["dashed"])
+    assert not np.array_equal(frames["solid"], frames["dashed"])
+
+
+def test_reached_goal_renders_differently_from_a_distant_one():
+    g = _geometry(n_agents=2)
+    far = render_frame(g, size=(240, 240), overlays={"goals"})
+    g.goals = g.pos.copy()  # every agent sitting on its goal
+    reached = render_frame(g, size=(240, 240), overlays={"goals"})
+    assert not np.array_equal(far, reached)
+
+
 # ----------------------------------------------------------- supersampling
 
 

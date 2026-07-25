@@ -105,13 +105,52 @@ def _draw_neighbor_graph(surface, g, camera, style):
         pygame.draw.line(surface, style.edge_color, pts[i], pts[j], style.edge_width)
 
 
+def _dashed_segments(p0, p1, dash_px: int, gap_px: int) -> np.ndarray:
+    """Screen-space on-segments of a dashed line from ``p0`` to ``p1`` as (N, 2, 2) int pixels."""
+    a = np.asarray(p0, dtype=np.float64)
+    b = np.asarray(p1, dtype=np.float64)
+    span = b - a
+    length = float(np.hypot(span[0], span[1]))
+    if length < 1.0:
+        return np.empty((0, 2, 2), dtype=np.int64)
+    unit = span / length
+    period = max(1.0, float(dash_px) + float(gap_px))
+    starts = np.arange(0.0, length, period)
+    ends = np.minimum(starts + float(dash_px), length)
+    on = np.stack((a + starts[:, None] * unit, a + ends[:, None] * unit), axis=1)
+    return np.rint(on).astype(np.int64)
+
+
 def _draw_goals(surface, g, camera, style):
+    """Goal rings, plus an agent->goal connector and a filled ring once the goal is reached."""
     if g.goals is None:
         return
     centers = _pts(camera, g.goals)
+    agents = _pts(camera, g.pos)
+    reached = np.linalg.norm(g.pos - g.goals, axis=1) <= g.radius * style.goal_reached_factor
+
+    if style.goal_connector != "none":
+        # Drawn on an alpha layer first, so connectors sit under the rings and the bodies.
+        layer = _alpha_layer("goals", surface.get_size())
+        for i in range(g.n_agents):
+            if reached[i]:
+                continue  # a reached goal needs no leader line
+            color = (*style.agent_color(i, g.model[i]), style.goal_connector_alpha)
+            if style.goal_connector == "dashed":
+                for start, end in _dashed_segments(
+                    agents[i], centers[i], style.goal_dash_px, style.goal_gap_px
+                ):
+                    pygame.draw.line(layer, color, start, end, style.edge_width)
+            else:
+                pygame.draw.line(layer, color, agents[i], centers[i], style.edge_width)
+        surface.blit(layer, (0, 0))
+
     for i in range(g.n_agents):
         color = style.agent_color(i, g.model[i])
         r = _r_px(camera, g.radius[i], floor=style.goal_min_px)
+        if reached[i]:
+            # Fill, then keep the agent-colored ring on top: both "reached" and "whose" readable.
+            pygame.draw.circle(surface, style.goal_reached_color, centers[i], r)
         pygame.draw.circle(surface, color, centers[i], r, style.goal_ring_width)
         pygame.draw.circle(surface, color, centers[i], style.goal_dot_px)  # center dot
 
@@ -199,7 +238,52 @@ def _draw_agent_decorations(surface, g, camera, style, i: int, r: int, color) ->
                 pygame.draw.circle(surface, color, tip, max(2, r // 3), style.agent_outline_width)
 
 
+def _contact_mask(g, style) -> np.ndarray:
+    """Bool ``(n_agents,)``: agents whose bodies overlap a neighbor's.
+
+    Derived purely from ``edges`` + ``pos`` + ``radius``, so the renderer stays read-only
+    w.r.t. the simulator. Neighbor lists exclude self, so an agent cannot flag itself; empty
+    ``edges`` (collisions disabled) yields all-False.
+    """
+    mask = np.zeros(g.n_agents, dtype=bool)
+    if g.edges.size == 0:
+        return mask
+    i, j = g.edges[:, 0], g.edges[:, 1]
+    gap = np.linalg.norm(g.pos[i] - g.pos[j], axis=1)
+    touching = gap < (g.radius[i] + g.radius[j]) * (1.0 + style.contact_tol)
+    mask[i[touching]] = True
+    mask[j[touching]] = True
+    return mask
+
+
+def _draw_agent_shadows(surface, g, camera, style) -> None:
+    """Offset silhouettes under every body, drawn in one pass so no shadow lands on a body."""
+    off = style.agent_shadow_offset_px
+    layer = _alpha_layer("agents", surface.get_size())
+    centers = _pts(camera, g.pos)
+    for i in range(g.n_agents):
+        body = _body_polygon(g, i)
+        if body is None:
+            r = _r_px(camera, g.radius[i], floor=style.agent_min_px)
+            pygame.draw.circle(layer, style.agent_shadow, _offset(centers[i], off), r)
+        else:
+            pygame.draw.polygon(
+                layer, style.agent_shadow, [_offset(p, off) for p in _pts(camera, body)]
+            )
+    surface.blit(layer, (0, 0))
+
+
+def _offset(pt, d: int) -> tuple[int, int]:
+    return (pt[0] + d, pt[1] + d)
+
+
 def _draw_agents(surface, g, camera, style):
+    if style.depth_cue == "shadow":
+        _draw_agent_shadows(surface, g, camera, style)
+    contact = (
+        _contact_mask(g, style) if style.contact_highlight else np.zeros(g.n_agents, dtype=bool)
+    )
+    halo = style.depth_cue == "halo"
     centers = _pts(camera, g.pos)
     for i in range(g.n_agents):
         center = centers[i]
@@ -207,6 +291,16 @@ def _draw_agents(surface, g, camera, style):
         color = style.agent_color(i, g.model[i])
         body = _body_polygon(g, i)
         pts = None if body is None else _pts(camera, body)
+
+        if halo:
+            # Stroke the silhouette before filling: half the width straddles outside the body
+            # and the fill covers the inner half, so the halo hugs even a 1.75r car sprite.
+            # Painter order does the rest — a later agent gets a clean gap over an earlier one.
+            w = 2 * style.agent_halo_px
+            if pts is None:
+                pygame.draw.circle(surface, style.agent_halo, center, r + style.agent_halo_px, w)
+            else:
+                pygame.draw.polygon(surface, style.agent_halo, pts, w)
 
         if int(g.model[i]) == 3:  # drone: a hub, the arms are decorations
             pygame.draw.circle(surface, color, center, max(2, r // 2))
@@ -216,9 +310,12 @@ def _draw_agents(surface, g, camera, style):
             pygame.draw.polygon(surface, color, pts)
 
         _draw_agent_decorations(surface, g, camera, style, i, r, color)
+
+        outline = style.contact_color if contact[i] else style.agent_outline
+        width = style.contact_outline_width if contact[i] else style.agent_outline_width
         if pts is not None:
-            pygame.draw.polygon(surface, style.agent_outline, pts, style.agent_outline_width)
-        pygame.draw.circle(surface, style.agent_outline, center, r, style.agent_outline_width)
+            pygame.draw.polygon(surface, outline, pts, width)
+        pygame.draw.circle(surface, outline, center, r, width)
 
 
 def _draw_heading(surface, g, camera, style):
