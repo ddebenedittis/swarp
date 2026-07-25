@@ -2,11 +2,12 @@
 
 import numpy as np
 import pygame
+import torch
 
 from wmas import Environment, NavigationScenario
 from wmas.render.camera import Camera
 from wmas.render.geometry import extract_geometry
-from wmas.render.input import InteractionController, ViewState, pick_agent
+from wmas.render.input import InteractionController, ViewState, pick_agent, pick_obstacle
 from wmas.render.overlays import DEFAULT_ENABLED
 from wmas.render.viewer import Viewer
 
@@ -51,6 +52,50 @@ def test_pick_agent_hits_center_and_misses_empty_space():
     assert pick_agent(g, cam, (-100.0, -100.0)) is None
 
 
+def test_pick_obstacle_hits_center_and_misses_empty_space():
+    env, scenario = make_env(n_obstacles=1)
+    g = extract_geometry(env.world, 0, scenario=scenario)
+    cam = Camera(g.bounds, (0, 0, 400, 400))
+    center = cam.world_to_screen(g.obstacle_pos[0])
+    assert pick_obstacle(g, cam, center) == 0
+    assert pick_obstacle(g, cam, (-100.0, -100.0)) is None
+
+
+def test_pick_obstacle_hits_a_zero_radius_box_by_its_extents():
+    """A box's collision radius is legitimately 0, so radius-only picking made boxes undraggable."""
+    env, scenario = make_env(n_obstacles=1)
+    g = extract_geometry(env.world, 0, scenario=scenario)
+    g.obstacle_radius = np.zeros(1)
+    g.obstacle_shape = np.array([1], dtype=np.int32)  # ObstacleShape.BOX
+    g.obstacle_angle = np.zeros(1)
+    g.obstacle_half_extents = np.array([[0.3, 0.2]])
+    cam = Camera(g.bounds, (0, 0, 400, 400))
+    assert pick_obstacle(g, cam, cam.world_to_screen(g.obstacle_pos[0])) == 0
+    assert pick_obstacle(g, cam, (-100.0, -100.0)) is None
+
+
+def test_supersampling_does_not_disturb_picking_or_the_viewers_camera():
+    """The Viewer's camera must stay window-space; only per-frame copies are scaled.
+
+    The interaction controller holds that exact object and feeds it raw window pixels, so a
+    scaled camera leaking back would break picking, panning and zoom-under-cursor.
+    """
+    from wmas.render.style import Style
+
+    env, scenario = make_env(n_agents=3)
+    viewer = Viewer(env, size=(300, 300), scenario=scenario, style=Style(supersample=3))
+    g = viewer._geometry()
+    cam = viewer._camera_for(g)
+    before = cam.world_to_screen(g.pos)
+
+    viewer.render_array(hud=True)  # renders at 3x internally
+
+    assert viewer._camera_for(g) is cam
+    np.testing.assert_allclose(cam.world_to_screen(g.pos), before)
+    for k in range(g.n_agents):
+        assert pick_agent(g, cam, cam.world_to_screen(g.pos[k])) == k
+
+
 # --------------------------------------------------------- event controller
 
 
@@ -91,6 +136,18 @@ def test_space_pauses_and_escape_quits():
     assert state.paused is True
     ctrl.handle_event(_key(pygame.K_ESCAPE))
     assert state.quit is True
+
+
+def test_reset_and_help_keys_update_view_state():
+    state, ctrl, _ = _controller()
+    ctrl.handle_event(_key("r"))
+    assert state.reset_requested is True
+    ctrl.handle_event(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_F1))
+    assert state.show_help is True
+    ctrl.handle_event(pygame.event.Event(pygame.TEXTINPUT, text="?"))
+    assert state.show_help is False
+    ctrl.handle_event(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_SLASH, mod=pygame.KMOD_SHIFT))
+    assert state.show_help is True
 
 
 def test_mouse_wheel_zooms_in():
@@ -139,12 +196,137 @@ def test_viewer_hover_panel_changes_pixels():
     assert not np.array_equal(base, hovered)
 
 
+def test_viewer_help_panel_changes_pixels():
+    env, _ = make_env(n_agents=3)
+    viewer = Viewer(env, size=(420, 320))
+    base = viewer.render_array(hud=True)
+    viewer.state.show_help = True
+    helped = viewer.render_array(hud=True)
+    assert not np.array_equal(base, helped)
+
+
+def test_viewer_help_panel_changes_pixels_in_mosaic():
+    env, _ = make_env(n_envs=4, n_agents=3)
+    viewer = Viewer(env, size=(520, 360), mosaic=True)
+    base = viewer.render_array(hud=True)
+    viewer.state.show_help = True
+    helped = viewer.render_array(hud=True)
+    assert not np.array_equal(base, helped)
+
+
+def test_viewer_write_obstacle_pos_moves_obstacle():
+    env, _ = make_env(n_obstacles=1)
+    viewer = Viewer(env, size=(320, 320))
+    viewer._write_obstacle_pos(0, (0.25, -0.25))
+    np.testing.assert_allclose(env.world.obstacle_pos[0, 0].cpu().numpy(), [0.25, -0.25])
+
+
 def test_viewer_focus_env_selects_that_env():
     env, _ = make_env(n_envs=3, n_agents=3)
     viewer = Viewer(env, env_index=2)
     assert viewer.state.focus_env == 2
     g = viewer._geometry()
     np.testing.assert_allclose(g.pos, env.world.state.pos[2].cpu().numpy())
+
+
+def test_period_key_requests_a_single_step():
+    state, ctrl, _ = _controller()
+    assert state.step_once is False
+    ctrl.handle_event(_key(pygame.K_PERIOD))
+    assert state.step_once is True
+
+
+def test_should_step_gate_honors_pause_step_once_and_done():
+    env, _ = make_env(n_agents=2)
+    viewer = Viewer(env, size=(160, 120))
+
+    assert viewer._should_step(done=False) is True  # running
+    viewer.state.paused = True
+    assert viewer._should_step(done=False) is False  # paused, no request
+
+    viewer.state.step_once = True
+    assert viewer._should_step(done=False) is True  # one-shot honored
+    assert viewer._should_step(done=False) is False  # ... and consumed
+
+    viewer.state.step_once = True
+    assert viewer._should_step(done=True) is False  # max_steps wins over a step request
+
+
+def test_plain_l_toggles_the_lidar_overlay_while_shift_l_cycles_the_mode():
+    """Regression: the mode-cycle branch used to swallow "l", making the overlay untoggleable."""
+    cycled = 0
+
+    def on_cycle():
+        nonlocal cycled
+        cycled += 1
+
+    state = ViewState(n_envs=2, enabled=set(DEFAULT_ENABLED))
+    cam = Camera((-1.0, 1.0, -1.0, 1.0), (0, 0, 400, 400))
+    ctrl = InteractionController(state, cam, on_cycle_lidar=on_cycle)
+
+    assert "lidar" in state.enabled
+    ctrl.handle_event(_key("l"))
+    assert "lidar" not in state.enabled and cycled == 0  # plain l reaches the overlay
+    ctrl.handle_event(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_l, mod=pygame.KMOD_SHIFT))
+    assert cycled == 1 and "lidar" not in state.enabled  # shift+l only cycles the mode
+
+
+def test_reward_hud_draws_and_no_ops_on_thin_data():
+    import pygame as pg
+
+    from wmas.render.hud import draw_reward_hud
+    from wmas.render.style import Style
+
+    env, scenario = make_env(n_agents=3)
+    g = extract_geometry(env.world, 0, scenario=scenario)
+    style = Style()
+    rng = np.random.default_rng(0)
+
+    def frame(rewards):
+        surf = pg.Surface((320, 240))
+        surf.fill(style.background)
+        draw_reward_hud(surf, rewards, g, style)
+        return pg.surfarray.array3d(surf).copy()
+
+    blank = frame(None)
+    assert np.array_equal(blank, frame(rng.normal(size=(1, 3))))  # one sample has no line
+    assert not np.array_equal(blank, frame(rng.normal(size=(20, 3))))
+    assert not np.array_equal(
+        blank, frame(np.full((20, 3), 0.5))
+    )  # flat window must not divide by 0
+
+
+def test_viewer_reward_hud_changes_pixels_once_samples_accumulate():
+    from wmas.render.style import Style
+
+    env, scenario = make_env(n_agents=3, n_envs=2)
+    viewer = Viewer(env, size=(320, 240), scenario=scenario, style=Style(reward_hud=True))
+    empty = viewer.render_array(hud=True)
+    for _ in range(5):
+        viewer._append_reward_sample(torch.randn(env.n_envs, env.n_agents))
+    assert len(viewer._reward_history) == 5
+    assert not np.array_equal(empty, viewer.render_array(hud=True))
+
+
+def test_focus_env_change_clears_the_trail_and_reward_buffers():
+    """Both buffers hold one env's history, so switching env must not smear them together."""
+    from wmas.render.style import Style
+
+    env, scenario = make_env(n_envs=3, n_agents=2)
+    viewer = Viewer(
+        env,
+        size=(200, 200),
+        scenario=scenario,
+        style=Style(reward_hud=True, trajectory_mode="trail"),
+    )
+    viewer._append_trail_sample()
+    viewer._append_reward_sample(torch.randn(env.n_envs, env.n_agents))
+    assert viewer._trail_history and viewer._reward_history
+
+    viewer.state.focus_env = 2
+    viewer.render_array()
+    assert viewer._trail_history == [] and viewer._reward_history == []
+    assert viewer._buffer_env == 2
 
 
 def test_viewer_run_loop_smoke_headless(monkeypatch):

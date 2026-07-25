@@ -23,6 +23,27 @@ class MosaicLayout:
     tile_envs: list[int]
     n_hidden: int = 0
 
+    def scaled(self, factor: int) -> MosaicLayout:
+        """A copy with every rect multiplied by ``factor`` (for supersampled rendering).
+
+        The unscaled layout stays authoritative for :func:`tile_at`, which resolves clicks in
+        window pixels.
+        """
+        f = max(1, int(factor))
+        if f == 1:
+            return self
+        return MosaicLayout(
+            focus_rect=_scale_rect(self.focus_rect, f),
+            tiles=[_scale_rect(t, f) for t in self.tiles],
+            tile_envs=list(self.tile_envs),
+            n_hidden=self.n_hidden,
+        )
+
+
+def _scale_rect(rect: Rect, factor: int) -> Rect:
+    x, y, w, h = rect
+    return (x * factor, y * factor, w * factor, h * factor)
+
 
 def compute_mosaic_layout(
     size: tuple[int, int],

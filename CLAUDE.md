@@ -42,8 +42,9 @@ kernels              wmas/dynamics/kernels.py, wmas/core/collisions.py, wmas/cor
 - `wmas/core/state.py` — `WorldState`: structure-of-arrays Warp storage. One unified state
   for all models (`pos/theta/vel/speed/ang_vel`); holonomic agents ignore `theta/ang_vel`.
 - `wmas/dynamics/base.py` — `DynamicsModel`/`ControlMode`/`Integrator` enums, `AgentConfig`
-  (per-agent, mixable in one world), and `build_agent_params`. Three models: holonomic point,
-  diff-drive, kinematic bicycle. `wmas/dynamics/drone.py` `DronePlaceholder` marks the 6-DOF slot.
+  (per-agent, mixable in one world), and `build_agent_params`. Four models: holonomic point,
+  diff-drive, kinematic bicycle (all 2D), and a 6-DOF `+`-config quadrotor whose `AgentConfig`
+  factory lives in `wmas/dynamics/drone.py`.
 - `wmas/interop/autograd.py` — the torch↔Warp bridge: `_WarpStepFn` (a `torch.autograd.Function`
   replaying Warp adjoints in `backward`), `warp_step`, and `rollout` for BPTT over multi-step rollouts.
 - `wmas/core/neighbors.py` — `NeighborGrid` with two backends (per-env brute force and one

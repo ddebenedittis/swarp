@@ -29,6 +29,44 @@ def _ensure_pygame():
     return pygame
 
 
+_HIRES_CACHE: dict[tuple[int, int], object] = {}
+
+
+def _hires_surface(pygame, size: tuple[int, int]):
+    """A reusable offscreen surface of ``size`` — the run loop must not allocate per frame."""
+    key = (int(size[0]), int(size[1]))
+    surf = _HIRES_CACHE.get(key)
+    if surf is None:
+        if len(_HIRES_CACHE) > 4:  # window resizes / supersample changes; keep the cache small
+            _HIRES_CACHE.clear()
+        surf = pygame.Surface(key)
+        _HIRES_CACHE[key] = surf
+    return surf
+
+
+def draw_supersampled(pygame, target, factor: int, draw_fn) -> None:
+    """Run ``draw_fn(surface, scale)`` at ``factor``x offscreen, then smoothscale onto ``target``.
+
+    ``factor <= 1`` draws straight onto ``target`` with ``scale=1``, at zero overhead.
+    ``draw_fn`` owns its coordinate spaces — it must scale the camera (:meth:`Camera.scaled`),
+    the style (:meth:`Style.scaled`) and any layout rects itself. Scaling the camera alone
+    would leave 1px features 1px wide in the hi-res buffer, so they would downscale to a
+    washed-out partial pixel: thinner, not smoother.
+    """
+    f = max(1, int(factor))
+    if f == 1:
+        draw_fn(target, 1)
+        return
+    w, h = target.get_size()
+    hi = _hires_surface(pygame, (w * f, h * f))
+    hi.set_clip(None)
+    draw_fn(hi, f)
+    try:
+        pygame.transform.smoothscale(hi, (w, h), target)
+    except (ValueError, TypeError):  # target format rejected as a destination surface
+        target.blit(pygame.transform.smoothscale(hi, (w, h)), (0, 0))
+
+
 def _bounds_from_geometry(g: RenderGeometry) -> tuple[float, float, float, float]:
     """Fallback view box when the world has no bounds: fit all drawable points + a margin."""
     pts = [g.pos]
@@ -75,6 +113,11 @@ def render_frame(
         camera = Camera(bounds, viewport=(0, 0, width, height))
 
     surface = pygame.Surface((width, height))
-    draw_scene(surface, geometry, camera, enabled, style)
+    draw_supersampled(
+        pygame,
+        surface,
+        style.supersample,
+        lambda surf, s: draw_scene(surf, geometry, camera.scaled(s), enabled, style.scaled(s)),
+    )
     arr = pygame.surfarray.array3d(surface)  # (W, H, 3)
     return np.ascontiguousarray(np.transpose(arr, (1, 0, 2)))  # (H, W, 3)

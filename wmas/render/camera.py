@@ -53,6 +53,27 @@ class Camera:
         wy = self.wcy - (s[..., 1] - self.vcy - self.pan_y) / self.scale
         return np.stack([wx, wy], axis=-1)
 
+    def scaled(self, factor: float) -> Camera:
+        """A copy whose screen space is ``factor`` x this one's: ``w2s'(p) == factor * w2s(p)``.
+
+        Used for supersampled rendering. It must be a *copy*: the interaction controller holds
+        the original and drives it with raw window-pixel coordinates, so scaling in place would
+        silently break picking, panning and zoom-under-cursor.
+        """
+        f = float(factor)
+        if f == 1.0:
+            return self
+        out = Camera(
+            self.bounds,
+            (self.vx * f, self.vy * f, self.vw * f, self.vh * f),
+            zoom=self.zoom,
+            margin_frac=self.margin_frac,
+        )
+        # _base_scale, vcx and vcy all scale by f from the viewport alone; pan is in pixels.
+        out.pan_x = self.pan_x * f
+        out.pan_y = self.pan_y * f
+        return out
+
     def pan(self, dx: float, dy: float) -> Camera:
         """Shift the view by a screen-pixel delta (e.g. a mouse drag)."""
         self.pan_x += dx

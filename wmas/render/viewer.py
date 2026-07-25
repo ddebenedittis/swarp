@@ -17,12 +17,17 @@ import numpy as np
 import torch
 
 from wmas.render.camera import Camera
-from wmas.render.geometry import extract_geometry
-from wmas.render.hud import draw_hover_panel, draw_hud
+from wmas.render.geometry import extract_geometry, extract_geometry_batch
+from wmas.render.hud import draw_help, draw_hover_panel, draw_hud, draw_reward_hud
 from wmas.render.input import InteractionController, ViewState
 from wmas.render.layout import MosaicLayout, compute_mosaic_layout, tile_at
 from wmas.render.overlays import DEFAULT_ENABLED, _p, _r_px
-from wmas.render.renderer import _bounds_from_geometry, _ensure_pygame, draw_scene
+from wmas.render.renderer import (
+    _bounds_from_geometry,
+    _ensure_pygame,
+    draw_scene,
+    draw_supersampled,
+)
 from wmas.render.style import Style
 
 
@@ -56,13 +61,20 @@ class Viewer:
         self._camera: Camera | None = None
         self._layout: MosaicLayout | None = None
         self._window = None
+        self._controller: InteractionController | None = None
         self._step_count = 0
+        self._trail_history: list[np.ndarray] = []
+        self._reward_history: list[np.ndarray] = []
+        self._buffer_env = env_index  # which focus_env the two rolling buffers belong to
 
     # ------------------------------------------------------------------ draw
 
     def _geometry(self, env_idx: int | None = None):
         idx = self.state.focus_env if env_idx is None else env_idx
-        return extract_geometry(self.env.world, idx, scenario=self.scenario)
+        g = extract_geometry(self.env.world, idx, scenario=self.scenario)
+        if env_idx is None and self.style.trajectory_mode != "none" and self._trail_history:
+            g.extras["trajectories"] = np.stack(self._trail_history, axis=1)
+        return g
 
     def _ensure_layout(self) -> MosaicLayout:
         if self._layout is None:
@@ -85,6 +97,86 @@ class Viewer:
     def _tile_env_at(self, screen_xy) -> int | None:
         return tile_at(self._ensure_layout(), screen_xy) if self.mosaic else None
 
+    def _interaction_controller(self, camera: Camera) -> InteractionController:
+        if self._controller is None:
+            self._controller = InteractionController(
+                self.state,
+                camera,
+                geometry_getter=self._geometry,
+                tile_resolver=self._tile_env_at,
+                on_drag_agent=self._write_agent_pos if self.allow_write_back else None,
+                on_drag_obstacle=self._write_obstacle_pos if self.allow_write_back else None,
+                on_place_goal=self._write_goal if self.allow_write_back else None,
+                on_cycle_trajectory=self._cycle_trajectory,
+                on_cycle_lidar=self._cycle_lidar,
+                on_cycle_color=self._cycle_color,
+            )
+        return self._controller
+
+    def _cycle_trajectory(self) -> None:
+        modes = ("none", "trail", "fade")
+        self.style.trajectory_mode = modes[
+            (modes.index(self.style.trajectory_mode) + 1) % len(modes)
+        ]
+        if self.style.trajectory_mode == "none":
+            self._trail_history.clear()
+
+    def _cycle_lidar(self) -> None:
+        modes = ("none", "rays", "area", "both")
+        self.style.lidar_mode = modes[(modes.index(self.style.lidar_mode) + 1) % len(modes)]
+
+    def _cycle_color(self) -> None:
+        modes = ("agent", "model")
+        self.style.color_mode = modes[(modes.index(self.style.color_mode) + 1) % len(modes)]
+
+    def _append_trail_sample(self) -> None:
+        if self.style.trajectory_mode == "none":
+            return
+        pos = self.env.world.state.pos[self.state.focus_env].detach().to("cpu").numpy().copy()
+        self._trail_history.append(pos)
+        if len(self._trail_history) > self.style.trajectory_len:
+            del self._trail_history[: len(self._trail_history) - self.style.trajectory_len]
+
+    def _append_reward_sample(self, reward) -> None:
+        """Buffer one ``[n_agents]`` reward row for the HUD sparkline.
+
+        Costs exactly one small device->host copy per *rendered* step, and only while
+        ``style.reward_hud`` is on. The viewer never runs on the differentiable hot path.
+        """
+        if not self.style.reward_hud or reward is None:
+            return
+        row = reward[self.state.focus_env].detach().to("cpu").numpy().astype(np.float32, copy=True)
+        self._reward_history.append(row)
+        if len(self._reward_history) > self.style.reward_hud_len:
+            del self._reward_history[: len(self._reward_history) - self.style.reward_hud_len]
+
+    def _invalidate_buffers_on_focus_change(self) -> None:
+        """Drop the trail and reward buffers when the focus env changes.
+
+        Both buffers hold one env's history; without this, ``[``/``]`` smears one env's trail
+        and rewards onto the next. Cleared together so the two cannot drift apart.
+        """
+        if self._buffer_env != self.state.focus_env:
+            self._trail_history.clear()
+            self._reward_history.clear()
+            self._buffer_env = self.state.focus_env
+
+    def _should_step(self, done: bool) -> bool:
+        """Whether to advance the sim; consumes a one-shot ``step_once`` request."""
+        once = self.state.step_once
+        self.state.step_once = False
+        return (not self.state.paused or once) and not done
+
+    def _apply_reset_request(self):
+        if not self.state.reset_requested:
+            return None
+        obs = self.env.reset()
+        self._step_count = 0
+        self._trail_history.clear()
+        self._reward_history.clear()
+        self.state.reset_requested = False
+        return obs
+
     # ------------------------------------------------------------ write-back
 
     def _write_agent_pos(self, agent_idx: int, world_xy) -> None:
@@ -102,6 +194,8 @@ class Viewer:
             s.vel[e, agent_idx] = 0
             s.speed[e, agent_idx] = 0
             s.ang_vel[e, agent_idx] = 0
+            if self._trail_history:
+                self._trail_history[-1][agent_idx] = np.asarray(world_xy, dtype=np.float64)
             # Positions changed out of band; drop any reusable neighbor list.
             self.env.world.mark_pos_dirty()
 
@@ -115,58 +209,102 @@ class Viewer:
                 world_xy, dtype=self.env.dtype, device=self.env.device
             )
 
-    def _draw(self, surface, geometry, camera, *, hud: bool, fps=None, clear: bool = True) -> None:
-        draw_scene(surface, geometry, camera, self.state.enabled, self.style, clear=clear)
-        if hud:
-            draw_hud(surface, self.state, self.style, step=self._step_count, fps=fps)
-            draw_hover_panel(surface, geometry, self.state.hover_agent, self.style)
+    def _write_obstacle_pos(self, obstacle_idx: int, world_xy) -> None:
+        """Move an obstacle in the focus env and refresh the stepper obstacle buffers."""
+        world = self.env.world
+        if world.obstacle_pos is None or world.obstacle_radius is None:
+            return
+        with torch.no_grad():
+            world.obstacle_pos[self.state.focus_env, obstacle_idx] = torch.tensor(
+                world_xy, dtype=self.env.dtype, device=self.env.device
+            )
+            world.set_obstacles(
+                world.obstacle_pos,
+                world.obstacle_radius,
+                shape=world.obstacle_shape,
+                angle=world.obstacle_angle,
+                half_extents=world.obstacle_half_extents,
+            )
 
-    def _draw_tile(self, pygame, surface, geometry, camera, rect, *, focused: bool) -> None:
+    def _draw(
+        self, surface, geometry, camera, style, *, hud: bool, fps=None, clear: bool = True
+    ) -> None:
+        draw_scene(surface, geometry, camera, self.state.enabled, style, clear=clear)
+        if hud:
+            draw_hud(surface, self.state, style, step=self._step_count, fps=fps)
+            draw_hover_panel(surface, geometry, self.state.hover_agent, style)
+            rewards = np.stack(self._reward_history) if len(self._reward_history) > 1 else None
+            draw_reward_hud(surface, rewards, geometry, style)
+            draw_help(surface, self.state, style)
+
+    def _draw_tile(self, pygame, surface, geometry, camera, rect, style, *, focused: bool) -> None:
         r = pygame.Rect(*rect)
-        surface.fill((236, 236, 240), r)
+        surface.fill(style.tile_background, r)
         prev = surface.get_clip()
         surface.set_clip(r)
         if geometry.bounds is not None:
             x0, x1, y0, y1 = geometry.bounds
             corners = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
             pygame.draw.lines(
-                surface, self.style.bounds_color, True, [_p(camera, c) for c in corners], 1
+                surface,
+                style.bounds_color,
+                True,
+                [_p(camera, c) for c in corners],
+                style.tile_border_width,
             )
         for i in range(geometry.n_agents):
             pygame.draw.circle(
                 surface,
-                self.style.agent_color(i),
+                style.agent_color(i, geometry.model[i]),
                 _p(camera, geometry.pos[i]),
-                _r_px(camera, geometry.radius[i], floor=2),
+                _r_px(camera, geometry.radius[i], floor=style.tile_agent_min_px),
             )
         surface.set_clip(prev)
-        border = self.style.velocity_color if focused else (185, 185, 190)
-        pygame.draw.rect(surface, border, r, 2 if focused else 1)
+        border = style.tile_focus_border if focused else style.tile_border
+        width = style.tile_focus_border_width if focused else style.tile_border_width
+        pygame.draw.rect(surface, border, r, width)
 
-    def _draw_mosaic(self, pygame, surface, *, hud: bool, fps=None) -> None:
-        layout = self._ensure_layout()
-        surface.fill(self.style.background)
-        for tile_rect, env_idx in zip(layout.tiles, layout.tile_envs, strict=True):
-            g = self._geometry(env_idx)
+    def _draw_mosaic(self, pygame, surface, scale: int, style, *, hud: bool, fps=None) -> None:
+        # Rects come from the *scaled* layout; self._layout stays window-space for tile_at().
+        layout = self._ensure_layout().scaled(scale)
+        surface.fill(style.background)
+        # Tiles draw only bounds/pos/radius, so skip the neighbor rebuild and the sensor hook.
+        tiles = extract_geometry_batch(
+            self.env.world, layout.tile_envs, with_edges=False, with_extras=False
+        )
+        for tile_rect, env_idx, g in zip(layout.tiles, layout.tile_envs, tiles, strict=True):
             cam = Camera(g.bounds or _bounds_from_geometry(g), viewport=tile_rect)
             self._draw_tile(
-                pygame, surface, g, cam, tile_rect, focused=env_idx == self.state.focus_env
+                pygame, surface, g, cam, tile_rect, style, focused=env_idx == self.state.focus_env
             )
         focus = pygame.Rect(*layout.focus_rect)
-        surface.fill(self.style.background, focus)
+        surface.fill(style.background, focus)
         prev = surface.get_clip()
         surface.set_clip(focus)
         gf = self._geometry()
-        self._draw(surface, gf, self._camera_for(gf), hud=hud, fps=fps, clear=False)
+        self._draw(
+            surface, gf, self._camera_for(gf).scaled(scale), style, hud=hud, fps=fps, clear=False
+        )
         surface.set_clip(prev)
-        pygame.draw.rect(surface, self.style.bounds_color, focus, 1)
+        pygame.draw.rect(surface, style.bounds_color, focus, style.tile_border_width)
 
     def _render_onto(self, pygame, surface, *, hud: bool, fps=None) -> None:
+        """Render the current view onto ``surface``, supersampling when the style asks for it."""
+        self._invalidate_buffers_on_focus_change()
+        draw_supersampled(
+            pygame,
+            surface,
+            self.style.supersample,
+            lambda surf, s: self._render_onto_scaled(pygame, surf, s, hud=hud, fps=fps),
+        )
+
+    def _render_onto_scaled(self, pygame, surface, scale: int, *, hud: bool, fps=None) -> None:
+        style = self.style.scaled(scale)
         if self.mosaic:
-            self._draw_mosaic(pygame, surface, hud=hud, fps=fps)
+            self._draw_mosaic(pygame, surface, scale, style, hud=hud, fps=fps)
         else:
             g = self._geometry()
-            self._draw(surface, g, self._camera_for(g), hud=hud, fps=fps)
+            self._draw(surface, g, self._camera_for(g).scaled(scale), style, hud=hud, fps=fps)
 
     def render_array(self, *, hud: bool = False) -> np.ndarray:
         """Render the current view (single env or mosaic) to an ``(H, W, 3)`` uint8 array."""
@@ -183,9 +321,12 @@ class Viewer:
             pygame.display.init()
             self._window = pygame.display.set_mode(self.size)
             pygame.display.set_caption("wmas viewer")
+        camera = self._camera_for(self._geometry())
+        controller = self._interaction_controller(camera)
         for event in pygame.event.get():  # keep the window responsive / closeable
-            if event.type == pygame.QUIT:
-                self.state.quit = True
+            controller.handle_event(event)
+        self._apply_reset_request()
+        self._append_trail_sample()
         self._render_onto(pygame, self._window, hud=True)
         pygame.display.flip()
 
@@ -225,24 +366,22 @@ class Viewer:
         pygame.display.set_caption("wmas viewer")
         clock = pygame.time.Clock()
         camera = self._camera_for(self._geometry())
-        controller = InteractionController(
-            self.state,
-            camera,
-            geometry_getter=self._geometry,
-            tile_resolver=self._tile_env_at,
-            on_drag_agent=self._write_agent_pos if self.allow_write_back else None,
-            on_place_goal=self._write_goal if self.allow_write_back else None,
-        )
+        controller = self._interaction_controller(camera)
         obs = self.scenario.observations() if self.scenario is not None else None
         try:
             while not self.state.quit:
                 for event in pygame.event.get():
                     controller.handle_event(event)
+                reset_obs = self._apply_reset_request()
+                if reset_obs is not None:
+                    obs = reset_obs
                 done = max_steps is not None and self._step_count >= max_steps
-                if not self.state.paused and not done:
+                if self._should_step(done):
                     with torch.no_grad():
-                        obs, *_ = self.env.step(self._actions(action_fn, obs))
+                        obs, reward, *_ = self.env.step(self._actions(action_fn, obs))
                     self._step_count += 1
+                    self._append_trail_sample()
+                    self._append_reward_sample(reward)
                 self._render_onto(pygame, window, hud=True, fps=clock.get_fps())
                 pygame.display.flip()
                 clock.tick(self.fps)
