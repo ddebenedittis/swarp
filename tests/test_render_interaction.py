@@ -2,6 +2,7 @@
 
 import numpy as np
 import pygame
+import torch
 
 from wmas import Environment, NavigationScenario
 from wmas.render.camera import Camera
@@ -226,6 +227,106 @@ def test_viewer_focus_env_selects_that_env():
     assert viewer.state.focus_env == 2
     g = viewer._geometry()
     np.testing.assert_allclose(g.pos, env.world.state.pos[2].cpu().numpy())
+
+
+def test_period_key_requests_a_single_step():
+    state, ctrl, _ = _controller()
+    assert state.step_once is False
+    ctrl.handle_event(_key(pygame.K_PERIOD))
+    assert state.step_once is True
+
+
+def test_should_step_gate_honors_pause_step_once_and_done():
+    env, _ = make_env(n_agents=2)
+    viewer = Viewer(env, size=(160, 120))
+
+    assert viewer._should_step(done=False) is True  # running
+    viewer.state.paused = True
+    assert viewer._should_step(done=False) is False  # paused, no request
+
+    viewer.state.step_once = True
+    assert viewer._should_step(done=False) is True  # one-shot honored
+    assert viewer._should_step(done=False) is False  # ... and consumed
+
+    viewer.state.step_once = True
+    assert viewer._should_step(done=True) is False  # max_steps wins over a step request
+
+
+def test_plain_l_toggles_the_lidar_overlay_while_shift_l_cycles_the_mode():
+    """Regression: the mode-cycle branch used to swallow "l", making the overlay untoggleable."""
+    cycled = 0
+
+    def on_cycle():
+        nonlocal cycled
+        cycled += 1
+
+    state = ViewState(n_envs=2, enabled=set(DEFAULT_ENABLED))
+    cam = Camera((-1.0, 1.0, -1.0, 1.0), (0, 0, 400, 400))
+    ctrl = InteractionController(state, cam, on_cycle_lidar=on_cycle)
+
+    assert "lidar" in state.enabled
+    ctrl.handle_event(_key("l"))
+    assert "lidar" not in state.enabled and cycled == 0  # plain l reaches the overlay
+    ctrl.handle_event(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_l, mod=pygame.KMOD_SHIFT))
+    assert cycled == 1 and "lidar" not in state.enabled  # shift+l only cycles the mode
+
+
+def test_reward_hud_draws_and_no_ops_on_thin_data():
+    import pygame as pg
+
+    from wmas.render.hud import draw_reward_hud
+    from wmas.render.style import Style
+
+    env, scenario = make_env(n_agents=3)
+    g = extract_geometry(env.world, 0, scenario=scenario)
+    style = Style()
+    rng = np.random.default_rng(0)
+
+    def frame(rewards):
+        surf = pg.Surface((320, 240))
+        surf.fill(style.background)
+        draw_reward_hud(surf, rewards, g, style)
+        return pg.surfarray.array3d(surf).copy()
+
+    blank = frame(None)
+    assert np.array_equal(blank, frame(rng.normal(size=(1, 3))))  # one sample has no line
+    assert not np.array_equal(blank, frame(rng.normal(size=(20, 3))))
+    assert not np.array_equal(
+        blank, frame(np.full((20, 3), 0.5))
+    )  # flat window must not divide by 0
+
+
+def test_viewer_reward_hud_changes_pixels_once_samples_accumulate():
+    from wmas.render.style import Style
+
+    env, scenario = make_env(n_agents=3, n_envs=2)
+    viewer = Viewer(env, size=(320, 240), scenario=scenario, style=Style(reward_hud=True))
+    empty = viewer.render_array(hud=True)
+    for _ in range(5):
+        viewer._append_reward_sample(torch.randn(env.n_envs, env.n_agents))
+    assert len(viewer._reward_history) == 5
+    assert not np.array_equal(empty, viewer.render_array(hud=True))
+
+
+def test_focus_env_change_clears_the_trail_and_reward_buffers():
+    """Both buffers hold one env's history, so switching env must not smear them together."""
+    from wmas.render.style import Style
+
+    env, scenario = make_env(n_envs=3, n_agents=2)
+    viewer = Viewer(
+        env,
+        size=(200, 200),
+        scenario=scenario,
+        style=Style(reward_hud=True, trajectory_mode="trail"),
+    )
+    viewer._append_trail_sample()
+    viewer._append_reward_sample(torch.randn(env.n_envs, env.n_agents))
+    assert viewer._trail_history and viewer._reward_history
+
+    viewer.state.focus_env = 2
+    viewer.render_array()
+    assert viewer._trail_history == [] and viewer._reward_history == []
+    assert viewer._buffer_env == 2
 
 
 def test_viewer_run_loop_smoke_headless(monkeypatch):

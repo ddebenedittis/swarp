@@ -94,6 +94,7 @@ class ViewState:
     enabled: set[str]
     focus_env: int = 0
     paused: bool = False
+    step_once: bool = False  # one-shot: advance a single step while paused, then clear
     show_help: bool = False
     reset_requested: bool = False
     hover_agent: int | None = None
@@ -208,12 +209,19 @@ class InteractionController:
         s = self.state
         key = event.key
         overlays = _overlay_keys()
+        shift = bool(getattr(event, "mod", 0) & pygame.KMOD_SHIFT)
         if key == pygame.K_t and self._on_cycle_trajectory is not None:
             self._on_cycle_trajectory()
-        elif key == pygame.K_l and self._on_cycle_lidar is not None:
+        elif key == pygame.K_l and shift and self._on_cycle_lidar is not None:
+            # Shift-qualified: plain "l" must fall through to toggling the lidar *overlay*,
+            # whose registry key is also "l" (it was unreachable while this branch took it).
             self._on_cycle_lidar()
         elif key == pygame.K_k and self._on_cycle_color is not None:
             self._on_cycle_color()
+        elif key == pygame.K_PERIOD:
+            # A period cannot collide with a future overlay (those auto-bind letters), and
+            # frame-advance is the debugger convention.
+            s.step_once = True
         elif key in overlays:
             name = overlays[key]
             s.enabled.discard(name) if name in s.enabled else s.enabled.add(name)

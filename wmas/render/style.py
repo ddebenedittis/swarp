@@ -76,6 +76,7 @@ class Style:
     depth_cue: str = "halo"  # none | halo | shadow
     goal_connector: str = "dashed"  # none | solid | dashed
     contact_highlight: bool = True
+    reward_hud: bool = False  # one small device->host copy per rendered step when on
 
     # ------------------------------------------------------------ pixel sizes
     line_width: int = 2
@@ -102,6 +103,7 @@ class Style:
     hover_pad: int = 6
     hud_margin: int = 8
     id_offset_px: int = 4
+    reward_hud_size: tuple[int, int] = (180, 84)
 
     # ------------------------------------------------------------------ fonts
     font_size: int = 15  # fallback when no viewport height is known
@@ -116,6 +118,7 @@ class Style:
     trajectory_alpha: int = 125
     trajectory_fade_min_alpha: int = 20
     trajectory_len: int = 80
+    reward_hud_len: int = 120
     supersample: int = 2  # 1 disables; >1 renders NxN offscreen and downscales
     goal_connector_alpha: int = 90
     goal_reached_factor: float = 1.0  # goal counts as reached within this many agent radii
@@ -199,6 +202,7 @@ _PX_FIELDS: frozenset[str] = frozenset(
         "hover_pad",
         "hud_margin",
         "id_offset_px",
+        "reward_hud_size",
         "font_size",
         "font_min",
         "font_max",
@@ -239,6 +243,8 @@ _UNSCALED_FIELDS: frozenset[str] = frozenset(
         "depth_cue",
         "goal_connector",
         "contact_highlight",
+        "reward_hud",
+        "reward_hud_len",
         "goal_connector_alpha",
         "goal_reached_factor",
         "contact_tol",

@@ -199,7 +199,9 @@ def test_style_scaled_multiplies_pixel_fields_only():
     base = Style()
     big = base.scaled(3)
     for name in _PX_FIELDS:
-        assert getattr(big, name) == 3 * getattr(base, name), name
+        was, now = getattr(base, name), getattr(big, name)
+        expected = tuple(3 * v for v in was) if isinstance(was, tuple) else 3 * was
+        assert now == expected, name
     for name in _UNSCALED_FIELDS:
         assert getattr(big, name) == getattr(base, name), name
     assert base.scaled(1) is base

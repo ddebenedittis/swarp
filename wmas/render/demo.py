@@ -196,6 +196,9 @@ def main(argv=None):
     parser.add_argument("--trail-len", type=int, default=80)
     parser.add_argument("--theme", choices=tuple(THEMES), default="light")
     parser.add_argument(
+        "--reward-hud", action="store_true", help="per-agent reward sparkline (adds a D2H copy)"
+    )
+    parser.add_argument(
         "--supersample", type=int, default=2, help="offscreen AA factor (1 disables)"
     )
     args = parser.parse_args(argv)
@@ -218,6 +221,7 @@ def main(argv=None):
         trajectory_mode=args.trajectory,
         trajectory_len=args.trail_len,
         supersample=args.supersample,
+        reward_hud=args.reward_hud,
     )
 
     if args.save:

@@ -18,7 +18,7 @@ import torch
 
 from wmas.render.camera import Camera
 from wmas.render.geometry import extract_geometry, extract_geometry_batch
-from wmas.render.hud import draw_help, draw_hover_panel, draw_hud
+from wmas.render.hud import draw_help, draw_hover_panel, draw_hud, draw_reward_hud
 from wmas.render.input import InteractionController, ViewState
 from wmas.render.layout import MosaicLayout, compute_mosaic_layout, tile_at
 from wmas.render.overlays import DEFAULT_ENABLED, _p, _r_px
@@ -64,6 +64,8 @@ class Viewer:
         self._controller: InteractionController | None = None
         self._step_count = 0
         self._trail_history: list[np.ndarray] = []
+        self._reward_history: list[np.ndarray] = []
+        self._buffer_env = env_index  # which focus_env the two rolling buffers belong to
 
     # ------------------------------------------------------------------ draw
 
@@ -135,12 +137,43 @@ class Viewer:
         if len(self._trail_history) > self.style.trajectory_len:
             del self._trail_history[: len(self._trail_history) - self.style.trajectory_len]
 
+    def _append_reward_sample(self, reward) -> None:
+        """Buffer one ``[n_agents]`` reward row for the HUD sparkline.
+
+        Costs exactly one small device->host copy per *rendered* step, and only while
+        ``style.reward_hud`` is on. The viewer never runs on the differentiable hot path.
+        """
+        if not self.style.reward_hud or reward is None:
+            return
+        row = reward[self.state.focus_env].detach().to("cpu").numpy().astype(np.float32, copy=True)
+        self._reward_history.append(row)
+        if len(self._reward_history) > self.style.reward_hud_len:
+            del self._reward_history[: len(self._reward_history) - self.style.reward_hud_len]
+
+    def _invalidate_buffers_on_focus_change(self) -> None:
+        """Drop the trail and reward buffers when the focus env changes.
+
+        Both buffers hold one env's history; without this, ``[``/``]`` smears one env's trail
+        and rewards onto the next. Cleared together so the two cannot drift apart.
+        """
+        if self._buffer_env != self.state.focus_env:
+            self._trail_history.clear()
+            self._reward_history.clear()
+            self._buffer_env = self.state.focus_env
+
+    def _should_step(self, done: bool) -> bool:
+        """Whether to advance the sim; consumes a one-shot ``step_once`` request."""
+        once = self.state.step_once
+        self.state.step_once = False
+        return (not self.state.paused or once) and not done
+
     def _apply_reset_request(self):
         if not self.state.reset_requested:
             return None
         obs = self.env.reset()
         self._step_count = 0
         self._trail_history.clear()
+        self._reward_history.clear()
         self.state.reset_requested = False
         return obs
 
@@ -200,6 +233,8 @@ class Viewer:
         if hud:
             draw_hud(surface, self.state, style, step=self._step_count, fps=fps)
             draw_hover_panel(surface, geometry, self.state.hover_agent, style)
+            rewards = np.stack(self._reward_history) if len(self._reward_history) > 1 else None
+            draw_reward_hud(surface, rewards, geometry, style)
             draw_help(surface, self.state, style)
 
     def _draw_tile(self, pygame, surface, geometry, camera, rect, style, *, focused: bool) -> None:
@@ -255,6 +290,7 @@ class Viewer:
 
     def _render_onto(self, pygame, surface, *, hud: bool, fps=None) -> None:
         """Render the current view onto ``surface``, supersampling when the style asks for it."""
+        self._invalidate_buffers_on_focus_change()
         draw_supersampled(
             pygame,
             surface,
@@ -340,11 +376,12 @@ class Viewer:
                 if reset_obs is not None:
                     obs = reset_obs
                 done = max_steps is not None and self._step_count >= max_steps
-                if not self.state.paused and not done:
+                if self._should_step(done):
                     with torch.no_grad():
-                        obs, *_ = self.env.step(self._actions(action_fn, obs))
+                        obs, reward, *_ = self.env.step(self._actions(action_fn, obs))
                     self._step_count += 1
                     self._append_trail_sample()
+                    self._append_reward_sample(reward)
                 self._render_onto(pygame, window, hud=True, fps=clock.get_fps())
                 pygame.display.flip()
                 clock.tick(self.fps)

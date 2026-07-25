@@ -6,6 +6,7 @@ Unlike overlays (world-space, per-agent), these render in pixel space and read t
 
 from __future__ import annotations
 
+import numpy as np
 import pygame
 
 from wmas.render.geometry import RenderGeometry
@@ -71,8 +72,9 @@ def draw_help(surface, state: ViewState, style: Style) -> None:
         "r: reset simulation",
         "left drag agent/obstacle: move it",
         "right click: move selected goal",
+        ".: step once while paused",
         "t: cycle trajectory mode",
-        "l: cycle lidar mode",
+        "shift+l: cycle lidar mode",
         "k: cycle color mode",
         "mouse wheel: zoom",
         "middle drag: pan",
@@ -92,6 +94,56 @@ def draw_help(surface, state: ViewState, style: Style) -> None:
 
     _blit_panel(pygame, surface, (x, y, width, height), style.help_panel_bg, style)
     _blit_lines(surface, font, lines, style.text_color, (x + pad, y + pad))
+
+
+def draw_reward_hud(surface, rewards, geometry: RenderGeometry, style: Style) -> None:
+    """Bottom-right per-agent reward sparkline over a ``(T, n_agents)`` window.
+
+    One shared y-scale across agents, so the lines are directly comparable. No-op below two
+    samples — a single point has no slope to show.
+    """
+    if rewards is None:
+        return
+    data = np.asarray(rewards, dtype=np.float64)
+    if data.ndim != 2 or data.shape[0] < 2 or data.shape[1] == 0:
+        return
+
+    pad = style.hover_pad
+    width, height = style.reward_hud_size
+    clip = surface.get_clip()
+    font = _get_font(style.font_px(clip.height))
+    x = clip.right - width - style.hud_margin
+    y = clip.bottom - height - style.hud_margin
+    _blit_panel(pygame, surface, (x, y, width, height), style.hover_panel_bg, style)
+
+    label = f"reward  mean {float(data[-1].mean()):+.3f}"
+    surface.blit(font.render(label, True, style.text_color), (x + pad, y + pad))
+
+    plot_top = y + pad + font.get_height()
+    plot_h = max(1, (y + height - pad) - plot_top)
+    plot_w = max(1, width - 2 * pad)
+    lo, hi = float(data.min()), float(data.max())
+    span = hi - lo
+    if span < 1e-12:  # flat window: center the line rather than divide by ~0
+        lo, span = lo - 0.5, 1.0
+
+    def to_px(col: np.ndarray) -> np.ndarray:
+        xs = x + pad + np.linspace(0.0, plot_w, num=col.shape[0])
+        ys = plot_top + plot_h * (1.0 - (col - lo) / span)
+        return np.rint(np.stack((xs, ys), axis=-1)).astype(np.int64)
+
+    if lo < 0.0 < hi:  # zero baseline, for sign-readability
+        zero_y = int(round(plot_top + plot_h * (1.0 - (0.0 - lo) / span)))
+        pygame.draw.line(
+            surface,
+            style.bounds_color,
+            (x + pad, zero_y),
+            (x + width - pad, zero_y),
+            style.tile_border_width,
+        )
+    for i in range(data.shape[1]):
+        color = style.agent_color(i, geometry.model[i] if i < geometry.n_agents else None)
+        pygame.draw.lines(surface, color, False, to_px(data[:, i]).tolist(), style.edge_width)
 
 
 def draw_hover_panel(
