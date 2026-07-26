@@ -26,10 +26,10 @@ raise ``--iters`` (and, if the curriculum stalls, ``--curriculum-iters``)::
 
 The defaults (600 iters x 512 envs x 32 steps = ~10M frames, a few minutes on a
 modern GPU) get the policy off the ground. ``--iters 2100`` (~34M frames, ~2 h) reaches
-**98%** of episodes solved — the full pose inside both tolerances — with a median solve
-time of ~63 steps, where random solves ~0%::
+**~96%** of episodes solved — the full pose inside both tolerances — with a median solve
+time of ~66 steps, where random solves ~0%::
 
-    python examples/pusht_torchrl.py --iters 2100 --checkpoint-dir runs/pusht_v12
+    python examples/pusht_torchrl.py --iters 2100 --checkpoint-dir runs/pusht_v13
 
 ``--resume``/``--start-difficulty`` continue a finished run if the curve is still
 climbing (which it was before the contact model was fixed).
@@ -48,8 +48,10 @@ position/rotation terms):
   ~63 steps, but the tail is long; a 100-step budget truncates successes away.
 
 The contact is stiff (``contact_k`` 8000) and the engine's contact law is implicit and
-relative-velocity based, which is why ``--substeps`` defaults to 8; see
-:class:`~wmas.scenarios.pusht.PushTScenario` and ``wmas/core/collisions.py``. Learning is
+relative-velocity based, which is why ``--substeps`` defaults to 8 — below that this
+stiffness is unstable. The T itself is a movable compound obstacle integrated inside the
+substep loop; see :class:`~wmas.scenarios.pusht.PushTScenario`, ``wmas/core/bodies.py``
+and ``wmas/core/collisions.py``. Learning is
 slower early on than with a soft contact — agents can no longer sink into the T and drag
 it — but the end policy is much better, because a crisp, well-posed contact makes push
 direction map predictably onto T motion.

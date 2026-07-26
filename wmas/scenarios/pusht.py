@@ -1,30 +1,34 @@
 """Push-T: agents push a T-shaped rigid body to a target pose.
 
-The movable-body model of :mod:`wmas.scenarios.transport`, extended from a disk to a
-non-convex body and from a position goal to a full **pose** goal. Each step:
+The T is a **movable compound obstacle** (:class:`~wmas.core.config.ObstacleKind`):
+two oriented ``BOX`` shapes tagged with the same body id and placed by their offsets in
+the body frame, so :mod:`wmas.core.bodies` integrates one rigid pose for the pair from
+the reaction of the very same agent contacts the collision kernel applies. That happens
+*inside* the substep loop, so the pose an agent collides against is at most one substep
+old — a body advanced once per env step instead sweeps its surface across agents that
+cannot react until the next step, which shows up as visible interpenetration.
 
-  1. the T is installed as two oriented ``BOX`` obstacles (crossbar + stem) sharing
-     one pose, so the Warp agent step pushes agents *off* it through the existing
-     soft agent-obstacle box-SDF contact;
-  2. after the step, the reaction contact force the T receives from the agents
-     (Newton's third law of that same spring-damper contact) is summed, gather-style,
-     into a net force + torque about the body centroid, and the T is integrated
-     (semi-implicit Euler);
-  3. the updated pose is installed for the next step.
+The scenario therefore owns no physics on the no-grad path: it seeds the body on reset
+(:meth:`_install_obstacles`), reads the engine's state back into ``tee_*``
+(:meth:`_sync_from_engine`), and computes obs/reward from it. Mass splits by area and
+inertia comes from the parallel-axis theorem, both about the area centroid, which is the
+body origin — so a contact above it produces the torque that makes the orientation half
+of the task solvable.
 
 Contacts are **frictionless** — normal-only spring plus normal damping, as everywhere
-else in the engine. The T still rotates: torque comes from normal forces applied off
-the centroid, which is what makes the orientation half of the task solvable.
+else in the engine; see :mod:`wmas.core.collisions` for the contact law (linearly
+implicit damping, clamped repulsive, closing-velocity based, depth-saturated).
 
-Coupling is staggered by one step (agents see last step's T pose), and the body
-integration is plain torch on the reference path, so gradients flow
-T->agent->action across a rollout (BPTT); the intra-step agent-avoids-T force is not
-taped (obstacles are constants inside a Warp step) — the same documented limitation as
-transport, not a full in-tape rigid body.
+Gradients: ``Stepper`` skips movable bodies on a taped step (body state is advanced with
+``record_tape=False``), so on the grad path the scenario integrates the T itself in plain
+torch (:meth:`_refresh`) and hands the result back. BPTT flows T->agent->action across a
+rollout; the intra-step agent-avoids-T force is still not taped — the same documented
+limitation as transport, not a full in-tape rigid body.
 
-Installing the T requires **per-env obstacle angle** (``[n_envs, n_obstacles]``), since
-the body rotates independently in every env; see
-:meth:`wmas.core.stepper.Stepper.set_obstacles`.
+The stiff contact (``contact_k`` 8000) needs ``substeps >= 8`` at ``dt=0.05``; below that
+it is unstable, and ``contact_max_overlap`` must stay above the depth a velocity-mode
+agent settles at or agents walk straight through the T. Both are derived in
+:meth:`make_world`.
 """
 
 from __future__ import annotations
@@ -81,9 +85,9 @@ class PushTScenario(Scenario):
         self.contact_k = contact_k
         self.contact_c = contact_c
         self.contact_margin = contact_margin
-        # An explicit spring-damper contact is stable only for sub_dt < 2 sqrt(m/k), so
-        # a stiff contact_k needs the body integration substepped (the world's own
-        # `substeps` covers the agent half of the step but not this body).
+        # Body substeps for the *grad path only*: on a taped step the engine leaves movable
+        # bodies alone, so _refresh integrates the T in torch and needs its own substepping
+        # to stay stable at this stiffness. The no-grad path uses Stepper.substeps instead.
         self.body_substeps = body_substeps
         # Depth at which the contact spring saturates (smoothly), bounding the impulse a
         # deep overlap can inject. Derived in make_world, where sub_dt is known: it has to
