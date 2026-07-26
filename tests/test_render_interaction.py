@@ -329,6 +329,49 @@ def test_focus_env_change_clears_the_trail_and_reward_buffers():
     assert viewer._buffer_env == 2
 
 
+def test_viewer_run_loop_paused_does_not_advance_the_sim(monkeypatch):
+    """Pausing must freeze the simulation, not just the ``paused`` flag.
+
+    ``_should_step`` is only consulted by :meth:`Viewer.run`, so a caller that drives its
+    own ``env.step`` loop and calls ``render(mode="human")`` steps regardless of the flag —
+    the agents keep moving with the HUD claiming "paused". Examples therefore hand the loop
+    to the viewer (see ``examples/pusht_eval.py --window``), and this pins the behaviour.
+    """
+    monkeypatch.setenv("SDL_VIDEODRIVER", "dummy")
+    env, _ = make_env(n_agents=3, n_envs=2)
+    viewer = Viewer(env, size=(160, 120), fps=0)
+    viewer.state.paused = True
+    before = env.world.state.pos.clone()
+    # max_steps counts *taken* steps, which never reach 3 while paused; close_when_done
+    # still fires because `done` is evaluated on the step count, so bound the wait with a
+    # quit request injected after a few frames.
+    viewer.state.quit = False
+
+    original = viewer._should_step
+    frames = {"n": 0}
+
+    def counting_should_step(done):
+        frames["n"] += 1
+        if frames["n"] >= 5:
+            viewer.state.quit = True
+        return original(done)
+
+    viewer._should_step = counting_should_step
+    viewer.run(max_steps=3, close_when_done=True)
+
+    assert viewer._step_count == 0, "paused viewer advanced the simulation"
+    assert torch.equal(env.world.state.pos, before), "paused viewer moved the agents"
+
+    # ...and a one-shot step request while paused advances exactly one step.
+    viewer._should_step = original
+    viewer.state.quit = False
+    viewer.state.step_once = True
+    frames["n"] = 0
+    viewer._should_step = counting_should_step
+    viewer.run(max_steps=3, close_when_done=True)
+    assert viewer._step_count == 1
+
+
 def test_viewer_run_loop_smoke_headless(monkeypatch):
     # Drive the real run() loop against SDL's dummy video driver (no display needed) to
     # catch loop-wiring bugs; close_when_done makes a bounded run terminate.

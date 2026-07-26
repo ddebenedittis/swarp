@@ -19,6 +19,9 @@ The T's **target pose** is drawn as a green outline (the ``goal_pose`` overlay, 
 half real time by default — ``--speed 1`` matches the simulated clock, ``--speed 0.25``
 crawls; ``--fps`` overrides the implied frame rate outright.
 
+``--window`` hands the loop to :class:`~wmas.render.viewer.Viewer`, so the usual controls
+work: space pauses, ``.`` steps once while paused, ``r`` resets, ``?`` lists the rest.
+
 Also plots ``metrics.csv`` written by the trainer::
 
     python examples/pusht_eval.py --curve runs/pusht_v11/metrics.csv
@@ -218,15 +221,14 @@ def main() -> None:
             path = save_video(env, args.video, action_fn=act, n_steps=n, fps=fps)
             print(f"  wrote {path} ({n / fps:.0f}s)")
         if args.window:
-            import pygame
+            # Hand the loop to the Viewer rather than stepping ourselves: it owns the
+            # interactive controls (space to pause, "." to step once while paused, "r" to
+            # reset, overlay toggles, dragging) and its own fps clock. A caller-driven
+            # loop steps unconditionally, so pause has nothing to act on.
+            from wmas.render.viewer import Viewer
 
             env.reset(seed=args.seed)
-            clock = pygame.time.Clock()
-            for _ in range(n):
-                env.step(act(scen.observations()))
-                env.render(mode="human")
-                clock.tick(fps)  # the window loop is otherwise GPU-speed, i.e. a blur
-            env.close_viewer()
+            Viewer(env, fps=fps).run(action_fn=act, max_steps=n, close_when_done=True)
 
 
 if __name__ == "__main__":
