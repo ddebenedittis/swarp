@@ -39,7 +39,7 @@ def _park(scenario, device, n_envs=1, goal=(0.7, 0.0), goal_theta=0.0):
 def test_pusht_api_and_finiteness(device):
     env = _env(device, n_envs=8)
     obs = env.reset()
-    assert obs.shape == (8, 4, 12) and torch.isfinite(obs).all()
+    assert obs.shape == (8, 4, 18) and torch.isfinite(obs).all()
     gen = torch.Generator(device=device).manual_seed(0)
     for _ in range(10):
         a = torch.rand(8, 4, env.world.act_dim, generator=gen, device=device) * 2 - 1

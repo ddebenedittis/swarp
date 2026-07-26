@@ -59,6 +59,8 @@ class Style:
     action_color: RGB = (20, 120, 210)
     action_brake_color: RGB = (200, 60, 60)
     goal_reached_color: RGB = (0, 158, 115)
+    goal_pose_color: RGB = (0, 158, 115)  # target-pose outline of a movable body
+    goal_pose_alpha: int = 130
     palette: tuple[RGB, ...] = field(default_factory=lambda: _PALETTE)
     model_palette: dict[int, RGB] = field(
         default_factory=lambda: {
@@ -235,6 +237,8 @@ _UNSCALED_FIELDS: frozenset[str] = frozenset(
         "action_color",
         "action_brake_color",
         "goal_reached_color",
+        "goal_pose_color",
+        "goal_pose_alpha",
         "palette",
         "model_palette",
         "color_mode",

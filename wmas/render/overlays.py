@@ -639,6 +639,30 @@ def _draw_comm_lines(surface, g, camera, style):
         pygame.draw.line(surface, color, pts[k], pts[k + 1], style.edge_width)
 
 
+def _draw_goal_pose(surface, g, camera, style):
+    """Outline where a scenario's *movable body* should end up, from ``extras['goal_pose']``.
+
+    Expected format: an array of oriented boxes, one row per box,
+    ``(cx, cy, angle, half_x, half_y)`` in world space — the same primitive
+    :func:`_draw_obstacles` uses for a ``BOX``, so a body built from boxes (Push-T's
+    crossbar + stem) draws its target pose with the identical geometry it collides with.
+    Drawn as a translucent outline so the body itself stays readable on top of it.
+    """
+    boxes = g.extras.get("goal_pose")
+    if boxes is None:
+        return
+    boxes = np.asarray(boxes, dtype=np.float64).reshape(-1, 5)
+    if boxes.size == 0:
+        return
+    color = (*getattr(style, "goal_pose_color", style.bounds_color),
+             getattr(style, "goal_pose_alpha", 110))
+    layer = _alpha_layer("goal_pose", surface.get_size())
+    for cx, cy, angle, hx, hy in boxes:
+        pts = _pts(camera, _rotated_rect((cx, cy), angle, hx, hy))
+        pygame.draw.polygon(layer, color, pts, style.goal_ring_width)
+    surface.blit(layer, (0, 0))
+
+
 def _draw_lidar(surface, g, camera, style):
     """Draw lidar rays if a sensor supplied them via ``extras['lidar']``.
 
@@ -704,6 +728,7 @@ OVERLAYS: tuple[Overlay, ...] = (
     Overlay("obstacles", _draw_obstacles, "o", True),
     Overlay("neighbor_graph", _draw_neighbor_graph, "n", False),
     Overlay("trajectories", _draw_trajectories, None, True),
+    Overlay("goal_pose", _draw_goal_pose, "p", True),
     Overlay("goals", _draw_goals, "g", True),
     Overlay("agents", _draw_agents, None, True),
     Overlay("heading", _draw_heading, "h", True),

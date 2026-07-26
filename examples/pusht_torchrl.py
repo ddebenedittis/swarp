@@ -13,18 +13,23 @@ Run with::
 
     python examples/pusht_torchrl.py [--device cuda:0] [--iters 600] [--n-envs 512]
 
-The defaults take ~2 min on a modern GPU (~10M frames). Over that budget the policy
-beats a random baseline on both halves of the pose — roughly ``tee-dist`` -0.11 and
-``tee-angle`` -0.36 over a 200-step episode, where random *worsens* both. The
-``solved`` column (inside **both** tolerances at once) stays near zero: that is a
-genuinely tight target and needs far longer than this demo budget.
+The defaults (600 iters x 512 envs x 32 steps = ~10M frames, a few minutes on a
+modern GPU) get the policy off the ground; ``--iters 1400`` (~23M frames, ~1 h)
+reaches ~60% (greedy) / ~70% (stochastic) of episodes solved — the full pose inside
+both tolerances — within a 400-step episode, where random solves ~0%.
 
-Note the shaping weights. The scenario's own defaults (1.0 position / 0.5 rotation)
-are mis-scaled for learning: per step ``|dt angle|`` runs ~8.7x ``|dt distance|``, so
-the rotation term ends up ~4x the position term *and* rotation is the easier of the
-two to influence. A policy trained on the raw weights optimizes orientation and
-leaves position no better than random. ``--pos-shaping 5.0`` rebalances them, and is
-the default here.
+Three ingredients matter beyond the scenario's shaped reward (see PushTScenario:
+per-agent approach shaping and the joint pose "crater" on top of the linear
+position/rotation terms):
+
+* ``--pos-shaping 5.0`` — the scenario's raw 1.0/0.5 weights let the (easier)
+  rotation term dominate; the policy then spins the T and ignores position.
+* a goal-pose curriculum — the goal spawns near the T early on, so the terminal
+  bonus is actually reachable by a novice policy, and widens to uniform over
+  ``--curriculum-iters``. Without it the +5 bonus is never experienced and the
+  policy plateaus at "touch and rotate".
+* 400-step episodes — push-T is slow: median solve time for a trained policy is
+  ~150 steps; a 100-step budget truncates most successes away.
 
 Verify the trained policy against random, and plot the curves, with::
 
@@ -35,6 +40,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import math
 from pathlib import Path
 
 import torch
@@ -62,7 +68,7 @@ def _expand(t: torch.Tensor, n_agents: int) -> torch.Tensor:
     return t.unsqueeze(-2).expand(*t.shape[:-1], n_agents, 1)
 
 
-def build_policy(obs_dim: int, act_dim: int, n_agents: int, device: str):
+def build_policy(obs_dim: int, act_dim: int, n_agents: int, device: str, num_cells: int = 128):
     """Decentralised actor with shared weights (the MAPPO actor half).
 
     Shared with ``pusht_eval.py`` so a checkpoint loads into an identical module.
@@ -76,7 +82,7 @@ def build_policy(obs_dim: int, act_dim: int, n_agents: int, device: str):
             share_params=True,
             device=device,
             depth=2,
-            num_cells=128,
+            num_cells=num_cells,
         ),
         NormalParamExtractor(),
     )
@@ -108,6 +114,17 @@ def main() -> None:
     # position entirely. These defaults rebalance the two terms.
     parser.add_argument("--pos-shaping", type=float, default=5.0)
     parser.add_argument("--rot-shaping", type=float, default=0.5)
+    parser.add_argument("--entropy-coeff", type=float, default=3e-3)
+    parser.add_argument("--max-steps", type=int, default=400, help="episode length")
+    parser.add_argument("--num-cells", type=int, default=256, help="MLP width")
+    # Goal-pose curriculum: the goal spawns near the T early on (so the terminal
+    # bonus is reachable by a novice policy) and widens to the full uniform
+    # distribution. Widening is gated on performance: difficulty only rises while
+    # the batch's episode-solve rate exceeds --curriculum-gate.
+    parser.add_argument("--curriculum-iters", type=int, default=250,
+                        help="iters of gated progress to reach full difficulty; 0 disables")
+    parser.add_argument("--curriculum-gate", type=float, default=0.35,
+                        help="min fraction of episodes solved to raise difficulty")
     parser.add_argument("--checkpoint-dir", default="runs/pusht")
     parser.add_argument("--checkpoint-every", type=int, default=100, help="0 disables")
     args = parser.parse_args()
@@ -124,13 +141,13 @@ def main() -> None:
             device=device,
             dt=0.05,
             seed=0,
-            max_steps=100,
+            max_steps=args.max_steps,
         )
     )
     obs_dim, act_dim = env.obs_dim, env.act_dim
 
     # Decentralised actor (shared weights), centralised critic — the usual MAPPO split.
-    policy = build_policy(obs_dim, act_dim, N_AGENTS, device)
+    policy = build_policy(obs_dim, act_dim, N_AGENTS, device, num_cells=args.num_cells)
     critic = TensorDictModule(
         MultiAgentMLP(
             n_agent_inputs=obs_dim,
@@ -140,7 +157,7 @@ def main() -> None:
             share_params=True,
             device=device,
             depth=2,
-            num_cells=128,
+            num_cells=args.num_cells,
         ),
         in_keys=["observation"],
         out_keys=["state_value"],
@@ -160,7 +177,9 @@ def main() -> None:
         sampler=SamplerWithoutReplacement(),
         batch_size=frames_per_batch // args.minibatches,
     )
-    loss_module = ClipPPOLoss(actor_network=policy, critic_network=critic, entropy_coeff=1e-3)
+    loss_module = ClipPPOLoss(
+        actor_network=policy, critic_network=critic, entropy_coeff=args.entropy_coeff
+    )
     # Leaf names: the value estimator looks them up under ("next", ...) itself.
     loss_module.set_keys(
         reward="reward", done=DONE_NAME, terminated=TERM_NAME, value="state_value"
@@ -171,12 +190,34 @@ def main() -> None:
     optim = torch.optim.Adam(loss_module.parameters(), lr=args.lr)
 
     scen = env._env.scenario
+
+    difficulty = 0.0
+
+    def set_curriculum(solved_rate: float) -> float:
+        """Raise the goal spawn radius/angle while the policy keeps solving.
+
+        ``solved_rate`` is the batch's per-step termination fraction; x max_steps
+        approximates the fraction of episodes that end on the goal.
+        """
+        nonlocal difficulty
+        if not args.curriculum_iters:
+            return 1.0
+        if solved_rate * args.max_steps > args.curriculum_gate:
+            difficulty = min(1.0, difficulty + 1.0 / args.curriculum_iters)
+        f = difficulty
+        scen.goal_spawn_radius = None if f >= 1.0 else 0.25 + 1.9 * f
+        scen.goal_spawn_angle = None if f >= 1.0 else 0.4 + (math.pi - 0.4) * f
+        return f
+
+    set_curriculum(0.0)
     ckpt_dir = Path(args.checkpoint_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     csv_path = ckpt_dir / "metrics.csv"
     csv_file = csv_path.open("w", newline="")
     csv_writer = csv.writer(csv_file)
-    csv_writer.writerow(["iter", "frames", "reward_per_step", "tee_dist", "tee_angle", "solved"])
+    csv_writer.writerow(
+        ["iter", "frames", "reward_per_step", "tee_dist", "tee_angle", "solved", "difficulty"]
+    )
 
     def save(tag: str) -> None:
         torch.save(
@@ -186,6 +227,7 @@ def main() -> None:
                 "obs_dim": obs_dim,
                 "act_dim": act_dim,
                 "n_agents": N_AGENTS,
+                "num_cells": args.num_cells,
             },
             ckpt_dir / f"pusht_{tag}.pt",
         )
@@ -222,14 +264,15 @@ def main() -> None:
         mean_reward = batch.get(("next", "reward")).mean().item()
         d, a = dist.mean().item(), ang.mean().item()
         solved = terminated.float().mean().item()
+        f = set_curriculum(solved)  # difficulty for the next batch's resets
         csv_writer.writerow(
             [it, (it + 1) * frames_per_batch, f"{mean_reward:.6f}", f"{d:.6f}",
-             f"{a:.6f}", f"{solved:.6f}"]
+             f"{a:.6f}", f"{solved:.6f}", f"{f:.3f}"]
         )
         csv_file.flush()
         print(
             f"iter {it:3d}  reward/step {mean_reward:+.4f}  "
-            f"tee-dist {d:.4f}  tee-angle {a:.4f}  solved {solved:.3f}"
+            f"tee-dist {d:.4f}  tee-angle {a:.4f}  solved {solved:.3f}  diff {f:.2f}"
         )
         if args.checkpoint_every and (it + 1) % args.checkpoint_every == 0:
             save(f"iter{it + 1:05d}")

@@ -51,7 +51,7 @@ class PushTScenario(Scenario):
     def __init__(
         self,
         n_agents: int = 4,
-        agent_radius: float = 0.05,
+        agent_radius: float = 0.025,
         bar_len: float = 0.40,
         bar_width: float = 0.12,
         stem_len: float = 0.28,
@@ -62,10 +62,12 @@ class PushTScenario(Scenario):
         contact_k: float = 100.0,
         contact_c: float = 5.0,
         contact_margin: float = 0.01,
-        linear_damping: float = 0.5,
-        angular_damping: float = 0.5,
+        linear_damping: float = 10.0,
+        angular_damping: float = 10.0,
         pos_shaping_factor: float = 1.0,
         rot_shaping_factor: float = 0.5,
+        agent_dist_shaping: float = 1.0,
+        joint_shaping: float = 2.0,
         goal_reward: float = 5.0,
         goal_tolerance: float = 0.1,
         angle_tolerance: float = 0.25,
@@ -82,6 +84,12 @@ class PushTScenario(Scenario):
         self.angular_damping = angular_damping
         self.pos_shaping_factor = pos_shaping_factor
         self.rot_shaping_factor = rot_shaping_factor
+        self.agent_dist_shaping = agent_dist_shaping
+        # Weight of the joint pose "crater": a potential-based Gaussian bump around
+        # the full (position AND orientation) goal. The linear pos/rot terms reward
+        # each error independently — this is the only term that rewards closing the
+        # last stretch of both at once, which is what the solved condition needs.
+        self.joint_shaping = joint_shaping
         self.goal_reward = goal_reward
         self.goal_tolerance = goal_tolerance
         self.angle_tolerance = angle_tolerance
@@ -110,6 +118,14 @@ class PushTScenario(Scenario):
             for (hx, hy), (_, oy) in zip(self.box_half, self.box_off, strict=True)
             for sy in (-1.0, 1.0)
         )
+        # Staging point for the approach shaping, push_point_offset past the T centre
+        # directly away from the goal. 0 = the T centre itself: plain approach shaping.
+        # (>0 turned out noisier in practice — the point moves with the T.)
+        self.push_point_offset = 0.0
+        # Curriculum hooks: when set, the goal pose is sampled within this radius /
+        # angle of the T's spawn pose instead of uniformly. Trainers anneal these.
+        self.goal_spawn_radius: float | None = None
+        self.goal_spawn_angle: float | None = None
 
     def make_world(self, n_envs, device, dt, substeps, dtype) -> World:
         cfgs = [
@@ -154,6 +170,7 @@ class PushTScenario(Scenario):
         self.goal_theta: torch.Tensor | None = None  # [n_envs]
         self._prev_dist: torch.Tensor | None = None
         self._prev_ang: torch.Tensor | None = None
+        self._prev_adist: torch.Tensor | None = None  # [n_envs, n_agents]
         self._cache: dict[str, torch.Tensor] | None = None
         self._fused_ready = False
         # Bumped by _sync_fused_handles when a cached buffer handle is rebuilt.
@@ -166,7 +183,8 @@ class PushTScenario(Scenario):
 
     @property
     def obs_dim(self) -> int:
-        return 12
+        # 12 own/task features + the other agents' relative positions (coordination).
+        return 12 + 2 * (self.n_agents - 1)
 
     # ------------------------------------------------------------------ reset
 
@@ -178,8 +196,21 @@ class PushTScenario(Scenario):
         spawn = w.sample_uniform((n, self.n_agents, 2), -lim, lim)
         tee = w.sample_uniform((n, 2), -tlim, tlim)
         theta = w.sample_uniform((n,), -math.pi, math.pi)
-        goal = w.sample_uniform((n, 2), -tlim, tlim)
-        goal_th = w.sample_uniform((n,), -math.pi, math.pi)
+        if self.goal_spawn_radius is None:
+            goal = w.sample_uniform((n, 2), -tlim, tlim)
+        else:
+            # Uniform in a disk of goal_spawn_radius around the T spawn (curriculum).
+            gdir = w.sample_uniform((n,), -math.pi, math.pi)
+            grad = self.goal_spawn_radius * w.sample_uniform((n,), 0.0, 1.0).sqrt()
+            goal = (
+                tee + torch.stack([grad * gdir.cos(), grad * gdir.sin()], dim=-1)
+            ).clamp(-tlim, tlim)
+        if self.goal_spawn_angle is None:
+            goal_th = w.sample_uniform((n,), -math.pi, math.pi)
+        else:
+            goal_th = theta + w.sample_uniform(
+                (n,), -self.goal_spawn_angle, self.goal_spawn_angle
+            )
         zeros_2 = torch.zeros(n, 2, device=w.device, dtype=w.dtype)
         zeros_1 = torch.zeros(n, device=w.device, dtype=w.dtype)
 
@@ -234,6 +265,7 @@ class PushTScenario(Scenario):
         else:
             self._prev_dist = None
             self._prev_ang = None
+            self._prev_adist = None
             self._refresh(reset_mask=env_mask, integrate=False)
 
     def _box_poses(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -297,6 +329,8 @@ class PushTScenario(Scenario):
             self._prev_dist = z(n_envs)
         if self._prev_ang is None:
             self._prev_ang = z(n_envs)
+        if self._prev_adist is None:
+            self._prev_adist = z(n_envs, na)
         scalar = w.wp_dtype
         vec2 = VEC2[scalar]
         self._wp = {
@@ -321,9 +355,11 @@ class PushTScenario(Scenario):
         }
         self._wp_prev = wp.from_torch(self._prev_dist.contiguous(), dtype=scalar)
         self._wp_prev_ang = wp.from_torch(self._prev_ang.contiguous(), dtype=scalar)
+        self._wp_prev_adist = wp.from_torch(self._prev_adist.contiguous(), dtype=scalar)
         self._body_ptrs = {k: getattr(self, k).data_ptr() for k in self._BODY_ATTRS}
         self._prev_ptr = self._prev_dist.data_ptr()
         self._prev_ang_ptr = self._prev_ang.data_ptr()
+        self._prev_adist_ptr = self._prev_adist.data_ptr()
         self._fused_ready = True
 
     def _sync_fused_handles(self) -> None:
@@ -346,6 +382,10 @@ class PushTScenario(Scenario):
             self._wp_prev_ang = wp.from_torch(self._prev_ang.contiguous(), dtype=scalar)
             self._prev_ang_ptr = self._prev_ang.data_ptr()
             changed = True
+        if self._prev_adist.data_ptr() != self._prev_adist_ptr:
+            self._wp_prev_adist = wp.from_torch(self._prev_adist.contiguous(), dtype=scalar)
+            self._prev_adist_ptr = self._prev_adist.data_ptr()
+            changed = True
         if changed:
             self._handle_version += 1
 
@@ -366,7 +406,7 @@ class PushTScenario(Scenario):
         st = self.world.stepper
         return [
             self.tee_pos, self.tee_vel, self.tee_theta, self.tee_ang_vel,
-            self._prev_dist, self._prev_ang,
+            self._prev_dist, self._prev_ang, self._prev_adist,
             wp.to_torch(st._obs_pos), wp.to_torch(st._obs_angle),
         ]
 
@@ -464,10 +504,12 @@ class PushTScenario(Scenario):
         w = self.world
         scalar = w.wp_dtype
         bd = self._body_wp()
+        pos, _ = self._state_wp()
         wp.launch(
             pusht_reward_kernel,
             dim=w.n_envs,
             inputs=[
+                pos,
                 bd["tee_pos"],
                 bd["tee_theta"],
                 bd["goal_pos"],
@@ -476,6 +518,9 @@ class PushTScenario(Scenario):
                 wp.int32(self.n_agents),
                 scalar(self.pos_shaping_factor),
                 scalar(self.rot_shaping_factor),
+                scalar(self.agent_dist_shaping),
+                scalar(self.push_point_offset),
+                scalar(self.joint_shaping),
                 scalar(self.goal_tolerance),
                 scalar(self.angle_tolerance),
                 scalar(self.goal_reward),
@@ -485,6 +530,7 @@ class PushTScenario(Scenario):
             outputs=[
                 self._wp_prev,
                 self._wp_prev_ang,
+                self._wp_prev_adist,
                 self._wp["reward"],
                 self._wp["done"],
                 self._wp["dist"],
@@ -573,27 +619,50 @@ class PushTScenario(Scenario):
         dist_to_goal = (self.tee_pos - self.goal_pos).norm(dim=-1)  # [E]
         raw = self.tee_theta - self.goal_theta
         angle_error = torch.atan2(torch.sin(raw), torch.cos(raw)).abs()  # [E]
+        tee_rel = self.tee_pos.unsqueeze(1) - pos  # [E, A, 2]
+        # Pushing point: push_point_offset past the T centre, directly away from the
+        # goal — being there (and pressing in) is what moves the T goal-ward.
+        away = (self.tee_pos - self.goal_pos) / dist_to_goal.clamp(min=1e-6).unsqueeze(-1)
+        push_pt = self.tee_pos + away * self.push_point_offset  # [E, 2]
+        agent_dist = (push_pt.unsqueeze(1) - pos).norm(dim=-1)  # [E, A]
         if self._prev_dist is None:
             self._prev_dist = dist_to_goal.detach().clone()
             self._prev_ang = angle_error.detach().clone()
+        if self._prev_adist is None:
+            self._prev_adist = agent_dist.detach().clone()
         shaping = (self._prev_dist - dist_to_goal) * self.pos_shaping_factor + (
             self._prev_ang - angle_error
         ) * self.rot_shaping_factor
+
+        def crater(dd: torch.Tensor, aa: torch.Tensor) -> torch.Tensor:
+            # 1.5x the tolerances so the bump's gradient reaches past the goal box.
+            sd, sa = 1.5 * self.goal_tolerance, 1.5 * self.angle_tolerance
+            return torch.exp(-(dd / sd) ** 2 - (aa / sa) ** 2)
+
+        shaping = shaping + self.joint_shaping * (
+            crater(dist_to_goal, angle_error) - crater(self._prev_dist, self._prev_ang)
+        )
+        agent_shaping = (self._prev_adist - agent_dist) * self.agent_dist_shaping  # [E, A]
         if reset_mask is None:
             self._prev_dist = dist_to_goal.detach().clone()
             self._prev_ang = angle_error.detach().clone()
+            self._prev_adist = agent_dist.detach().clone()
         else:
+            m2 = reset_mask.view(-1, 1)
             shaping = torch.where(reset_mask, torch.zeros_like(shaping), shaping)
+            agent_shaping = torch.where(m2, torch.zeros_like(agent_shaping), agent_shaping)
             self._prev_dist = torch.where(reset_mask, dist_to_goal.detach(), self._prev_dist)
             self._prev_ang = torch.where(reset_mask, angle_error.detach(), self._prev_ang)
+            self._prev_adist = torch.where(m2, agent_dist.detach(), self._prev_adist)
 
         on_goal = (dist_to_goal < self.goal_tolerance) & (angle_error < self.angle_tolerance)
         self._cache = {
             "dist_to_goal": dist_to_goal,
             "angle_error": angle_error,
             "shaping": shaping,  # [E]
+            "agent_shaping": agent_shaping,  # [E, A]
             "on_goal": on_goal,
-            "tee_rel": self.tee_pos.unsqueeze(1) - pos,  # [E, A, 2]
+            "tee_rel": tee_rel,
         }
 
     # ------------------------------------------------------------ obs/rewards
@@ -608,7 +677,14 @@ class PushTScenario(Scenario):
         raw = (self.tee_theta - self.goal_theta).unsqueeze(1).expand(-1, na)
         th = self.tee_theta.unsqueeze(1).expand(-1, na)
         angles = torch.stack([th.cos(), th.sin(), raw.cos(), raw.sin()], dim=-1)
-        return torch.cat([s.pos, s.vel, self._cache["tee_rel"], tee_to_goal, angles], dim=-1)
+        # Teammates' positions relative to each agent, ascending index, self skipped.
+        idx = torch.arange(na, device=s.pos.device)
+        others = idx.unsqueeze(0).expand(na, -1)[idx.unsqueeze(1) != idx.unsqueeze(0)]
+        others = others.view(na, na - 1)  # [A, A-1]
+        rel = (s.pos[:, others] - s.pos.unsqueeze(2)).flatten(2)  # [E, A, 2(A-1)]
+        return torch.cat(
+            [s.pos, s.vel, self._cache["tee_rel"], tee_to_goal, angles, rel], dim=-1
+        )
 
     def observation(self, agent_idx: int) -> torch.Tensor:
         return self.observations()[:, agent_idx]
@@ -620,12 +696,30 @@ class PushTScenario(Scenario):
     def rewards(self) -> torch.Tensor:
         if self._fused_active:
             return self._f_reward
-        return super().rewards()
+        return self._cache["agent_shaping"] + self.global_reward().unsqueeze(1)
 
     def done(self) -> torch.Tensor:
         if self._fused_active:
             return self._f_done_bool
         return self._cache["on_goal"]
+
+    def render_extras(self, env_idx: int) -> dict[str, Any]:
+        """The target pose of the T, as oriented boxes for the ``goal_pose`` overlay.
+
+        Same two boxes the body is built from, placed at ``(goal_pos, goal_theta)``:
+        the outline shows exactly where the T has to end up.
+        """
+        if self.goal_pos is None:
+            return {}
+        th = float(self.goal_theta[env_idx])
+        gx, gy = (float(v) for v in self.goal_pos[env_idx])
+        ca, sa = math.cos(th), math.sin(th)
+        rows = []
+        for (hx, hy), (ox, oy) in zip(self.box_half, self.box_off, strict=True):
+            rows.append(
+                (gx + ca * ox - sa * oy, gy + sa * ox + ca * oy, th, hx, hy)
+            )
+        return {"goal_pose": rows}
 
     def info(self) -> dict[str, Any]:
         if self._fused_active:
