@@ -15,8 +15,14 @@ Run with::
 
 The defaults (600 iters x 512 envs x 32 steps = ~10M frames, a few minutes on a
 modern GPU) get the policy off the ground; ``--iters 1400`` (~23M frames, ~1 h)
-reaches ~60% (greedy) / ~70% (stochastic) of episodes solved — the full pose inside
-both tolerances — within a 400-step episode, where random solves ~0%.
+reaches ~59% of episodes solved — the full pose inside both tolerances — within a
+400-step episode, where random solves ~0%. Performance is still climbing there:
+another 700 iterations at full difficulty, resumed from that checkpoint, reach
+**95%** (greedy) / **89%** (stochastic)::
+
+    python examples/pusht_torchrl.py --iters 1400 --checkpoint-dir runs/pusht_v10
+    python examples/pusht_torchrl.py --iters 700 --resume runs/pusht_v10/pusht_final.pt \
+        --start-difficulty 1.0 --checkpoint-dir runs/pusht_v11
 
 Three ingredients matter beyond the scenario's shaped reward (see PushTScenario:
 per-agent approach shaping and the joint pose "crater" on top of the linear
@@ -29,7 +35,13 @@ position/rotation terms):
   ``--curriculum-iters``. Without it the +5 bonus is never experienced and the
   policy plateaus at "touch and rotate".
 * 400-step episodes — push-T is slow: median solve time for a trained policy is
-  ~150 steps; a 100-step budget truncates most successes away.
+  ~120 steps; a 100-step budget truncates most successes away.
+
+The contact is stiff (``contact_k`` 8000, ``zeta`` ~0.56), which is why ``--substeps``
+defaults to 8; see :class:`~wmas.scenarios.pusht.PushTScenario`. Learning is slower
+early on than with a soft contact — agents can no longer sink into the T and drag it —
+but the end policy is much better, because a crisp contact makes push direction map
+predictably onto T motion.
 
 Verify the trained policy against random, and plot the curves, with::
 

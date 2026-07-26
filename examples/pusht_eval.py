@@ -21,13 +21,13 @@ crawls; ``--fps`` overrides the implied frame rate outright.
 
 Also plots ``metrics.csv`` written by the trainer::
 
-    python examples/pusht_eval.py --curve runs/pusht/metrics.csv
+    python examples/pusht_eval.py --curve runs/pusht_v11/metrics.csv
 
 Run with::
 
-    python examples/pusht_eval.py runs/pusht_v9/pusht_final.pt [--video pusht.mp4]
-    python examples/pusht_eval.py runs/pusht_v9/pusht_final.pt --window --speed 0.25
-    python examples/pusht_eval.py runs/pusht_v9/pusht_final.pt --video long.mp4 \
+    python examples/pusht_eval.py runs/pusht_v11/pusht_final.pt [--video pusht.mp4]
+    python examples/pusht_eval.py runs/pusht_v11/pusht_final.pt --window --speed 0.25
+    python examples/pusht_eval.py runs/pusht_v11/pusht_final.pt --video long.mp4 \
         --render-steps 2400 --episode-steps 400        # 6 episodes back to back
 """
 
