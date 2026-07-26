@@ -12,11 +12,15 @@ DEVICES = ["cpu"] + (["cuda:0"] if torch.cuda.is_available() else [])
 
 
 def _env(device, n_envs=4, **kw):
+    # substeps=8 is the scenario's documented operating point: contact_k 8000 with
+    # dt=0.05 needs it (k*sub_dt^2/m < 2 and the velocity-mode holding force), and the
+    # examples use the same. At substeps=1 this stiffness is simply unstable.
     return Environment(
         PushTScenario(n_agents=4, **kw),
         n_envs=n_envs,
         device=device,
         dt=0.05,
+        substeps=8,
         seed=1,
     )
 
@@ -72,14 +76,21 @@ def test_pusht_determinism(device):
 
 @pytest.mark.parametrize("device", DEVICES)
 def test_agents_push_tee_toward_goal(device):
-    """Agents behind the T, driving toward the goal, move it closer."""
+    """Agents behind the T, driving toward the goal, move it closer.
+
+    They line up *on the centroid's own height* (local y=0, against the stem's left face)
+    and stack behind one another. A normal force there passes through the body origin, so
+    this is a clean translation test; pushing the crossbar instead is off-centre for the
+    centroid and legitimately spins the T, which
+    :func:`test_offset_push_rotates_tee` covers.
+    """
     scenario = PushTScenario(n_agents=4, world_size=1.0)
-    env = Environment(scenario, n_envs=1, device=device, dt=0.05, seed=0)
+    env = Environment(scenario, n_envs=1, device=device, dt=0.05, substeps=8, seed=0)
     env.reset()
     _park(scenario, device)
-    # agents on the -x side, starting clear of the T and driving into it
+    # agents on the -x side, in a line through the centroid, driving into the stem
     ax = torch.tensor(
-        [[[-0.30, -0.08], [-0.30, 0.0], [-0.30, 0.08], [-0.38, 0.0]]],
+        [[[-0.10, 0.0], [-0.16, 0.0], [-0.22, 0.0], [-0.28, 0.0]]],
         device=device,
         dtype=torch.float32,
     )
@@ -103,7 +114,7 @@ def test_offset_push_rotates_tee(device):
     """Frictionless normal contact still spins the T: a single agent pressing the
     crossbar off-centre applies a torque about the centroid."""
     scenario = PushTScenario(n_agents=1, world_size=1.0)
-    env = Environment(scenario, n_envs=1, device=device, dt=0.05, seed=0)
+    env = Environment(scenario, n_envs=1, device=device, dt=0.05, substeps=8, seed=0)
     env.reset()
     _park(scenario, device)
     # push +x against the far right end of the crossbar -> negative torque
@@ -128,7 +139,7 @@ def test_offset_push_rotates_tee(device):
 def test_pusht_shaping_reward_positive_when_closer(device):
     """Global reward is positive on a step that reduces position *or* angle error."""
     scenario = PushTScenario(n_agents=4)
-    env = Environment(scenario, n_envs=1, device=device, dt=0.05, seed=0)
+    env = Environment(scenario, n_envs=1, device=device, dt=0.05, substeps=8, seed=0)
     env.reset()
     _park(scenario, device, goal=(0.8, 0.0), goal_theta=0.0)
     scenario.tee_theta = torch.tensor([0.5], device=device, dtype=torch.float32)

@@ -35,13 +35,13 @@ from typing import Any
 import torch
 import warp as wp
 
-from wmas.core.config import ObstacleShape, WorldConfig
+from wmas.core.bodies import body_state_gather_kernel
+from wmas.core.config import ObstacleKind, ObstacleShape, WorldConfig
 from wmas.core.state import VEC2
 from wmas.core.world import World
 from wmas.dynamics.base import AgentConfig, ControlMode, DynamicsModel
 from wmas.scenarios.base import Scenario
 from wmas.scenarios.pusht_kernels import (
-    pusht_body_kernel,
     pusht_obs_kernel,
     pusht_reward_kernel,
 )
@@ -85,11 +85,11 @@ class PushTScenario(Scenario):
         # a stiff contact_k needs the body integration substepped (the world's own
         # `substeps` covers the agent half of the step but not this body).
         self.body_substeps = body_substeps
-        # Depth at which the contact spring saturates (smoothly). Obstacle poses are
-        # frozen within an env step, so a moving T can sweep its surface over an agent
-        # that cannot react until the next step; this bounds the resulting impulse.
-        # Legitimate pushing compresses ~0.05 agent radii, well inside the linear region.
-        self.max_overlap = 0.5 * agent_radius
+        # Depth at which the contact spring saturates (smoothly), bounding the impulse a
+        # deep overlap can inject. Derived in make_world, where sub_dt is known: it has to
+        # sit *above* the depth a velocity-controlled agent settles at, or the contact can
+        # no longer hold the agent out and it walks straight through the T.
+        self.max_overlap = 0.0
         # Viscous drag standing in for table friction, and the knob that sets how
         # responsive the T is: under a sustained push it settles at
         # ``sum(f) / (mass * linear_damping)``, so N agents pressing together can drive it
@@ -156,6 +156,15 @@ class PushTScenario(Scenario):
             for _ in range(self.n_agents)
         ]
         margin = 0.5 * self.agent_radius
+        # A velocity-mode agent has no contact memory: each substep its velocity is
+        # overwritten by the command plus f*sub_dt/m, so holding it out of the body needs
+        # f >= m*max_speed/sub_dt, i.e. an equilibrium depth of
+        # max_speed*m/(k*sub_dt). Saturating the spring *below* that lets agents walk
+        # through the T; twice it bounds a deep sweep's impulse while leaving the holding
+        # force intact (2x headroom, and legitimate pushing sits ~20x shallower).
+        sub_dt = dt / max(1, substeps)
+        equilibrium_depth = self.max_speed / (self.contact_k * sub_dt)
+        self.max_overlap = 2.0 * equilibrium_depth
         # No neighbor_radius override: obstacles are scanned linearly by
         # _static_forces, not looked up in the neighbor grid, so the T's size does
         # not have to inflate the agent<->agent reach (the default 2*r + margin).
@@ -167,6 +176,10 @@ class PushTScenario(Scenario):
             bounds=(-self.world_size, self.world_size, -self.world_size, self.world_size),
             bounds_mode="soft",
             max_neighbors=min(32, max(4, self.n_agents)),
+            # The T is a movable obstacle now, so its drag is engine config.
+            obstacle_linear_damping=self.linear_damping,
+            obstacle_angular_damping=self.angular_damping,
+            contact_max_overlap=self.max_overlap,
         )
         self.dt = dt
         self.world = World(
@@ -179,6 +192,15 @@ class PushTScenario(Scenario):
         self._obs_radius = torch.zeros(self.n_boxes, **tt)  # a box ignores radius
         self._obs_half = torch.tensor(self.box_half, **tt)
         self._box_off_t = torch.tensor(self.box_off, **tt)  # [n_boxes, 2]
+        # The T is ONE movable compound body: both boxes share body 0 (the root) and sit
+        # at their local offsets, so the engine integrates a single pose for the pair.
+        # Mass/inertia are read from the root and are about the body origin (the centroid).
+        self._obs_kind = torch.full(
+            (self.n_boxes,), int(ObstacleKind.MOVABLE), device=device, dtype=torch.int32
+        )
+        self._obs_body = torch.zeros(self.n_boxes, device=device, dtype=torch.int32)
+        self._obs_mass = torch.full((self.n_boxes,), self.tee_mass, **tt)
+        self._obs_inertia = torch.full((self.n_boxes,), self.tee_inertia, **tt)
         self.tee_pos: torch.Tensor | None = None  # [n_envs, 2]
         self.tee_vel: torch.Tensor | None = None
         self.tee_theta: torch.Tensor | None = None  # [n_envs]
@@ -308,6 +330,13 @@ class PushTScenario(Scenario):
         return centers, th.unsqueeze(1).expand(-1, self.n_boxes)
 
     def _install_obstacles(self) -> None:
+        """Seed the engine's movable body from ``tee_*``.
+
+        Called on reset, and after a *grad* step (where the torch reference integrates the
+        body instead of the engine). The engine derives the body's own pose from the root
+        shape and takes its velocity from the root, so writing the shapes' world poses is
+        enough to hand over the whole state.
+        """
         centers, angles = self._box_poses()
         # Each box's own velocity: the body's linear velocity plus omega x r, where r is
         # the lever from the T centroid to that box centre. Contact damping needs it —
@@ -327,18 +356,56 @@ class PushTScenario(Scenario):
             half_extents=self._obs_half,
             vel=vel,
             ang_vel=ang_vel,
+            kind=self._obs_kind,
+            mass=self._obs_mass,
+            inertia=self._obs_inertia,
+            body=self._obs_body,
+            body_offset=self._box_off_t,
         )
+
+    def _sync_from_engine(self) -> None:
+        """Copy the engine's body state into ``tee_*`` (the obs/reward inputs).
+
+        The engine owns the T on no-grad steps: it integrates the body inside the substep
+        loop, so the pose the agents collided against is at most one substep old rather
+        than a step behind. These are four ``[n_envs]``-sized strided copies of the root
+        body's slot; the fused obs/reward kernels keep reading ``tee_*`` unchanged.
+        """
+        b_pos, b_angle, b_vel, b_ang_vel = self.world.movable_obstacle_state(body=True)
+        self.tee_pos.copy_(b_pos[:, 0])
+        self.tee_theta.copy_(b_angle[:, 0])
+        self.tee_vel.copy_(b_vel[:, 0])
+        self.tee_ang_vel.copy_(b_ang_vel[:, 0])
 
     # -------------------------------------------------------------- T physics
 
     def post_step(self) -> None:
+        """Post-physics: the engine already advanced the T, so only read it back.
+
+        The body is a movable compound obstacle integrated inside the substep loop, so
+        there is nothing to integrate here on the no-grad path. The grad path still uses
+        the differentiable torch reference (``_refresh``), because the engine advances body
+        state with ``record_tape=False`` and is skipped on taped steps.
+        """
         if self._fused_active:
             # Same sequence the whole-step graph runs (keeps non-graph fused mode
             # and CPU eager-persistent bit-identical).
             self._pre_graph_step()
             self._graph_post_physics()
-        else:
+        elif self._grad_step():
+            # The engine skips movable bodies on a taped step, so integrate the T here in
+            # differentiable torch and hand the result back (BPTT through the body).
             self._refresh(integrate=True)
+        else:
+            self._sync_from_engine()
+            self._refresh(integrate=False)
+
+    def _grad_step(self) -> bool:
+        """True when the step just taken was taped, so the engine left the body alone."""
+        s = self.world.state
+        return torch.is_grad_enabled() and any(
+            t is not None and t.requires_grad for t in (s.pos, s.vel)
+        )
 
     # --------------------------------------------------------- fused fast path
 
@@ -437,17 +504,20 @@ class PushTScenario(Scenario):
         return self._handle_version
 
     def _graph_warmup_carries(self) -> list[torch.Tensor]:
-        # _launch_body advances the body state in place and overwrites the stepper's
-        # obstacle pose buffers (read by the next step's physics); _launch_reward
-        # advances both shaping carries. Snapshot all of them so warm-up (which runs
-        # the hook only to compile kernels) never advances them. Unlike transport we
-        # must also snapshot _obs_angle — the T's orientation lives there.
+        # _launch_body_sync overwrites tee_* from the engine's body state, and
+        # _launch_reward advances both shaping carries. Snapshot everything the hook
+        # writes so warm-up (which runs it only to compile kernels) never advances the
+        # simulation. The engine's own body/obstacle arrays are advanced by the substep
+        # loop, not by this hook, but warm-up may still have stepped physics, so they are
+        # snapshotted too.
         st = self.world.stepper
         return [
             self.tee_pos, self.tee_vel, self.tee_theta, self.tee_ang_vel,
             self._prev_dist, self._prev_ang, self._prev_adist,
             wp.to_torch(st._obs_pos), wp.to_torch(st._obs_angle),
             wp.to_torch(st._obs_vel), wp.to_torch(st._obs_ang_vel),
+            wp.to_torch(st._body_pos), wp.to_torch(st._body_angle),
+            wp.to_torch(st._body_vel), wp.to_torch(st._body_ang_vel),
         ]
 
     def _pre_graph_step(self) -> None:
@@ -456,11 +526,27 @@ class PushTScenario(Scenario):
         self._sync_fused_handles()
 
     def _graph_post_physics(self) -> None:
-        # _launch_body also re-installs the obstacle pose for the next step, so
-        # there is no host-side set_obstacles call inside the graph.
-        self._launch_body()
+        # No body launch: wmas.core.bodies advanced the T inside the substep loop and
+        # re-installed its box poses there. Copying the body state into tee_* keeps the
+        # fused obs/reward kernels (which read tee_*) unchanged, and stays capture-safe:
+        # four fixed-size device-to-device copies, no allocation.
+        self._launch_body_sync()
         self._launch_obs()
         self._launch_reward(advance_prev=1, full_pass=1)
+
+    def _launch_body_sync(self) -> None:
+        """Lift the engine's root-body state into the cached ``tee_*`` Warp arrays."""
+        w = self.world
+        st = w.stepper
+        bd = self._body_wp()
+        wp.launch(
+            body_state_gather_kernel,
+            dim=w.n_envs,
+            inputs=[st._body_pos, st._body_angle, st._body_vel, st._body_ang_vel, wp.int32(0)],
+            outputs=[bd["tee_pos"], bd["tee_theta"], bd["tee_vel"], bd["tee_ang_vel"]],
+            device=w.device,
+            record_tape=False,
+        )
 
     def _state_wp(self):
         """(pos, vel) agent state as Warp arrays for the fused kernels."""
@@ -479,49 +565,6 @@ class PushTScenario(Scenario):
         """Cached Warp handles over the body tensors (rebuilt by _sync_fused_handles
         when the grad path reassigns them)."""
         return self._wp_body
-
-    def _launch_body(self) -> None:
-        w = self.world
-        scalar = w.wp_dtype
-        pos, vel = self._state_wp()
-        bd = self._body_wp()
-        st = w.stepper
-        wp.launch(
-            pusht_body_kernel,
-            dim=w.n_envs,
-            inputs=[
-                pos,
-                vel,
-                self._wp_box_off,
-                self._wp_box_half,
-                wp.int32(self.n_agents),
-                wp.int32(self.n_boxes),
-                scalar(self.agent_radius),
-                scalar(self.contact_margin),
-                scalar(self.contact_k),
-                scalar(self.contact_c),
-                scalar(self.tee_mass),
-                scalar(self.tee_inertia),
-                scalar(self.linear_damping),
-                scalar(self.angular_damping),
-                scalar(self.dt),
-                wp.int32(self.body_substeps),
-                scalar(self.max_overlap),
-                scalar(self.world_size - self.tee_radius),
-            ],
-            outputs=[
-                bd["tee_pos"],
-                bd["tee_vel"],
-                bd["tee_theta"],
-                bd["tee_ang_vel"],
-                st._obs_pos,
-                st._obs_angle,
-                st._obs_vel,
-                st._obs_ang_vel,
-            ],
-            device=w.device,
-            record_tape=False,
-        )
 
     def _launch_obs(self) -> None:
         w = self.world

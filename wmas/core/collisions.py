@@ -41,18 +41,30 @@ SHAPE_SEGMENT = wp.constant(2)
 
 
 @wp.func
-def _normal_coeff(overlap: Any, vn: Any, k: Any, c: Any, damp_denom: Any):
-    """Scalar normal force: linearly-implicit damping, clamped repulsive.
+def _normal_coeff(overlap: Any, vn: Any, k: Any, c: Any, damp_denom: Any, max_overlap: Any):
+    """Scalar normal force: linearly-implicit damping, clamped repulsive, depth-saturated.
 
     ``vn`` is the *closing* normal velocity (relative, positive when separating) and
     ``damp_denom = 1 + c*sub_dt/m`` is the implicit-solve denominator, precomputed once
-    per agent by the caller (the Jacobi / per-agent-diagonal approximation)."""
+    per agent by the caller (the Jacobi / per-agent-diagonal approximation).
+
+    ``max_overlap > 0`` smoothly saturates the depth fed to the spring at that value
+    (``tanh``, so the force stays differentiable in the depth everywhere, unlike a hard
+    clamp). A velocity-mode agent has no contact memory, so it settles at an overlap of
+    ``v*m/(k*sub_dt)`` — 20 mm at the Push-T defaults — and against a light body that depth
+    is a violent impulse. Saturating bounds it without touching the shallow regime that
+    legitimate pushing lives in. ``0`` disables it, which is the historical behaviour."""
     zero = type(k)(0.0)
-    return wp.max((k * overlap - c * vn) / damp_denom, zero)
+    ov = overlap
+    if max_overlap > zero:
+        ov = max_overlap * wp.tanh(overlap / max_overlap)
+    return wp.max((k * ov - c * vn) / damp_denom, zero)
 
 
 @wp.func
-def _pair_force(d: Any, rel_v: Any, min_dist: Any, k: Any, c: Any, damp_denom: Any):
+def _pair_force(
+    d: Any, rel_v: Any, min_dist: Any, k: Any, c: Any, damp_denom: Any, max_overlap: Any
+):
     """Spring-damper repulsion along d (from other to self) within min_dist."""
     zero = type(k)(0.0)
     dist = wp.sqrt(wp.max(wp.dot(d, d), type(k)(_EPS2)))
@@ -60,16 +72,18 @@ def _pair_force(d: Any, rel_v: Any, min_dist: Any, k: Any, c: Any, damp_denom: A
     overlap = min_dist - dist
     if overlap > zero:
         n = d / dist
-        f = _normal_coeff(overlap, wp.dot(rel_v, n), k, c, damp_denom) * n
+        f = _normal_coeff(overlap, wp.dot(rel_v, n), k, c, damp_denom, max_overlap) * n
     return f
 
 
 @wp.func
-def _normal_force(n: Any, overlap: Any, rel_v: Any, k: Any, c: Any, damp_denom: Any):
+def _normal_force(
+    n: Any, overlap: Any, rel_v: Any, k: Any, c: Any, damp_denom: Any, max_overlap: Any
+):
     """Spring-damper along a precomputed unit normal ``n`` (n points from the
     surface toward the agent). Used when the normal is known analytically (box
     SDF) rather than derived from a separation vector."""
-    return _normal_coeff(overlap, wp.dot(rel_v, n), k, c, damp_denom) * n
+    return _normal_coeff(overlap, wp.dot(rel_v, n), k, c, damp_denom, max_overlap) * n
 
 
 @wp.func
@@ -92,6 +106,7 @@ def _box_force(
     k: Any,
     c: Any,
     damp_denom: Any,
+    max_overlap: Any,
     v_obs: Any,
     om_obs: Any,
 ):
@@ -152,7 +167,7 @@ def _box_force(
         rx = ca * spx - sa * spy
         ry = sa * spx + ca * spy
         v_surface = v_obs + type(p)(-om_obs * ry, om_obs * rx)
-        f = _normal_force(n, overlap, v - v_surface, k, c, damp_denom)
+        f = _normal_force(n, overlap, v - v_surface, k, c, damp_denom, max_overlap)
     return f
 
 
@@ -174,6 +189,7 @@ def _static_forces(
     c: Any,
     margin: Any,
     damp_denom: Any,
+    max_overlap: Any,
     soft_walls: wp.int32,
     bounds_min: Any,
     bounds_max: Any,
@@ -197,17 +213,21 @@ def _static_forces(
             # box surface is the boundary itself; agent inflated by ra + margin
             f += _box_force(
                 p, v, center, obs_angle[e, o], obs_half[o], ra + margin, k, c, damp_denom,
-                vo, omo,
+                max_overlap, vo, omo,
             )
         elif st == SHAPE_SEGMENT:
             cp = _closest_on_segment(p, center, obs_angle[e, o], obs_half[o][0])
             # surface point velocity: v_obs + om x (cp - centre)
             r = cp - center
             vs = vo + type(p)(-omo * r[1], omo * r[0])
-            f += _pair_force(p - cp, v - vs, ra + obs_radius[o] + margin, k, c, damp_denom)
+            f += _pair_force(
+                p - cp, v - vs, ra + obs_radius[o] + margin, k, c, damp_denom, max_overlap
+            )
         else:  # SHAPE_CIRCLE
             # a spinning disc has no normal-direction surface motion (frictionless)
-            f += _pair_force(p - center, v - vo, ra + obs_radius[o] + margin, k, c, damp_denom)
+            f += _pair_force(
+                p - center, v - vo, ra + obs_radius[o] + margin, k, c, damp_denom, max_overlap
+            )
 
     if soft_walls == 1:
         reach = ra + margin
@@ -217,16 +237,16 @@ def _static_forces(
         # closing velocity is +-v[i]; same implicit, clamped-repulsive coefficient.
         pen = reach - (p[0] - bounds_min[0])  # left wall, inward normal (+1, 0)
         if pen > zero:
-            fx += _normal_coeff(pen, v[0], k, c, damp_denom)
+            fx += _normal_coeff(pen, v[0], k, c, damp_denom, max_overlap)
         pen = reach - (bounds_max[0] - p[0])  # right wall, inward normal (-1, 0)
         if pen > zero:
-            fx += -_normal_coeff(pen, -v[0], k, c, damp_denom)
+            fx += -_normal_coeff(pen, -v[0], k, c, damp_denom, max_overlap)
         pen = reach - (p[1] - bounds_min[1])  # bottom wall
         if pen > zero:
-            fy += _normal_coeff(pen, v[1], k, c, damp_denom)
+            fy += _normal_coeff(pen, v[1], k, c, damp_denom, max_overlap)
         pen = reach - (bounds_max[1] - p[1])  # top wall
         if pen > zero:
-            fy += -_normal_coeff(pen, -v[1], k, c, damp_denom)
+            fy += -_normal_coeff(pen, -v[1], k, c, damp_denom, max_overlap)
         f += type(p)(fx, fy)
 
     return f
@@ -251,6 +271,7 @@ def collision_forces_kernel(
     c: Any,
     margin: Any,
     sub_dt: Any,
+    max_overlap: Any,
     soft_walls: wp.int32,
     bounds_min: Any,
     bounds_max: Any,
@@ -268,7 +289,8 @@ def collision_forces_kernel(
     for n_i in range(neighbor_count[e, a]):
         b = neighbor_idx[e, a, n_i]
         f += _pair_force(
-            p - pos[e, b], v - vel[e, b], ra + params[b, P_RADIUS] + margin, k, c, damp_denom
+            p - pos[e, b], v - vel[e, b], ra + params[b, P_RADIUS] + margin, k, c, damp_denom,
+            max_overlap,
         )
 
     f += _static_forces(
@@ -288,6 +310,7 @@ def collision_forces_kernel(
         c,
         margin,
         damp_denom,
+        max_overlap,
         soft_walls,
         bounds_min,
         bounds_max,
@@ -314,6 +337,7 @@ def collision_forces_kernel_per_env(
     c: Any,
     margin: Any,
     sub_dt: Any,
+    max_overlap: Any,
     soft_walls: wp.int32,
     bounds_min: Any,
     bounds_max: Any,
@@ -331,7 +355,8 @@ def collision_forces_kernel_per_env(
         b = neighbor_idx[e, a, n_i]
         # neighbor b's radius is env-specific in the per-env layout
         f += _pair_force(
-            p - pos[e, b], v - vel[e, b], ra + params[e, b, P_RADIUS] + margin, k, c, damp_denom
+            p - pos[e, b], v - vel[e, b], ra + params[e, b, P_RADIUS] + margin, k, c, damp_denom,
+            max_overlap,
         )
 
     f += _static_forces(
@@ -351,6 +376,7 @@ def collision_forces_kernel_per_env(
         c,
         margin,
         damp_denom,
+        max_overlap,
         soft_walls,
         bounds_min,
         bounds_max,
@@ -379,6 +405,7 @@ def _signature(dtype, per_env: bool = False) -> list:
         dtype,  # c
         dtype,  # margin
         dtype,  # sub_dt (implicit damping)
+        dtype,  # max_overlap
         wp.int32,
         vec2,
         vec2,
@@ -409,6 +436,7 @@ def launch_collision_forces(
     c: float,
     margin: float,
     sub_dt: float,
+    max_overlap: float,
     soft_walls: bool,
     bounds_min,
     bounds_max,
@@ -441,6 +469,7 @@ def launch_collision_forces(
             dtype(c),
             dtype(margin),
             dtype(sub_dt),
+            dtype(max_overlap),
             wp.int32(1 if soft_walls else 0),
             bounds_min,
             bounds_max,

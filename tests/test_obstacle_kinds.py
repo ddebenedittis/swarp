@@ -164,6 +164,38 @@ def test_damping_bounds_a_pushed_body(device):
 
 
 @pytest.mark.parametrize("device", DEVICES)
+def test_compound_body_stays_rigid(device):
+    """Two boxes sharing one body must move and rotate as one piece (Push-T's T).
+
+    Both shapes belong to body 0, offset along local y; the invariants are that the
+    world distance between the shapes never changes and that they keep one angle.
+    """
+    w = _world(device, n_envs=1)
+    dev, dt = device, torch.float32
+    off = torch.tensor([[0.0, 0.1], [0.0, -0.1]], device=dev, dtype=dt)
+    centers = torch.tensor([[[0.0, 0.1], [0.0, -0.1]]], device=dev, dtype=dt)
+    w.set_obstacles(
+        centers,
+        torch.zeros(2, device=dev, dtype=dt),
+        shape=torch.full((2,), int(ObstacleShape.BOX), device=dev, dtype=torch.int32),
+        angle=torch.zeros(1, 2, device=dev, dtype=dt),
+        half_extents=torch.tensor([[0.12, 0.05], [0.05, 0.12]], device=dev, dtype=dt),
+        kind=torch.full((2,), int(ObstacleKind.MOVABLE), device=dev, dtype=torch.int32),
+        mass=torch.full((2,), 1.0, device=dev, dtype=dt),
+        inertia=torch.full((2,), 0.02, device=dev, dtype=dt),
+        body=torch.zeros(2, device=dev, dtype=torch.int32),  # both shapes -> body 0
+        body_offset=off,
+    )
+    d0 = (centers[0, 0] - centers[0, 1]).norm().item()
+    pos, angle, _, _ = _push(w, steps=60, start=(-0.4, 0.06))
+    d1 = (pos[0, 0] - pos[0, 1]).norm().item()
+    assert d1 == pytest.approx(d0, abs=1e-5), "compound body came apart"
+    assert angle[0, 0].item() == pytest.approx(angle[0, 1].item(), abs=1e-6)
+    assert pos[0, :, 0].min().item() > 0.02, "compound body was not pushed"
+    assert abs(angle[0, 0].item()) > 1e-4, "off-centre push did not rotate the body"
+
+
+@pytest.mark.parametrize("device", DEVICES)
 def test_movable_obstacle_determinism(device):
     def run():
         w = _world(device)

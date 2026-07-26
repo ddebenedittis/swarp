@@ -158,12 +158,15 @@ class World:
         kind: torch.Tensor | None = None,
         mass: torch.Tensor | None = None,
         inertia: torch.Tensor | None = None,
+        body: torch.Tensor | None = None,
+        body_offset: torch.Tensor | None = None,
     ) -> None:
         """Install obstacles (circle/box/segment). ``angle`` may be ``[n_obstacles]`` or
         per-env ``[n_envs, n_obstacles]``. ``vel``/``ang_vel`` give a *moving* obstacle's
         velocity so contact damping uses the closing velocity. ``kind`` tags each obstacle
         IMMOVABLE or MOVABLE (see :class:`~wmas.core.config.ObstacleKind`); movable ones
-        use ``mass``/``inertia`` and are integrated by the engine each substep. See
+        use ``mass``/``inertia`` and are integrated by the engine each substep. ``body``/
+        ``body_offset`` group shapes into compound rigid bodies (a T from two boxes). See
         :meth:`wmas.core.stepper.Stepper.set_obstacles` for shape semantics."""
         self.obstacle_pos = pos
         self.obstacle_radius = radius
@@ -174,16 +177,27 @@ class World:
         self.stepper.set_obstacles(
             pos, radius, shape=shape, angle=angle, half_extents=half_extents,
             vel=vel, ang_vel=ang_vel, kind=kind, mass=mass, inertia=inertia,
+            body=body, body_offset=body_offset,
         )
 
     def movable_obstacle_state(
-        self,
+        self, body: bool = False
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Live ``(pos, angle, vel, ang_vel)`` of the obstacles, as zero-copy torch views.
+        """Live ``(pos, angle, vel, ang_vel)`` as zero-copy torch views.
 
         Movable obstacles are advanced in place by the engine, so these views track the
-        current pose; ``pos``/``angle`` are ``[n_envs, n_obstacles]``."""
+        current state. By default they are per *shape* — what collides and what renders,
+        ``[n_envs, n_obstacles]``. With ``body=True`` they are the per-*body* state instead,
+        indexed by body root, which is what a compound body (several shapes sharing one
+        pose) actually integrates."""
         st = self.stepper
+        if body:
+            return (
+                wp.to_torch(st._body_pos),
+                wp.to_torch(st._body_angle),
+                wp.to_torch(st._body_vel),
+                wp.to_torch(st._body_ang_vel),
+            )
         return (
             wp.to_torch(st._obs_pos),
             wp.to_torch(st._obs_angle),

@@ -26,7 +26,7 @@ def _env(device, fused, *, n_agents=4, n_envs=24, world_size=0.5):
         n_envs=n_envs,
         device=device,
         dt=0.05,
-        substeps=1,
+        substeps=8,  # the scenario's operating point; contact_k 8000 needs it
         seed=0,
         auto_reset=True,
         max_steps=5,

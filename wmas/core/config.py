@@ -62,6 +62,11 @@ class WorldConfig:
     # for a frictionless puck that coasts.
     obstacle_linear_damping: float = 10.0
     obstacle_angular_damping: float = 10.0
+    # Depth at which the contact spring saturates (smoothly; 0 disables). A
+    # velocity-controlled agent has no contact memory and settles at an overlap of
+    # v*mass/(k*sub_dt), which at high collision_k is a violent impulse against a light
+    # movable body. Saturating bounds it and leaves the shallow regime untouched.
+    contact_max_overlap: float = 0.0
     bounds: tuple[float, float, float, float] | None = None
     bounds_mode: str = "soft"
     neighbor_radius: float | None = None
@@ -89,3 +94,5 @@ class WorldConfig:
             raise ValueError("collision constants must be non-negative")
         if self.obstacle_linear_damping < 0.0 or self.obstacle_angular_damping < 0.0:
             raise ValueError("obstacle damping must be non-negative")
+        if self.contact_max_overlap < 0.0:
+            raise ValueError("contact_max_overlap must be non-negative (0 disables)")

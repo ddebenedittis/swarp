@@ -66,6 +66,7 @@ def _reaction(
     c: Any,
     margin: Any,
     sub_dt: Any,
+    max_overlap: Any,
 ):
     """Force *on the body* from one agent, plus the lever arm it acts through.
 
@@ -78,7 +79,7 @@ def _reaction(
     r = type(p)(zero, zero)
     if st == SHAPE_BOX:
         f_agent = _box_force(
-            p, v, center, angle, half, ra + margin, k, c, damp_denom, v_obs, om_obs
+            p, v, center, angle, half, ra + margin, k, c, damp_denom, max_overlap, v_obs, om_obs
         )
         # Lever: from the body centre to the agent's closest point on the box. Using the
         # agent centre projected onto the surface normal would double-count the radius.
@@ -87,10 +88,14 @@ def _reaction(
         cp = _closest_on_segment(p, center, angle, half[0])
         rr = cp - center
         vs = v_obs + type(p)(-om_obs * rr[1], om_obs * rr[0])
-        f_agent = _pair_force(p - cp, v - vs, ra + obs_r + margin, k, c, damp_denom)
+        f_agent = _pair_force(
+            p - cp, v - vs, ra + obs_r + margin, k, c, damp_denom, max_overlap
+        )
         r = rr
     else:  # SHAPE_CIRCLE: a frictionless normal passes through the centre -> no torque
-        f_agent = _pair_force(p - center, v - v_obs, ra + obs_r + margin, k, c, damp_denom)
+        f_agent = _pair_force(
+            p - center, v - v_obs, ra + obs_r + margin, k, c, damp_denom, max_overlap
+        )
         r = type(p)(zero, zero)
     return -f_agent, r
 
@@ -128,6 +133,7 @@ def _body_body(
     c: Any,
     margin: Any,
     damp_denom: Any,
+    max_overlap: Any,
 ):
     """Contact force on body ``self`` from another obstacle, plus its lever arm.
 
@@ -148,17 +154,21 @@ def _body_body(
             c2 = q2
             if st2 == SHAPE_SEGMENT:
                 c2 = _closest_on_segment(q, q2, th2, half2[0])
-            f_other = _box_force(c2, tv2, q, th, half_self, r2 + margin, k, c, damp_denom, tv, th2)
+            f_other = _box_force(
+                c2, tv2, q, th, half_self, r2 + margin, k, c, damp_denom, max_overlap, tv, th2
+            )
             f = -f_other
             r = _closest_in_box(c2 - q, th, half_self)
     elif st2 == SHAPE_BOX:
         # This (round) body vs a box.
-        f = _box_force(q, tv, q2, th2, half2, r_self + margin, k, c, damp_denom, tv2, zero)
+        f = _box_force(
+            q, tv, q2, th2, half2, r_self + margin, k, c, damp_denom, max_overlap, tv2, zero
+        )
     elif st2 == SHAPE_SEGMENT:
         cp = _closest_on_segment(q, q2, th2, half2[0])
-        f = _pair_force(q - cp, tv - tv2, r_self + r2 + margin, k, c, damp_denom)
+        f = _pair_force(q - cp, tv - tv2, r_self + r2 + margin, k, c, damp_denom, max_overlap)
     else:
-        f = _pair_force(q - q2, tv - tv2, r_self + r2 + margin, k, c, damp_denom)
+        f = _pair_force(q - q2, tv - tv2, r_self + r2 + margin, k, c, damp_denom, max_overlap)
     # A frictionless normal on a round body passes through its centre: no torque, so the
     # lever stays zero except in the box branch above.
     return f, r
@@ -175,63 +185,98 @@ def obstacle_dynamics_kernel(
     obs_half: wp.array(dtype=Any),
     obs_mass: wp.array(dtype=Any),
     obs_inertia: wp.array(dtype=Any),
+    obs_body: wp.array(dtype=wp.int32),
+    obs_body_off: wp.array(dtype=Any),
     n_obstacles: wp.int32,
     n_agents: wp.int32,
     k: Any,
     c: Any,
     margin: Any,
     sub_dt: Any,
+    max_overlap: Any,
     lin_damping: Any,
     ang_damping: Any,
     bounds_min: Any,
     bounds_max: Any,
     clamp_bounds: wp.int32,
+    body_pos: wp.array2d(dtype=Any),
+    body_angle: wp.array2d(dtype=Any),
+    body_vel: wp.array2d(dtype=Any),
+    body_ang_vel: wp.array2d(dtype=Any),
     obs_pos: wp.array2d(dtype=Any),
     obs_angle: wp.array2d(dtype=Any),
     obs_vel: wp.array2d(dtype=Any),
     obs_ang_vel: wp.array2d(dtype=Any),
 ):
-    """Thread per (env, obstacle): sum agent reactions, integrate the body one substep."""
+    """Thread per (env, body root): sum reactions over the body's shapes, integrate once.
+
+    A *compound* body is several obstacle shapes rigidly sharing one pose: ``obs_body[s]``
+    names the body a shape belongs to (its lowest-index shape, the "root") and
+    ``obs_body_off[s]`` places the shape in the body frame. Only the root thread does
+    work; it accumulates force and torque about the body origin over every shape it owns,
+    integrates the single body state, then writes each shape's world pose and velocity
+    back for the agent-side force pass. A one-shape body is the ordinary case with a zero
+    offset, so nothing special-cases it.
+    """
     e, o = wp.tid()
+    if obs_body[o] != o:
+        return  # not a body root: its pose is written by the root below
     if obs_kind[o] != KIND_MOVABLE:
         return  # immovable scenery: infinite mass, never integrated
 
-    q = obs_pos[e, o]
-    tv = obs_vel[e, o]
-    th = obs_angle[e, o]
-    om = obs_ang_vel[e, o]
+    q = body_pos[e, o]
+    tv = body_vel[e, o]
+    th = body_angle[e, o]
+    om = body_ang_vel[e, o]
     zero = type(th)(0.0)
     one = type(th)(1.0)
-    st = obs_type[o]
-    obs_r = obs_radius[o]
-    half = obs_half[o]
+    ca = wp.cos(th)
+    sa = wp.sin(th)
 
     fx = zero
     fy = zero
     tau = zero
-    for a in range(n_agents):
-        f, r = _reaction(
-            pos[e, a], vel[e, a], params[a, P_RADIUS], params[a, P_MASS],
-            q, th, st, obs_r, half, tv, om, k, c, margin, sub_dt,
-        )
-        fx += f[0]
-        fy += f[1]
-        tau += r[0] * f[1] - r[1] * f[0]
-
-    # Contacts with the other obstacles, movable or not, so a pushed body stops at
-    # scenery instead of sliding through it. Own mass as the Jacobi diagonal.
     denom_self = one + c * sub_dt / obs_mass[o]
-    for o2 in range(n_obstacles):
-        if o2 != o:
-            f2, r2v = _body_body(
-                q, tv, th, st, obs_r, half,
-                obs_pos[e, o2], obs_vel[e, o2], obs_angle[e, o2], obs_type[o2],
-                obs_radius[o2], obs_half[o2],
-                k, c, margin, denom_self,
+    for s in range(n_obstacles):
+        if obs_body[s] != o:
+            continue
+        off = obs_body_off[s]
+        # this shape's world pose and the velocity of its own centre (v + om x r)
+        owx = ca * off[0] - sa * off[1]
+        owy = sa * off[0] + ca * off[1]
+        cs = type(q)(q[0] + owx, q[1] + owy)
+        vs = type(tv)(tv[0] - om * owy, tv[1] + om * owx)
+        st = obs_type[s]
+        obs_r = obs_radius[s]
+        half = obs_half[s]
+
+        for a in range(n_agents):
+            f, r = _reaction(
+                pos[e, a], vel[e, a], params[a, P_RADIUS], params[a, P_MASS],
+                cs, th, st, obs_r, half, vs, om, k, c, margin, sub_dt, max_overlap,
             )
-            fx += f2[0]
-            fy += f2[1]
-            tau += r2v[0] * f2[1] - r2v[1] * f2[0]
+            # Lever about the *body* origin: out to the shape, then within the shape.
+            lx = owx + r[0]
+            ly = owy + r[1]
+            fx += f[0]
+            fy += f[1]
+            tau += lx * f[1] - ly * f[0]
+
+        # Contacts with shapes of *other* bodies, so a pushed body stops at scenery
+        # instead of sliding through it. Shapes of the same body never self-collide.
+        for o2 in range(n_obstacles):
+            if obs_body[o2] != o:
+                f2, r2v = _body_body(
+                    cs, vs, th, st, obs_r, half,
+                    obs_pos[e, o2], obs_vel[e, o2], obs_angle[e, o2], obs_type[o2],
+                    obs_radius[o2], obs_half[o2],
+                    k, c, margin, denom_self, max_overlap,
+                )
+                lx = owx + r2v[0]
+                ly = owy + r2v[1]
+                fx += f2[0]
+                fy += f2[1]
+                tau += lx * f2[1] - ly * f2[0]
 
     lin_decay = one - lin_damping * sub_dt
     ang_decay = one - ang_damping * sub_dt
@@ -243,10 +288,66 @@ def obstacle_dynamics_kernel(
     if clamp_bounds == 1:
         new_x = wp.clamp(new_x, bounds_min[0], bounds_max[0])
         new_y = wp.clamp(new_y, bounds_min[1], bounds_max[1])
-    obs_vel[e, o] = type(tv)(new_vx, new_vy)
-    obs_ang_vel[e, o] = new_om
-    obs_pos[e, o] = type(q)(new_x, new_y)
-    obs_angle[e, o] = th + new_om * sub_dt
+    new_th = th + new_om * sub_dt
+    body_vel[e, o] = type(tv)(new_vx, new_vy)
+    body_ang_vel[e, o] = new_om
+    body_pos[e, o] = type(q)(new_x, new_y)
+    body_angle[e, o] = new_th
+
+    # Re-install every shape of this body at the new pose, for the next substep's agent
+    # force pass (and for rendering, which reads these arrays).
+    nca = wp.cos(new_th)
+    nsa = wp.sin(new_th)
+    for s in range(n_obstacles):
+        if obs_body[s] == o:
+            off = obs_body_off[s]
+            owx = nca * off[0] - nsa * off[1]
+            owy = nsa * off[0] + nca * off[1]
+            obs_pos[e, s] = type(q)(new_x + owx, new_y + owy)
+            obs_angle[e, s] = new_th
+            obs_vel[e, s] = type(tv)(new_vx - new_om * owy, new_vy + new_om * owx)
+            obs_ang_vel[e, s] = new_om
+
+
+@wp.kernel
+def body_state_gather_kernel(
+    body_pos: wp.array2d(dtype=Any),
+    body_angle: wp.array2d(dtype=Any),
+    body_vel: wp.array2d(dtype=Any),
+    body_ang_vel: wp.array2d(dtype=Any),
+    root: wp.int32,
+    out_pos: wp.array(dtype=Any),
+    out_angle: wp.array(dtype=Any),
+    out_vel: wp.array(dtype=Any),
+    out_ang_vel: wp.array(dtype=Any),
+):
+    """Thread per env: lift one body's ``[n_envs, n_obstacles]`` column into flat arrays.
+
+    A scenario that keeps its own view of a movable body (Push-T's ``tee_*``, which its
+    fused obs/reward kernels read) uses this to pick up the engine's state. A strided
+    column of a 2-D array is not contiguous, so this cannot be a ``wp.copy``. Allocation
+    free, hence safe inside a captured whole-step graph.
+    """
+    e = wp.tid()
+    out_pos[e] = body_pos[e, root]
+    out_angle[e] = body_angle[e, root]
+    out_vel[e] = body_vel[e, root]
+    out_ang_vel[e] = body_ang_vel[e, root]
+
+
+def _gather_signature(dtype) -> list:
+    vec2 = VEC2[dtype]
+    return [
+        wp.array2d(dtype=vec2),  # body_pos
+        wp.array2d(dtype=dtype),  # body_angle
+        wp.array2d(dtype=vec2),  # body_vel
+        wp.array2d(dtype=dtype),  # body_ang_vel
+        wp.int32,  # root
+        wp.array(dtype=vec2),  # out_pos
+        wp.array(dtype=dtype),  # out_angle
+        wp.array(dtype=vec2),  # out_vel
+        wp.array(dtype=dtype),  # out_ang_vel
+    ]
 
 
 def _signature(dtype) -> list:
@@ -261,17 +362,24 @@ def _signature(dtype) -> list:
         wp.array(dtype=vec2),  # obs_half
         wp.array(dtype=dtype),  # obs_mass
         wp.array(dtype=dtype),  # obs_inertia
+        wp.array(dtype=wp.int32),  # obs_body
+        wp.array(dtype=vec2),  # obs_body_off
         wp.int32,  # n_obstacles
         wp.int32,  # n_agents
         dtype,  # k
         dtype,  # c
         dtype,  # margin
         dtype,  # sub_dt
+        dtype,  # max_overlap
         dtype,  # lin_damping
         dtype,  # ang_damping
         vec2,  # bounds_min
         vec2,  # bounds_max
         wp.int32,  # clamp_bounds
+        wp.array2d(dtype=vec2),  # body_pos
+        wp.array2d(dtype=dtype),  # body_angle
+        wp.array2d(dtype=vec2),  # body_vel
+        wp.array2d(dtype=dtype),  # body_ang_vel
         wp.array2d(dtype=vec2),  # obs_pos
         wp.array2d(dtype=dtype),  # obs_angle
         wp.array2d(dtype=vec2),  # obs_vel
@@ -281,6 +389,7 @@ def _signature(dtype) -> list:
 
 for _T in (wp.float32, wp.float64):
     wp.overload(obstacle_dynamics_kernel, _signature(_T))
+    wp.overload(body_state_gather_kernel, _gather_signature(_T))
 
 
 def launch_obstacle_dynamics(
@@ -293,6 +402,7 @@ def launch_obstacle_dynamics(
     c: float,
     margin: float,
     sub_dt: float,
+    max_overlap: float,
     lin_damping: float,
     ang_damping: float,
     bounds_min,
@@ -315,12 +425,15 @@ def launch_obstacle_dynamics(
             stepper._obs_half,
             stepper._obs_mass,
             stepper._obs_inertia,
+            stepper._obs_body,
+            stepper._obs_body_off,
             wp.int32(stepper.n_obstacles),
             wp.int32(n_agents),
             dtype(k),
             dtype(c),
             dtype(margin),
             dtype(sub_dt),
+            dtype(max_overlap),
             dtype(lin_damping),
             dtype(ang_damping),
             bounds_min,
@@ -328,6 +441,10 @@ def launch_obstacle_dynamics(
             wp.int32(1 if clamp_bounds else 0),
         ],
         outputs=[
+            stepper._body_pos,
+            stepper._body_angle,
+            stepper._body_vel,
+            stepper._body_ang_vel,
             stepper._obs_pos,
             stepper._obs_angle,
             stepper._obs_vel,
