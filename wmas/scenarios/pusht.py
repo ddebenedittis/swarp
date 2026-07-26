@@ -59,9 +59,10 @@ class PushTScenario(Scenario):
         tee_mass: float = 1.0,
         world_size: float = 1.0,
         max_speed: float = 1.0,
-        contact_k: float = 100.0,
-        contact_c: float = 5.0,
-        contact_margin: float = 0.01,
+        contact_k: float = 8000.0,
+        contact_c: float = 100.0,
+        contact_margin: float = 0.002,
+        body_substeps: int = 16,
         linear_damping: float = 10.0,
         angular_damping: float = 10.0,
         pos_shaping_factor: float = 1.0,
@@ -80,6 +81,10 @@ class PushTScenario(Scenario):
         self.contact_k = contact_k
         self.contact_c = contact_c
         self.contact_margin = contact_margin
+        # An explicit spring-damper contact is stable only for sub_dt < 2 sqrt(m/k), so
+        # a stiff contact_k needs the body integration substepped (the world's own
+        # `substeps` covers the agent half of the step but not this body).
+        self.body_substeps = body_substeps
         self.linear_damping = linear_damping
         self.angular_damping = angular_damping
         self.pos_shaping_factor = pos_shaping_factor
@@ -195,6 +200,16 @@ class PushTScenario(Scenario):
         tlim = self.world_size - self.tee_radius
         spawn = w.sample_uniform((n, self.n_agents, 2), -lim, lim)
         tee = w.sample_uniform((n, 2), -tlim, tlim)
+        # Push any agent that landed inside the T's bounding disk out to its rim. With a
+        # stiff contact_k a spawn overlap is a violent ejection (k * depth * sub_dt is
+        # metres per second), so the reset must not start interpenetrating.
+        clear = self.tee_radius + 2.0 * self.agent_radius
+        d = spawn - tee.unsqueeze(1)  # [n, A, 2]
+        dn = d.norm(dim=-1, keepdim=True)
+        # Straight up (arbitrary but deterministic) for an agent exactly on the centre.
+        unit = torch.where(dn > 1.0e-9, d / dn.clamp(min=1.0e-9), torch.tensor(
+            [0.0, 1.0], device=w.device, dtype=w.dtype).expand_as(d))
+        spawn = torch.where(dn < clear, tee.unsqueeze(1) + unit * clear, spawn).clamp(-lim, lim)
         theta = w.sample_uniform((n,), -math.pi, math.pi)
         if self.goal_spawn_radius is None:
             goal = w.sample_uniform((n, 2), -tlim, tlim)
@@ -465,6 +480,7 @@ class PushTScenario(Scenario):
                 scalar(self.linear_damping),
                 scalar(self.angular_damping),
                 scalar(self.dt),
+                wp.int32(self.body_substeps),
                 scalar(self.world_size - self.tee_radius),
             ],
             outputs=[
@@ -600,20 +616,23 @@ class PushTScenario(Scenario):
         pos, vel = w.state.pos, w.state.vel  # [n_envs, n_agents, 2]
 
         if integrate:
-            force, torque = self._box_contact(pos, vel)  # [E,A,B,2], [E,A,B]
-            f_total = force.sum(dim=(1, 2))  # [E, 2] net force on the T
-            tau = torque.sum(dim=(1, 2))  # [E]
-
-            dt = self.dt
-            self.tee_vel = (self.tee_vel + f_total / self.tee_mass * dt) * (
-                1.0 - self.linear_damping * dt
-            )
-            self.tee_ang_vel = (self.tee_ang_vel + tau / self.tee_inertia * dt) * (
-                1.0 - self.angular_damping * dt
-            )
+            # Substepped exactly like pusht_body_kernel: the contact force is recomputed
+            # from the frozen agent state each sub-step, which is what keeps a stiff
+            # contact_k stable. Gradients flow through every sub-step.
+            sub_dt = self.dt / self.body_substeps
             b = self.world_size - self.tee_radius
-            self.tee_pos = (self.tee_pos + self.tee_vel * dt).clamp(-b, b)
-            self.tee_theta = self.tee_theta + self.tee_ang_vel * dt
+            for _ in range(self.body_substeps):
+                force, torque = self._box_contact(pos, vel)  # [E,A,B,2], [E,A,B]
+                f_total = force.sum(dim=(1, 2))  # [E, 2] net force on the T
+                tau = torque.sum(dim=(1, 2))  # [E]
+                self.tee_vel = (self.tee_vel + f_total / self.tee_mass * sub_dt) * (
+                    1.0 - self.linear_damping * sub_dt
+                )
+                self.tee_ang_vel = (self.tee_ang_vel + tau / self.tee_inertia * sub_dt) * (
+                    1.0 - self.angular_damping * sub_dt
+                )
+                self.tee_pos = (self.tee_pos + self.tee_vel * sub_dt).clamp(-b, b)
+                self.tee_theta = self.tee_theta + self.tee_ang_vel * sub_dt
             self._install_obstacles()  # for the next step
 
         dist_to_goal = (self.tee_pos - self.goal_pos).norm(dim=-1)  # [E]

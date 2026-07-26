@@ -154,12 +154,16 @@ def test_pusht_shaping_reward_positive_when_closer(device):
 def test_pusht_differentiable_rollout():
     """BPTT: the T-pose loss backprops to the action sequence.
 
-    The agents are seeded in contact with the crossbar — gradient reaches the body
-    only through an active contact, so a random spawn would (correctly) give zeros.
+    The agents are seeded against the crossbar and *commanded into it* — gradient
+    reaches the body only through an active contact, so a random spawn would
+    (correctly) give zeros. The command matters: agents are velocity-controlled, so
+    with a zero action the stiff contact simply expels them to zero overlap within the
+    step and the body then sees no contact at all. Substeps match the scenario's
+    operating point (the stiff spring-damper needs them to stay stable).
     """
     device = "cpu"
     scenario = PushTScenario(n_agents=4)
-    env = Environment(scenario, n_envs=2, device=device, dt=0.05, seed=0)
+    env = Environment(scenario, n_envs=2, device=device, dt=0.05, substeps=8, seed=0)
     env.reset()
     _park(scenario, device, n_envs=2)
     bar_hx = scenario.box_half[0][0]
@@ -176,7 +180,10 @@ def test_pusht_differentiable_rollout():
     scenario._prev_ang = None
     scenario._refresh(integrate=False)
 
-    actions = torch.zeros(2, 4, env.world.act_dim, requires_grad=True)
+    # Push +x, straight into the crossbar's left face, so the contact stays live.
+    base = torch.zeros(2, 4, env.world.act_dim)
+    base[..., 0] = 1.0
+    actions = base.clone().requires_grad_(True)
     loss = torch.zeros((), dtype=torch.float32)
     for _ in range(4):
         env.step(actions)

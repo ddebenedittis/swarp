@@ -65,6 +65,7 @@ def pusht_body_kernel(
     linear_damping: Any,
     angular_damping: Any,
     dt: Any,
+    body_substeps: wp.int32,
     bound: Any,
     tee_pos: wp.array(dtype=Any),
     tee_vel: wp.array(dtype=Any),
@@ -73,7 +74,15 @@ def pusht_body_kernel(
     obs_pos: wp.array2d(dtype=Any),
     obs_angle: wp.array2d(dtype=Any),
 ):
-    """Thread per env: accumulate box-SDF contact force/torque, integrate, re-install."""
+    """Thread per env: accumulate box-SDF contact force/torque, integrate, re-install.
+
+    The integration is substepped ``body_substeps`` times at ``dt / body_substeps``,
+    recomputing the contact force from the (frozen) agent state each time. An explicit
+    spring-damper is stable only while ``sub_dt < 2 sqrt(m / k)``, so substepping here
+    is what lets ``contact_k`` be stiff enough to behave like a real contact instead of
+    a soft sponge. It is the body analogue of ``Stepper.substeps``, which does the same
+    for the agent half of the step but does not reach this kernel.
+    """
     e = wp.tid()
     q = tee_pos[e]
     tv = tee_vel[e]
@@ -81,95 +90,101 @@ def pusht_body_kernel(
     om = tee_ang_vel[e]
     qx = q[0]
     qy = q[1]
+    tvx = tv[0]
+    tvy = tv[1]
     zero = type(qx)(0.0)
     one = type(qx)(1.0)
     eps2 = type(qx)(_EPS2)
-    ca = wp.cos(th)
-    sa = wp.sin(th)
     reach = agent_radius + contact_margin
+    sub_dt = dt / type(qx)(body_substeps)
+    lin_decay = one - linear_damping * sub_dt
+    ang_decay = one - angular_damping * sub_dt
 
-    fx = zero
-    fy = zero
-    tau = zero
-    for b in range(n_boxes):
-        off = box_off[b]
-        half = box_half[b]
-        # box centre in world = tee centre + R(theta) @ local offset
-        owx = ca * off[0] - sa * off[1]
-        owy = sa * off[0] + ca * off[1]
-        cwx = qx + owx
-        cwy = qy + owy
-        hx = half[0]
-        hy = half[1]
-        for a in range(n_agents):
-            p = pos[e, a]
-            dx = p[0] - cwx
-            dy = p[1] - cwy
-            # into the box frame (R^T d)
-            lx = ca * dx + sa * dy
-            ly = -sa * dx + ca * dy
-            cx = wp.clamp(lx, -hx, hx)
-            cy = wp.clamp(ly, -hy, hy)
-            ox = lx - cx
-            oy = ly - cy
-            out_d2 = ox * ox + oy * oy
-            if out_d2 > eps2:
-                # exterior: signed distance is the positive outside distance
-                s = wp.sqrt(out_d2)
-                nlx = ox / s
-                nly = oy / s
-            else:
-                # interior: nearest face gives the (negative) signed distance
-                gx = wp.abs(lx) - hx
-                gy = wp.abs(ly) - hy
-                if gx > gy:
-                    s = gx
-                    if lx >= zero:
-                        nlx = one
-                    else:
-                        nlx = -one
-                    nly = zero
+    for _sub in range(body_substeps):
+        ca = wp.cos(th)
+        sa = wp.sin(th)
+        fx = zero
+        fy = zero
+        tau = zero
+        for b in range(n_boxes):
+            off = box_off[b]
+            half = box_half[b]
+            # box centre in world = tee centre + R(theta) @ local offset
+            owx = ca * off[0] - sa * off[1]
+            owy = sa * off[0] + ca * off[1]
+            cwx = qx + owx
+            cwy = qy + owy
+            hx = half[0]
+            hy = half[1]
+            for a in range(n_agents):
+                p = pos[e, a]
+                dx = p[0] - cwx
+                dy = p[1] - cwy
+                # into the box frame (R^T d)
+                lx = ca * dx + sa * dy
+                ly = -sa * dx + ca * dy
+                cx = wp.clamp(lx, -hx, hx)
+                cy = wp.clamp(ly, -hy, hy)
+                ox = lx - cx
+                oy = ly - cy
+                out_d2 = ox * ox + oy * oy
+                if out_d2 > eps2:
+                    # exterior: signed distance is the positive outside distance
+                    s = wp.sqrt(out_d2)
+                    nlx = ox / s
+                    nly = oy / s
                 else:
-                    s = gy
-                    nlx = zero
-                    if ly >= zero:
-                        nly = one
+                    # interior: nearest face gives the (negative) signed distance
+                    gx = wp.abs(lx) - hx
+                    gy = wp.abs(ly) - hy
+                    if gx > gy:
+                        s = gx
+                        if lx >= zero:
+                            nlx = one
+                        else:
+                            nlx = -one
+                        nly = zero
                     else:
-                        nly = -one
-            overlap = reach - s
-            if overlap <= zero:
-                continue
-            # closest surface point, box frame -> lever arm about the tee centre
-            spx = lx - s * nlx
-            spy = ly - s * nly
-            rx = owx + (ca * spx - sa * spy)
-            ry = owy + (sa * spx + ca * spy)
-            # m = -n: unit normal pointing from the agent into the T
-            mx = -(ca * nlx - sa * nly)
-            my = -(sa * nlx + ca * nly)
-            # relative velocity of the T's contact point w.r.t. the agent
-            av = vel[e, a]
-            rvx = tv[0] - om * ry - av[0]
-            rvy = tv[1] + om * rx - av[1]
-            vn = rvx * mx + rvy * my
-            coeff = contact_k * overlap - contact_c * vn
-            forcex = coeff * mx
-            forcey = coeff * my
-            fx += forcex
-            fy += forcey
-            tau += rx * forcey - ry * forcex
+                        s = gy
+                        nlx = zero
+                        if ly >= zero:
+                            nly = one
+                        else:
+                            nly = -one
+                overlap = reach - s
+                if overlap <= zero:
+                    continue
+                # closest surface point, box frame -> lever arm about the tee centre
+                spx = lx - s * nlx
+                spy = ly - s * nly
+                rx = owx + (ca * spx - sa * spy)
+                ry = owy + (sa * spx + ca * spy)
+                # m = -n: unit normal pointing from the agent into the T
+                mx = -(ca * nlx - sa * nly)
+                my = -(sa * nlx + ca * nly)
+                # relative velocity of the T's contact point w.r.t. the agent
+                av = vel[e, a]
+                rvx = tvx - om * ry - av[0]
+                rvy = tvy + om * rx - av[1]
+                vn = rvx * mx + rvy * my
+                coeff = contact_k * overlap - contact_c * vn
+                forcex = coeff * mx
+                forcey = coeff * my
+                fx += forcex
+                fy += forcey
+                tau += rx * forcey - ry * forcex
 
-    lin_decay = one - linear_damping * dt
-    ang_decay = one - angular_damping * dt
-    new_vx = (tv[0] + fx / tee_mass * dt) * lin_decay
-    new_vy = (tv[1] + fy / tee_mass * dt) * lin_decay
-    new_av = (om + tau / tee_inertia * dt) * ang_decay
-    new_px = wp.clamp(qx + new_vx * dt, -bound, bound)
-    new_py = wp.clamp(qy + new_vy * dt, -bound, bound)
-    new_th = th + new_av * dt
-    tee_vel[e] = type(tv)(new_vx, new_vy)
-    tee_ang_vel[e] = new_av
-    tee_pos[e] = type(q)(new_px, new_py)
+        tvx = (tvx + fx / tee_mass * sub_dt) * lin_decay
+        tvy = (tvy + fy / tee_mass * sub_dt) * lin_decay
+        om = (om + tau / tee_inertia * sub_dt) * ang_decay
+        qx = wp.clamp(qx + tvx * sub_dt, -bound, bound)
+        qy = wp.clamp(qy + tvy * sub_dt, -bound, bound)
+        th = th + om * sub_dt
+
+    new_th = th
+    tee_vel[e] = type(tv)(tvx, tvy)
+    tee_ang_vel[e] = om
+    tee_pos[e] = type(q)(qx, qy)
     tee_theta[e] = new_th
 
     # Re-install the two boxes at the new pose for the next physics step.
@@ -178,8 +193,8 @@ def pusht_body_kernel(
     for b in range(n_boxes):
         off = box_off[b]
         obs_pos[e, b] = type(q)(
-            new_px + nca * off[0] - nsa * off[1],
-            new_py + nsa * off[0] + nca * off[1],
+            qx + nca * off[0] - nsa * off[1],
+            qy + nsa * off[0] + nca * off[1],
         )
         obs_angle[e, b] = new_th
 
@@ -344,6 +359,7 @@ def _body_signature(dtype) -> list:
         dtype,  # linear_damping
         dtype,  # angular_damping
         dtype,  # dt
+        wp.int32,  # body_substeps
         dtype,  # bound
         a1v,  # tee_pos
         a1v,  # tee_vel

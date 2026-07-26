@@ -76,12 +76,16 @@ def _greedy(policy, n_envs: int, device: str):
     return action_fn
 
 
-def score(policy, n_agents: int, n_envs: int, steps: int, device: str, seed: int) -> dict:
+def score(
+    policy, n_agents: int, n_envs: int, steps: int, device: str, seed: int, substeps: int = 8
+) -> dict:
     """Mean pose error before/after a fresh episode, for the policy and for random."""
     out = {}
     for name in ("policy", "random"):
         scen = PushTScenario(n_agents=n_agents)
-        env = Environment(scen, n_envs=n_envs, device=device, dt=0.05, seed=seed)
+        env = Environment(
+            scen, n_envs=n_envs, device=device, dt=0.05, seed=seed, substeps=substeps
+        )
         env.reset(seed=seed)
         act = _greedy(policy, n_envs, device)
         gen = torch.Generator(device=device).manual_seed(seed)
@@ -139,6 +143,10 @@ def main() -> None:
     parser.add_argument("--n-envs", type=int, default=512)
     parser.add_argument("--steps", type=int, default=400)
     parser.add_argument("--seed", type=int, default=123)
+    parser.add_argument(
+        "--substeps", type=int, default=8,
+        help="physics substeps; keep equal to training (the stiff contact needs them)",
+    )
     parser.add_argument("--video", help="write an mp4/webm of one env's rollout")
     parser.add_argument("--window", action="store_true", help="live pygame window")
     parser.add_argument(
@@ -167,7 +175,10 @@ def main() -> None:
         return
 
     policy, n_agents = _load(args.checkpoint, args.device)
-    res = score(policy, n_agents, args.n_envs, args.steps, args.device, args.seed)
+    res = score(
+        policy, n_agents, args.n_envs, args.steps, args.device, args.seed,
+        substeps=args.substeps,
+    )
     print(f"{args.checkpoint}: {args.steps} steps x {args.n_envs} envs (seed {args.seed})")
     for name, m in res.items():
         d0, d1 = m["dist"]
@@ -188,6 +199,7 @@ def main() -> None:
             n_envs=1,
             device=args.device,
             dt=dt,
+            substeps=args.substeps,
             seed=args.seed,
             max_steps=args.episode_steps,
             auto_reset=True,

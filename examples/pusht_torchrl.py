@@ -116,6 +116,10 @@ def main() -> None:
     parser.add_argument("--rot-shaping", type=float, default=0.5)
     parser.add_argument("--entropy-coeff", type=float, default=3e-3)
     parser.add_argument("--max-steps", type=int, default=400, help="episode length")
+    # The stiff contact (contact_k 8000) is an explicit spring-damper: the agent half of
+    # the step is stable only while contact_c * dt / substeps < ~1, so 8 substeps at
+    # dt=0.05 is the floor. Fewer substeps diverge to NaN rather than degrade gracefully.
+    parser.add_argument("--substeps", type=int, default=8, help="physics substeps per step")
     parser.add_argument("--num-cells", type=int, default=256, help="MLP width")
     # Goal-pose curriculum: the goal spawns near the T early on (so the terminal
     # bonus is reachable by a novice policy) and widens to the full uniform
@@ -126,6 +130,13 @@ def main() -> None:
     parser.add_argument("--curriculum-gate", type=float, default=0.35,
                         help="min fraction of episodes solved to raise difficulty")
     parser.add_argument("--checkpoint-dir", default="runs/pusht")
+    parser.add_argument(
+        "--resume", help="pusht_*.pt to continue from (actor + critic weights)"
+    )
+    parser.add_argument(
+        "--start-difficulty", type=float, default=0.0,
+        help="initial curriculum difficulty in [0, 1]; use 1.0 when resuming a finished run",
+    )
     parser.add_argument("--checkpoint-every", type=int, default=100, help="0 disables")
     args = parser.parse_args()
 
@@ -140,6 +151,7 @@ def main() -> None:
             n_envs=args.n_envs,
             device=device,
             dt=0.05,
+            substeps=args.substeps,
             seed=0,
             max_steps=args.max_steps,
         )
@@ -191,7 +203,13 @@ def main() -> None:
 
     scen = env._env.scenario
 
-    difficulty = 0.0
+    if args.resume:
+        ckpt = torch.load(args.resume, map_location=device, weights_only=True)
+        policy.load_state_dict(ckpt["policy"])
+        critic.load_state_dict(ckpt["critic"])
+        print(f"resumed actor + critic from {args.resume}")
+
+    difficulty = min(1.0, max(0.0, args.start_difficulty))
 
     def set_curriculum(solved_rate: float) -> float:
         """Raise the goal spawn radius/angle while the policy keeps solving.
