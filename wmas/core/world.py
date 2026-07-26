@@ -152,16 +152,22 @@ class World:
         shape: torch.Tensor | None = None,
         angle: torch.Tensor | None = None,
         half_extents: torch.Tensor | None = None,
+        vel: torch.Tensor | None = None,
+        ang_vel: torch.Tensor | None = None,
     ) -> None:
-        """Install static obstacles (circle/box/segment). ``angle`` may be
-        ``[n_obstacles]`` or per-env ``[n_envs, n_obstacles]``. See
+        """Install obstacles (circle/box/segment). ``angle`` may be ``[n_obstacles]`` or
+        per-env ``[n_envs, n_obstacles]``. ``vel``/``ang_vel`` give a *moving* obstacle's
+        velocity so contact damping uses the closing velocity. See
         :meth:`wmas.core.stepper.Stepper.set_obstacles` for shape semantics."""
         self.obstacle_pos = pos
         self.obstacle_radius = radius
         self.obstacle_shape = shape
         self.obstacle_angle = angle
         self.obstacle_half_extents = half_extents
-        self.stepper.set_obstacles(pos, radius, shape=shape, angle=angle, half_extents=half_extents)
+        self.stepper.set_obstacles(
+            pos, radius, shape=shape, angle=angle, half_extents=half_extents,
+            vel=vel, ang_vel=ang_vel,
+        )
 
     # -------------------------------------------------------------- neighbors
 

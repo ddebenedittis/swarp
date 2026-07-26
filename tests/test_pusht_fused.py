@@ -55,9 +55,13 @@ def _run(env, n_steps, device, n_agents):
 
 
 @pytest.mark.parametrize("device", DEVICES)
-def test_fused_matches_torch(device):
-    fused = _run(_env(device, fused=True), 20, device, 4)
-    torchp = _run(_env(device, fused=False), 20, device, 4)
+# n_agents=1 is the single-robot Push-T: obs_dim collapses to 12 (the obs kernel's
+# teammate loop writes nothing) and the body kernel reduces over one contact.
+@pytest.mark.parametrize("n_agents", [1, 4])
+def test_fused_matches_torch(device, n_agents):
+    fused = _run(_env(device, fused=True, n_agents=n_agents), 20, device, n_agents)
+    torchp = _run(_env(device, fused=False, n_agents=n_agents), 20, device, n_agents)
+    assert fused[0][0].shape[-1] == 12 + 2 * (n_agents - 1)
     # The T must actually translate *and* rotate (contact physics exercised).
     moved = any((fused[t][3] - fused[0][3]).abs().sum().item() > 0 for t in range(1, 20))
     spun = any((fused[t][4] - fused[0][4]).abs().sum().item() > 0 for t in range(1, 20))

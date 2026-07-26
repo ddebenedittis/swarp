@@ -63,8 +63,8 @@ class PushTScenario(Scenario):
         contact_c: float = 100.0,
         contact_margin: float = 0.002,
         body_substeps: int = 16,
-        linear_damping: float = 10.0,
-        angular_damping: float = 10.0,
+        linear_damping: float = 40.0,
+        angular_damping: float = 40.0,
         pos_shaping_factor: float = 1.0,
         rot_shaping_factor: float = 0.5,
         agent_dist_shaping: float = 1.0,
@@ -85,6 +85,18 @@ class PushTScenario(Scenario):
         # a stiff contact_k needs the body integration substepped (the world's own
         # `substeps` covers the agent half of the step but not this body).
         self.body_substeps = body_substeps
+        # Depth at which the contact spring saturates (smoothly). Obstacle poses are
+        # frozen within an env step, so a moving T can sweep its surface over an agent
+        # that cannot react until the next step; this bounds the resulting impulse.
+        # Legitimate pushing compresses ~0.05 agent radii, well inside the linear region.
+        self.max_overlap = 0.5 * agent_radius
+        # Viscous drag standing in for table friction, and the knob that sets how
+        # responsive the T is: under a sustained push it settles at
+        # ``sum(f) / (mass * linear_damping)``, so N agents pressing together can drive it
+        # at N times the speed one can. At damping 10 four robots drove it to ~4 m/s off
+        # 1.25 mm of compression, which reads as the T moving without being touched (and
+        # then outrunning its pushers). At 40 it tops out near the robots' own 1 m/s and
+        # needs a visible 5 mm of compression to do it.
         self.linear_damping = linear_damping
         self.angular_damping = angular_damping
         self.pos_shaping_factor = pos_shaping_factor
@@ -297,12 +309,24 @@ class PushTScenario(Scenario):
 
     def _install_obstacles(self) -> None:
         centers, angles = self._box_poses()
+        # Each box's own velocity: the body's linear velocity plus omega x r, where r is
+        # the lever from the T centroid to that box centre. Contact damping needs it —
+        # without it the agents are damped against their absolute velocity and the
+        # moving T applies drag unrelated to the contact.
+        r = centers - self.tee_pos.detach().unsqueeze(1)  # [E, B, 2]
+        om = self.tee_ang_vel.detach().unsqueeze(1)  # [E, 1]
+        vel = self.tee_vel.detach().unsqueeze(1) + torch.stack(
+            [-om * r[..., 1], om * r[..., 0]], dim=-1
+        )
+        ang_vel = om.expand(-1, self.n_boxes)
         self.world.set_obstacles(
             centers,
             self._obs_radius,
             shape=self._obs_shape,
             angle=angles,  # per-env: the T rotates independently in each env
             half_extents=self._obs_half,
+            vel=vel,
+            ang_vel=ang_vel,
         )
 
     # -------------------------------------------------------------- T physics
@@ -423,6 +447,7 @@ class PushTScenario(Scenario):
             self.tee_pos, self.tee_vel, self.tee_theta, self.tee_ang_vel,
             self._prev_dist, self._prev_ang, self._prev_adist,
             wp.to_torch(st._obs_pos), wp.to_torch(st._obs_angle),
+            wp.to_torch(st._obs_vel), wp.to_torch(st._obs_ang_vel),
         ]
 
     def _pre_graph_step(self) -> None:
@@ -481,6 +506,7 @@ class PushTScenario(Scenario):
                 scalar(self.angular_damping),
                 scalar(self.dt),
                 wp.int32(self.body_substeps),
+                scalar(self.max_overlap),
                 scalar(self.world_size - self.tee_radius),
             ],
             outputs=[
@@ -490,6 +516,8 @@ class PushTScenario(Scenario):
                 bd["tee_ang_vel"],
                 st._obs_pos,
                 st._obs_angle,
+                st._obs_vel,
+                st._obs_ang_vel,
             ],
             device=w.device,
             record_tape=False,
@@ -595,6 +623,10 @@ class PushTScenario(Scenario):
 
         overlap = (self.agent_radius + self.contact_margin) - s
         active = (overlap > 0).to(pos.dtype)
+        # Smooth depth saturation, mirroring pusht_body_kernel: bounds the impulse a
+        # frozen-pose sweep can inject without a gradient-killing hard clamp.
+        mo = self.max_overlap
+        overlap = mo * torch.tanh(overlap.clamp(min=0.0) / mo)
         # closest surface point (box frame) -> lever arm about the tee centroid
         spx, spy = lx - s * nlx, ly - s * nly
         rx = owx + (ca * spx - sa * spy)
@@ -607,7 +639,12 @@ class PushTScenario(Scenario):
         rvx = self.tee_vel[:, None, None, 0] - om * ry - vel[..., 0].unsqueeze(-1)
         rvy = self.tee_vel[:, None, None, 1] + om * rx - vel[..., 1].unsqueeze(-1)
         vn = rvx * mx + rvy * my
-        coeff = (self.contact_k * overlap.clamp(min=0.0) - self.contact_c * vn) * active
+        # Linearly-implicit damping + repulsive clamp; see pusht_body_kernel.
+        sub_dt = self.dt / self.body_substeps
+        coeff = (self.contact_k * overlap - self.contact_c * vn) / (
+            1.0 + self.contact_c * sub_dt / self.tee_mass
+        )
+        coeff = coeff.clamp(min=0.0) * active
         fx, fy = coeff * mx, coeff * my
         return torch.stack([fx, fy], dim=-1), rx * fy - ry * fx
 

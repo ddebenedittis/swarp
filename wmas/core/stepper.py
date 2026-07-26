@@ -114,6 +114,10 @@ class Stepper:
         self._obs_type = wp.zeros(1, dtype=wp.int32, device=device)
         self._obs_angle = wp.zeros((1, 1), dtype=dtype, device=device)
         self._obs_half = wp.zeros(1, dtype=vec2, device=device)
+        # Obstacle velocities, so contact damping can use the closing velocity even for
+        # a moving body installed as obstacles. Zero for a genuinely static obstacle.
+        self._obs_vel = wp.zeros((1, 1), dtype=vec2, device=device)
+        self._obs_ang_vel = wp.zeros((1, 1), dtype=dtype, device=device)
 
         self._zero_forces: dict[int, wp.array] = {}
         self._zero_nbr: dict[int, tuple[wp.array, wp.array]] = {}
@@ -156,6 +160,8 @@ class Stepper:
         shape: torch.Tensor | None = None,
         angle: torch.Tensor | None = None,
         half_extents: torch.Tensor | None = None,
+        vel: torch.Tensor | None = None,
+        ang_vel: torch.Tensor | None = None,
     ) -> None:
         """Install static obstacles.
 
@@ -171,6 +177,12 @@ class Stepper:
                 either way. Default 0.
             half_extents: ``[n_obstacles, 2]`` box half-extents; for a segment
                 the ``[:, 0]`` column is the half-length. Default 0.
+            vel: ``[n_envs, n_obstacles, 2]`` obstacle linear velocities, and
+                ``ang_vel`` ``[n_envs, n_obstacles]`` angular velocities. Contact
+                damping uses the closing velocity, so a *moving* obstacle (a
+                scenario-layer movable body installed as obstacles) must pass these or
+                its contacts are damped against the agent's absolute velocity instead.
+                Default 0, i.e. a static obstacle.
         """
         vec2 = VEC2[self.dtype]
         n_envs, n_obs = pos.shape[0], pos.shape[1]
@@ -208,6 +220,17 @@ class Stepper:
                 wp.copy(
                     self._obs_half, wp.from_torch(half_extents.detach().contiguous(), dtype=vec2)
                 )
+            if vel is None:
+                self._obs_vel.zero_()
+            else:
+                wp.copy(self._obs_vel, wp.from_torch(vel.detach().contiguous(), dtype=vec2))
+            if ang_vel is None:
+                self._obs_ang_vel.zero_()
+            else:
+                wp.copy(
+                    self._obs_ang_vel,
+                    wp.from_torch(ang_vel.detach().contiguous(), dtype=self.dtype),
+                )
             return
 
         self.n_obstacles = n_obs
@@ -228,6 +251,16 @@ class Stepper:
             self._obs_half = wp.zeros(n_obs, dtype=vec2, device=dev)
         else:
             self._obs_half = wp.clone(wp.from_torch(half_extents.detach().contiguous(), dtype=vec2))
+        if vel is None:
+            self._obs_vel = wp.zeros((n_envs, n_obs), dtype=vec2, device=dev)
+        else:
+            self._obs_vel = wp.clone(wp.from_torch(vel.detach().contiguous(), dtype=vec2))
+        if ang_vel is None:
+            self._obs_ang_vel = wp.zeros((n_envs, n_obs), dtype=self.dtype, device=dev)
+        else:
+            self._obs_ang_vel = wp.clone(
+                wp.from_torch(ang_vel.detach().contiguous(), dtype=self.dtype)
+            )
         # _needs_forces may have flipped: cached buffers could alias the shared
         # zero-force buffer, which the force pass would then overwrite. A shape
         # change also invalidates any captured CUDA graph.
@@ -498,10 +531,13 @@ class Stepper:
                     self._obs_type,
                     self._obs_angle,
                     self._obs_half,
+                    self._obs_vel,
+                    self._obs_ang_vel,
                     self.n_obstacles,
                     world.collision_k,
                     world.collision_c,
                     world.collision_margin,
+                    self.sub_dt,
                     self._soft_walls,
                     self._bounds_min,
                     self._bounds_max,

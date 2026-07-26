@@ -66,6 +66,7 @@ def pusht_body_kernel(
     angular_damping: Any,
     dt: Any,
     body_substeps: wp.int32,
+    max_overlap: Any,
     bound: Any,
     tee_pos: wp.array(dtype=Any),
     tee_vel: wp.array(dtype=Any),
@@ -73,6 +74,8 @@ def pusht_body_kernel(
     tee_ang_vel: wp.array(dtype=Any),
     obs_pos: wp.array2d(dtype=Any),
     obs_angle: wp.array2d(dtype=Any),
+    obs_vel: wp.array2d(dtype=Any),
+    obs_ang_vel: wp.array2d(dtype=Any),
 ):
     """Thread per env: accumulate box-SDF contact force/torque, integrate, re-install.
 
@@ -154,6 +157,14 @@ def pusht_body_kernel(
                 overlap = reach - s
                 if overlap <= zero:
                     continue
+                # Obstacle poses are frozen within an env step, so a moving T can sweep
+                # its surface over an agent that was outside it; the agent cannot react
+                # until the next step. Saturate the depth that feeds the spring so that
+                # artifact cannot become a k*depth impulse (which fed back into a faster
+                # sweep). tanh, not min(), to keep the force differentiable in the depth
+                # everywhere. Legitimate pushing compresses ~0.05 agent radii, far below
+                # max_overlap, where tanh(x) ~ x leaves the intended regime untouched.
+                overlap = max_overlap * wp.tanh(overlap / max_overlap)
                 # closest surface point, box frame -> lever arm about the tee centre
                 spx = lx - s * nlx
                 spy = ly - s * nly
@@ -167,7 +178,19 @@ def pusht_body_kernel(
                 rvx = tvx - om * ry - av[0]
                 rvy = tvy + om * rx - av[1]
                 vn = rvx * mx + rvy * my
-                coeff = contact_k * overlap - contact_c * vn
+                # Linearly-implicit (semi-implicit) damping: with the normal frozen over
+                # the sub-step, solving f = k*ov - c*vn(f) for the post-impulse normal
+                # velocity is one divide, and is unconditionally stable in contact_c
+                # instead of needing sub_dt < m/c. tee_mass is the Jacobi (per-contact
+                # diagonal) approximation of the effective mass. Smooth in every input,
+                # and better conditioned for adjoints than the explicit form, which can
+                # flip sign.
+                coeff = (contact_k * overlap - contact_c * vn) / (
+                    one + contact_c * sub_dt / tee_mass
+                )
+                # Keep the contact repulsive: an explicit damper can turn a contact
+                # attractive and yank the T toward a separating agent.
+                coeff = wp.max(coeff, zero)
                 forcex = coeff * mx
                 forcey = coeff * my
                 fx += forcex
@@ -192,11 +215,14 @@ def pusht_body_kernel(
     nsa = wp.sin(new_th)
     for b in range(n_boxes):
         off = box_off[b]
-        obs_pos[e, b] = type(q)(
-            qx + nca * off[0] - nsa * off[1],
-            qy + nsa * off[0] + nca * off[1],
-        )
+        owx = nca * off[0] - nsa * off[1]
+        owy = nsa * off[0] + nca * off[1]
+        obs_pos[e, b] = type(q)(qx + owx, qy + owy)
         obs_angle[e, b] = new_th
+        # Each box's velocity, v + om x r, so the agent-side contact damper can use the
+        # closing velocity next step (see wmas.core.collisions).
+        obs_vel[e, b] = type(q)(tvx - om * owy, tvy + om * owx)
+        obs_ang_vel[e, b] = om
 
 
 @wp.kernel
@@ -360,6 +386,7 @@ def _body_signature(dtype) -> list:
         dtype,  # angular_damping
         dtype,  # dt
         wp.int32,  # body_substeps
+        dtype,  # max_overlap
         dtype,  # bound
         a1v,  # tee_pos
         a1v,  # tee_vel
@@ -367,6 +394,8 @@ def _body_signature(dtype) -> list:
         a1s,  # tee_ang_vel
         wp.array2d(dtype=vec2),  # obs_pos [n_envs, n_boxes]
         wp.array2d(dtype=dtype),  # obs_angle [n_envs, n_boxes]
+        wp.array2d(dtype=vec2),  # obs_vel [n_envs, n_boxes]
+        wp.array2d(dtype=dtype),  # obs_ang_vel [n_envs, n_boxes]
     ]
 
 

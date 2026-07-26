@@ -1,4 +1,4 @@
-"""MAPPO on Push-T: four robots learn to push a T to a target pose, via TorchRL.
+"""MAPPO on Push-T: N robots learn to push a T to a target pose, via TorchRL.
 
 Wraps :class:`~wmas.scenarios.pusht.PushTScenario` in the batched TorchRL ``EnvBase``
 from :mod:`wmas.interop.torchrl` and runs a small on-policy PPO loop with a shared
@@ -12,6 +12,17 @@ Needs the optional torchrl group::
 Run with::
 
     python examples/pusht_torchrl.py [--device cuda:0] [--iters 600] [--n-envs 512]
+
+``--n-agents`` sets the team size, and 1 is a first-class setting: that is the
+classic single-robot Push-T (one pusher, one T, a full pose goal). Nothing about the
+scenario needs retuning — the contact/body physics and the shaping terms are already
+per-agent sums, and the obs row simply loses its teammate block
+(``obs_dim = 12 + 2*(n_agents-1)``, so 12). Only the *task* gets harder: one contact
+point can push or spin the T but not both at once, so a solve takes more steps and
+more frames than the 4-robot run below. Start from the 4-agent recipe and expect to
+raise ``--iters`` (and, if the curriculum stalls, ``--curriculum-iters``)::
+
+    python examples/pusht_torchrl.py --n-agents 1 --iters 2000 --checkpoint-dir runs/pusht_1a
 
 The defaults (600 iters x 512 envs x 32 steps = ~10M frames, a few minutes on a
 modern GPU) get the policy off the ground; ``--iters 1400`` (~23M frames, ~1 h)
@@ -65,7 +76,7 @@ from torchrl.objectives import ClipPPOLoss, ValueEstimators
 from wmas import Environment, PushTScenario
 from wmas.interop.torchrl import WmasEnv
 
-N_AGENTS = 4
+N_AGENTS = 4  # default team size; override with --n-agents (1 = single-robot Push-T)
 
 # WmasEnv is flat (no ("agents", ...) group) and emits one shared done per env,
 # [n_envs, 1], while reward is per-agent [n_envs, n_agents, 1]. GAE needs the two
@@ -112,6 +123,10 @@ def main() -> None:
     default_device = "cuda:0" if torch.cuda.is_available() else "cpu"
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", default=default_device)
+    parser.add_argument(
+        "--n-agents", type=int, default=N_AGENTS,
+        help="pushers on the team; 1 is the classic single-robot Push-T",
+    )
     parser.add_argument("--iters", type=int, default=600)
     parser.add_argument("--n-envs", type=int, default=512)
     parser.add_argument("--steps-per-batch", type=int, default=32)
@@ -151,12 +166,15 @@ def main() -> None:
     )
     parser.add_argument("--checkpoint-every", type=int, default=100, help="0 disables")
     args = parser.parse_args()
+    if args.n_agents < 1:
+        parser.error("--n-agents must be >= 1")
 
     device = args.device
+    n_agents = args.n_agents
     env = WmasEnv(
         Environment(
             PushTScenario(
-                n_agents=N_AGENTS,
+                n_agents=n_agents,
                 pos_shaping_factor=args.pos_shaping,
                 rot_shaping_factor=args.rot_shaping,
             ),
@@ -171,12 +189,12 @@ def main() -> None:
     obs_dim, act_dim = env.obs_dim, env.act_dim
 
     # Decentralised actor (shared weights), centralised critic — the usual MAPPO split.
-    policy = build_policy(obs_dim, act_dim, N_AGENTS, device, num_cells=args.num_cells)
+    policy = build_policy(obs_dim, act_dim, n_agents, device, num_cells=args.num_cells)
     critic = TensorDictModule(
         MultiAgentMLP(
             n_agent_inputs=obs_dim,
             n_agent_outputs=1,
-            n_agents=N_AGENTS,
+            n_agents=n_agents,
             centralised=True,
             share_params=True,
             device=device,
@@ -256,7 +274,7 @@ def main() -> None:
                 "critic": critic.state_dict(),
                 "obs_dim": obs_dim,
                 "act_dim": act_dim,
-                "n_agents": N_AGENTS,
+                "n_agents": n_agents,
                 "num_cells": args.num_cells,
             },
             ckpt_dir / f"pusht_{tag}.pt",
@@ -270,8 +288,8 @@ def main() -> None:
         # termination (the on-goal condition) from info so only real terminals cut,
         # and keep the wrapper's flag as `done` (terminated | truncated).
         terminated = ((dist < scen.goal_tolerance) & (ang < scen.angle_tolerance)).unsqueeze(-1)
-        batch.set(DONE_KEY, _expand(batch.get(("next", "done")), N_AGENTS))
-        batch.set(TERM_KEY, _expand(terminated, N_AGENTS))
+        batch.set(DONE_KEY, _expand(batch.get(("next", "done")), n_agents))
+        batch.set(TERM_KEY, _expand(terminated, n_agents))
         with torch.no_grad():
             loss_module.value_estimator(
                 batch, params=loss_module.critic_network_params,

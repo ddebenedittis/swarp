@@ -77,11 +77,14 @@ def test_two_agent_spring_damper_analytic():
     with torch.no_grad():
         out = warp_step(stepper, state, actions)
     # agent0: n = (-1,0), overlap 0.07, rel_v = (1,0), dot(rel_v,n) = -1
-    # F0 = k*0.07*(-1,0) - c*(-1)*(-1,0) = (-7-2, 0) = (-9, 0)
-    # accel mode, zero action: v_new = v + F/m*dt = 0.5 - 0.9 = -0.4
-    np.testing.assert_allclose(out.vel[0, 0].cpu(), [-0.4, 0.0], atol=1e-12)
-    np.testing.assert_allclose(out.pos[0, 0].cpu(), [-0.04, 0.0], atol=1e-12)
-    np.testing.assert_allclose(out.vel[0, 1].cpu(), [0.4, 0.0], atol=1e-12)
+    # The damping is linearly implicit, so the scalar coefficient carries the
+    # 1 + c*sub_dt/m denominator (see wmas.core.collisions):
+    #   coeff = (k*0.07 - c*(-1)) / (1 + 2*0.1/1) = 9 / 1.2 = 7.5
+    #   F0 = 7.5*(-1, 0) = (-7.5, 0)
+    # accel mode, zero action: v_new = v + F/m*dt = 0.5 - 0.75 = -0.25
+    np.testing.assert_allclose(out.vel[0, 0].cpu(), [-0.25, 0.0], atol=1e-12)
+    np.testing.assert_allclose(out.pos[0, 0].cpu(), [-0.025, 0.0], atol=1e-12)
+    np.testing.assert_allclose(out.vel[0, 1].cpu(), [0.25, 0.0], atol=1e-12)
 
 
 @pytest.mark.parametrize("device", DEVICES)
