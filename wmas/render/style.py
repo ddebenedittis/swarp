@@ -59,6 +59,10 @@ class Style:
     action_color: RGB = (20, 120, 210)
     action_brake_color: RGB = (200, 60, 60)
     goal_reached_color: RGB = (0, 158, 115)
+    # Obstacles are drawn by kind: immovable scenery black, pushable bodies grey
+    # (obstacle_color below is the grey, kept as the name other code already uses).
+    obstacle_immovable_color: RGB = (24, 24, 28)
+    obstacle_immovable_outline: RGB = (8, 8, 10)
     goal_pose_color: RGB = (0, 158, 115)  # target-pose outline of a movable body
     goal_pose_alpha: int = 130
     palette: tuple[RGB, ...] = field(default_factory=lambda: _PALETTE)
@@ -237,6 +241,8 @@ _UNSCALED_FIELDS: frozenset[str] = frozenset(
         "action_color",
         "action_brake_color",
         "goal_reached_color",
+        "obstacle_immovable_color",
+        "obstacle_immovable_outline",
         "goal_pose_color",
         "goal_pose_alpha",
         "palette",
@@ -270,6 +276,9 @@ _DARK: dict[str, object] = {
     "bounds_color": (90, 90, 100),
     "obstacle_color": (78, 78, 86),
     "obstacle_outline": (105, 105, 115),
+    # On a dark background "black" reads through its outline, not its fill.
+    "obstacle_immovable_color": (8, 8, 10),
+    "obstacle_immovable_outline": (128, 128, 140),
     "edge_color": (70, 70, 80),
     "agent_outline": (235, 235, 240),
     "heading_color": (235, 235, 240),

@@ -9,11 +9,25 @@ from wmas.dynamics.base import Integrator
 
 
 class ObstacleShape(IntEnum):
-    """Static obstacle geometry tags (must match wmas.core.collisions SHAPE_*)."""
+    """Obstacle geometry tags (must match wmas.core.collisions SHAPE_*)."""
 
     CIRCLE = 0
     BOX = 1
     SEGMENT = 2
+
+
+class ObstacleKind(IntEnum):
+    """Whether an obstacle can be pushed around.
+
+    ``IMMOVABLE`` is infinite-mass scenery: agents bounce off it and it never moves.
+    ``MOVABLE`` obstacles carry a mass and inertia and are integrated from the reaction
+    of the very same agent contacts (Newton's third law), inside the substep loop — so
+    agents see the body's up-to-date pose rather than last step's. Renderers draw
+    immovable obstacles black and movable ones grey.
+    """
+
+    IMMOVABLE = 0
+    MOVABLE = 1
 
 
 @dataclass
@@ -43,6 +57,11 @@ class WorldConfig:
     collision_k: float = 100.0
     collision_c: float = 1.0
     collision_margin: float = 0.02
+    # Viscous drag on MOVABLE obstacles, standing in for table friction: a pushed body
+    # settles at sum(f) / (mass * damping) rather than accelerating without limit. Set 0
+    # for a frictionless puck that coasts.
+    obstacle_linear_damping: float = 10.0
+    obstacle_angular_damping: float = 10.0
     bounds: tuple[float, float, float, float] | None = None
     bounds_mode: str = "soft"
     neighbor_radius: float | None = None
@@ -68,3 +87,5 @@ class WorldConfig:
                 raise ValueError("bounds must satisfy x_min < x_max and y_min < y_max")
         if self.collision_k < 0.0 or self.collision_c < 0.0 or self.collision_margin < 0.0:
             raise ValueError("collision constants must be non-negative")
+        if self.obstacle_linear_damping < 0.0 or self.obstacle_angular_damping < 0.0:
+            raise ValueError("obstacle damping must be non-negative")

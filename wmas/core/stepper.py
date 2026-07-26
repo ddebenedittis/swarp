@@ -25,6 +25,7 @@ import numpy as np
 import torch
 import warp as wp
 
+from wmas.core.bodies import launch_obstacle_dynamics
 from wmas.core.collisions import launch_collision_forces
 from wmas.core.config import WorldConfig
 from wmas.core.neighbors import NeighborGrid
@@ -118,6 +119,12 @@ class Stepper:
         # a moving body installed as obstacles. Zero for a genuinely static obstacle.
         self._obs_vel = wp.zeros((1, 1), dtype=vec2, device=device)
         self._obs_ang_vel = wp.zeros((1, 1), dtype=dtype, device=device)
+        # IMMOVABLE (0) vs MOVABLE (1) per obstacle; a movable body carries mass/inertia
+        # and is integrated per substep from the reaction of the agent contacts.
+        self._obs_kind = wp.zeros(1, dtype=wp.int32, device=device)
+        self._obs_mass = wp.ones(1, dtype=dtype, device=device)
+        self._obs_inertia = wp.ones(1, dtype=dtype, device=device)
+        self._any_movable = False
 
         self._zero_forces: dict[int, wp.array] = {}
         self._zero_nbr: dict[int, tuple[wp.array, wp.array]] = {}
@@ -162,6 +169,9 @@ class Stepper:
         half_extents: torch.Tensor | None = None,
         vel: torch.Tensor | None = None,
         ang_vel: torch.Tensor | None = None,
+        kind: torch.Tensor | None = None,
+        mass: torch.Tensor | None = None,
+        inertia: torch.Tensor | None = None,
     ) -> None:
         """Install static obstacles.
 
@@ -183,6 +193,14 @@ class Stepper:
                 scenario-layer movable body installed as obstacles) must pass these or
                 its contacts are damped against the agent's absolute velocity instead.
                 Default 0, i.e. a static obstacle.
+            kind: ``[n_obstacles]`` int tensor of :class:`ObstacleKind` tags
+                (0=immovable, 1=movable). Default all immovable. A MOVABLE obstacle is
+                integrated inside the substep loop from the reaction of the agent
+                contacts, so ``pos``/``angle``/``vel``/``ang_vel`` are treated as its
+                initial state rather than a fixed pose.
+            mass: ``[n_obstacles]`` masses and ``inertia`` ``[n_obstacles]`` moments of
+                inertia about each obstacle's centre; used only by movable obstacles.
+                Default 1.
         """
         vec2 = VEC2[self.dtype]
         n_envs, n_obs = pos.shape[0], pos.shape[1]
@@ -231,6 +249,22 @@ class Stepper:
                     self._obs_ang_vel,
                     wp.from_torch(ang_vel.detach().contiguous(), dtype=self.dtype),
                 )
+            if kind is None:
+                self._obs_kind.zero_()
+                self._any_movable = False
+            else:
+                wp.copy(
+                    self._obs_kind,
+                    wp.from_torch(kind.detach().to(torch.int32).contiguous(), dtype=wp.int32),
+                )
+                self._any_movable = bool((kind != 0).any().item())
+            if mass is not None:
+                wp.copy(self._obs_mass, wp.from_torch(mass.detach().contiguous(), dtype=self.dtype))
+            if inertia is not None:
+                wp.copy(
+                    self._obs_inertia,
+                    wp.from_torch(inertia.detach().contiguous(), dtype=self.dtype),
+                )
             return
 
         self.n_obstacles = n_obs
@@ -260,6 +294,24 @@ class Stepper:
         else:
             self._obs_ang_vel = wp.clone(
                 wp.from_torch(ang_vel.detach().contiguous(), dtype=self.dtype)
+            )
+        if kind is None:
+            self._obs_kind = wp.zeros(n_obs, dtype=wp.int32, device=dev)
+            self._any_movable = False
+        else:
+            self._obs_kind = wp.clone(
+                wp.from_torch(kind.detach().to(torch.int32).contiguous(), dtype=wp.int32)
+            )
+            self._any_movable = bool((kind != 0).any().item())
+        if mass is None:
+            self._obs_mass = wp.full(n_obs, self.dtype(1.0), dtype=self.dtype, device=dev)
+        else:
+            self._obs_mass = wp.clone(wp.from_torch(mass.detach().contiguous(), dtype=self.dtype))
+        if inertia is None:
+            self._obs_inertia = wp.full(n_obs, self.dtype(1.0), dtype=self.dtype, device=dev)
+        else:
+            self._obs_inertia = wp.clone(
+                wp.from_torch(inertia.detach().contiguous(), dtype=self.dtype)
             )
         # _needs_forces may have flipped: cached buffers could alias the shared
         # zero-force buffer, which the force pass would then overwrite. A shape
@@ -544,6 +596,27 @@ class Stepper:
                     forces,
                     self.dtype,
                 )
+                if self._any_movable:
+                    # Same state the force pass just used, so action and reaction match;
+                    # advancing here (not once per env step) keeps the pose an agent
+                    # collides against at most one substep old.
+                    launch_obstacle_dynamics(
+                        st.pos,
+                        st.vel,
+                        self.params.floats,
+                        self,
+                        self.n_agents,
+                        world.collision_k,
+                        world.collision_c,
+                        world.collision_margin,
+                        self.sub_dt,
+                        world.obstacle_linear_damping,
+                        world.obstacle_angular_damping,
+                        self._bounds_min,
+                        self._bounds_max,
+                        world.bounds is not None,
+                        self.dtype,
+                    )
             launch_integrate(
                 st,
                 chain[k + 1],

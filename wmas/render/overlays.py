@@ -87,6 +87,7 @@ def _draw_bounds(surface, g, camera, style):
 
 
 SHAPE_CIRCLE, SHAPE_BOX, SHAPE_SEGMENT = 0, 1, 2  # mirrors core.config.ObstacleShape
+KIND_MOVABLE = 1  # mirrors core.config.ObstacleKind.MOVABLE
 
 
 def _rotated_rect(center, angle: float, half_x: float, half_y: float) -> np.ndarray:
@@ -103,6 +104,9 @@ def _draw_obstacles(surface, g, camera, style):
     Mirrors the shape dispatch in ``core.collisions._static_forces`` — a box's boundary *is*
     its collision surface (the radius is unused), and a segment is a capsule of
     ``obstacle_radius`` around a spine of half-length ``half_extents[:, 0]``.
+
+    Colour carries the *kind*: immovable scenery is black, a movable (pushable) body grey,
+    so which obstacles the agents can shift is readable at a glance.
     """
     if g.obstacle_pos is None:
         return
@@ -111,10 +115,15 @@ def _draw_obstacles(surface, g, camera, style):
         shape = SHAPE_CIRCLE if g.obstacle_shape is None else int(g.obstacle_shape[i])
         angle = 0.0 if g.obstacle_angle is None else float(g.obstacle_angle[i])
         radius = float(g.obstacle_radius[i])
+        movable = g.obstacle_kind is not None and int(g.obstacle_kind[i]) == KIND_MOVABLE
+        fill = style.obstacle_color if movable else style.obstacle_immovable_color
+        line = style.obstacle_outline if movable else style.obstacle_immovable_outline
 
         if shape == SHAPE_BOX and g.obstacle_half_extents is not None:
             hx, hy = (float(v) for v in g.obstacle_half_extents[i])
-            _filled_polygon(surface, style, _pts(camera, _rotated_rect(center, angle, hx, hy)))
+            _filled_polygon(
+                surface, style, _pts(camera, _rotated_rect(center, angle, hx, hy)), fill, line
+            )
         elif shape == SHAPE_SEGMENT and g.obstacle_half_extents is not None:
             half_len = float(g.obstacle_half_extents[i, 0])
             spine = np.array([(half_len, 0.0), (-half_len, 0.0)])
@@ -123,25 +132,32 @@ def _draw_obstacles(surface, g, camera, style):
             r_px = _r_px(camera, radius, floor=0)
             if r_px < 1:  # a zero-radius spine still has to be visible
                 pts = _pts(camera, ends)
-                pygame.draw.line(surface, style.obstacle_color, pts[0], pts[1], style.line_width)
+                pygame.draw.line(surface, fill, pts[0], pts[1], style.line_width)
                 continue
             _filled_polygon(
-                surface, style, _pts(camera, _rotated_rect(center, angle, half_len, radius))
+                surface,
+                style,
+                _pts(camera, _rotated_rect(center, angle, half_len, radius)),
+                fill,
+                line,
             )
             for end in _pts(camera, ends):
-                pygame.draw.circle(surface, style.obstacle_color, end, r_px)
+                pygame.draw.circle(surface, fill, end, r_px)
         else:
             center_px = _p(camera, center)
             r_px = _r_px(camera, radius)
-            pygame.draw.circle(surface, style.obstacle_color, center_px, r_px)
-            pygame.draw.circle(
-                surface, style.obstacle_outline, center_px, r_px, style.obstacle_outline_width
-            )
+            pygame.draw.circle(surface, fill, center_px, r_px)
+            pygame.draw.circle(surface, line, center_px, r_px, style.obstacle_outline_width)
 
 
-def _filled_polygon(surface, style, pts) -> None:
-    pygame.draw.polygon(surface, style.obstacle_color, pts)
-    pygame.draw.polygon(surface, style.obstacle_outline, pts, style.obstacle_outline_width)
+def _filled_polygon(surface, style, pts, fill=None, outline=None) -> None:
+    pygame.draw.polygon(surface, fill if fill is not None else style.obstacle_color, pts)
+    pygame.draw.polygon(
+        surface,
+        outline if outline is not None else style.obstacle_outline,
+        pts,
+        style.obstacle_outline_width,
+    )
 
 
 def _draw_neighbor_graph(surface, g, camera, style):

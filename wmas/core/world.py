@@ -69,6 +69,7 @@ class World:
         # [n_obstacles] (shared) or [n_envs, n_obstacles] (per-env, rotating body)
         self.obstacle_angle: torch.Tensor | None = None
         self.obstacle_half_extents: torch.Tensor | None = None  # [n_obstacles, 2]
+        self.obstacle_kind: torch.Tensor | None = None  # [n_obstacles] ObstacleKind tags
         self.generator: torch.Generator | None = None  # installed by Environment
         self.agent_radius = torch.tensor(
             [c.radius for c in agent_configs], device=device, dtype=dtype
@@ -154,19 +155,40 @@ class World:
         half_extents: torch.Tensor | None = None,
         vel: torch.Tensor | None = None,
         ang_vel: torch.Tensor | None = None,
+        kind: torch.Tensor | None = None,
+        mass: torch.Tensor | None = None,
+        inertia: torch.Tensor | None = None,
     ) -> None:
         """Install obstacles (circle/box/segment). ``angle`` may be ``[n_obstacles]`` or
         per-env ``[n_envs, n_obstacles]``. ``vel``/``ang_vel`` give a *moving* obstacle's
-        velocity so contact damping uses the closing velocity. See
+        velocity so contact damping uses the closing velocity. ``kind`` tags each obstacle
+        IMMOVABLE or MOVABLE (see :class:`~wmas.core.config.ObstacleKind`); movable ones
+        use ``mass``/``inertia`` and are integrated by the engine each substep. See
         :meth:`wmas.core.stepper.Stepper.set_obstacles` for shape semantics."""
         self.obstacle_pos = pos
         self.obstacle_radius = radius
         self.obstacle_shape = shape
         self.obstacle_angle = angle
         self.obstacle_half_extents = half_extents
+        self.obstacle_kind = kind
         self.stepper.set_obstacles(
             pos, radius, shape=shape, angle=angle, half_extents=half_extents,
-            vel=vel, ang_vel=ang_vel,
+            vel=vel, ang_vel=ang_vel, kind=kind, mass=mass, inertia=inertia,
+        )
+
+    def movable_obstacle_state(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Live ``(pos, angle, vel, ang_vel)`` of the obstacles, as zero-copy torch views.
+
+        Movable obstacles are advanced in place by the engine, so these views track the
+        current pose; ``pos``/``angle`` are ``[n_envs, n_obstacles]``."""
+        st = self.stepper
+        return (
+            wp.to_torch(st._obs_pos),
+            wp.to_torch(st._obs_angle),
+            wp.to_torch(st._obs_vel),
+            wp.to_torch(st._obs_ang_vel),
         )
 
     # -------------------------------------------------------------- neighbors
