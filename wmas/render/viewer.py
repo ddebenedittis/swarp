@@ -18,7 +18,13 @@ import torch
 
 from wmas.render.camera import Camera
 from wmas.render.geometry import extract_geometry, extract_geometry_batch
-from wmas.render.hud import draw_help, draw_hover_panel, draw_hud, draw_reward_hud
+from wmas.render.hud import (
+    draw_help,
+    draw_hover_panel,
+    draw_hud,
+    draw_reward_hud,
+    draw_speed_badge,
+)
 from wmas.render.input import InteractionController, ViewState
 from wmas.render.layout import MosaicLayout, compute_mosaic_layout, tile_at
 from wmas.render.overlays import DEFAULT_ENABLED, _p, _r_px
@@ -41,7 +47,8 @@ class Viewer:
         env_index: int = 0,
         style: Style | None = None,
         scenario=None,
-        fps: int = 30,
+        fps: int = 60,
+        steps_per_frame: float = 1.0,
         mosaic: bool = False,
         max_tiles: int = 16,
         focus_frac: float = 0.68,
@@ -52,6 +59,10 @@ class Viewer:
         self.size = (int(size[0]), int(size[1]))
         self.style = style or Style()
         self.fps = fps
+        # Base pacing, in sim steps per rendered frame; the up/down ladder multiplies it. A
+        # caller that knows its dt sets this to (real-time steps per second) / fps, which makes
+        # the interactive multiplier read as a multiple of *real* time.
+        self.steps_per_frame = float(steps_per_frame)
         self.mosaic = mosaic
         self.max_tiles = max_tiles
         self.focus_frac = focus_frac
@@ -63,6 +74,7 @@ class Viewer:
         self._window = None
         self._controller: InteractionController | None = None
         self._step_count = 0
+        self._step_accum = 0.0  # fractional-speed carry, see _steps_this_frame
         self._trail_history: list[np.ndarray] = []
         self._reward_history: list[np.ndarray] = []
         self._buffer_env = env_index  # which focus_env the two rolling buffers belong to
@@ -161,11 +173,27 @@ class Viewer:
             self._reward_history.clear()
             self._buffer_env = self.state.focus_env
 
-    def _should_step(self, done: bool) -> bool:
-        """Whether to advance the sim; consumes a one-shot ``step_once`` request."""
+    def _steps_this_frame(self, done: bool) -> int:
+        """How many sim steps this rendered frame advances; consumes a ``step_once`` request.
+
+        The frame rate stays at ``self.fps`` at every playback speed and
+        ``steps_per_frame * state.speed`` decides how many steps ride on each frame — so slow
+        motion keeps the window as responsive to input as 1x, instead of ticking the clock
+        (and the event pump) at 3 fps. Fractional rates carry across frames: 0.25 steps per
+        frame advances on every fourth frame.
+        """
         once = self.state.step_once
         self.state.step_once = False
-        return (not self.state.paused or once) and not done
+        if done:
+            self._step_accum = 0.0
+            return 0
+        if self.state.paused:
+            self._step_accum = 0.0
+            return 1 if once else 0
+        self._step_accum += self.steps_per_frame * self.state.speed
+        n = int(self._step_accum)
+        self._step_accum -= n
+        return n
 
     def _apply_reset_request(self):
         if not self.state.reset_requested:
@@ -235,7 +263,8 @@ class Viewer:
             draw_hover_panel(surface, geometry, self.state.hover_agent, style)
             rewards = np.stack(self._reward_history) if len(self._reward_history) > 1 else None
             draw_reward_hud(surface, rewards, geometry, style)
-            draw_help(surface, self.state, style)
+            badge_h = draw_speed_badge(surface, self.state, style)
+            draw_help(surface, self.state, style, top_offset=badge_h)
 
     def _draw_tile(self, pygame, surface, geometry, camera, rect, style, *, focused: bool) -> None:
         r = pygame.Rect(*rect)
@@ -358,7 +387,8 @@ class Viewer:
         """Open a window and run the interactive loop until quit (Esc/Q or window close).
 
         With ``max_steps`` set, stepping stops at that many steps; ``close_when_done`` then
-        also closes the window (useful for scripted/headless-dummy runs).
+        also closes the window (useful for scripted/headless-dummy runs). Up/down change the
+        playback speed around the nominal ``fps`` (see :meth:`_steps_this_frame`).
         """
         pygame = _ensure_pygame()
         pygame.display.init()
@@ -376,12 +406,15 @@ class Viewer:
                 if reset_obs is not None:
                     obs = reset_obs
                 done = max_steps is not None and self._step_count >= max_steps
-                if self._should_step(done):
+                for _ in range(self._steps_this_frame(done)):
                     with torch.no_grad():
                         obs, reward, *_ = self.env.step(self._actions(action_fn, obs))
                     self._step_count += 1
                     self._append_trail_sample()
                     self._append_reward_sample(reward)
+                    if max_steps is not None and self._step_count >= max_steps:
+                        done = True
+                        break
                 self._render_onto(pygame, window, hud=True, fps=clock.get_fps())
                 pygame.display.flip()
                 clock.tick(self.fps)

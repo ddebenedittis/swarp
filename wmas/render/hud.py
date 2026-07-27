@@ -68,7 +68,35 @@ def draw_hud(
     _blit_lines(surface, font, lines, style.text_color, origin)
 
 
-def draw_help(surface, state: ViewState, style: Style) -> None:
+def format_speed(speed: float) -> str:
+    """Playback multiplier as it appears on the badge (``0.25x``, ``1x``, ``8x``)."""
+    return f"{speed:g}x"
+
+
+def draw_speed_badge(surface, state: ViewState, style: Style) -> int:
+    """Top-right playback-speed badge; returns the vertical space it took (0 when hidden).
+
+    Only drawn off 1x: at real time the badge would be pure noise, and its absence is itself
+    the "running at 1x" signal. The returned height is what :func:`draw_help` shifts by, so
+    the two top-right panels stack instead of overlapping.
+    """
+    if state.speed == 1.0:
+        return 0
+    clip = surface.get_clip()
+    font = _get_font(int(round(style.font_px(clip.height) * style.speed_badge_font_factor)))
+    text = format_speed(state.speed)
+    pad = style.hover_pad
+    width = font.size(text)[0] + 2 * pad
+    height = font.get_height() + 2 * pad
+    x = clip.right - width - style.hud_margin
+    y = clip.top + style.hud_margin
+
+    _blit_panel(pygame, surface, (x, y, width, height), style.speed_badge_bg, style)
+    surface.blit(font.render(text, True, style.speed_badge_color), (x + pad, y + pad))
+    return height + style.hud_margin
+
+
+def draw_help(surface, state: ViewState, style: Style, *, top_offset: int = 0) -> None:
     """Top-right controls legend for the interactive viewer."""
     if not state.show_help:
         return
@@ -82,6 +110,7 @@ def draw_help(surface, state: ViewState, style: Style) -> None:
         "left drag agent/obstacle: move it",
         "right click: move selected goal",
         ".: step once while paused",
+        "up/down: faster/slower",
         "t: cycle trajectory mode",
         "shift+l: cycle lidar mode",
         "k: cycle color mode",
@@ -99,7 +128,7 @@ def draw_help(surface, state: ViewState, style: Style) -> None:
     width = max(font.size(line)[0] for line in lines) + 2 * pad
     height = len(lines) * line_h + 2 * pad
     x = clip.right - width - style.hud_margin
-    y = clip.top + style.hud_margin
+    y = clip.top + style.hud_margin + top_offset
 
     _blit_panel(pygame, surface, (x, y, width, height), style.help_panel_bg, style)
     _blit_lines(surface, font, lines, style.text_color, (x + pad, y + pad))

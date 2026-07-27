@@ -15,9 +15,10 @@ displacement (and counts an env as solved if it is *ever* inside both tolerances
 which is where an episode would terminate in training).
 
 The T's **target pose** is drawn as a green outline (the ``goal_pose`` overlay, fed by
-``PushTScenario.render_extras``; toggle it with ``p`` in the live window). Playback is
-half real time by default — ``--speed 1`` matches the simulated clock, ``--speed 0.25``
-crawls; ``--fps`` overrides the implied frame rate outright.
+``PushTScenario.render_extras``; toggle it with ``p`` in the live window). Playback runs at
+real time by default — ``--speed 0.25`` crawls, and in the window up/down change the speed
+live (anything off 1x shows as a badge in the corner). ``--fps`` sets how often the window
+redraws, independently of the playback rate.
 
 ``--window`` hands the loop to :class:`~wmas.render.viewer.Viewer`, so the usual controls
 work: space pauses, ``.`` steps once while paused, ``r`` resets, ``?`` lists the rest.
@@ -161,11 +162,11 @@ def main() -> None:
         default=400,
         help="steps before the T and goal respawn; the rollout keeps going",
     )
-    # One sim step is dt=0.05 s, so 20 frames = 1 s of simulated time. --speed is a
-    # multiple of that real-time rate: 1.0 plays as fast as the T actually moves,
-    # 0.5 (the default) plays it at half speed, which is much easier to follow.
-    parser.add_argument("--speed", type=float, default=0.5, help="playback speed vs real time")
-    parser.add_argument("--fps", type=int, help="override the frame rate implied by --speed")
+    # One sim step is dt=0.05 s, so 20 steps = 1 s of simulated time. --speed is a multiple of
+    # that real-time rate: 1.0 (the default) plays as fast as the T actually moves. In the live
+    # window --speed only sets the *starting* rate, since up/down change it on the fly.
+    parser.add_argument("--speed", type=float, default=1.0, help="playback speed vs real time")
+    parser.add_argument("--fps", type=int, default=60, help="frame rate of the window/video")
     parser.add_argument("--curve", help="metrics.csv to plot as ASCII curves")
     args = parser.parse_args()
 
@@ -210,25 +211,33 @@ def main() -> None:
         env.reset(seed=args.seed)
         act = _greedy(policy, 1, args.device)
         n = args.render_steps
-        fps = args.fps if args.fps else max(1, round(args.speed / dt))
+        step_rate = args.speed / dt  # sim steps per second of wall clock
         print(
-            f"  rendering {n} steps at {fps} fps ({args.speed:g}x real time), "
+            f"  rendering {n} steps at {args.speed:g}x real time ({step_rate:.0f} steps/s), "
             f"respawning every {args.episode_steps}"
         )
         if args.video:
             from wmas.render.video import save_video
 
-            path = save_video(env, args.video, action_fn=act, n_steps=n, fps=fps)
-            print(f"  wrote {path} ({n / fps:.0f}s)")
+            # save_video steps once per frame, so the file's fps *is* its playback rate.
+            video_fps = max(1, round(step_rate))
+            path = save_video(env, args.video, action_fn=act, n_steps=n, fps=video_fps)
+            print(f"  wrote {path} ({n / video_fps:.0f}s at {video_fps} fps)")
         if args.window:
             # Hand the loop to the Viewer rather than stepping ourselves: it owns the
             # interactive controls (space to pause, "." to step once while paused, "r" to
-            # reset, overlay toggles, dragging) and its own fps clock. A caller-driven
-            # loop steps unconditionally, so pause has nothing to act on.
+            # reset, up/down for speed, overlay toggles, dragging) and its own fps clock. A
+            # caller-driven loop steps unconditionally, so pause has nothing to act on.
+            #
+            # The window redraws at --fps regardless of the playback rate; steps_per_frame
+            # carries the dt->wall-clock conversion, so panning and dragging stay smooth even
+            # at 0.25x (they were stuck at the 10 fps that --speed 0.5 used to imply).
             from wmas.render.viewer import Viewer
 
             env.reset(seed=args.seed)
-            Viewer(env, fps=fps).run(action_fn=act, max_steps=n, close_when_done=True)
+            Viewer(env, fps=args.fps, steps_per_frame=step_rate / args.fps).run(
+                action_fn=act, max_steps=n, close_when_done=True
+            )
 
 
 if __name__ == "__main__":

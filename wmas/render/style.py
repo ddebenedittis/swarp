@@ -52,6 +52,8 @@ class Style:
     tile_focus_border: RGB = (200, 60, 60)
     help_panel_bg: RGBA = (255, 255, 255, 225)
     hover_panel_bg: RGBA = (255, 255, 255, 210)
+    speed_badge_bg: RGBA = (255, 255, 255, 225)
+    speed_badge_color: RGB = (200, 60, 60)
     panel_border: RGB = (40, 40, 45)
     agent_halo: RGB = (245, 245, 247)  # depth_cue="halo"; defaults to the light background
     agent_shadow: RGBA = (0, 0, 0, 70)  # depth_cue="shadow"
@@ -131,6 +133,7 @@ class Style:
     action_scale: float = 0.3  # world units per commanded (m/s)
     action_accel_scale: float = 0.15  # world units per commanded (m/s^2)
     contact_tol: float = 0.0  # slack on (r_i + r_j) before an overlap counts as contact
+    speed_badge_font_factor: float = 1.7  # badge text size relative to the HUD text
 
     # ------------------------------------------------------------------ colors
     def agent_color(self, i: int, model: int | None = None) -> RGB:
@@ -234,6 +237,9 @@ _UNSCALED_FIELDS: frozenset[str] = frozenset(
         "tile_focus_border",
         "help_panel_bg",
         "hover_panel_bg",
+        "speed_badge_bg",
+        "speed_badge_color",
+        "speed_badge_font_factor",
         "panel_border",
         "agent_halo",
         "agent_shadow",
@@ -289,6 +295,8 @@ _DARK: dict[str, object] = {
     "tile_focus_border": (235, 105, 95),
     "help_panel_bg": (26, 26, 32, 230),
     "hover_panel_bg": (26, 26, 32, 215),
+    "speed_badge_bg": (26, 26, 32, 230),
+    "speed_badge_color": (235, 105, 95),
     "panel_border": (120, 120, 130),
     "agent_halo": (18, 18, 22),
 }
