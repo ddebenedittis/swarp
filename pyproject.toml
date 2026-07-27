@@ -9,7 +9,7 @@ description = "Warp Multi-Agent Simulator: a GPU-resident, differentiable, vecto
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "MIT" }
-authors = [{ name = "Davide" }]
+authors = [{ name = "Davide De Benedittis", email = "davide@cyber-fusion.io" }]
 keywords = ["multi-agent", "simulator", "differentiable", "warp", "gpu", "robotics"]
 dependencies = [
     "warp-lang>=1.15",
@@ -32,8 +32,8 @@ dev = [
     "ruff>=0.8",
 ]
 # VMAS comparison benchmark (wmas/benchmark/compare_vmas.py). VMAS pulls in gym,
-# which requires numpy < 2. Falls back to a vendored ./VectorizedMultiAgentSimulator
-# checkout if `vmas` is not importable.
+# which requires numpy < 2. Falls back to an optional (gitignored) local
+# ./VectorizedMultiAgentSimulator clone if `vmas` is not importable.
 bench = [
     "vmas>=1.5",
 ]
@@ -81,3 +81,8 @@ ignore = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+markers = [
+    "gpu: requires a CUDA device (deselect on CPU-only machines with -m 'not gpu')",
+    "slow: takes more than a few seconds (large batches, long rollouts, gradcheck)",
+    "viz: needs the `viz` extra (pygame-ce / imageio) for rendering or video export",
+]
