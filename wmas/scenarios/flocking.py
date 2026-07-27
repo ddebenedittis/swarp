@@ -14,14 +14,13 @@ import torch
 import warp as wp
 
 from wmas.core.config import WorldConfig
-from wmas.core.state import VEC2
 from wmas.core.world import World
 from wmas.dynamics.base import AgentConfig, ControlMode, DynamicsModel
-from wmas.scenarios.base import Scenario
 from wmas.scenarios.flocking_kernels import flocking_obs_reward_kernel
+from wmas.scenarios.fused import Buf, FusedPass, FusedScenario
 
 
-class FlockingScenario(Scenario):
+class FlockingScenario(FusedScenario):
     def __init__(
         self,
         n_agents: int = 8,
@@ -71,9 +70,8 @@ class FlockingScenario(Scenario):
             cfgs, cfg, n_envs=n_envs, device=device, dt=dt, substeps=substeps, dtype=dtype
         )
         self._cache: dict[str, torch.Tensor] | None = None
-        # Fused-kernel obs width (capped at max_neighbors) and lazy-alloc flag.
+        # Fused-kernel obs width (capped at max_neighbors).
         self._k_obs = min(self.neighbor_obs, cfg.max_neighbors)
-        self._fused_ready = False
         return self.world
 
     #: Flocking ships a fused Warp obs/reward kernel (2D, needs neighbors).
@@ -91,98 +89,54 @@ class FlockingScenario(Scenario):
         lim = self.world_size - 2.0 * self.agent_radius
         spawn = w.sample_uniform((n, self.n_agents, 2), -lim, lim)
         vel = w.sample_uniform((n, self.n_agents, 2), -0.3 * self.max_speed, 0.3 * self.max_speed)
-        if env_mask is None:
-            w.state.pos.data.copy_(spawn)
-            w.state.vel.data.copy_(vel)
-        else:
-            m3 = env_mask.view(-1, 1, 1)
-            w.state.pos.data.copy_(torch.where(m3, spawn, w.state.pos.data))
-            w.state.vel.data.copy_(torch.where(m3, vel, w.state.vel.data))
-        if self.fused_active:
-            # full_pass=0 on the mid-step auto-reset obs-only pass (don't clobber
-            # the reward/info already returned this step); 1 on a standalone reset.
-            # _launch rebuilds neighbors on the new state, mirroring the torch
-            # _refresh (which also calls w.neighbors()); no mark_pos_dirty needed.
-            self._launch(full_pass=0 if obs_only else 1)
-        else:
-            self._refresh()
+        w.write_state(env_mask, pos=spawn, vel=vel)
+        self.finish_reset(env_mask, obs_only=obs_only)
 
-    def post_step(self) -> None:
-        if self.fused_active:
-            # Same sequence the whole-step graph runs (keeps non-graph fused mode
-            # and CPU eager-persistent bit-identical).
-            self._pre_graph_step()
-            self._graph_post_physics()
-        else:
-            self._refresh()
+    # ---------------------------------------- torch reference path (parity oracle)
 
-    # ----------------------------------------------------- whole-step graph
+    def post_step_torch(self) -> None:
+        self._refresh()
 
-    def graph_capturable(self) -> bool:
-        return True
-
-    def graph_recapture_token(self) -> int:
-        # No per-launch re-wrapped handles and no persistent carry — the single
-        # kernel reads stable state + grid buffers, so the graph never recaptures.
-        return 0
-
-    def _pre_graph_step(self) -> None:
-        self._ensure_fused(self.world.n_envs)
-
-    def _graph_post_physics(self) -> None:
-        self._launch(full_pass=1)
+    def reset_torch(self, env_mask: torch.Tensor | None) -> None:
+        self._refresh()
 
     # --------------------------------------------------------- fused fast path
 
-    def _ensure_fused(self, n_envs: int) -> None:
-        """Allocate the persistent fused output buffers + cached wp handles."""
-        if self._fused_ready:
-            return
-        w = self.world
-        na, dev, dt = self.n_agents, w.device, w.dtype
-        od = self.obs_dim
+    def fused_spec(self, n_envs: int) -> tuple[Buf, ...]:
+        """The degenerate spec: three framework-owned outputs and nothing else.
 
-        def z(*shape):
-            return torch.zeros(*shape, device=dev, dtype=dt)
-
-        self._f_obs = z(n_envs, na, od)
-        self._f_reward = z(n_envs, na)
-        self._f_crowd = z(n_envs, na)
-        scalar = w.wp_dtype
-        self._wp = {
-            "obs": wp.from_torch(self._f_obs, dtype=scalar),
-            "reward": wp.from_torch(self._f_reward, dtype=scalar),
-            "crowd": wp.from_torch(self._f_crowd, dtype=scalar),
-        }
-        self._fused_ready = True
-
-    def _state_wp(self):
-        """(pos, vel) as Warp arrays for the fused kernel."""
-        w = self.world
-        vec2 = VEC2[w.wp_dtype]
-        if w._persistent and not w._detached:
-            s = w.runtime.state
-            return s.pos, s.vel
-        st = w.state
+        No adopted state, no carry, no watched handle and no reset mask — so
+        :meth:`~wmas.scenarios.fused.FusedScenario.fused_token` stays pinned at 0
+        *structurally* (there is nothing for the resync loop to iterate) rather than by a
+        hand-written ``return 0`` that a later edit could quietly invalidate.
+        """
+        ne, na = n_envs, self.n_agents
         return (
-            wp.from_torch(st.pos.contiguous(), dtype=vec2),
-            wp.from_torch(st.vel.contiguous(), dtype=vec2),
+            Buf("obs", (ne, na, self.obs_dim)),
+            Buf("reward", (ne, na)),
+            Buf("crowd", (ne, na)),
         )
+
+    def launch_fused(self, pass_: FusedPass) -> None:
+        """One kernel, always. A reset differs only in ``full_pass``: it recomputes
+        observations on the new state without clobbering the reward/info a mid-step
+        auto-reset has already returned. The launch rebuilds neighbors itself (mirroring
+        the torch ``_refresh``), so no ``mark_pos_dirty`` bookkeeping is needed either."""
+        self._launch(full_pass=pass_.full_pass)
 
     def _launch(self, full_pass: int) -> None:
         w = self.world
         n_envs = w.n_envs
-        self._ensure_fused(n_envs)
         w.neighbors()  # build the grid on the current state
         grid = w.stepper.grid(n_envs)
         scalar = w.wp_dtype
-        pos, vel = self._state_wp()
+        st = w.state_wp()
         wp.launch(
             flocking_obs_reward_kernel,
             dim=(n_envs, self.n_agents),
             inputs=[
-                pos,
-                vel,
+                st.pos,
+                st.vel,
                 grid.neighbor_idx,
                 grid.neighbor_count,
                 wp.int32(self._k_obs),
@@ -236,7 +190,7 @@ class FlockingScenario(Scenario):
 
     def observations(self) -> torch.Tensor:
         if self.fused_active:
-            return self._f_obs
+            return self.fb["obs"]
         w = self.world
         s = w.state
         c = self._cache
@@ -260,10 +214,10 @@ class FlockingScenario(Scenario):
 
     def rewards(self) -> torch.Tensor:
         if self.fused_active:
-            return self._f_reward
+            return self.fb["reward"]
         return super().rewards()
 
     def info(self) -> dict[str, Any]:
         if self.fused_active:
-            return {"crowding": self._f_crowd}
+            return {"crowding": self.fb["crowd"]}
         return {"crowding": self._cache["crowd"]}
