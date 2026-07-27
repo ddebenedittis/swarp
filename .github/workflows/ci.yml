@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      # GitHub runners have no GPU. The default PyPI torch wheel is the CUDA build
+      # (several GB of nvidia-* payload); the CPU wheel is all CI can use anyway.
+      UV_TORCH_BACKEND: cpu
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Create the environment
+        run: uv venv --python 3.12
+
+      # The `viz` extra is installed so the renderer/video tests actually run
+      # instead of skipping: they are pure-CPU (pygame headless + imageio) and are
+      # the part of the tree least covered by the physics suite.
+      - name: Install wmas + dev + viz
+        run: uv pip install -e '.[viz]' --group dev
+
+      - name: Lint
+        run: uv run --no-sync ruff check .
+
+      # `not gpu` selects the CPU-only suite; CUDA-only tests carry the `gpu` marker
+      # and must be run on a CUDA box (see docs/benchmarks.md for the reference box).
+      - name: Test
+        env:
+          SDL_VIDEODRIVER: dummy
+        run: uv run --no-sync pytest -m "not gpu"
