@@ -74,6 +74,14 @@ TorchRL `EnvBase` wrapper).
   transport, pusht. Each pairs a torch implementation of obs/reward/done with fused Warp
   `*_kernels.py` for the no-grad hot path. The torch path is the **parity oracle** the fused
   kernels are tested against — keep them independent rather than sharing code.
+- `wmas/scenarios/fused.py` — `FusedScenario`, which all 7 subclass. A scenario declares its
+  persistent buffers as a tuple of `Buf` from `fused_spec(n_envs)` and its launch sequence
+  as `launch_fused(FusedPass)`; the framework owns lazy allocation, uint8→bool reinterpret
+  views, Warp handle caching, pointer-move resync, the recapture token, the warm-up carry
+  list and the reset-mask stamp. **Zero opt-outs** — a test asserts all 7 implement the same
+  four members and override none of the framework's. `wmas/core/hooks.py` holds
+  `WholeStepHook`, the declared form of what the scenario hands `StepRuntime`. Contract and
+  capture-safety rules: `docs/writing-a-scenario.md`.
 
 ## Design Invariants (read before extending the step)
 
