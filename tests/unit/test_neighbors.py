@@ -130,9 +130,15 @@ def test_uniform_grid_rebuild_deterministic(device):
 
 
 def test_auto_selects_uniform_grid():
-    """auto picks the uniform grid for large per-env populations, brute otherwise."""
-    assert NeighborGrid(4, 600, radius=0.1, method="auto").method == "uniform_grid"
-    assert NeighborGrid(4, 512, radius=0.1, method="auto").method == "brute"
+    """auto picks the uniform grid for large per-env populations, brute otherwise.
+
+    ``device="cpu"`` explicitly: the heuristic is arithmetic on ``n_agents`` and has
+    nothing to do with the device, but NeighborGrid defaults to ``"cuda:0"`` and
+    allocates its buffers in ``__init__``, so leaving it out makes a pure-logic test
+    fail on a GPU-less machine.
+    """
+    assert NeighborGrid(4, 600, radius=0.1, method="auto", device="cpu").method == "uniform_grid"
+    assert NeighborGrid(4, 512, radius=0.1, method="auto", device="cpu").method == "brute"
 
 
 @pytest.mark.parametrize("device", DEVICES)
