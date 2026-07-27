@@ -250,7 +250,10 @@ def main(argv=None):
     parser.add_argument("--agents", type=int, default=5)
     parser.add_argument("--obstacles", type=int, default=2)
     parser.add_argument("--size", type=int, default=700)
-    parser.add_argument("--fps", type=int, default=30)
+    # Two independent rates: how often the window redraws, and how fast the sim plays. The
+    # step rate is also the saved video's fps (save_video steps once per frame).
+    parser.add_argument("--fps", type=int, default=60, help="window redraw rate")
+    parser.add_argument("--step-rate", type=float, default=30.0, help="sim steps per second")
     parser.add_argument("--mosaic", action="store_true", help="grid of all envs + focus pane")
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--lidar-rays", type=int, default=16)
@@ -298,7 +301,7 @@ def main(argv=None):
             args.save,
             action_fn=policy,
             n_steps=args.steps,
-            fps=args.fps,
+            fps=max(1, round(args.step_rate)),
             size=size,
             overlays=overlays,
             style=style,
@@ -309,7 +312,13 @@ def main(argv=None):
     from wmas.render.viewer import Viewer
 
     viewer = Viewer(
-        env, size=size, mosaic=args.mosaic, fps=args.fps, overlays=overlays, style=style
+        env,
+        size=size,
+        mosaic=args.mosaic,
+        fps=args.fps,
+        steps_per_frame=args.step_rate / args.fps,
+        overlays=overlays,
+        style=style,
     )
     viewer.run(action_fn=policy)
     return None

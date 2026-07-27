@@ -7,7 +7,13 @@ import torch
 from wmas import Environment, NavigationScenario
 from wmas.render.camera import Camera
 from wmas.render.geometry import extract_geometry
-from wmas.render.input import InteractionController, ViewState, pick_agent, pick_obstacle
+from wmas.render.input import (
+    SPEED_LADDER,
+    InteractionController,
+    ViewState,
+    pick_agent,
+    pick_obstacle,
+)
 from wmas.render.overlays import DEFAULT_ENABLED
 from wmas.render.viewer import Viewer
 
@@ -236,20 +242,97 @@ def test_period_key_requests_a_single_step():
     assert state.step_once is True
 
 
-def test_should_step_gate_honors_pause_step_once_and_done():
+def test_step_gate_honors_pause_step_once_and_done():
     env, _ = make_env(n_agents=2)
     viewer = Viewer(env, size=(160, 120))
 
-    assert viewer._should_step(done=False) is True  # running
+    assert viewer._steps_this_frame(done=False) == 1  # running at 1x
     viewer.state.paused = True
-    assert viewer._should_step(done=False) is False  # paused, no request
+    assert viewer._steps_this_frame(done=False) == 0  # paused, no request
 
     viewer.state.step_once = True
-    assert viewer._should_step(done=False) is True  # one-shot honored
-    assert viewer._should_step(done=False) is False  # ... and consumed
+    assert viewer._steps_this_frame(done=False) == 1  # one-shot honored
+    assert viewer._steps_this_frame(done=False) == 0  # ... and consumed
 
     viewer.state.step_once = True
-    assert viewer._should_step(done=True) is False  # max_steps wins over a step request
+    assert viewer._steps_this_frame(done=True) == 0  # max_steps wins over a step request
+
+
+def test_speed_multiplier_sets_steps_per_frame():
+    """Fast speeds batch steps into one frame; slow ones spread one step over several."""
+    env, _ = make_env(n_agents=2)
+    viewer = Viewer(env, size=(160, 120))
+
+    viewer.state.speed_index = SPEED_LADDER.index(4.0)
+    assert [viewer._steps_this_frame(done=False) for _ in range(3)] == [4, 4, 4]
+
+    viewer.state.speed_index = SPEED_LADDER.index(0.25)
+    # 0.25x: exactly one step every fourth frame, and no drift over many frames.
+    assert [viewer._steps_this_frame(done=False) for _ in range(8)] == [0, 0, 0, 1, 0, 0, 0, 1]
+
+    # A one-shot step while paused always advances exactly one step, whatever the speed.
+    viewer.state.speed_index = SPEED_LADDER.index(8.0)
+    viewer.state.paused = True
+    viewer.state.step_once = True
+    assert viewer._steps_this_frame(done=False) == 1
+
+
+def test_steps_per_frame_base_rate_decouples_playback_from_the_frame_rate():
+    """A fractional base rate lets the window redraw faster than the sim advances.
+
+    Push-T renders at 60 fps with dt=0.05, i.e. one step every third frame at real time;
+    the ladder then multiplies that base instead of replacing it.
+    """
+    env, _ = make_env(n_agents=2)
+    viewer = Viewer(env, size=(160, 120), fps=60, steps_per_frame=1 / 3)
+
+    assert [viewer._steps_this_frame(done=False) for _ in range(6)] == [0, 0, 1, 0, 0, 1]
+
+    viewer.state.speed_index = SPEED_LADDER.index(4.0)  # 4x real time -> 4 steps per 3 frames
+    # The carry keeps the count on the ideal to within the one step still in the accumulator
+    # (binary 1/3 rounds down, so an exact == would be off by one after enough frames).
+    assert sum(viewer._steps_this_frame(done=False) for _ in range(30)) in (39, 40)
+
+
+def test_up_down_keys_walk_the_speed_ladder_and_clamp():
+    state, ctrl, _ = _controller()
+    assert state.speed == 1.0
+
+    ctrl.handle_event(_key(pygame.K_UP))
+    assert state.speed == 2.0
+    ctrl.handle_event(_key(pygame.K_DOWN))
+    ctrl.handle_event(_key(pygame.K_DOWN))
+    assert state.speed == 0.5
+
+    for _ in range(20):  # clamped, not wrapped, at both ends
+        ctrl.handle_event(_key(pygame.K_DOWN))
+    assert state.speed == SPEED_LADDER[0]
+    for _ in range(40):
+        ctrl.handle_event(_key(pygame.K_UP))
+    assert state.speed == SPEED_LADDER[-1]
+
+
+def test_speed_badge_shows_only_off_1x():
+    import pygame as pg
+
+    from wmas.render.hud import draw_speed_badge
+    from wmas.render.style import Style
+
+    style = Style()
+    state = ViewState(n_envs=1, enabled=set())
+
+    def frame():
+        surf = pg.Surface((320, 240))
+        surf.fill(style.background)
+        height = draw_speed_badge(surf, state, style)
+        return height, pg.surfarray.array3d(surf).copy()
+
+    h1, blank = frame()
+    assert h1 == 0  # 1x draws nothing and reserves no space for the help panel
+
+    state.speed_index = SPEED_LADDER.index(0.25)
+    h2, slow = frame()
+    assert h2 > 0 and not np.array_equal(blank, slow)
 
 
 def test_plain_l_toggles_the_lidar_overlay_while_shift_l_cycles_the_mode():
@@ -327,6 +410,49 @@ def test_focus_env_change_clears_the_trail_and_reward_buffers():
     viewer.render_array()
     assert viewer._trail_history == [] and viewer._reward_history == []
     assert viewer._buffer_env == 2
+
+
+def test_viewer_run_loop_paused_does_not_advance_the_sim(monkeypatch):
+    """Pausing must freeze the simulation, not just the ``paused`` flag.
+
+    ``_steps_this_frame`` is only consulted by :meth:`Viewer.run`, so a caller that drives its
+    own ``env.step`` loop and calls ``render(mode="human")`` steps regardless of the flag —
+    the agents keep moving with the HUD claiming "paused". Examples therefore hand the loop
+    to the viewer (see ``examples/pusht_eval.py --window``), and this pins the behaviour.
+    """
+    monkeypatch.setenv("SDL_VIDEODRIVER", "dummy")
+    env, _ = make_env(n_agents=3, n_envs=2)
+    viewer = Viewer(env, size=(160, 120), fps=0)
+    viewer.state.paused = True
+    before = env.world.state.pos.clone()
+    # max_steps counts *taken* steps, which never reach 3 while paused; close_when_done
+    # still fires because `done` is evaluated on the step count, so bound the wait with a
+    # quit request injected after a few frames.
+    viewer.state.quit = False
+
+    original = viewer._steps_this_frame
+    frames = {"n": 0}
+
+    def counting_should_step(done):
+        frames["n"] += 1
+        if frames["n"] >= 5:
+            viewer.state.quit = True
+        return original(done)
+
+    viewer._steps_this_frame = counting_should_step
+    viewer.run(max_steps=3, close_when_done=True)
+
+    assert viewer._step_count == 0, "paused viewer advanced the simulation"
+    assert torch.equal(env.world.state.pos, before), "paused viewer moved the agents"
+
+    # ...and a one-shot step request while paused advances exactly one step.
+    viewer._steps_this_frame = original
+    viewer.state.quit = False
+    viewer.state.step_once = True
+    frames["n"] = 0
+    viewer._steps_this_frame = counting_should_step
+    viewer.run(max_steps=3, close_when_done=True)
+    assert viewer._step_count == 1
 
 
 def test_viewer_run_loop_smoke_headless(monkeypatch):

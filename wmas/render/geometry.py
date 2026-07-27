@@ -45,6 +45,9 @@ class RenderGeometry:
     obstacle_shape: np.ndarray | None = None  # (n_obstacles,) int ObstacleShape tags
     obstacle_angle: np.ndarray | None = None  # (n_obstacles,) rad
     obstacle_half_extents: np.ndarray | None = None  # (n_obstacles, 2); [:, 0] = SEGMENT half-len
+    # (n_obstacles,) ObstacleKind tags; None means "all immovable". Renderers draw
+    # immovable obstacles black and movable (pushable) ones grey.
+    obstacle_kind: np.ndarray | None = None
     # Last action applied to each agent — one step older than the state drawn alongside it.
     action: np.ndarray | None = None  # (n_agents, act_dim) or None before the first step
     ctrl_mode: np.ndarray | None = None  # (n_agents,) int ControlMode tags
@@ -95,11 +98,26 @@ def extract_geometry_batch(
     action = _to_np(world.action.index_select(0, sel)) if world.action is not None else None
 
     if world.obstacle_pos is not None:
-        obstacle_pos = _to_np(world.obstacle_pos.index_select(0, sel))
+        # Movable obstacles are advanced in place inside the stepper's own buffers, so
+        # the live pose lives there, not in the tensor the scenario installed.
+        live_pos, live_angle, _, _ = world.movable_obstacle_state()
+        obstacle_pos = _to_np(live_pos.index_select(0, sel))
         obstacle_radius = _to_np(world.obstacle_radius)
+        # Same for orientation, but only where orientation is meaningful: a circle-only
+        # scenario keeps obstacle_angle None (the documented "no angle" contract), while a
+        # movable box needs the live value because it rotates as it is pushed.
+        movable = getattr(world, "obstacle_kind", None) is not None and bool(
+            (world.obstacle_kind != 0).any()
+        )
+        live_obs_angle = (
+            _to_np(live_angle.index_select(0, sel))
+            if (world.obstacle_angle is not None or movable)
+            else None
+        )
     else:
         obstacle_pos = None
         obstacle_radius = None
+        live_obs_angle = None
 
     # Env-independent: extracted once, shared by every geometry below.
     radius = _to_np(world.agent_radius)
@@ -108,9 +126,15 @@ def extract_geometry_batch(
     agent_params = np.array([c.to_row() for c in world.agent_configs], dtype=np.float64)
     bounds = world.config.bounds if world.config is not None else None
     edges = _extract_edges_batch(world, idx) if with_edges else [_no_edges()] * len(idx)
-    # Obstacle shape/angle/half-extents are per-obstacle, so no env indexing here.
+    # Obstacle shape/half-extents are per-obstacle, so no env indexing here.
     obs_shape = _shape_tags(world)
-    obs_angle = _to_np(world.obstacle_angle) if world.obstacle_angle is not None else None
+    # Angle may be per-obstacle [n_obs] (shared) or per-env [n_envs, n_obs] — a
+    # body that rotates independently per env. Env-index the latter so each
+    # RenderGeometry still carries a flat (n_obstacles,) angle array.
+    obs_angle = live_obs_angle if live_obs_angle is not None else _obstacle_angles(world, sel)
+    obs_kind = (
+        _to_np(world.obstacle_kind) if getattr(world, "obstacle_kind", None) is not None else None
+    )
     obs_half = (
         _to_np(world.obstacle_half_extents) if world.obstacle_half_extents is not None else None
     )
@@ -134,8 +158,9 @@ def extract_geometry_batch(
                 bounds=bounds,
                 edges=edges[k],
                 obstacle_shape=obs_shape,
-                obstacle_angle=obs_angle,
+                obstacle_angle=None if obs_angle is None else obs_angle[k],
                 obstacle_half_extents=obs_half,
+                obstacle_kind=obs_kind,
                 action=None if action is None else action[k],
                 ctrl_mode=ctrl_mode,
                 agent_params=agent_params,
@@ -143,6 +168,19 @@ def extract_geometry_batch(
             )
         )
     return out
+
+
+def _obstacle_angles(world, sel) -> np.ndarray | None:
+    """Obstacle angles as ``(len(sel), n_obstacles)``, broadcasting the shared
+    ``[n_obstacles]`` layout so callers index one row per selected env."""
+    if world.obstacle_angle is None:
+        return None
+    a = world.obstacle_angle
+    if a.dim() == 1:
+        a = a.unsqueeze(0).expand(len(sel), -1)
+    else:
+        a = a.index_select(0, sel)
+    return _to_np(a)
 
 
 def _shape_tags(world) -> np.ndarray | None:

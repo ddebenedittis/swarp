@@ -52,6 +52,8 @@ class Style:
     tile_focus_border: RGB = (200, 60, 60)
     help_panel_bg: RGBA = (255, 255, 255, 225)
     hover_panel_bg: RGBA = (255, 255, 255, 210)
+    speed_badge_bg: RGBA = (255, 255, 255, 225)
+    speed_badge_color: RGB = (200, 60, 60)
     panel_border: RGB = (40, 40, 45)
     agent_halo: RGB = (245, 245, 247)  # depth_cue="halo"; defaults to the light background
     agent_shadow: RGBA = (0, 0, 0, 70)  # depth_cue="shadow"
@@ -59,6 +61,12 @@ class Style:
     action_color: RGB = (20, 120, 210)
     action_brake_color: RGB = (200, 60, 60)
     goal_reached_color: RGB = (0, 158, 115)
+    # Obstacles are drawn by kind: immovable scenery black, pushable bodies grey
+    # (obstacle_color below is the grey, kept as the name other code already uses).
+    obstacle_immovable_color: RGB = (24, 24, 28)
+    obstacle_immovable_outline: RGB = (8, 8, 10)
+    goal_pose_color: RGB = (0, 158, 115)  # target-pose outline of a movable body
+    goal_pose_alpha: int = 130
     palette: tuple[RGB, ...] = field(default_factory=lambda: _PALETTE)
     model_palette: dict[int, RGB] = field(
         default_factory=lambda: {
@@ -125,6 +133,7 @@ class Style:
     action_scale: float = 0.3  # world units per commanded (m/s)
     action_accel_scale: float = 0.15  # world units per commanded (m/s^2)
     contact_tol: float = 0.0  # slack on (r_i + r_j) before an overlap counts as contact
+    speed_badge_font_factor: float = 1.7  # badge text size relative to the HUD text
 
     # ------------------------------------------------------------------ colors
     def agent_color(self, i: int, model: int | None = None) -> RGB:
@@ -228,6 +237,9 @@ _UNSCALED_FIELDS: frozenset[str] = frozenset(
         "tile_focus_border",
         "help_panel_bg",
         "hover_panel_bg",
+        "speed_badge_bg",
+        "speed_badge_color",
+        "speed_badge_font_factor",
         "panel_border",
         "agent_halo",
         "agent_shadow",
@@ -235,6 +247,10 @@ _UNSCALED_FIELDS: frozenset[str] = frozenset(
         "action_color",
         "action_brake_color",
         "goal_reached_color",
+        "obstacle_immovable_color",
+        "obstacle_immovable_outline",
+        "goal_pose_color",
+        "goal_pose_alpha",
         "palette",
         "model_palette",
         "color_mode",
@@ -266,6 +282,9 @@ _DARK: dict[str, object] = {
     "bounds_color": (90, 90, 100),
     "obstacle_color": (78, 78, 86),
     "obstacle_outline": (105, 105, 115),
+    # On a dark background "black" reads through its outline, not its fill.
+    "obstacle_immovable_color": (8, 8, 10),
+    "obstacle_immovable_outline": (128, 128, 140),
     "edge_color": (70, 70, 80),
     "agent_outline": (235, 235, 240),
     "heading_color": (235, 235, 240),
@@ -276,6 +295,8 @@ _DARK: dict[str, object] = {
     "tile_focus_border": (235, 105, 95),
     "help_panel_bg": (26, 26, 32, 230),
     "hover_panel_bg": (26, 26, 32, 215),
+    "speed_badge_bg": (26, 26, 32, 230),
+    "speed_badge_color": (235, 105, 95),
     "panel_border": (120, 120, 130),
     "agent_halo": (18, 18, 22),
 }

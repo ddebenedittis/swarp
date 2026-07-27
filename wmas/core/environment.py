@@ -208,6 +208,14 @@ class Environment:
         ``mode="human"`` updates a persistent window and returns ``None``. Extra keyword
         args (``size``, ``overlays``, ``mosaic``, ...) are forwarded to the Viewer, which is
         created once and reused. Import is lazy so the core has no hard pygame dependency.
+
+        This only *draws*: the caller owns the stepping, so the viewer's interactive
+        pause and single-step controls cannot take effect (they gate
+        :meth:`wmas.render.viewer.Viewer.run`'s own loop). A caller-driven loop that
+        keeps calling ``step`` will keep moving while the HUD reads "paused". For an
+        interactive window, hand the loop over instead::
+
+            Viewer(env, fps=20).run(action_fn=policy_fn)
         """
         if mode not in ("human", "rgb_array"):
             raise ValueError(f"render mode must be 'human' or 'rgb_array', got {mode!r}")

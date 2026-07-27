@@ -66,8 +66,10 @@ class World:
         self.obstacle_pos: torch.Tensor | None = None  # [n_envs, n_obstacles, 2]
         self.obstacle_radius: torch.Tensor | None = None  # [n_obstacles]
         self.obstacle_shape: torch.Tensor | None = None  # [n_obstacles]
-        self.obstacle_angle: torch.Tensor | None = None  # [n_obstacles]
+        # [n_obstacles] (shared) or [n_envs, n_obstacles] (per-env, rotating body)
+        self.obstacle_angle: torch.Tensor | None = None
         self.obstacle_half_extents: torch.Tensor | None = None  # [n_obstacles, 2]
+        self.obstacle_kind: torch.Tensor | None = None  # [n_obstacles] ObstacleKind tags
         self.generator: torch.Generator | None = None  # installed by Environment
         self.agent_radius = torch.tensor(
             [c.radius for c in agent_configs], device=device, dtype=dtype
@@ -151,15 +153,57 @@ class World:
         shape: torch.Tensor | None = None,
         angle: torch.Tensor | None = None,
         half_extents: torch.Tensor | None = None,
+        vel: torch.Tensor | None = None,
+        ang_vel: torch.Tensor | None = None,
+        kind: torch.Tensor | None = None,
+        mass: torch.Tensor | None = None,
+        inertia: torch.Tensor | None = None,
+        body: torch.Tensor | None = None,
+        body_offset: torch.Tensor | None = None,
     ) -> None:
-        """Install static obstacles (circle/box/segment). See
+        """Install obstacles (circle/box/segment). ``angle`` may be ``[n_obstacles]`` or
+        per-env ``[n_envs, n_obstacles]``. ``vel``/``ang_vel`` give a *moving* obstacle's
+        velocity so contact damping uses the closing velocity. ``kind`` tags each obstacle
+        IMMOVABLE or MOVABLE (see :class:`~wmas.core.config.ObstacleKind`); movable ones
+        use ``mass``/``inertia`` and are integrated by the engine each substep. ``body``/
+        ``body_offset`` group shapes into compound rigid bodies (a T from two boxes). See
         :meth:`wmas.core.stepper.Stepper.set_obstacles` for shape semantics."""
         self.obstacle_pos = pos
         self.obstacle_radius = radius
         self.obstacle_shape = shape
         self.obstacle_angle = angle
         self.obstacle_half_extents = half_extents
-        self.stepper.set_obstacles(pos, radius, shape=shape, angle=angle, half_extents=half_extents)
+        self.obstacle_kind = kind
+        self.stepper.set_obstacles(
+            pos, radius, shape=shape, angle=angle, half_extents=half_extents,
+            vel=vel, ang_vel=ang_vel, kind=kind, mass=mass, inertia=inertia,
+            body=body, body_offset=body_offset,
+        )
+
+    def movable_obstacle_state(
+        self, body: bool = False
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Live ``(pos, angle, vel, ang_vel)`` as zero-copy torch views.
+
+        Movable obstacles are advanced in place by the engine, so these views track the
+        current state. By default they are per *shape* — what collides and what renders,
+        ``[n_envs, n_obstacles]``. With ``body=True`` they are the per-*body* state instead,
+        indexed by body root, which is what a compound body (several shapes sharing one
+        pose) actually integrates."""
+        st = self.stepper
+        if body:
+            return (
+                wp.to_torch(st._body_pos),
+                wp.to_torch(st._body_angle),
+                wp.to_torch(st._body_vel),
+                wp.to_torch(st._body_ang_vel),
+            )
+        return (
+            wp.to_torch(st._obs_pos),
+            wp.to_torch(st._obs_angle),
+            wp.to_torch(st._obs_vel),
+            wp.to_torch(st._obs_ang_vel),
+        )
 
     # -------------------------------------------------------------- neighbors
 

@@ -21,6 +21,12 @@ from wmas.render.overlays import OVERLAYS
 _ZOOM_STEP = 1.1
 _PAN_BUTTON = 2  # middle mouse
 
+# Playback multipliers reachable with up/down, slowest first. A discrete ladder rather than a
+# continuous factor: the reachable speeds are then predictable, and 1.0 is always exactly 1.0
+# (repeated multiply/divide by 1.1 never lands back on it).
+SPEED_LADDER: tuple[float, ...] = (0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0)
+DEFAULT_SPEED_INDEX = SPEED_LADDER.index(1.0)
+
 
 def pick_agent(
     geometry: RenderGeometry, camera: Camera, screen_xy, extra_px: float = 4.0
@@ -100,7 +106,17 @@ class ViewState:
     hover_agent: int | None = None
     selected_agent: int | None = None
     selected_obstacle: int | None = None
+    speed_index: int = DEFAULT_SPEED_INDEX  # index into SPEED_LADDER; up/down move it
     quit: bool = False
+
+    @property
+    def speed(self) -> float:
+        """Playback multiplier: simulated steps per step of wall-clock at the nominal fps."""
+        return SPEED_LADDER[self.speed_index]
+
+    def nudge_speed(self, delta: int) -> None:
+        """Move ``delta`` rungs up (faster) or down (slower) the ladder, clamped at both ends."""
+        self.speed_index = max(0, min(len(SPEED_LADDER) - 1, self.speed_index + delta))
 
 
 _OVERLAY_KEYS: dict[int, str] | None = None
@@ -229,6 +245,10 @@ class InteractionController:
             s.focus_env = (s.focus_env - 1) % s.n_envs
         elif key == pygame.K_RIGHTBRACKET:
             s.focus_env = (s.focus_env + 1) % s.n_envs
+        elif key == pygame.K_UP:
+            s.nudge_speed(+1)
+        elif key == pygame.K_DOWN:
+            s.nudge_speed(-1)
         elif key == pygame.K_SPACE:
             s.paused = not s.paused
         elif key == pygame.K_r:
