@@ -16,14 +16,13 @@ import torch
 import warp as wp
 
 from wmas.core.config import WorldConfig
-from wmas.core.state import VEC2
 from wmas.core.world import World
 from wmas.dynamics.base import AgentConfig, ControlMode, DynamicsModel
-from wmas.scenarios.base import Scenario
 from wmas.scenarios.formation_kernels import formation_obs_kernel, formation_reward_kernel
+from wmas.scenarios.fused import Buf, FusedPass, FusedScenario
 
 
-class FormationScenario(Scenario):
+class FormationScenario(FusedScenario):
     def __init__(
         self,
         n_agents: int = 5,
@@ -75,22 +74,22 @@ class FormationScenario(Scenario):
         self._slot_offsets = self.formation_radius * torch.stack(
             [torch.cos(ang), torch.sin(ang)], dim=-1
         )  # [n_agents, 2]
+        # Left None so the first refresh seeds the shaping baseline from the spawn
+        # distance (shaping 0) rather than from zeros; the fused spec adopts it with
+        # alloc="if_none". The torch path reassigns it, which watch=True catches.
         self._prev_dist: torch.Tensor | None = None
         self._cache: dict[str, torch.Tensor] | None = None
-        self._fused_ready = False
-        # Bumped by _sync_fused_handles when a cached buffer handle is rebuilt.
-        self._handle_version = 0
+        # Allocated here, not in reset_world, so the fused spec can adopt the slots.
+        self.world.goals = torch.zeros(n_envs, self.n_agents, 2, device=device, dtype=dtype)
         return self.world
-
-    def fused_available(self) -> bool:
-        """Formation ships fused Warp obs/reward kernels (2D holonomic)."""
-        return True
 
     @property
     def obs_dim(self) -> int:
         return 6
 
-    def reset_world(self, env_mask: torch.Tensor | None = None) -> None:
+    def reset_world(
+        self, env_mask: torch.Tensor | None = None, *, obs_only: bool = False
+    ) -> None:
         w = self.world
         n = w.n_envs
         lim = self.world_size - 2.0 * self.agent_radius
@@ -99,157 +98,57 @@ class FormationScenario(Scenario):
         clim = max(0.0, self.world_size - self.formation_radius - self.agent_radius)
         center = w.sample_uniform((n, 1, 2), -clim, clim)
         goals = center + self._slot_offsets.unsqueeze(0)  # [n_envs, n_agents, 2]
-        if w.goals is None:
-            w.goals = torch.zeros(n, self.n_agents, 2, device=w.device, dtype=w.dtype)
+        w.write_state(env_mask, pos=spawn, vel=0.0)
         if env_mask is None:
-            w.state.pos.data.copy_(spawn)
-            w.state.vel.data.zero_()
             w.goals.copy_(goals)
         else:
-            m3 = env_mask.view(-1, 1, 1)
-            w.state.pos.data.copy_(torch.where(m3, spawn, w.state.pos.data))
-            w.state.vel.data.copy_(
-                torch.where(m3, torch.zeros_like(w.state.vel.data), w.state.vel.data)
-            )
-            w.goals.copy_(torch.where(m3, goals, w.goals))
-        if self._fused_active:
-            self._ensure_fused(w.n_envs)
-            self._sync_fused_handles()  # this eager _launch_obs uses cached handles
-            if env_mask is None:
-                self._f_resetmask.fill_(1)
-            else:
-                self._f_resetmask.copy_(env_mask)  # bool -> uint8
-            full = 0 if self._fused_obs_only else 1
-            self._launch_obs(advance_prev=0, full_pass=full)
-        else:
-            self._refresh(reset_mask=env_mask)
+            w.goals.copy_(torch.where(env_mask.view(-1, 1, 1), goals, w.goals))
+        self.finish_reset(env_mask, obs_only=obs_only)
 
-    def post_step(self) -> None:
-        if self._fused_active:
-            # Same sequence the whole-step graph runs (keeps non-graph fused mode
-            # and CPU eager-persistent bit-identical).
-            self._pre_graph_step()
-            self._graph_post_physics()
-        else:
-            self._refresh()
+    # ---------------------------------------- torch reference path (parity oracle)
+
+    def post_step_torch(self) -> None:
+        self._refresh()
+
+    def reset_torch(self, env_mask: torch.Tensor | None) -> None:
+        self._refresh(reset_mask=env_mask)
 
     # --------------------------------------------------------- fused fast path
 
-    def _ensure_fused(self, n_envs: int) -> None:
-        """Allocate the persistent fused output buffers + cached wp handles."""
-        if self._fused_ready:
-            return
-        w = self.world
-        na, dev, dt = self.n_agents, w.device, w.dtype
-
-        def z(*shape, d=dt):
-            return torch.zeros(*shape, device=dev, dtype=d)
-
-        self._f_obs = z(n_envs, na, self.obs_dim)
-        self._f_shaping = z(n_envs, na)
-        self._f_touch = z(n_envs, na)
-        self._f_dist = z(n_envs, na)
-        self._f_reward = z(n_envs, na)
-        self._f_multiobj = z(n_envs, na, 2)
-        self._f_ferror = z(n_envs)
-        self._f_inform = z(n_envs, na, d=torch.uint8)
-        self._f_done = z(n_envs, d=torch.uint8)
-        self._f_resetmask = z(n_envs, d=torch.uint8)
-        if self._prev_dist is None:
-            self._prev_dist = z(n_envs, na)
-        scalar = w.wp_dtype
-        self._wp = {
-            "obs": wp.from_torch(self._f_obs, dtype=scalar),
-            "shaping": wp.from_torch(self._f_shaping, dtype=scalar),
-            "touch": wp.from_torch(self._f_touch, dtype=scalar),
-            "dist": wp.from_torch(self._f_dist, dtype=scalar),
-            "reward": wp.from_torch(self._f_reward, dtype=scalar),
-            "multiobj": wp.from_torch(self._f_multiobj, dtype=scalar),
-            "ferror": wp.from_torch(self._f_ferror, dtype=scalar),
-            "inform": wp.from_torch(self._f_inform, dtype=wp.uint8),
-            "done": wp.from_torch(self._f_done, dtype=wp.uint8),
-            "resetmask": wp.from_torch(self._f_resetmask, dtype=wp.uint8),
-        }
-        self._f_inform_bool = self._f_inform.view(torch.bool)
-        self._f_done_bool = self._f_done.view(torch.bool)
-        # Stable wp handles for the two buffers otherwise re-wrapped per launch.
-        # w.goals is updated in place (copy_) after its one-time alloc; _prev_dist
-        # is written in place by the fused kernel but reassigned on the torch/grad
-        # path — _sync_fused_handles rebuilds either if its data_ptr moves.
-        vec2 = VEC2[scalar]
-        self._wp_goals = wp.from_torch(w.goals.contiguous(), dtype=vec2)
-        self._wp_prev = wp.from_torch(self._prev_dist.contiguous(), dtype=scalar)
-        self._goals_ptr = w.goals.data_ptr()
-        self._prev_ptr = self._prev_dist.data_ptr()
-        self._fused_ready = True
-
-    def _sync_fused_handles(self) -> None:
-        """Rebuild any cached wp handle whose backing tensor was reallocated
-        (grad-path ``_prev_dist`` reassignment; goals realloc); bumps
-        ``_handle_version`` to force recapture. Runs outside capture."""
-        w = self.world
-        scalar = w.wp_dtype
-        vec2 = VEC2[scalar]
-        changed = False
-        if w.goals.data_ptr() != self._goals_ptr:
-            self._wp_goals = wp.from_torch(w.goals.contiguous(), dtype=vec2)
-            self._goals_ptr = w.goals.data_ptr()
-            changed = True
-        if self._prev_dist.data_ptr() != self._prev_ptr:
-            self._wp_prev = wp.from_torch(self._prev_dist.contiguous(), dtype=scalar)
-            self._prev_ptr = self._prev_dist.data_ptr()
-            changed = True
-        if changed:
-            self._handle_version += 1
-
-    # ----------------------------------------------------- whole-step graph
-
-    def graph_capturable(self) -> bool:
-        return True
-
-    def graph_recapture_token(self) -> int:
-        return self._handle_version
-
-    def _graph_warmup_carries(self) -> list[torch.Tensor]:
-        return [self._prev_dist]
-
-    def _pre_graph_step(self) -> None:
-        self._ensure_fused(self.world.n_envs)
-        self._f_resetmask.zero_()  # a normal step resets no env
-        self._sync_fused_handles()
-
-    def _graph_post_physics(self) -> None:
-        self._launch_obs(advance_prev=1, full_pass=1)
-        self._launch_reward()
-
-    def _state_wp(self):
-        """(pos, vel, goals) as Warp arrays for the fused kernels."""
-        w = self.world
-        vec2 = VEC2[w.wp_dtype]
-        goals = self._wp_goals
-        if w._persistent and not w._detached:
-            s = w.runtime.state
-            return s.pos, s.vel, goals
-        st = w.state
+    def fused_spec(self, n_envs: int) -> tuple[Buf, ...]:
+        ne, na = n_envs, self.n_agents
         return (
-            wp.from_torch(st.pos.contiguous(), dtype=vec2),
-            wp.from_torch(st.vel.contiguous(), dtype=vec2),
-            goals,
+            Buf("obs", (ne, na, self.obs_dim)),
+            Buf("shaping", (ne, na)),
+            Buf("touch", (ne, na)),
+            Buf("dist", (ne, na)),
+            Buf("reward", (ne, na)),
+            Buf("multiobj", (ne, na, 2)),
+            Buf("ferror", (ne,)),
+            Buf("inform", (ne, na), "uint8", bool_view=True),
+            Buf("done", (ne,), "uint8", bool_view=True),
+            Buf("resetmask", (ne,), "uint8", reset_mask=True),
+            Buf("goals", (ne, na, 2), "vec2", attr="world.goals", alloc="never", watch=True),
+            Buf("prev", (ne, na), attr="_prev_dist", alloc="if_none", carry=True, watch=True),
         )
+
+    def launch_fused(self, pass_: FusedPass) -> None:
+        """Obs, then reward — the reward only on a step (see NavigationScenario)."""
+        self._launch_obs(advance_prev=pass_.advance_prev, full_pass=pass_.full_pass)
+        if pass_.is_step:
+            self._launch_reward()
 
     def _launch_obs(self, advance_prev: int, full_pass: int) -> None:
         w = self.world
-        self._ensure_fused(w.n_envs)
         scalar = w.wp_dtype
-        pos, vel, goals = self._state_wp()
-        prev = self._wp_prev
+        st = w.state_wp()
         wp.launch(
             formation_obs_kernel,
             dim=(w.n_envs, self.n_agents),
             inputs=[
-                pos,
-                vel,
-                goals,
+                st.pos,
+                st.vel,
+                self._wp["goals"],
                 self._wp["resetmask"],
                 scalar((2.0 * self.agent_radius) ** 2),
                 scalar(self.goal_tolerance),
@@ -264,7 +163,7 @@ class FormationScenario(Scenario):
                 self._wp["touch"],
                 self._wp["dist"],
                 self._wp["inform"],
-                prev,
+                self._wp["prev"],
             ],
             device=w.device,
             record_tape=False,
@@ -323,34 +222,29 @@ class FormationScenario(Scenario):
         }
 
     def observations(self) -> torch.Tensor:
-        if self._fused_active:
-            return self._f_obs
+        if self.fused_active:
+            return self.fb["obs"]
         w = self.world
         s = w.state
         return torch.cat([s.pos, s.vel, w.goals - s.pos], dim=-1)
-
-    def observation(self, agent_idx: int) -> torch.Tensor:
-        return self.observations()[:, agent_idx]
 
     def agent_reward(self, agent_idx: int) -> torch.Tensor:
         c = self._cache
         return c["shaping"][:, agent_idx] + self.collision_penalty * c["touching"][:, agent_idx]
 
     def rewards(self) -> torch.Tensor:
-        if self._fused_active:
-            return self._f_reward
-        return super().rewards()
+        return self.fb["reward"] if self.fused_active else super().rewards()
 
     def done(self) -> torch.Tensor:
-        if self._fused_active:
-            return self._f_done_bool
+        if self.fused_active:
+            return self.fb["done_bool"]
         return self._cache["in_formation"].all(dim=-1)
 
     def info(self) -> dict[str, Any]:
-        if self._fused_active:
+        if self.fused_active:
             return {
-                "multiobj_reward": self._f_multiobj,
-                "formation_error": self._f_ferror,
+                "multiobj_reward": self.fb["multiobj"],
+                "formation_error": self.fb["ferror"],
             }
         c = self._cache
         # Per-agent objective vector [n_envs, n_agents, n_obj]: the two reward terms

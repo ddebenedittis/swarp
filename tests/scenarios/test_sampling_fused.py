@@ -20,6 +20,7 @@ from conftest import (
 from wmas import SamplingScenario
 
 SPEC = FusedSpec(
+    scenario=SamplingScenario,
     fields=("obs", "rew", "info:field", "info:consumed_frac"),
     grad_steps=4,
     grad_index=2,
@@ -52,9 +53,9 @@ def test_fused_matches_torch(device, grid_res):
     for t, (f, r) in enumerate(zip(fused, torchp, strict=True)):
         of, rf, ff, cff = f
         ot, rt, ft, cft = r
-        torch.testing.assert_close(of, ot, rtol=1e-5, atol=1e-6, msg=f"obs@{t}")
-        torch.testing.assert_close(rf, rt, rtol=1e-5, atol=1e-6, msg=f"reward@{t}")
-        torch.testing.assert_close(ff, ft, rtol=1e-5, atol=1e-6, msg=f"field@{t}")
+        torch.testing.assert_close(of, ot, rtol=SPEC.rtol, atol=SPEC.atol, msg=f"obs@{t}")
+        torch.testing.assert_close(rf, rt, rtol=SPEC.rtol, atol=SPEC.atol, msg=f"reward@{t}")
+        torch.testing.assert_close(ff, ft, rtol=SPEC.rtol, atol=SPEC.atol, msg=f"field@{t}")
         # consumed grid is discrete -> its coverage fraction must match exactly
         assert torch.equal(cff, cft), f"consumed_frac@{t}"
 
@@ -67,7 +68,7 @@ def test_fused_shared_cell_double_reward(device):
     f = _run(_env(fused=True, **kw), 12, device, 6)
     t = _run(_env(fused=False, **kw), 12, device, 6)
     for f_i, t_i in zip(f, t, strict=True):
-        torch.testing.assert_close(f_i[1], t_i[1], rtol=1e-5, atol=1e-6)  # reward
+        torch.testing.assert_close(f_i[1], t_i[1], rtol=SPEC.rtol, atol=SPEC.atol)  # reward
         assert torch.equal(f_i[3], t_i[3])  # consumed_frac
 
 

@@ -53,6 +53,32 @@ def test_hot_loop_api_guard(device):
 
 
 @pytest.mark.parametrize("device", DEVICES)
+def test_transport_obstacle_reinstall_no_host_transfer(device):
+    """Transport re-installs its packages as obstacles every step, from inside the
+    whole-step hook. That must not sync.
+
+    ``Obstacles.any_movable`` costs a reduction plus ``.item()`` on a *fresh* spec and is
+    memoized on a retained one, so the scenario has to hold one instance and re-install it
+    rather than rebuild it per call. Auto-reset is on with a short ``max_steps`` so the
+    guarded window crosses several resets, which is where the rebuild used to happen.
+    """
+    from wmas import TransportScenario
+
+    scen = TransportScenario(n_agents=4, n_packages=2)
+    env = Environment(
+        scen, n_envs=32, device=device, dt=0.05, seed=0, auto_reset=True, max_steps=3
+    )
+    env.reset(seed=0)
+    actions = torch.zeros(32, 4, 2, device=device)
+    with torch.no_grad():
+        for _ in range(4):  # warmup: kernel compilation, graph capture
+            env.step(actions)
+        with forbid_host_transfers():
+            for _ in range(8):
+                env.step(actions)
+
+
+@pytest.mark.parametrize("device", DEVICES)
 def test_reset_no_host_transfer(device):
     """reset / reset_at must also stay host-sync-free (no .any() in spawn)."""
     env = make_env(device)

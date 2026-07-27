@@ -90,8 +90,13 @@ VARIANTS: list[Variant] = [
 # --------------------------------------------------------------- feature probing
 
 
-def _scenario_supports(kw: str) -> bool:
-    return kw in inspect.signature(NavigationScenario.__init__).parameters
+def _scenario_attrs() -> set[str]:
+    """Class-level ablation knobs the scenario exposes (e.g. ``eager_trims``).
+
+    These are attributes rather than ``__init__`` parameters on purpose: they select an
+    implementation of the *same* task, so they do not belong in the task definition.
+    """
+    return set(vars(NavigationScenario))
 
 
 def _env_supports(kw: str) -> bool:
@@ -115,7 +120,7 @@ def _stepper_attrs(device: str) -> set[str]:
 
 def _feature_available(feature: str, device: str) -> bool:
     if feature == "eager_trims":
-        return _scenario_supports("eager_trims")
+        return "eager_trims" in _scenario_attrs()
     if feature == "neighbor_reuse":
         return "neighbor_reuse" in _stepper_attrs(device)
     if feature == "slim2d":
@@ -139,14 +144,11 @@ def _build_env(v: Variant, n_envs: int, n_agents: int, device: str) -> Environme
 
     Assumes :func:`_variant_available` already returned True for ``v``.
     """
-    scen_kwargs: dict = {"n_agents": n_agents, "world_size": max(1.0, n_agents**0.5 / 4)}
-    if v.eager_trims and _scenario_supports("eager_trims"):
-        scen_kwargs["eager_trims"] = True
-    elif _scenario_supports("eager_trims"):
-        # Baseline / pre-eager variants explicitly disable the trims so the
-        # un-optimized eager path is what gets measured.
-        scen_kwargs["eager_trims"] = False
-    scenario = NavigationScenario(**scen_kwargs)
+    scenario = NavigationScenario(n_agents=n_agents, world_size=max(1.0, n_agents**0.5 / 4))
+    if "eager_trims" in _scenario_attrs():
+        # Set explicitly either way: baseline / pre-eager variants disable the trims so
+        # the un-optimized torch path is what gets measured.
+        scenario.eager_trims = v.eager_trims
 
     env_kwargs: dict = {
         "n_envs": n_envs,
@@ -195,9 +197,15 @@ def _trajectory(env: Environment, action_seq: list[torch.Tensor]) -> dict:
     return {"obs": obs_l, "reward": rew_l, "done": done_l}
 
 
-def _parity_ok(ref: dict, cur: dict, rtol: float = 1e-5, atol: float = 1e-5) -> tuple[bool, str]:
-    # atol 1e-5 tolerates the documented ulp-scale drift of the fused kernels vs
-    # the torch reference (sqrt/reduction order); a real regression is far larger.
+def _parity_ok(ref: dict, cur: dict, rtol: float, atol: float) -> tuple[bool, str]:
+    """Compare two trajectories field by field within ``(rtol, atol)``.
+
+    The tolerance is **the scenario's**, not this module's: it is the scenario that knows
+    why its optimized and reference paths differ (see
+    :attr:`wmas.scenarios.base.Scenario.parity_rtol`). This function used to hardcode a
+    flat 1e-5 for everything, which reported push-t as a parity failure for a divergence
+    its own test suite documents as by design.
+    """
     for key in ("obs", "reward"):
         for t, (r, c) in enumerate(zip(ref[key], cur[key], strict=True)):
             if r.shape != c.shape:
@@ -285,7 +293,8 @@ def bench_one(
         # Parity first (cheap, catches correctness regressions before timing).
         cur_traj = _trajectory(env, action_seq)
         if ref_traj is not None:
-            ok, why = _parity_ok(ref_traj, cur_traj)
+            scen = type(env.scenario)
+            ok, why = _parity_ok(ref_traj, cur_traj, scen.parity_rtol, scen.parity_atol)
             if not ok:
                 row["status"] = "parity-fail"
                 row["detail"] = why

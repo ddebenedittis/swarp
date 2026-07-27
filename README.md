@@ -123,40 +123,45 @@ structure, so gradients flow through contact geometry, not through neighbor memb
 
 ## Writing a scenario
 
-Subclass `wmas.Scenario` and implement four methods (mirroring VMAS `BaseScenario`):
+Subclass `wmas.Scenario` and implement four members (mirroring VMAS `BaseScenario`):
 
 ```python
 import torch
 from wmas import AgentConfig, DynamicsModel, Scenario, World, WorldConfig
 
 class MyScenario(Scenario):
+    obs_dim = 4                                # per-agent observation width
+
     def make_world(self, n_envs, device, dt, substeps, dtype) -> World:
         configs = [AgentConfig(model=DynamicsModel.HOLONOMIC, radius=0.05)
                    for _ in range(4)]
         world_config = WorldConfig(bounds=(-1, 1, -1, 1), bounds_mode="soft")
         self.world = World(configs, world_config, n_envs=n_envs, device=device,
                            dt=dt, substeps=substeps, dtype=dtype)
-        return self.world
+        return self.world                      # allocate all persistent state here too
 
-    def reset_world(self, env_mask=None):    # None = all; else bool [n_envs] mask
-        w = self.world           # write into w.state.* / w.goals; use w.sample_uniform
-        w.state.pos.data[:] = w.sample_uniform((w.n_envs, w.n_agents, 2), -1.0, 1.0)
+    def reset_world(self, env_mask=None, *, obs_only=False):  # None = all envs
+        w = self.world                         # write_state does the masked blend
+        w.write_state(env_mask,
+                      pos=w.sample_uniform((w.n_envs, w.n_agents, 2), -1.0, 1.0),
+                      vel=0.0)
 
-    def observation(self, agent_idx):          # [n_envs, obs_dim], torch ops on w.state
+    def observations(self):                    # [n_envs, n_agents, obs_dim]
         s = self.world.state
-        return torch.cat([s.pos[:, agent_idx], s.vel[:, agent_idx]], dim=-1)
+        return torch.cat([s.pos, s.vel], dim=-1)
 
     def agent_reward(self, agent_idx):         # per-agent term [n_envs]
         return -self.world.state.pos[:, agent_idx].norm(dim=-1)
 
     # optional: global_reward() (shared term), done(), info(), post_step(),
-    # and batched observations()/rewards() overrides for large fleets.
+    # render_extras(); observation(i) and rewards() are derived from the above.
 ```
 
 Observations and rewards are plain torch ops over `world.state`, so they are
 differentiable together with the Warp step and stay on-device. A scenario can additionally
-supply fused Warp obs/reward kernels for the no-grad hot path — see
-[docs/writing-a-scenario.md](docs/writing-a-scenario.md).
+subclass `FusedScenario` to supply fused Warp obs/reward kernels for the no-grad hot path,
+declaring its buffers rather than hand-rolling the CUDA-graph bookkeeping — see
+[docs/writing-a-scenario.md](docs/writing-a-scenario.md), which covers both tiers.
 
 ## Visualization
 

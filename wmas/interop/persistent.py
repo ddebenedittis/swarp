@@ -20,11 +20,11 @@ offset is not capture-safe. (This mirrors :class:`wmas.interop.compile.CudaGraph
 from __future__ import annotations
 
 import warnings
-from collections.abc import Callable
 
 import torch
 import warp as wp
 
+from wmas.core.hooks import WholeStepHook
 from wmas.core.stepper import Stepper
 from wmas.dynamics.base import Integrator
 from wmas.interop.autograd import TorchState, fill_state_defaults
@@ -86,13 +86,11 @@ class StepRuntime:
         self._graph = None
         self._graph_version: tuple[int, int] | None = None
 
-        # Optional whole-step hook: a capture-safe, zero-arg closure (neighbor
-        # query + fused obs/reward into persistent buffers) run right after the
-        # physics copy-back, inside both the captured graph and the eager
-        # fallback. Wired by ``Environment`` for graph-capturable fused scenarios.
-        self._post_physics: Callable[[], None] | None = None
-        self._post_physics_version: Callable[[], int] | None = None
-        self._post_physics_carries: Callable[[], list[torch.Tensor]] | None = None
+        # Optional whole-step hook (neighbor query + fused obs/reward into the
+        # persistent buffers), run right after the physics copy-back inside both the
+        # captured graph and the eager fallback. Wired by ``Environment`` from
+        # ``Scenario.graph_hook()``; see :class:`~wmas.core.hooks.WholeStepHook`.
+        self._hook: WholeStepHook | None = None
         self._ran_post = False
 
     # ------------------------------------------------------------------ state
@@ -111,28 +109,17 @@ class StepRuntime:
     def graph_active(self) -> bool:
         return self._graph is not None
 
-    def set_post_physics(
-        self,
-        hook: Callable[[], None] | None,
-        version_fn: Callable[[], int] | None = None,
-        carries_fn: Callable[[], list[torch.Tensor]] | None = None,
-    ) -> None:
-        """Register the whole-step hook + its recapture-token fn.
+    def set_post_physics(self, hook: WholeStepHook | None) -> None:
+        """Register (or clear) the whole-step hook. Invalidates any existing graph.
 
-        ``hook`` must be capture-safe: only ``wp.launch`` / grid builds against
-        stable persistent buffers, no torch ops and no allocation. ``version_fn``
-        returns a monotonically bumped token whenever the hook's cached buffer
-        handles change (e.g. a ``_prev_dist`` reallocation) so the graph is
-        recaptured. ``carries_fn`` returns the hook's persistent carry buffers
-        (position-shaping baseline, coverage latches, movable-body state) that a
-        real step advances in place; they are snapshotted and restored around the
-        warm-up launch so warm-up — which runs the hook on the *input* state just
-        to compile kernels — never advances them. Registering invalidates any
-        existing graph.
+        The runtime uses three of the hook's four members: :attr:`~wmas.core.hooks.
+        WholeStepHook.run` is captured / invoked eagerly after the physics copy-back,
+        :attr:`~wmas.core.hooks.WholeStepHook.token` gates recapture, and
+        :attr:`~wmas.core.hooks.WholeStepHook.carries` is snapshotted around warm-up.
+        ``prepare`` is the caller's to run, eagerly, before the step — see
+        :class:`~wmas.core.hooks.WholeStepHook` for why it cannot live in here.
         """
-        self._post_physics = hook
-        self._post_physics_version = version_fn
-        self._post_physics_carries = carries_fn
+        self._hook = hook
         self._graph = None
         self._graph_version = None
 
@@ -161,12 +148,12 @@ class StepRuntime:
             skip_drone=True,
         )
         self._copy_back()
-        if self._post_physics is not None:
-            self._post_physics()
+        if self._hook is not None:
+            self._hook.run()
 
     def _graph_key(self) -> tuple[int, int]:
         """Recapture key: physics mutation version + the hook's handle token."""
-        post_ver = self._post_physics_version() if self._post_physics_version is not None else 0
+        post_ver = 0 if self._hook is None else self._hook.token()
         return (self.stepper.mutation_version, post_ver)
 
     def _ensure_graph(self) -> None:
@@ -174,7 +161,7 @@ class StepRuntime:
 
         Recapture fires on a physics mutation (``stepper.mutation_version`` — e.g.
         an obstacle-count change) or when the post-physics hook's buffer handles
-        change (its ``version_fn`` token — e.g. a ``_prev_dist`` reallocation)."""
+        change (its ``token`` — e.g. a shaping-baseline reallocation)."""
         key = self._graph_key()
         if self._graph is not None and self._graph_version == key:
             return
@@ -186,8 +173,21 @@ class StepRuntime:
         grid_valid = (
             stepper.collisions and stepper.grid(self.n_envs).built_version == stepper.state_version
         )
-        # Warm-up compiles kernels/allocates without mutating state (launch into
-        # the scratch output only, no copy-back).
+        # Warm-up runs the whole step once *before* ScopedCapture (which forbids
+        # allocation), purely to compile kernels and allocate scratch: the physics into
+        # the scratch output with no copy-back, then the hook, which compiles the
+        # obs/reward kernels.
+        #
+        # Neither launch is side-effect-free, so snapshot everything they advance **in
+        # place** up front and restore it afterwards. That is the hook's declared carries
+        # (shaping baselines, coverage latches, movable-body state) *and* the engine's own
+        # movable-body/obstacle arrays, which ``launch_substeps`` advances in place inside
+        # the substep loop even though it writes agent state only to the scratch output.
+        # Snapshotting after the physics warm-up — as this used to — could not undo that:
+        # a scenario with a movable body entered its first replay one extra body-step
+        # ahead of the eager path.
+        carries = self._hook.carries() if self._hook is not None else []
+        saved = [c.clone() for c in carries]
         stepper.launch_substeps(
             self.state,
             self._actions,
@@ -196,18 +196,10 @@ class StepRuntime:
             reuse_neighbors=True,
             skip_drone=True,
         )
-        # Warm-up the hook too (on the input state, no copy-back): compiles the
-        # obs/reward kernels and allocates any scratch (uniform-grid radix, JIT)
-        # before ScopedCapture, which forbids allocation. Its obs/reward writes
-        # are transient (overwritten by the first real capture_launch), but it
-        # advances the hook's persistent carries in place — snapshot & restore
-        # them so warm-up leaves the pre-step baseline intact for the replay.
-        if self._post_physics is not None:
-            carries = self._post_physics_carries() if self._post_physics_carries else []
-            saved = [c.clone() for c in carries]
-            self._post_physics()
-            for c, s in zip(carries, saved, strict=True):
-                c.copy_(s)
+        if self._hook is not None:
+            self._hook.run()
+        for c, s in zip(carries, saved, strict=True):
+            c.copy_(s)
         wp.synchronize_device(stepper.device)
         # Re-sync built_version after warm-up (which bumped state_version without
         # touching the grid's contents) so the capture takes the reuse branch iff
@@ -224,8 +216,8 @@ class StepRuntime:
                 skip_drone=True,
             )
             self._copy_back()
-            if self._post_physics is not None:
-                self._post_physics()
+            if self._hook is not None:
+                self._hook.run()
         self._graph = capture.graph
         self._graph_version = key
 
@@ -243,5 +235,5 @@ class StepRuntime:
             self._run_eager()
         # Both paths run the hook when one is registered (captured into the graph
         # or invoked eagerly); Environment reads this to skip a redundant post_step.
-        self._ran_post = self._post_physics is not None
+        self._ran_post = self._hook is not None
         return self.state_views

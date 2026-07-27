@@ -203,7 +203,9 @@ def test_formation_info_multiobj_reward(device):
     both on-device, with leading dim n_envs."""
     ne, na = 8, 4
     scenario = FormationScenario(n_agents=na)
-    env = Environment(scenario, n_envs=ne, device=device, dt=0.1, seed=0)
+    # fused=False: the assertion below cross-checks info() against agent_reward(), which
+    # only the torch reference path populates (the fused path has no per-agent split).
+    env = Environment(scenario, n_envs=ne, device=device, dt=0.1, seed=0, fused=False)
     env.reset()  # populates the cache via reset_world -> _refresh
     info = scenario.info()
     assert set(info) >= {"multiobj_reward", "formation_error"}

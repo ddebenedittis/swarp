@@ -183,3 +183,67 @@ def test_radius_graph_api():
     env.reset(seed=0)
     edges = env.radius_graph()
     assert edges.shape[0] == 2 and edges.dtype == torch.int64
+
+
+# ------------------------------------------------------------------- ergonomics
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_default_step_outputs_alias_and_clone_outputs_snapshots(device):
+    """The default zero-copy return is a documented footgun; ``clone_outputs`` fixes it.
+
+    ``step`` hands back views of buffers the *next* step overwrites, so retaining them
+    (a replay buffer, a trajectory list) silently records the latest step N times over.
+    Nothing passed the flag before, so neither half of the contract was pinned.
+    """
+    aliased = make_env(device, n_envs=4, n_agents=2)
+    aliased.reset(seed=0)
+    cloned = make_env(device, n_envs=4, n_agents=2, clone_outputs=True)
+    cloned.reset(seed=0)
+    act = torch.full((4, 2, aliased.act_dim), 0.5, device=device)
+
+    kept_a, kept_c = [], []
+    with torch.no_grad():
+        for _ in range(3):
+            kept_a.append(aliased.step(act)[0])
+            kept_c.append(cloned.step(act)[0])
+
+    # Both envs really ran the same trajectory: the last step agrees.
+    assert torch.equal(kept_a[-1], kept_c[-1])
+    # But every entry the aliasing env kept is the *same tensor*, so its "history" is
+    # three copies of the final step — the footgun, pinned.
+    assert all(t.data_ptr() == kept_a[-1].data_ptr() for t in kept_a)
+    assert torch.equal(kept_a[0], kept_a[-1])
+    # clone_outputs snapshots, so the history is a real history.
+    assert len({t.data_ptr() for t in kept_c}) == 3
+    assert not torch.equal(kept_c[0], kept_c[-1])
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_env_forwards_obs_dim_and_act_dim(device):
+    env = make_env(device, n_envs=4, n_agents=3, neighbor_obs=2)
+    assert env.obs_dim == env.scenario.obs_dim
+    assert env.act_dim == env.world.act_dim
+    assert env.reset(seed=0).shape == (4, 3, env.obs_dim)
+
+
+def test_use_graph_auto_follows_the_scenario_and_the_device():
+    """``use_graph="auto"`` turns on exactly where the whole-step graph can pay off."""
+    # No CUDA device: capture is impossible, so no persistent runtime at all.
+    assert make_env("cpu", n_envs=4, n_agents=2).world.runtime is None
+    # Explicit False always wins.
+    off = make_env(DEVICES[-1], n_envs=4, n_agents=2, use_graph=False)
+    assert off.world.runtime is None and not off._whole_step
+
+
+@pytest.mark.gpu(reason="the auto default only engages where a graph can be captured")
+def test_use_graph_auto_is_on_for_a_capturable_fused_scenario():
+    auto = make_env("cuda:0", n_envs=4, n_agents=2)
+    auto.reset(seed=0)
+    with torch.no_grad():
+        auto.step(torch.zeros(4, 2, auto.act_dim, device="cuda:0"))
+    assert auto._whole_step and auto.graph_mode
+    # ...and turning the fused kernels off takes the graph with it: a physics-only
+    # graph is not what the 2.5-5x in docs/benchmarks.md measures.
+    plain = make_env("cuda:0", n_envs=4, n_agents=2, fused=False)
+    assert plain.world.runtime is None

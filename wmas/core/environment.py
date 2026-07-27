@@ -22,6 +22,23 @@ class Environment:
     ``auto_reset=True`` to have :meth:`step` reset done envs in-place via a
     host-sync-free masked path (no ``.any()``/``.nonzero()`` round-trip), so the
     whole loop can stay on device.
+
+    Args:
+        use_graph: persistent-buffer execution backed by a whole-step CUDA graph.
+            ``"auto"`` (the default) enables it whenever it can actually pay off — a
+            CUDA device and a scenario that provides a capturable whole-step hook —
+            which is the configuration ``docs/benchmarks.md`` measures at 2.5-5x.
+            Pass ``False`` to force the plain functional step, ``True`` to demand
+            persistent execution even where capture is unavailable (it then falls back
+            to eager persistent execution with a warning).
+        clone_outputs: clone ``obs``/``reward``/``done`` before returning them. Off by
+            default, so :meth:`step` hands back **zero-copy views of buffers the next
+            step overwrites** — fine for a policy that consumes them immediately, wrong
+            for anything that retains them (a replay buffer, a trajectory list). Turn
+            this on, or clone at the call site.
+        fused: use the scenario's fused Warp obs/reward kernels on the no-grad path.
+            ``"auto"`` follows :attr:`~wmas.scenarios.base.Scenario.fused_available`;
+            grad mode always falls back to the differentiable torch path.
     """
 
     def __init__(
@@ -35,8 +52,8 @@ class Environment:
         max_steps: int | None = None,
         seed: int = 0,
         auto_reset: bool = False,
-        use_graph: bool = False,
-        copy_outputs: bool = False,
+        use_graph: bool | str = "auto",
+        clone_outputs: bool = False,
         fused: bool | str = "auto",
     ) -> None:
         self.scenario = scenario
@@ -45,7 +62,8 @@ class Environment:
         self.dtype = dtype
         self.max_steps = max_steps
         self.auto_reset = auto_reset
-        self.copy_outputs = copy_outputs
+        self.clone_outputs = clone_outputs
+        self._viewer: Any = None
         self.world = scenario.make_world(
             n_envs=n_envs, device=device, dt=dt, substeps=substeps, dtype=dtype
         )
@@ -54,29 +72,42 @@ class Environment:
         self._step_count = torch.zeros(n_envs, device=device, dtype=torch.int32)
         # Fused Warp obs/reward/done kernels for the no-grad hot path. "auto"
         # follows the scenario; grad mode always falls back to the torch path.
-        self._fused = scenario.fused_available() if fused == "auto" else bool(fused)
-        # Opt-in persistent-buffer + CUDA-graph execution for the no-grad hot
-        # path. Zero-copy views are returned by default; copy_outputs clones them.
+        self._fused = scenario.fused_available if fused == "auto" else bool(fused)
+        # The whole-step hook (fused obs/reward folded into the graph), or None when
+        # the scenario has none / fused is off. It also decides the "auto" default for
+        # use_graph: persistent execution is only the *advertised* fast path when the
+        # obs/reward launches can ride along inside the same graph.
+        self._hook = scenario.graph_hook() if self._fused else None
+        if use_graph == "auto":
+            use_graph = self._hook is not None and device.startswith("cuda")
         if use_graph:
             self.world.enable_persistent(use_graph=True)
-        # Fold the fused obs/reward launches into the whole-step CUDA graph when
-        # the scenario is fused + capture-safe and a persistent runtime exists.
-        self._whole_step = False
-        self._maybe_wire_whole_step_graph()
-
-    def _maybe_wire_whole_step_graph(self) -> None:
         runtime = self.world.runtime
-        if self._fused and runtime is not None and self.scenario.graph_capturable():
-            runtime.set_post_physics(
-                self.scenario._graph_post_physics,
-                self.scenario.graph_recapture_token,
-                self.scenario._graph_warmup_carries,
-            )
-            self._whole_step = True
+        self._whole_step = self._hook is not None and runtime is not None
+        if self._whole_step:
+            runtime.set_post_physics(self._hook)
+        else:
+            self._hook = None
 
-    def _set_fused_active(self) -> None:
-        """Fused kernels run only on the no-grad path (grad uses the torch ref)."""
-        self.scenario._fused_active = self._fused and not torch.is_grad_enabled()
+    def _taped_step(self, actions: torch.Tensor | None = None) -> bool:
+        """Whether the coming step will be recorded on the Warp tape.
+
+        This is the same predicate :meth:`wmas.core.world.World.step` uses to choose
+        between the taped functional path and the no-grad hot path, and the two have to
+        agree: the fused obs/reward launches ride on the no-grad path, and once they are
+        baked into a whole-step CUDA graph that graph cannot be replayed "half" — the
+        physics and the fused kernels are one capture. Merely being inside
+        ``enable_grad`` is not enough to tape a step; something has to require grad.
+        """
+        if not torch.is_grad_enabled():
+            return False
+        if actions is not None and actions.requires_grad:
+            return True
+        return any(t is not None and t.requires_grad for t in self.world.state)
+
+    def _set_fused_active(self, actions: torch.Tensor | None = None) -> None:
+        """Fused kernels run only on the untaped path (a taped step uses the torch ref)."""
+        self.scenario.set_fused_active(self._fused and not self._taped_step(actions))
 
     def _seed(self, seed: int) -> None:
         self.world.generator = torch.Generator(device=self.device)
@@ -87,6 +118,16 @@ class Environment:
         """True when a CUDA graph is actively backing the no-grad step."""
         return self.world.runtime is not None and self.world.runtime.graph_active
 
+    @property
+    def obs_dim(self) -> int:
+        """Per-agent observation width, forwarded from the scenario."""
+        return self.scenario.obs_dim
+
+    @property
+    def act_dim(self) -> int:
+        """Env-level action width (max arity over the agent models)."""
+        return self.world.act_dim
+
     # ------------------------------------------------------------------- API
 
     def reset(self, seed: int | None = None) -> torch.Tensor:
@@ -94,7 +135,6 @@ class Environment:
         if seed is not None:
             self._seed(seed)
         self._set_fused_active()
-        self.scenario._fused_obs_only = False
         self.world.action = None  # no action applied yet this episode
         with torch.no_grad():
             self.world.reset_state()
@@ -110,7 +150,6 @@ class Environment:
         Returns stacked observations for all envs.
         """
         self._set_fused_active()
-        self.scenario._fused_obs_only = False
         with torch.no_grad():
             self.scenario.reset_world(env_mask)
         self._step_count = torch.where(
@@ -141,12 +180,11 @@ class Environment:
         if actions.dtype != self.dtype:
             raise TypeError(f"actions dtype {actions.dtype} != env dtype {self.dtype}")
 
-        self._set_fused_active()
-        self.scenario._fused_obs_only = False
-        # Whole-step graph: run capture-unsafe prep (buffer ensure, resetmask
+        self._set_fused_active(actions)
+        # Whole-step graph: run the hook's capture-unsafe prep (buffer ensure, reset-mask
         # zero, handle sync) eagerly on the default stream before the replay.
-        if self._whole_step and self.scenario._fused_active:
-            self.scenario._pre_graph_step()
+        if self._whole_step and self.scenario.fused_active:
+            self._hook.prepare()
         # Expose the applied action to the scenario reward path (post_step reads
         # world.action for control-input shaping, e.g. action-smoothness).
         self.world.action = actions
@@ -167,10 +205,8 @@ class Environment:
         if self.auto_reset:
             # Obs-only reset pass: reward/done/info were already returned for this
             # transition and their (fused) buffers must not be clobbered.
-            self.scenario._fused_obs_only = True
             with torch.no_grad():
-                self.scenario.reset_world(done)
-            self.scenario._fused_obs_only = False
+                self.scenario.reset_world(done, obs_only=True)
             self._step_count = torch.where(
                 done, torch.zeros_like(self._step_count), self._step_count
             )
@@ -178,7 +214,7 @@ class Environment:
         # Observations reflect the state after any auto-reset (next episode's
         # first obs for done envs), matching the gym/VMAS vec-env convention.
         obs = self.scenario.observations()
-        if self.copy_outputs:
+        if self.clone_outputs:
             obs, reward = obs.clone(), reward.clone()
             done = done.clone()
         return obs, reward, done, info
@@ -221,7 +257,7 @@ class Environment:
             raise ValueError(f"render mode must be 'human' or 'rgb_array', got {mode!r}")
         from wmas.render.viewer import Viewer
 
-        if getattr(self, "_viewer", None) is None:
+        if self._viewer is None:
             self._viewer = Viewer(self, env_index=env_index, **viewer_kwargs)
         viewer = self._viewer
         viewer.state.focus_env = env_index
@@ -233,7 +269,6 @@ class Environment:
 
     def close_viewer(self) -> None:
         """Close the persistent render window, if one was opened by ``render``."""
-        viewer = getattr(self, "_viewer", None)
-        if viewer is not None:
-            viewer.close()
+        if self._viewer is not None:
+            self._viewer.close()
             self._viewer = None

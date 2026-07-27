@@ -9,12 +9,16 @@ from wmas.scenarios.transport import TransportScenario
 
 
 def _env(device, n_envs=4, **kw):
+    # fused=False on purpose: this suite exercises the *torch reference* package
+    # integration (``_refresh``), poking ``pkg_*`` directly and reading it back. The
+    # fused parity of that path is what test_transport_fused.py is for.
     return Environment(
         TransportScenario(n_agents=3, n_packages=1, **kw),
         n_envs=n_envs,
         device=device,
         dt=0.05,
         seed=1,
+        fused=False,
     )
 
 
@@ -55,7 +59,7 @@ def test_agents_push_package_toward_goal(device):
     scenario = TransportScenario(
         n_agents=4, n_packages=1, package_radius=0.12, agent_radius=0.05, world_size=1.0
     )
-    env = Environment(scenario, n_envs=1, device=device, dt=0.05, seed=0)
+    env = Environment(scenario, n_envs=1, device=device, dt=0.05, seed=0, fused=False)
     env.reset()
     # place package at origin, goal to the +x, agents just behind it (-x side)
     scenario.pkg_pos = torch.tensor([[[0.0, 0.0]]], device=device, dtype=torch.float32)
@@ -84,7 +88,7 @@ def test_agents_push_package_toward_goal(device):
 def test_transport_shaping_reward_positive_when_closer(device):
     """Global reward is positive on a step that moves the package toward goal."""
     scenario = TransportScenario(n_agents=3, n_packages=1)
-    env = Environment(scenario, n_envs=1, device=device, dt=0.05, seed=0)
+    env = Environment(scenario, n_envs=1, device=device, dt=0.05, seed=0, fused=False)
     env.reset()
     scenario.goal = torch.tensor([[[0.8, 0.0]]], device=device, dtype=torch.float32)
     scenario.pkg_pos = torch.tensor([[[0.0, 0.0]]], device=device, dtype=torch.float32)
@@ -100,7 +104,7 @@ def test_transport_shaping_reward_positive_when_closer(device):
 def test_transport_differentiable_rollout():
     """BPTT: the package-to-goal loss backprops to the action sequence."""
     scenario = TransportScenario(n_agents=3, n_packages=1)
-    env = Environment(scenario, n_envs=2, device="cpu", dt=0.05, seed=0)
+    env = Environment(scenario, n_envs=2, device="cpu", dt=0.05, seed=0, fused=False)
     env.reset()
     actions = torch.zeros(2, 3, env.world.act_dim, requires_grad=True)
     loss = torch.zeros((), dtype=torch.float32)

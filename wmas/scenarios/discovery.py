@@ -15,18 +15,17 @@ import torch
 import warp as wp
 
 from wmas.core.config import WorldConfig
-from wmas.core.state import VEC2
 from wmas.core.world import World
 from wmas.dynamics.base import AgentConfig, ControlMode, DynamicsModel
-from wmas.scenarios.base import Scenario
 from wmas.scenarios.discovery_kernels import (
     discovery_cover_kernel,
     discovery_obs_kernel,
     discovery_reward_kernel,
 )
+from wmas.scenarios.fused import Buf, FusedPass, FusedScenario
 
 
-class DiscoveryScenario(Scenario):
+class DiscoveryScenario(FusedScenario):
     def __init__(
         self,
         n_agents: int = 5,
@@ -73,85 +72,49 @@ class DiscoveryScenario(Scenario):
         self.world = World(
             cfgs, cfg, n_envs=n_envs, device=device, dt=dt, substeps=substeps, dtype=dtype
         )
-        self.targets: torch.Tensor | None = None  # [n_envs, n_targets, 2]
-        self.covered: torch.Tensor | None = None  # [n_envs, n_targets] bool (ever covered)
+        # Task state, allocated here (n_envs is known) and only ever written in place, so
+        # the fused spec can adopt it with alloc="never". Allocating it on first reset
+        # instead made the fused path silently depend on reset running first.
+        self.targets = torch.zeros(  # [n_envs, n_targets, 2]
+            n_envs, self.n_targets, 2, device=device, dtype=dtype
+        )
+        self.covered = torch.zeros(  # [n_envs, n_targets] bool (ever covered)
+            n_envs, self.n_targets, dtype=torch.bool, device=device
+        )
         self._cache: dict[str, torch.Tensor] | None = None
-        self._fused_ready = False
         return self.world
-
-    def fused_available(self) -> bool:
-        """Discovery ships fused Warp obs/reward kernels (2D holonomic)."""
-        return True
 
     @property
     def obs_dim(self) -> int:
         return 4 + 3 * self.n_targets
 
-    def reset_world(self, env_mask: torch.Tensor | None = None) -> None:
+    def reset_world(
+        self, env_mask: torch.Tensor | None = None, *, obs_only: bool = False
+    ) -> None:
         w = self.world
         n = w.n_envs
         lim = self.world_size - 2.0 * self.agent_radius
         spawn = w.sample_uniform((n, self.n_agents, 2), -lim, lim)
         targets = w.sample_uniform((n, self.n_targets, 2), -lim, lim)
-        covered = torch.zeros(n, self.n_targets, dtype=torch.bool, device=w.device)
 
-        if self.targets is None:
-            self.targets = torch.zeros(n, self.n_targets, 2, device=w.device, dtype=w.dtype)
-            self.covered = torch.zeros(n, self.n_targets, dtype=torch.bool, device=w.device)
-
+        w.write_state(env_mask, pos=spawn, vel=0.0)
         if env_mask is None:
-            w.state.pos.data.copy_(spawn)
-            w.state.vel.data.zero_()
             self.targets.copy_(targets)
-            self.covered.copy_(covered)
+            self.covered.zero_()
         else:
-            m3 = env_mask.view(-1, 1, 1)
-            w.state.pos.data.copy_(torch.where(m3, spawn, w.state.pos.data))
-            w.state.vel.data.copy_(
-                torch.where(m3, torch.zeros_like(w.state.vel.data), w.state.vel.data)
+            self.targets.copy_(torch.where(env_mask.view(-1, 1, 1), targets, self.targets))
+            self.covered.copy_(
+                torch.where(env_mask.view(-1, 1), torch.zeros_like(self.covered), self.covered)
             )
-            self.targets.copy_(torch.where(m3, targets, self.targets))
-            self.covered.copy_(torch.where(env_mask.view(-1, 1), covered, self.covered))
-        if self._fused_active:
-            self._ensure_fused(w.n_envs)
-            # A reset recomputes coverage/obs on the new state (updating the
-            # covered latch, as the reference _refresh does) but never the reward
-            # (the transition's reward buffer was already returned this step).
-            self._launch_cover()
-            self._launch_obs()
-        else:
-            self._refresh()
+        self.finish_reset(env_mask, obs_only=obs_only)
 
-    def post_step(self) -> None:
-        if self._fused_active:
-            # Same sequence the whole-step graph runs (keeps non-graph fused mode
-            # and CPU eager-persistent bit-identical).
-            self._pre_graph_step()
-            self._graph_post_physics()
-        else:
-            self._refresh()
+    # ---------------------------------------- torch reference path (parity oracle)
 
-    # ----------------------------------------------------- whole-step graph
+    def post_step_torch(self) -> None:
+        self._refresh()
 
-    def graph_capturable(self) -> bool:
-        return True
-
-    def graph_recapture_token(self) -> int:
-        # targets/covered are allocated once and updated in place; state/grid
-        # buffers are stable — nothing re-wrapped per launch, so no recapture.
-        return 0
-
-    def _graph_warmup_carries(self) -> list[torch.Tensor]:
-        # The coverage latch is advanced in place by _launch_cover.
-        return [self.covered]
-
-    def _pre_graph_step(self) -> None:
-        self._ensure_fused(self.world.n_envs)
-
-    def _graph_post_physics(self) -> None:
-        self._launch_cover()
-        self._launch_obs()
-        self._launch_reward()
+    def reset_torch(self, env_mask: torch.Tensor | None) -> None:
+        self._refresh()
 
     def _refresh(self) -> None:
         w = self.world
@@ -184,60 +147,40 @@ class DiscoveryScenario(Scenario):
 
     # --------------------------------------------------------- fused fast path
 
-    def _ensure_fused(self, n_envs: int) -> None:
-        """Allocate the persistent fused output buffers + cached wp handles.
-
-        ``targets``/``covered`` are allocated by ``reset_world`` before this runs
-        and only ever updated in place, so their data_ptr is stable."""
-        if self._fused_ready:
-            return
-        w = self.world
-        na, dev, dt = self.n_agents, w.device, w.dtype
-
-        def z(*shape, d=dt):
-            return torch.zeros(*shape, device=dev, dtype=d)
-
-        self._f_obs = z(n_envs, na, self.obs_dim)
-        self._f_touch = z(n_envs, na)
-        self._f_reward = z(n_envs, na)
-        self._f_newly = z(n_envs, self.n_targets, d=torch.uint8)
-        self._f_done = z(n_envs, d=torch.uint8)
-        scalar = w.wp_dtype
-        self._wp = {
-            "obs": wp.from_torch(self._f_obs, dtype=scalar),
-            "touch": wp.from_torch(self._f_touch, dtype=scalar),
-            "reward": wp.from_torch(self._f_reward, dtype=scalar),
-            "newly": wp.from_torch(self._f_newly, dtype=wp.uint8),
-            "done": wp.from_torch(self._f_done, dtype=wp.uint8),
-            "covered": wp.from_torch(self.covered.view(torch.uint8), dtype=wp.uint8),
-            "targets": wp.from_torch(self.targets, dtype=VEC2[scalar]),
-        }
-        self._f_done_bool = self._f_done.view(torch.bool)
-        self._fused_ready = True
-
-    def _state_wp(self):
-        """(pos, vel) as Warp arrays for the fused kernels."""
-        w = self.world
-        vec2 = VEC2[w.wp_dtype]
-        if w._persistent and not w._detached:
-            s = w.runtime.state
-            return s.pos, s.vel
-        st = w.state
+    def fused_spec(self, n_envs: int) -> tuple[Buf, ...]:
+        ne, na = n_envs, self.n_agents
         return (
-            wp.from_torch(st.pos.contiguous(), dtype=vec2),
-            wp.from_torch(st.vel.contiguous(), dtype=vec2),
+            Buf("obs", (ne, na, self.obs_dim)),
+            Buf("touch", (ne, na)),
+            Buf("reward", (ne, na)),
+            Buf("newly", (ne, self.n_targets), "uint8"),
+            Buf("done", (ne,), "uint8", bool_view=True),
+            Buf("targets", (ne, self.n_targets, 2), "vec2", attr="targets", alloc="never"),
+            Buf("covered", (ne, self.n_targets), "bool", attr="covered", alloc="never", carry=True),
         )
+
+    def launch_fused(self, pass_: FusedPass) -> None:
+        """Coverage, observations, and — on a step only — the reward.
+
+        Discovery's kernels take *neither* ``advance_prev`` nor ``full_pass``: there is no
+        shaping baseline to rebase, and "a reset must not clobber the reward already
+        returned for this transition" is expressed by simply not launching the reward
+        kernel. Coverage still runs on a reset, updating the ``covered`` latch exactly as
+        the torch ``_refresh`` does.
+        """
+        self._launch_cover()
+        self._launch_obs()
+        if pass_.is_step:
+            self._launch_reward()
 
     def _launch_cover(self) -> None:
         w = self.world
-        self._ensure_fused(w.n_envs)
         scalar = w.wp_dtype
-        pos, _ = self._state_wp()
         wp.launch(
             discovery_cover_kernel,
             dim=(w.n_envs, self.n_targets),
             inputs=[
-                pos,
+                w.state_wp().pos,
                 self._wp["targets"],
                 wp.int32(self.n_agents),
                 scalar(self.covering_range**2),
@@ -251,13 +194,13 @@ class DiscoveryScenario(Scenario):
     def _launch_obs(self) -> None:
         w = self.world
         scalar = w.wp_dtype
-        pos, vel = self._state_wp()
+        st = w.state_wp()
         wp.launch(
             discovery_obs_kernel,
             dim=(w.n_envs, self.n_agents),
             inputs=[
-                pos,
-                vel,
+                st.pos,
+                st.vel,
                 self._wp["targets"],
                 self._wp["covered"],
                 wp.int32(self.n_agents),
@@ -293,15 +236,12 @@ class DiscoveryScenario(Scenario):
     # ------------------------------------------------------------ obs/rewards
 
     def observations(self) -> torch.Tensor:
-        if self._fused_active:
-            return self._f_obs
+        if self.fused_active:
+            return self.fb["obs"]
         w = self.world
         s = w.state
         covered_flag = self.covered.to(w.dtype).unsqueeze(1).expand(-1, w.n_agents, -1)
         return torch.cat([s.pos, s.vel, self._cache["rel_targets"], covered_flag], dim=-1)
-
-    def observation(self, agent_idx: int) -> torch.Tensor:
-        return self.observations()[:, agent_idx]
 
     def agent_reward(self, agent_idx: int) -> torch.Tensor:
         c = self._cache
@@ -313,16 +253,14 @@ class DiscoveryScenario(Scenario):
         return self.covering_reward * self._cache["newly"].sum(dim=-1).to(self.world.dtype)
 
     def rewards(self) -> torch.Tensor:
-        if self._fused_active:
-            return self._f_reward
-        return super().rewards()
+        return self.fb["reward"] if self.fused_active else super().rewards()
 
     def done(self) -> torch.Tensor:
-        if self._fused_active:
-            return self._f_done_bool
+        if self.fused_active:
+            return self.fb["done_bool"]
         return self.covered.all(dim=-1)
 
     def info(self) -> dict[str, Any]:
-        if self._fused_active:
+        if self.fused_active:
             return {"covered_frac": self.covered.float().mean(-1)}
         return {"covered_frac": self._cache["covered_frac"]}
