@@ -14,7 +14,6 @@ import numpy as np
 import torch
 
 from wmas import Environment, NavigationScenario
-from wmas.core.config import WorldConfig
 from wmas.core.world import World
 from wmas.dynamics.base import AgentConfig, ControlMode, DynamicsModel
 from wmas.render.overlays import DEFAULT_ENABLED
@@ -75,17 +74,25 @@ class VisualizationScenario(NavigationScenario):
 
 
 class MixedVisualizationScenario(VisualizationScenario):
-    """Navigation demo with heterogeneous 2D dynamics models."""
+    """Navigation demo with heterogeneous 2D dynamics models.
 
-    def make_world(self, n_envs, device, dt, substeps, dtype) -> World:
-        cycle = (
-            DynamicsModel.HOLONOMIC,
-            DynamicsModel.DIFF_DRIVE,
-            DynamicsModel.KINEMATIC_BICYCLE,
-        )
-        configs = [
+    The whole scenario is the fleet composition, so it overrides only
+    :meth:`~wmas.scenarios.navigation.NavigationScenario._agent_configs`. It used to
+    reimplement ``make_world``, which meant a verbatim copy of navigation's world config
+    *and* of its fused/graph bookkeeping — out of tree, and silently stale the moment
+    either changed.
+    """
+
+    _CYCLE = (
+        DynamicsModel.HOLONOMIC,
+        DynamicsModel.DIFF_DRIVE,
+        DynamicsModel.KINEMATIC_BICYCLE,
+    )
+
+    def _agent_configs(self) -> list[AgentConfig]:
+        return [
             AgentConfig(
-                model=cycle[i % len(cycle)],
+                model=self._CYCLE[i % len(self._CYCLE)],
                 ctrl_mode=ControlMode.VELOCITY,
                 radius=self.agent_radius,
                 max_speed=self.max_speed,
@@ -93,36 +100,6 @@ class MixedVisualizationScenario(VisualizationScenario):
             )
             for i in range(self.n_agents)
         ]
-        margin = 0.5 * self.agent_radius
-        reach = 2.0 * self.agent_radius + margin
-        world_config = WorldConfig(
-            collisions=True,
-            collision_k=100.0,
-            collision_c=1.0,
-            collision_margin=margin,
-            bounds=(-self.world_size, self.world_size, -self.world_size, self.world_size),
-            bounds_mode="soft",
-            neighbor_radius=max(self.neighbor_radius or 0.0, reach),
-            max_neighbors=min(32, max(4, self.n_agents)),
-            neighbor_method=self.neighbor_method,
-        )
-        self.world = World(
-            configs,
-            world_config,
-            n_envs=n_envs,
-            device=device,
-            dt=dt,
-            substeps=substeps,
-            dtype=dtype,
-        )
-        self._nbr_cache = None
-        self._prev_dist = None
-        self._eager_k_all = -1
-        self._eager_k = -1
-        self._k_obs = min(self.neighbor_obs, world_config.max_neighbors)
-        self._fused_ready = False
-        self._handle_version = 0
-        return self.world
 
 
 def build_env(

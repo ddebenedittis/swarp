@@ -268,7 +268,8 @@ def test_prev_dist_reassignment_recapture(eager_trims):
     dev = "cuda:0"
 
     def mk(use_graph):
-        scen = NavigationScenario(n_agents=4, neighbor_method="brute", eager_trims=eager_trims)
+        scen = NavigationScenario(n_agents=4, neighbor_method="brute")
+        scen.eager_trims = eager_trims  # an ablation knob, set directly (not a ctor kwarg)
         return Environment(scen, n_envs=16, device=dev, dt=0.05, seed=0, max_steps=50,
                            use_graph=use_graph)
 
@@ -289,7 +290,7 @@ def test_prev_dist_reassignment_recapture(eager_trims):
             g.step(a0)
             e.step(a0)
     rt = g.world.runtime
-    graph0, tok0 = rt._graph, g.scenario._handle_version
+    graph0, tok0 = rt._graph, g.scenario.fused_token()
     one_grad_step(g)  # reassigns/refreshes _prev_dist on the torch path
     one_grad_step(e)
     with torch.no_grad():
@@ -301,10 +302,10 @@ def test_prev_dist_reassignment_recapture(eager_trims):
             assert torch.equal(rg, re)
             assert torch.equal(dg, de)
     if eager_trims:
-        assert g.scenario._handle_version == tok0
+        assert g.scenario.fused_token() == tok0
         assert g.world.runtime._graph is graph0
     else:
-        assert g.scenario._handle_version > tok0
+        assert g.scenario.fused_token() > tok0
         assert g.world.runtime._graph is not graph0
 
 
