@@ -282,6 +282,7 @@ def main() -> None:
             ckpt_dir / f"pusht_{tag}.pt",
         )
 
+    nonfinite_skips = 0
     for it, batch in enumerate(collector):
         dist = batch.get(("next", "info", "tee_dist_to_goal"))
         ang = batch.get(("next", "info", "tee_angle_error"))
@@ -307,7 +308,19 @@ def main() -> None:
                 total = losses["loss_objective"] + losses["loss_critic"] + losses["loss_entropy"]
                 optim.zero_grad()
                 total.backward()
-                torch.nn.utils.clip_grad_norm_(loss_module.parameters(), 1.0)
+                # `clip_grad_norm_` rescales but does not filter: one non-finite gradient
+                # goes straight into Adam, whose moments then turn *every* parameter NaN
+                # on the next step. That is unrecoverable, and nothing stops the run --
+                # it keeps collecting, reporting nan reward and a tee_dist pinned at the
+                # arena bound (nan positions clamp there), for as long as you let it. A
+                # 1-agent run died this way at iter 351; the exact source was not pinned
+                # down. Skipping the minibatch costs one update, and on a healthy
+                # gradient this branch never runs.
+                gnorm = torch.nn.utils.clip_grad_norm_(loss_module.parameters(), 1.0)
+                if not torch.isfinite(gnorm):
+                    optim.zero_grad(set_to_none=True)
+                    nonfinite_skips += 1
+                    continue
                 optim.step()
         buffer.empty()
 
@@ -323,6 +336,7 @@ def main() -> None:
         print(
             f"iter {it:3d}  reward/step {mean_reward:+.4f}  "
             f"tee-dist {d:.4f}  tee-angle {a:.4f}  solved {solved:.3f}  diff {f:.2f}"
+            + (f"  skipped {nonfinite_skips}" if nonfinite_skips else "")
         )
         if args.checkpoint_every and (it + 1) % args.checkpoint_every == 0:
             save(f"iter{it + 1:05d}")
