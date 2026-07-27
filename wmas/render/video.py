@@ -23,8 +23,9 @@ _VIDEO_CODECS = {".mp4": "libx264", ".webm": "libvpx-vp9"}
 
 
 def _open_writer(path, fps: int):
-    import imageio.v2 as imageio
-
+    # Validate the extension *before* importing imageio: rejecting a bad path is
+    # argument validation and must not depend on the optional ``viz`` extra being
+    # installed, or the ValueError below is unreachable without it.
     suffix = Path(path).suffix.lower()
     codec = _VIDEO_CODECS.get(suffix)
     if codec is None:
@@ -32,6 +33,8 @@ def _open_writer(path, fps: int):
             f"unsupported video extension {suffix or '(none)'!r}; "
             "wmas writes .mp4 (H.264) or .webm (VP9) only"
         )
+    import imageio.v2 as imageio
+
     return imageio.get_writer(str(path), fps=fps, codec=codec)
 
 
