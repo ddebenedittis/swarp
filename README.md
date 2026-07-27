@@ -197,7 +197,7 @@ right-click to move its goal (writes into the shown env only).
 In a notebook, embed a rollout inline:
 
 ```python
-from wmas.render.notebook import animate
+from wmas.render import animate
 animate(env, n_steps=200)   # returns an HTML5 <video>
 ```
 
