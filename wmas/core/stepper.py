@@ -27,7 +27,7 @@ import warp as wp
 
 from wmas.core.bodies import launch_obstacle_dynamics
 from wmas.core.collisions import launch_collision_forces
-from wmas.core.config import WorldConfig
+from wmas.core.config import Obstacles, WorldConfig
 from wmas.core.neighbors import NeighborGrid
 from wmas.core.state import VEC2, WorldState
 from wmas.dynamics.base import (
@@ -104,37 +104,42 @@ class Stepper:
             self._bounds_min = vec2(0.0, 0.0)
             self._bounds_max = vec2(0.0, 0.0)
 
-        # Obstacles (static per episode); dummies keep kernel signatures fixed.
+        # Obstacle arrays. Public: the kernel wrappers in wmas.core.bodies and the
+        # scenario/render layers read them directly. Written only by
+        # :meth:`set_obstacles`; dummies here keep the kernel signatures fixed at
+        # zero obstacles.
+        #
         # Pose is per-env — obs_pos [n_envs, n_obs] and obs_angle [n_envs, n_obs]
         # — so a body that moves and *rotates* independently in each env (a
         # scenario-layer movable body, e.g. PushTScenario's T) can be installed
         # as obstacles. Extent attributes (type/radius/half) are env-independent
         # [n_obs]. Default shape is a circle (type 0).
         self.n_obstacles = 0
-        self._obs_pos = wp.zeros((1, 1), dtype=vec2, device=device)
-        self._obs_radius = wp.zeros(1, dtype=dtype, device=device)
-        self._obs_type = wp.zeros(1, dtype=wp.int32, device=device)
-        self._obs_angle = wp.zeros((1, 1), dtype=dtype, device=device)
-        self._obs_half = wp.zeros(1, dtype=vec2, device=device)
+        self.obs_pos = wp.zeros((1, 1), dtype=vec2, device=device)
+        self.obs_radius = wp.zeros(1, dtype=dtype, device=device)
+        self.obs_type = wp.zeros(1, dtype=wp.int32, device=device)
+        self.obs_angle = wp.zeros((1, 1), dtype=dtype, device=device)
+        self.obs_half = wp.zeros(1, dtype=vec2, device=device)
         # Obstacle velocities, so contact damping can use the closing velocity even for
         # a moving body installed as obstacles. Zero for a genuinely static obstacle.
-        self._obs_vel = wp.zeros((1, 1), dtype=vec2, device=device)
-        self._obs_ang_vel = wp.zeros((1, 1), dtype=dtype, device=device)
+        self.obs_vel = wp.zeros((1, 1), dtype=vec2, device=device)
+        self.obs_ang_vel = wp.zeros((1, 1), dtype=dtype, device=device)
         # IMMOVABLE (0) vs MOVABLE (1) per obstacle; a movable body carries mass/inertia
         # and is integrated per substep from the reaction of the agent contacts.
-        self._obs_kind = wp.zeros(1, dtype=wp.int32, device=device)
-        self._obs_mass = wp.ones(1, dtype=dtype, device=device)
-        self._obs_inertia = wp.ones(1, dtype=dtype, device=device)
-        # Compound bodies: several shapes rigidly sharing one pose. _obs_body[s] names the
-        # body a shape belongs to (its lowest-index shape) and _obs_body_off[s] places the
-        # shape in the body frame; the body's own state lives in _body_* at the root index.
-        self._obs_body = wp.zeros(1, dtype=wp.int32, device=device)
-        self._obs_body_off = wp.zeros(1, dtype=vec2, device=device)
-        self._body_pos = wp.zeros((1, 1), dtype=vec2, device=device)
-        self._body_angle = wp.zeros((1, 1), dtype=dtype, device=device)
-        self._body_vel = wp.zeros((1, 1), dtype=vec2, device=device)
-        self._body_ang_vel = wp.zeros((1, 1), dtype=dtype, device=device)
-        self._any_movable = False
+        self.obs_kind = wp.zeros(1, dtype=wp.int32, device=device)
+        # ---- the body group. Read only when ``any_movable``; see set_obstacles.
+        self.obs_mass = wp.ones(1, dtype=dtype, device=device)
+        self.obs_inertia = wp.ones(1, dtype=dtype, device=device)
+        # Compound bodies: several shapes rigidly sharing one pose. obs_body[s] names the
+        # body a shape belongs to (its lowest-index shape) and obs_body_off[s] places the
+        # shape in the body frame; the body's own state lives in body_* at the root index.
+        self.obs_body = wp.zeros(1, dtype=wp.int32, device=device)
+        self.obs_body_off = wp.zeros(1, dtype=vec2, device=device)
+        self.body_pos = wp.zeros((1, 1), dtype=vec2, device=device)
+        self.body_angle = wp.zeros((1, 1), dtype=dtype, device=device)
+        self.body_vel = wp.zeros((1, 1), dtype=vec2, device=device)
+        self.body_ang_vel = wp.zeros((1, 1), dtype=dtype, device=device)
+        self.any_movable = False
 
         self._zero_forces: dict[int, wp.array] = {}
         self._zero_nbr: dict[int, tuple[wp.array, wp.array]] = {}
@@ -170,240 +175,149 @@ class Stepper:
 
     # ------------------------------------------------------------------ setup
 
-    def set_obstacles(
-        self,
-        pos: torch.Tensor,
-        radius: torch.Tensor,
-        shape: torch.Tensor | None = None,
-        angle: torch.Tensor | None = None,
-        half_extents: torch.Tensor | None = None,
-        vel: torch.Tensor | None = None,
-        ang_vel: torch.Tensor | None = None,
-        kind: torch.Tensor | None = None,
-        mass: torch.Tensor | None = None,
-        inertia: torch.Tensor | None = None,
-        body: torch.Tensor | None = None,
-        body_offset: torch.Tensor | None = None,
-    ) -> None:
-        """Install static obstacles.
+    def set_obstacles(self, obstacles: Obstacles) -> None:
+        """Install (or refresh) the obstacle set described by ``obstacles``.
 
-        Args:
-            pos: ``[n_envs, n_obstacles, 2]`` tensor of centers (per-env).
-            radius: ``[n_obstacles]`` radii. Circle radius, capsule radius; a box
-                ignores it (its surface is the box boundary).
-            shape: ``[n_obstacles]`` int tensor of :class:`ObstacleShape` tags
-                (0=circle, 1=box, 2=segment). Defaults to all circles.
-            angle: orientation (rad) for box/segment, either ``[n_obstacles]``
-                (shared by every env) or ``[n_envs, n_obstacles]`` (per-env, for
-                a body that rotates independently in each env). Stored per-env
-                either way. Default 0.
-            half_extents: ``[n_obstacles, 2]`` box half-extents; for a segment
-                the ``[:, 0]`` column is the half-length. Default 0.
-            vel: ``[n_envs, n_obstacles, 2]`` obstacle linear velocities, and
-                ``ang_vel`` ``[n_envs, n_obstacles]`` angular velocities. Contact
-                damping uses the closing velocity, so a *moving* obstacle (a
-                scenario-layer movable body installed as obstacles) must pass these or
-                its contacts are damped against the agent's absolute velocity instead.
-                Default 0, i.e. a static obstacle.
-            kind: ``[n_obstacles]`` int tensor of :class:`ObstacleKind` tags
-                (0=immovable, 1=movable). Default all immovable. A MOVABLE obstacle is
-                integrated inside the substep loop from the reaction of the agent
-                contacts, so ``pos``/``angle``/``vel``/``ang_vel`` are treated as its
-                initial state rather than a fixed pose.
-            mass: ``[n_obstacles]`` masses and ``inertia`` ``[n_obstacles]`` moments of
-                inertia about each obstacle's centre; used only by movable obstacles.
-                Default 1.
-            body: ``[n_obstacles]`` int tensor grouping shapes into *compound* rigid
-                bodies — several shapes that share one pose, e.g. Push-T's T as a crossbar
-                plus a stem. Each entry names the body's root (its lowest-index shape);
-                the default (``None``) gives every shape its own body. ``mass``/``inertia``
-                are read from the root and are about the body origin.
-            body_offset: ``[n_obstacles, 2]`` placement of each shape in its body frame,
-                relative to the body origin. Default 0. ``pos``/``angle`` are still the
-                shapes' *world* poses; the body origin is derived from the root.
+        The spec is normalized once (:meth:`~wmas.core.config.Obstacles.resolve`) and then
+        written by a single install path in one of two regimes:
+
+        * **in place** — the obstacle count *and* the batch size are unchanged. Every array
+          is refreshed with a device-to-device copy or a fill: no allocation, no cached
+          buffer invalidation and no ``mutation_version`` bump, so a scenario that
+          re-samples obstacle poses every reset does not force a CUDA-graph recapture.
+        * **reallocate** — first install, or the obstacle count or ``n_envs`` changed. Fresh
+          arrays, cached step buffers dropped (``_needs_forces`` may have flipped, and a
+          shape change invalidates any captured graph), ``mutation_version`` bumped.
+
+        Both regimes give the *same* result: an absent field always means the documented
+        default (see :class:`~wmas.core.config.Obstacles`), never "keep the previous
+        value". To keep previous values, retain the :class:`~wmas.core.config.Obstacles`
+        and re-install it — which is what :class:`~wmas.core.world.World` does.
+
+        One asymmetry is deliberate: the **body group** (``obs_mass``/``obs_inertia``/
+        ``obs_body``/``obs_body_off`` and the derived ``body_*`` state) is refreshed in
+        place only when at least one obstacle is ``MOVABLE``. Nothing reads it otherwise,
+        and deriving it costs torch temporaries and a host read.
+
+        **Capture safety.** The in-place regime is allocation-free and host-read-free
+        exactly when the spec carries no movable obstacles (``kind`` is ``None`` or all
+        immovable) and its ``angle`` is already 2-D or absent — the regime
+        :class:`~wmas.scenarios.transport.TransportScenario` re-installs from *inside* the
+        captured whole-step graph. An install with movable bodies derives the body group in
+        torch and reads ``any_movable`` back to the host, so it must stay outside a
+        capture. Pinned by ``tests/unit/test_obstacles.py``.
         """
+        obs = obstacles.resolve(self.device, self.torch_dtype)
+        n_envs, n_obs = obs.n_envs, obs.n_obstacles
+        # n_envs is part of the test: wp.copy sizes itself from the *source*, so a smaller
+        # batch would silently copy into the head of the array and leave a stale tail.
+        in_place = (
+            n_obs > 0 and n_obs == self.n_obstacles and tuple(self.obs_pos.shape) == (n_envs, n_obs)
+        )
+        self._install(obs, in_place=in_place)
+
+    def _install(self, obs: Obstacles, *, in_place: bool) -> None:
+        """Write a resolved obstacle set into the Warp arrays (the single install path)."""
         vec2 = VEC2[self.dtype]
-        n_envs, n_obs = pos.shape[0], pos.shape[1]
-        dev = self.device
+        dtype, dev = self.dtype, self.device
+        n_envs, n_obs = obs.n_envs, obs.n_obstacles
 
-        def body_arrays():
-            """(body ids, offsets, body pos, body angle) as contiguous torch tensors.
+        def write(name, src, wp_dtype, shape, fill=0.0) -> None:
+            """Install one field: ``src`` if given, else ``fill`` everywhere.
 
-            The body origin is derived from its root shape: ``root_pos - R(angle) @ off``,
-            so a caller only ever has to describe where the *shapes* are."""
-            ids = (
-                torch.arange(n_obs, device=dev, dtype=torch.int32)
-                if body is None
-                else body.detach().to(torch.int32).contiguous()
-            )
-            off = (
-                torch.zeros(n_obs, 2, device=dev, dtype=self.torch_dtype)
-                if body_offset is None
-                else body_offset.detach().contiguous()
-            )
-            root = ids.long()
-            r_pos = pos.detach()[:, root]  # [n_envs, n_obs, 2] root world position
-            if angle is None:
-                r_ang = torch.zeros(n_envs, n_obs, device=dev, dtype=self.torch_dtype)
-            else:
-                a = angle.detach()
-                r_ang = (a.unsqueeze(0).expand(n_envs, -1) if a.dim() == 1 else a)[:, root]
-            r_off = off[root]  # [n_obs, 2]
-            ca, sa = torch.cos(r_ang), torch.sin(r_ang)
-            wx = ca * r_off[:, 0] - sa * r_off[:, 1]
-            wy = sa * r_off[:, 0] + ca * r_off[:, 1]
-            b_pos = r_pos - torch.stack([wx, wy], dim=-1)
-            return ids, off, b_pos.contiguous(), r_ang.contiguous()
-
-        def angle_2d() -> torch.Tensor:
-            """``angle`` as a contiguous per-env ``[n_envs, n_obs]`` tensor."""
-            a = angle.detach()
-            if a.dim() == 1:
-                a = a.unsqueeze(0).expand(n_envs, -1)
-            return a.contiguous()
-
-        # In-place refresh when the obstacle *count* is unchanged: no realloc, no
-        # buffer clear, no version bump — so a scenario that re-samples obstacle
-        # positions every reset (NavigationScenario) does not force a graph
-        # recapture in steady state. Only a count change reallocates.
-        same_count = n_obs == self.n_obstacles and self._obs_pos.shape[1] == n_obs and n_obs > 0
-        if same_count:
-            wp.copy(self._obs_pos, wp.from_torch(pos.detach().contiguous(), dtype=vec2))
-            wp.copy(self._obs_radius, wp.from_torch(radius.detach().contiguous(), dtype=self.dtype))
-            if shape is None:
-                self._obs_type.zero_()
-            else:
-                wp.copy(
-                    self._obs_type,
-                    wp.from_torch(shape.detach().to(torch.int32).contiguous(), dtype=wp.int32),
-                )
-            if angle is None:
-                self._obs_angle.zero_()
-            else:
-                wp.copy(self._obs_angle, wp.from_torch(angle_2d(), dtype=self.dtype))
-            if half_extents is None:
-                self._obs_half.zero_()
-            else:
-                wp.copy(
-                    self._obs_half, wp.from_torch(half_extents.detach().contiguous(), dtype=vec2)
-                )
-            if vel is None:
-                self._obs_vel.zero_()
-            else:
-                wp.copy(self._obs_vel, wp.from_torch(vel.detach().contiguous(), dtype=vec2))
-            if ang_vel is None:
-                self._obs_ang_vel.zero_()
-            else:
-                wp.copy(
-                    self._obs_ang_vel,
-                    wp.from_torch(ang_vel.detach().contiguous(), dtype=self.dtype),
-                )
-            if kind is None:
-                self._obs_kind.zero_()
-                self._any_movable = False
-            else:
-                wp.copy(
-                    self._obs_kind,
-                    wp.from_torch(kind.detach().to(torch.int32).contiguous(), dtype=wp.int32),
-                )
-                self._any_movable = bool((kind != 0).any().item())
-            if mass is not None:
-                wp.copy(self._obs_mass, wp.from_torch(mass.detach().contiguous(), dtype=self.dtype))
-            if inertia is not None:
-                wp.copy(
-                    self._obs_inertia,
-                    wp.from_torch(inertia.detach().contiguous(), dtype=self.dtype),
-                )
-            if kind is None and not self._any_movable:
-                # No bodies involved: skip the body bookkeeping entirely. It allocates
-                # torch temporaries and reads a flag off the device, neither of which is
-                # legal inside a CUDA graph capture — and transport re-installs its
-                # obstacles from *inside* the captured whole-step graph.
+            In place this is a ``wp.copy`` / memset / fill — no allocation, so it is legal
+            inside a graph capture. On a reallocation it clones into a fresh array; ``src``
+            is already on ``self.device``, which is what keeps a CPU input to a CUDA
+            stepper from producing a mixed-device obstacle set.
+            """
+            if in_place:
+                arr = getattr(self, name)
+                if src is None:
+                    if fill == 0.0:
+                        arr.zero_()
+                    else:
+                        arr.fill_(fill)
+                else:
+                    wp.copy(arr, wp.from_torch(src, dtype=wp_dtype))
                 return
-            ids, off, b_pos, b_ang = body_arrays()
-            wp.copy(self._obs_body, wp.from_torch(ids, dtype=wp.int32))
-            wp.copy(self._obs_body_off, wp.from_torch(off, dtype=vec2))
-            # Re-seed the body state from what was just installed, so a caller can write a
-            # body's pose (a reset) or its whole state (a scenario that integrated the body
-            # itself on a grad step) and have the engine continue from there.
-            wp.copy(self._body_pos, wp.from_torch(b_pos, dtype=vec2))
-            wp.copy(self._body_angle, wp.from_torch(b_ang, dtype=self.dtype))
-            if vel is None:
-                self._body_vel.zero_()
+            if src is not None:
+                arr = wp.clone(wp.from_torch(src, dtype=wp_dtype))
+            elif fill == 0.0:
+                arr = wp.zeros(shape, dtype=wp_dtype, device=dev)
             else:
-                root = ids.long()
-                wp.copy(
-                    self._body_vel,
-                    wp.from_torch(vel.detach()[:, root].contiguous(), dtype=vec2),
-                )
-            if ang_vel is None:
-                self._body_ang_vel.zero_()
-            else:
-                root = ids.long()
-                wp.copy(
-                    self._body_ang_vel,
-                    wp.from_torch(ang_vel.detach()[:, root].contiguous(), dtype=self.dtype),
-                )
-            return
+                arr = wp.full(shape, wp_dtype(fill), dtype=wp_dtype, device=dev)
+            setattr(self, name, arr)
 
-        self.n_obstacles = n_obs
-        self._obs_pos = wp.clone(wp.from_torch(pos.detach().contiguous(), dtype=vec2))
-        self._obs_radius = wp.clone(wp.from_torch(radius.detach().contiguous(), dtype=self.dtype))
+        write("obs_pos", obs.pos, vec2, (n_envs, n_obs))
+        write("obs_radius", obs.radius, dtype, n_obs)
+        write("obs_type", obs.shape, wp.int32, n_obs)
+        write("obs_angle", obs.angle, dtype, (n_envs, n_obs))
+        write("obs_half", obs.half_extents, vec2, n_obs)
+        write("obs_vel", obs.vel, vec2, (n_envs, n_obs))
+        write("obs_ang_vel", obs.ang_vel, dtype, (n_envs, n_obs))
+        write("obs_kind", obs.kind, wp.int32, n_obs)
+        self.any_movable = obs.any_movable
+        if not in_place:
+            self.n_obstacles = n_obs
 
-        if shape is None:
-            self._obs_type = wp.zeros(n_obs, dtype=wp.int32, device=dev)
-        else:
-            self._obs_type = wp.clone(
-                wp.from_torch(shape.detach().to(torch.int32).contiguous(), dtype=wp.int32)
-            )
-        if angle is None:
-            self._obs_angle = wp.zeros((n_envs, n_obs), dtype=self.dtype, device=dev)
-        else:
-            self._obs_angle = wp.clone(wp.from_torch(angle_2d(), dtype=self.dtype))
-        if half_extents is None:
-            self._obs_half = wp.zeros(n_obs, dtype=vec2, device=dev)
-        else:
-            self._obs_half = wp.clone(wp.from_torch(half_extents.detach().contiguous(), dtype=vec2))
-        if vel is None:
-            self._obs_vel = wp.zeros((n_envs, n_obs), dtype=vec2, device=dev)
-        else:
-            self._obs_vel = wp.clone(wp.from_torch(vel.detach().contiguous(), dtype=vec2))
-        if ang_vel is None:
-            self._obs_ang_vel = wp.zeros((n_envs, n_obs), dtype=self.dtype, device=dev)
-        else:
-            self._obs_ang_vel = wp.clone(
-                wp.from_torch(ang_vel.detach().contiguous(), dtype=self.dtype)
-            )
-        if kind is None:
-            self._obs_kind = wp.zeros(n_obs, dtype=wp.int32, device=dev)
-            self._any_movable = False
-        else:
-            self._obs_kind = wp.clone(
-                wp.from_torch(kind.detach().to(torch.int32).contiguous(), dtype=wp.int32)
-            )
-            self._any_movable = bool((kind != 0).any().item())
-        if mass is None:
-            self._obs_mass = wp.full(n_obs, self.dtype(1.0), dtype=self.dtype, device=dev)
-        else:
-            self._obs_mass = wp.clone(wp.from_torch(mass.detach().contiguous(), dtype=self.dtype))
-        if inertia is None:
-            self._obs_inertia = wp.full(n_obs, self.dtype(1.0), dtype=self.dtype, device=dev)
-        else:
-            self._obs_inertia = wp.clone(
-                wp.from_torch(inertia.detach().contiguous(), dtype=self.dtype)
-            )
-        ids, off, b_pos, b_ang = body_arrays()
-        self._obs_body = wp.clone(wp.from_torch(ids, dtype=wp.int32))
-        self._obs_body_off = wp.clone(wp.from_torch(off, dtype=vec2))
-        self._body_pos = wp.clone(wp.from_torch(b_pos, dtype=vec2))
-        self._body_angle = wp.clone(wp.from_torch(b_ang, dtype=self.dtype))
-        self._body_vel = wp.zeros((n_envs, n_obs), dtype=vec2, device=dev)
-        self._body_ang_vel = wp.zeros((n_envs, n_obs), dtype=self.dtype, device=dev)
-        # _needs_forces may have flipped: cached buffers could alias the shared
-        # zero-force buffer, which the force pass would then overwrite. A shape
-        # change also invalidates any captured CUDA graph.
-        self._cached_buffers.clear()
-        self.mutation_version += 1
+        if self.any_movable or not in_place:
+            write("obs_mass", obs.mass, dtype, n_obs, fill=1.0)
+            write("obs_inertia", obs.inertia, dtype, n_obs, fill=1.0)
+            ids, off, b_pos, b_ang, b_vel, b_ang_vel = self._body_seed(obs)
+            write("obs_body", ids, wp.int32, n_obs)
+            write("obs_body_off", off, vec2, n_obs)
+            write("body_pos", b_pos, vec2, (n_envs, n_obs))
+            write("body_angle", b_ang, dtype, (n_envs, n_obs))
+            write("body_vel", b_vel, vec2, (n_envs, n_obs))
+            write("body_ang_vel", b_ang_vel, dtype, (n_envs, n_obs))
+
+        if not in_place:
+            self._cached_buffers.clear()
+            self.mutation_version += 1
+
+    def _body_seed(self, obs: Obstacles) -> tuple[torch.Tensor, ...]:
+        """``(ids, offsets, body pos, angle, vel, ang_vel)`` as contiguous torch tensors.
+
+        The body origin is derived from its root shape (``root_pos - R(angle) @ off``) and
+        its velocity is the root shape's, so a caller only ever has to describe where the
+        *shapes* are — writing the shapes' world poses hands over the whole body state,
+        which is how a reset (or a scenario that integrated the body itself on a grad step)
+        makes the engine continue from there.
+
+        All torch, so it allocates: never call this from inside a graph capture.
+        """
+        dev, td = self.device, self.torch_dtype
+        n_envs, n_obs = obs.n_envs, obs.n_obstacles
+        ids = (
+            torch.arange(n_obs, device=dev, dtype=torch.int32) if obs.body is None else obs.body
+        )
+        off = (
+            torch.zeros(n_obs, 2, device=dev, dtype=td)
+            if obs.body_offset is None
+            else obs.body_offset
+        )
+        root = ids.long()
+        r_ang = (
+            torch.zeros(n_envs, n_obs, device=dev, dtype=td)
+            if obs.angle is None
+            else obs.angle[:, root].contiguous()
+        )
+        r_off = off[root]  # [n_obs, 2]
+        ca, sa = torch.cos(r_ang), torch.sin(r_ang)
+        wx = ca * r_off[:, 0] - sa * r_off[:, 1]
+        wy = sa * r_off[:, 0] + ca * r_off[:, 1]
+        b_pos = (obs.pos[:, root] - torch.stack([wx, wy], dim=-1)).contiguous()
+        b_vel = (
+            torch.zeros(n_envs, n_obs, 2, device=dev, dtype=td)
+            if obs.vel is None
+            else obs.vel[:, root].contiguous()
+        )
+        b_ang_vel = (
+            torch.zeros(n_envs, n_obs, device=dev, dtype=td)
+            if obs.ang_vel is None
+            else obs.ang_vel[:, root].contiguous()
+        )
+        return ids, off, b_pos, r_ang, b_vel, b_ang_vel
 
     def set_agent_params_per_env(self, floats: torch.Tensor | np.ndarray) -> None:
         """Install a per-env parameter override for domain randomization.
@@ -615,6 +529,7 @@ class Stepper:
         actions: wp.array,
         state_out: WorldState,
         buffers: StepBuffers,
+        *,
         reuse_neighbors: bool = False,
         skip_drone: bool = False,
     ) -> None:
@@ -664,26 +579,26 @@ class Stepper:
                     self.params,
                     idx,
                     cnt,
-                    self._obs_pos,
-                    self._obs_radius,
-                    self._obs_type,
-                    self._obs_angle,
-                    self._obs_half,
-                    self._obs_vel,
-                    self._obs_ang_vel,
-                    self.n_obstacles,
-                    world.collision_k,
-                    world.collision_c,
-                    world.collision_margin,
-                    self.sub_dt,
-                    world.contact_max_overlap,
-                    self._soft_walls,
-                    self._bounds_min,
-                    self._bounds_max,
+                    self.obs_pos,
+                    self.obs_radius,
+                    self.obs_type,
+                    self.obs_angle,
+                    self.obs_half,
+                    self.obs_vel,
+                    self.obs_ang_vel,
                     forces,
-                    self.dtype,
+                    n_obstacles=self.n_obstacles,
+                    k=world.collision_k,
+                    c=world.collision_c,
+                    margin=world.collision_margin,
+                    sub_dt=self.sub_dt,
+                    max_overlap=world.contact_max_overlap,
+                    soft_walls=self._soft_walls,
+                    bounds_min=self._bounds_min,
+                    bounds_max=self._bounds_max,
+                    dtype=self.dtype,
                 )
-                if self._any_movable and not buffers.taped:
+                if self.any_movable and not buffers.taped:
                     # Same state the force pass just used, so action and reaction match;
                     # advancing here (not once per env step) keeps the pose an agent
                     # collides against at most one substep old.
@@ -697,18 +612,18 @@ class Stepper:
                         st.vel,
                         self.params.floats,
                         self,
-                        self.n_agents,
-                        world.collision_k,
-                        world.collision_c,
-                        world.collision_margin,
-                        self.sub_dt,
-                        world.contact_max_overlap,
-                        world.obstacle_linear_damping,
-                        world.obstacle_angular_damping,
-                        self._bounds_min,
-                        self._bounds_max,
-                        world.bounds is not None,
-                        self.dtype,
+                        n_agents=self.n_agents,
+                        k=world.collision_k,
+                        c=world.collision_c,
+                        margin=world.collision_margin,
+                        sub_dt=self.sub_dt,
+                        max_overlap=world.contact_max_overlap,
+                        lin_damping=world.obstacle_linear_damping,
+                        ang_damping=world.obstacle_angular_damping,
+                        bounds_min=self._bounds_min,
+                        bounds_max=self._bounds_max,
+                        clamp_bounds=world.bounds is not None,
+                        dtype=self.dtype,
                     )
             launch_integrate(
                 st,

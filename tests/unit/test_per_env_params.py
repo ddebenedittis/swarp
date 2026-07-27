@@ -13,7 +13,7 @@ import torch
 import warp as wp
 from conftest import DEVICES, _core, _map5, holo_cfgs
 
-from wmas.core.config import WorldConfig
+from wmas.core.config import Obstacles, WorldConfig
 from wmas.core.stepper import Stepper
 from wmas.dynamics.base import (
     NUM_PARAMS,
@@ -61,8 +61,10 @@ def test_per_env_mass_divergence_analytic(device):
     cfgs = holo_cfgs(1, radius=0.1)
     stepper = Stepper(cfgs, dt=dt, device=device, dtype=wp.float64, world=world)
     stepper.set_obstacles(
-        pos=torch.tensor([[[0.3, 0.0]], [[0.3, 0.0]]], dtype=torch.float64, device=device),
-        radius=torch.tensor([0.15], dtype=torch.float64, device=device),
+        Obstacles(
+            pos=torch.tensor([[[0.3, 0.0]], [[0.3, 0.0]]], dtype=torch.float64, device=device),
+            radius=torch.tensor([0.15], dtype=torch.float64, device=device),
+        )
     )
     floats = per_env_float_template(cfgs, n_envs=2)
     floats[0, 0, P_MASS] = 1.0
@@ -136,8 +138,10 @@ def test_per_env_broadcast_matches_shared_bit_exact():
     per_env = Stepper(cfgs, dt=0.05, substeps=3, device="cpu", dtype=wp.float64, world=world)
     for s in (shared, per_env):
         s.set_obstacles(
-            pos=torch.tensor([[[0.4, 0.4]]] * 4, dtype=torch.float64),
-            radius=torch.tensor([0.12], dtype=torch.float64),
+            Obstacles(
+                pos=torch.tensor([[[0.4, 0.4]]] * 4, dtype=torch.float64),
+                radius=torch.tensor([0.12], dtype=torch.float64),
+            )
         )
     per_env.set_agent_params_per_env(torch.as_tensor(per_env_float_template(cfgs, n_envs=4)))
 

@@ -11,7 +11,7 @@ import torch
 import warp as wp
 from conftest import DEVICES, _core, _map5
 
-from wmas.core.config import ObstacleShape, WorldConfig
+from wmas.core.config import Obstacles, ObstacleShape, WorldConfig
 from wmas.core.stepper import Stepper
 from wmas.dynamics.base import AgentConfig, ControlMode, DynamicsModel
 from wmas.interop.autograd import TorchState, warp_step
@@ -55,11 +55,13 @@ def stepper_with_obstacle(
     world = WorldConfig(collision_k=K, collision_c=0.0, collision_margin=margin)
     st = Stepper(holo(n_agents, agent_radius), dt=DT, device=device, dtype=wp.float64, world=world)
     st.set_obstacles(
-        pos=torch.tensor([center], dtype=torch.float64, device=device).view(1, -1, 2),
-        radius=torch.tensor([radius], dtype=torch.float64, device=device),
-        shape=torch.tensor([int(shape)], dtype=torch.int32, device=device),
-        angle=torch.tensor([angle], dtype=torch.float64, device=device),
-        half_extents=torch.tensor([half], dtype=torch.float64, device=device),
+        Obstacles(
+            pos=torch.tensor([center], dtype=torch.float64, device=device).view(1, -1, 2),
+            radius=torch.tensor([radius], dtype=torch.float64, device=device),
+            shape=torch.tensor([int(shape)], dtype=torch.int32, device=device),
+            angle=torch.tensor([angle], dtype=torch.float64, device=device),
+            half_extents=torch.tensor([half], dtype=torch.float64, device=device),
+        )
     )
     return st
 
@@ -184,11 +186,13 @@ def test_per_env_box_angle(device):
     world = WorldConfig(collision_k=K, collision_c=0.0, collision_margin=0.02)
     st = Stepper(holo(1, 0.1), dt=DT, device=device, dtype=wp.float64, world=world)
     st.set_obstacles(
-        pos=torch.tensor([[center], [center]], dtype=torch.float64, device=device),
-        radius=torch.zeros(1, dtype=torch.float64, device=device),
-        shape=torch.tensor([int(ObstacleShape.BOX)], dtype=torch.int32, device=device),
-        angle=torch.tensor([[angles[0]], [angles[1]]], dtype=torch.float64, device=device),
-        half_extents=torch.tensor([half], dtype=torch.float64, device=device),
+        Obstacles(
+            pos=torch.tensor([[center], [center]], dtype=torch.float64, device=device),
+            radius=torch.zeros(1, dtype=torch.float64, device=device),  # a box ignores radius
+            shape=torch.tensor([int(ObstacleShape.BOX)], dtype=torch.int32, device=device),
+            angle=torch.tensor([[angles[0]], [angles[1]]], dtype=torch.float64, device=device),
+            half_extents=torch.tensor([half], dtype=torch.float64, device=device),
+        )
     )
     state = _map5(
         TorchState(
@@ -218,11 +222,13 @@ def test_shared_angle_broadcasts_across_envs(device):
     world = WorldConfig(collision_k=K, collision_c=0.0, collision_margin=0.02)
     st = Stepper(holo(1, 0.1), dt=DT, device=device, dtype=wp.float64, world=world)
     st.set_obstacles(
-        pos=torch.tensor([[center], [center]], dtype=torch.float64, device=device),
-        radius=torch.zeros(1, dtype=torch.float64, device=device),
-        shape=torch.tensor([int(ObstacleShape.BOX)], dtype=torch.int32, device=device),
-        angle=torch.tensor([angle], dtype=torch.float64, device=device),  # 1D
-        half_extents=torch.tensor([half], dtype=torch.float64, device=device),
+        Obstacles(
+            pos=torch.tensor([[center], [center]], dtype=torch.float64, device=device),
+            radius=torch.zeros(1, dtype=torch.float64, device=device),
+            shape=torch.tensor([int(ObstacleShape.BOX)], dtype=torch.int32, device=device),
+            angle=torch.tensor([angle], dtype=torch.float64, device=device),  # 1D
+            half_extents=torch.tensor([half], dtype=torch.float64, device=device),
+        )
     )
     state = _map5(
         TorchState(
@@ -247,11 +253,15 @@ def test_gradcheck_box_and_segment():
     world = WorldConfig(collision_k=10.0, collision_c=1.0, collision_margin=0.02)
     st = Stepper(holo(1, 0.1), dt=0.1, substeps=2, device="cpu", dtype=wp.float64, world=world)
     st.set_obstacles(
-        pos=torch.tensor([[[0.22, 0.0], [0.0, -0.2]]], dtype=torch.float64),
-        radius=torch.tensor([0.0, 0.05], dtype=torch.float64),
-        shape=torch.tensor([int(ObstacleShape.BOX), int(ObstacleShape.SEGMENT)], dtype=torch.int32),
-        angle=torch.tensor([0.0, 0.0], dtype=torch.float64),
-        half_extents=torch.tensor([[0.1, 0.1], [0.2, 0.0]], dtype=torch.float64),
+        Obstacles(
+            pos=torch.tensor([[[0.22, 0.0], [0.0, -0.2]]], dtype=torch.float64),
+            radius=torch.tensor([0.0, 0.05], dtype=torch.float64),
+            shape=torch.tensor(
+                [int(ObstacleShape.BOX), int(ObstacleShape.SEGMENT)], dtype=torch.int32
+            ),
+            angle=torch.tensor([0.0, 0.0], dtype=torch.float64),
+            half_extents=torch.tensor([[0.1, 0.1], [0.2, 0.0]], dtype=torch.float64),
+        )
     )
     state = _map5(make_state([[0.05, -0.05]]), lambda t: t.requires_grad_(True))
     actions = (

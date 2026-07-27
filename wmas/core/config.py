@@ -1,15 +1,21 @@
-"""World-level configuration."""
+"""World-level configuration and the obstacle-set description."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import IntEnum
+
+import torch
 
 from wmas.dynamics.base import Integrator
 
 
 class ObstacleShape(IntEnum):
-    """Obstacle geometry tags (must match wmas.core.collisions SHAPE_*)."""
+    """Obstacle geometry tags.
+
+    :mod:`wmas.core.collisions` derives its kernel-side ``SHAPE_*`` constants from these
+    members, so the two cannot drift.
+    """
 
     CIRCLE = 0
     BOX = 1
@@ -28,6 +34,148 @@ class ObstacleKind(IntEnum):
 
     IMMOVABLE = 0
     MOVABLE = 1
+
+
+@dataclass
+class Obstacles:
+    """One batched obstacle set — the complete input to ``set_obstacles``.
+
+    ``pos`` and ``radius`` are required and come first; every other field is optional and
+    ``None`` means **the documented default**, never "keep whatever was installed before".
+    A field is resolved exactly once, by :meth:`resolve`: detached, made contiguous, moved
+    to the target device/precision, and (for ``angle``) broadcast to its per-env layout.
+
+    Fields (``E`` = ``n_envs``, ``N`` = ``n_obstacles``):
+
+    ``pos`` ``[E, N, 2]``
+        Shape centres, per env.
+    ``radius`` ``[N]``
+        Circle radius / capsule radius. A ``BOX`` **ignores** it: its surface is its
+        boundary, so ``torch.zeros(N)`` is the idiomatic value there.
+    ``shape`` ``[N]`` int, default ``CIRCLE``
+        :class:`ObstacleShape` tag per obstacle.
+    ``angle`` ``[N]`` or ``[E, N]``, default 0
+        Orientation (rad) of a box/segment. A 1-D tensor is shared by every env; a 2-D one
+        lets a body rotate independently per env. Stored per-env either way.
+    ``half_extents`` ``[N, 2]``, default 0
+        Box half-extents; for a segment ``[:, 0]`` is the half-length.
+    ``vel`` ``[E, N, 2]`` / ``ang_vel`` ``[E, N]``, default 0
+        The obstacles' own velocities. Contact damping uses the *closing* velocity, so a
+        moving obstacle that omits these is damped against the agent's absolute velocity.
+        For a movable obstacle they are its initial velocity.
+    ``kind`` ``[N]`` int, default ``IMMOVABLE``
+        :class:`ObstacleKind` tag. A ``MOVABLE`` obstacle is integrated inside the substep
+        loop from the reaction of the agent contacts, so ``pos``/``angle``/``vel``/
+        ``ang_vel`` are its *initial state* rather than a fixed pose.
+    ``mass`` / ``inertia`` ``[N]``, default 1.0
+        Read only for movable obstacles; taken from the body root and about the body origin.
+    ``body`` ``[N]`` int, default "each shape its own body"
+        Groups shapes into *compound* rigid bodies sharing one pose (Push-T's T is a
+        crossbar plus a stem). Each entry names the body's root, its lowest-index shape.
+    ``body_offset`` ``[N, 2]``, default 0
+        Placement of each shape in its body frame. ``pos``/``angle`` are still the shapes'
+        *world* poses; the body origin is derived back out from the root.
+
+    Treat an instance as immutable apart from writing *into* its tensors: :meth:`resolve`
+    and :attr:`any_movable` memoize, and a reassigned field would leave them stale.
+    Mutating the tensors in place and re-installing is the supported partial update, and
+    what :class:`~wmas.core.world.World` does for the interactive obstacle drag.
+    """
+
+    pos: torch.Tensor
+    radius: torch.Tensor
+    shape: torch.Tensor | None = None
+    angle: torch.Tensor | None = None
+    half_extents: torch.Tensor | None = None
+    vel: torch.Tensor | None = None
+    ang_vel: torch.Tensor | None = None
+    kind: torch.Tensor | None = None
+    mass: torch.Tensor | None = None
+    inertia: torch.Tensor | None = None
+    body: torch.Tensor | None = None
+    body_offset: torch.Tensor | None = None
+    # (device, dtype) this instance is already normalized for; None until resolved.
+    _resolved_for: tuple | None = field(default=None, init=False, repr=False, compare=False)
+    # Memoized ``any_movable``: reading it costs a device->host sync, so it is computed at
+    # most once per instance and skipped entirely when ``kind`` is None.
+    _any_movable: bool | None = field(default=None, init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if self.pos.dim() != 3 or self.pos.shape[-1] != 2:
+            raise ValueError(f"obstacle pos must be [n_envs, n_obstacles, 2]; got {self.pos.shape}")
+        n = self.pos.shape[1]
+        if self.radius.dim() != 1 or self.radius.shape[0] != n:
+            raise ValueError(
+                f"obstacle radius must be [n_obstacles={n}]; got {tuple(self.radius.shape)}"
+            )
+        if self.angle is not None and self.angle.dim() not in (1, 2):
+            raise ValueError(
+                "obstacle angle must be [n_obstacles] or [n_envs, n_obstacles]; got "
+                f"{tuple(self.angle.shape)}"
+            )
+
+    @property
+    def n_envs(self) -> int:
+        return self.pos.shape[0]
+
+    @property
+    def n_obstacles(self) -> int:
+        return self.pos.shape[1]
+
+    @property
+    def any_movable(self) -> bool:
+        """Whether any obstacle is ``MOVABLE`` (i.e. whether the engine integrates a body).
+
+        Reading this **syncs the device to the host** the first time (a reduction over
+        ``kind`` plus an ``.item()``), so it is memoized, and returns ``False`` without
+        touching the device when ``kind`` is ``None``. That is what keeps a ``kind``-free
+        install legal inside a CUDA-graph capture.
+        """
+        if self._any_movable is None:
+            self._any_movable = self.kind is not None and bool((self.kind != 0).any().item())
+        return self._any_movable
+
+    def resolve(self, device, dtype: torch.dtype) -> Obstacles:
+        """This set, normalized for ``device``/``dtype``. Idempotent and memoized.
+
+        Every present field is detached, cast, moved to ``device`` and made contiguous, and
+        ``angle`` is broadcast to its per-env ``[n_envs, n_obstacles]`` layout; absent
+        fields stay ``None`` so the installer can fill their defaults without allocating.
+        Returns ``self`` when it is already normalized for this target, so re-installing a
+        retained set costs nothing and allocates nothing.
+        """
+        key = (str(device), dtype)
+        if self._resolved_for == key:
+            return self
+
+        def f(t):  # float field
+            return None if t is None else t.detach().to(device=device, dtype=dtype).contiguous()
+
+        def i(t):  # int32 field
+            if t is None:
+                return None
+            return t.detach().to(device=device, dtype=torch.int32).contiguous()
+
+        angle = f(self.angle)
+        if angle is not None and angle.dim() == 1:
+            angle = angle.unsqueeze(0).expand(self.n_envs, -1).contiguous()
+        out = Obstacles(
+            pos=f(self.pos),
+            radius=f(self.radius),
+            shape=i(self.shape),
+            angle=angle,
+            half_extents=f(self.half_extents),
+            vel=f(self.vel),
+            ang_vel=f(self.ang_vel),
+            kind=i(self.kind),
+            mass=f(self.mass),
+            inertia=f(self.inertia),
+            body=i(self.body),
+            body_offset=f(self.body_offset),
+        )
+        out._resolved_for = key
+        out._any_movable = self._any_movable
+        return out
 
 
 @dataclass

@@ -25,7 +25,7 @@ from typing import Any
 import torch
 import warp as wp
 
-from wmas.core.config import WorldConfig
+from wmas.core.config import Obstacles, WorldConfig
 from wmas.core.state import VEC2
 from wmas.core.world import World
 from wmas.dynamics.base import AgentConfig, ControlMode, DynamicsModel
@@ -159,16 +159,15 @@ class TransportScenario(Scenario):
             self.goal.copy_(goal)
         else:
             m3 = env_mask.view(-1, 1, 1)
-            m3p = env_mask.view(-1, 1, 1)
             w.state.pos.data.copy_(torch.where(m3, spawn, w.state.pos.data))
             w.state.vel.data.copy_(
                 torch.where(m3, torch.zeros_like(w.state.vel.data), w.state.vel.data)
             )
-            self.pkg_pos.copy_(torch.where(m3p, pkg, self.pkg_pos))
-            self.pkg_vel.copy_(torch.where(m3p, zeros_p2, self.pkg_vel))
+            self.pkg_pos.copy_(torch.where(m3, pkg, self.pkg_pos))
+            self.pkg_vel.copy_(torch.where(m3, zeros_p2, self.pkg_vel))
             self.pkg_theta.copy_(torch.where(env_mask.view(-1, 1), zeros_p, self.pkg_theta))
             self.pkg_ang_vel.copy_(torch.where(env_mask.view(-1, 1), zeros_p, self.pkg_ang_vel))
-            self.goal.copy_(torch.where(m3p, goal, self.goal))
+            self.goal.copy_(torch.where(m3, goal, self.goal))
 
         self._install_obstacles()
         if self._fused_active:
@@ -188,7 +187,11 @@ class TransportScenario(Scenario):
             self._refresh(reset_mask=env_mask, integrate=False)
 
     def _install_obstacles(self) -> None:
-        self.world.set_obstacles(self.pkg_pos.detach(), self._pkg_radius)
+        # Called from inside the captured whole-step graph (_graph_post_physics), so this
+        # must stay in the capture-safe regime of Stepper.set_obstacles: an unchanged
+        # obstacle count and a spec with no movable obstacles and no 1-D angle to broadcast.
+        # Constructing the spec is host-side bookkeeping only — no device allocation.
+        self.world.set_obstacles(Obstacles(self.pkg_pos.detach(), self._pkg_radius))
 
     # -------------------------------------------------------- package physics
 
@@ -283,7 +286,7 @@ class TransportScenario(Scenario):
         # torch view of it so warm-up leaves step 0's obstacles correct.
         return [
             self.pkg_pos, self.pkg_vel, self.pkg_theta, self.pkg_ang_vel,
-            self._prev_dist, wp.to_torch(self.world.stepper._obs_pos),
+            self._prev_dist, wp.to_torch(self.world.stepper.obs_pos),
         ]
 
     def _pre_graph_step(self) -> None:

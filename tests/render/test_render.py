@@ -296,17 +296,19 @@ def test_render_frame_trajectory_overlay_changes_pixels():
 
 def _shaped_obstacle_env(shape, angle=0.4, half=(0.25, 0.12), radius=0.05):
     """An env whose single obstacle is a BOX/SEGMENT rather than a circle."""
-    from wmas.core.config import ObstacleShape
+    from wmas.core.config import Obstacles, ObstacleShape
 
     env, scenario = make_env(n_agents=2, n_obstacles=1)
     world = env.world
     n_obs = 1
     env.world.set_obstacles(
-        torch.zeros(env.n_envs, n_obs, 2, dtype=env.dtype, device=env.device),
-        torch.full((n_obs,), radius, dtype=env.dtype, device=env.device),
-        shape=torch.full((n_obs,), int(shape), dtype=torch.int32, device=env.device),
-        angle=torch.full((n_obs,), angle, dtype=env.dtype, device=env.device),
-        half_extents=torch.tensor([half], dtype=env.dtype, device=env.device),
+        Obstacles(
+            torch.zeros(env.n_envs, n_obs, 2, dtype=env.dtype, device=env.device),
+            torch.full((n_obs,), radius, dtype=env.dtype, device=env.device),
+            shape=torch.full((n_obs,), int(shape), dtype=torch.int32, device=env.device),
+            angle=torch.full((n_obs,), angle, dtype=env.dtype, device=env.device),
+            half_extents=torch.tensor([half], dtype=env.dtype, device=env.device),
+        )
     )
     assert world.obstacle_shape is not None and ObstacleShape.CIRCLE == 0
     return env, scenario
