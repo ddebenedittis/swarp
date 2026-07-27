@@ -26,10 +26,9 @@ import torch
 import warp as wp
 
 from wmas.core.config import Obstacles, WorldConfig
-from wmas.core.state import VEC2
 from wmas.core.world import World
 from wmas.dynamics.base import AgentConfig, ControlMode, DynamicsModel
-from wmas.scenarios.base import Scenario
+from wmas.scenarios.fused import Buf, FusedPass, FusedScenario
 from wmas.scenarios.transport_kernels import (
     transport_body_kernel,
     transport_obs_kernel,
@@ -37,7 +36,7 @@ from wmas.scenarios.transport_kernels import (
 )
 
 
-class TransportScenario(Scenario):
+class TransportScenario(FusedScenario):
     def __init__(
         self,
         n_agents: int = 4,
@@ -102,19 +101,23 @@ class TransportScenario(Scenario):
         self.world = World(
             cfgs, cfg, n_envs=n_envs, device=device, dt=dt, substeps=substeps, dtype=dtype
         )
-        self._pkg_radius = torch.full(
-            (self.n_packages,), self.package_radius, device=device, dtype=dtype
-        )
-        self.pkg_pos: torch.Tensor | None = None  # [n_envs, n_packages, 2]
-        self.pkg_vel: torch.Tensor | None = None
-        self.pkg_theta: torch.Tensor | None = None  # [n_envs, n_packages]
-        self.pkg_ang_vel: torch.Tensor | None = None
-        self.goal: torch.Tensor | None = None  # [n_envs, n_packages, 2]
+        # Package state and goal: allocated here (n_envs is known) so the fused spec can
+        # adopt them, and written in place by every reset so their handles stay valid.
+        tt = {"device": device, "dtype": dtype}
+        self.pkg_pos = torch.zeros(n_envs, self.n_packages, 2, **tt)
+        self.pkg_vel = torch.zeros(n_envs, self.n_packages, 2, **tt)
+        self.pkg_theta = torch.zeros(n_envs, self.n_packages, **tt)  # [n_envs, n_packages]
+        self.pkg_ang_vel = torch.zeros(n_envs, self.n_packages, **tt)
+        self.goal = torch.zeros(n_envs, self.n_packages, 2, **tt)
+        # ONE retained obstacle spec over pkg_pos, re-installed rather than rebuilt: both
+        # ``resolve`` and ``any_movable`` memoize, so a re-install allocates nothing and
+        # costs no device->host sync. Built here so the single count-changing install
+        # happens before any graph capture. It aliases pkg_pos, so writing new package
+        # poses in place is all a "move the packages" update needs.
+        self._pkg_radius = torch.full((self.n_packages,), self.package_radius, **tt)
+        self._obstacles = Obstacles(self.pkg_pos.detach(), self._pkg_radius).resolve(device, dtype)
         self._prev_dist: torch.Tensor | None = None
         self._cache: dict[str, torch.Tensor] | None = None
-        self._fused_ready = False
-        # Bumped by _sync_fused_handles when a cached buffer handle is rebuilt.
-        self._handle_version = 0
         return self.world
 
     #: Transport ships fused Warp obs/reward + movable-body kernels.
@@ -136,23 +139,13 @@ class TransportScenario(Scenario):
         spawn = w.sample_uniform((n, self.n_agents, 2), -lim, lim)
         pkg = w.sample_uniform((n, self.n_packages, 2), -plim, plim)
         goal = w.sample_uniform((n, self.n_packages, 2), -plim, plim)
-        zeros_p2 = torch.zeros(n, self.n_packages, 2, device=w.device, dtype=w.dtype)
-        zeros_p = torch.zeros(n, self.n_packages, device=w.device, dtype=w.dtype)
-
-        if self.pkg_pos is None:
-            self.pkg_pos = zeros_p2.clone()
-            self.pkg_vel = zeros_p2.clone()
-            self.pkg_theta = zeros_p.clone()
-            self.pkg_ang_vel = zeros_p.clone()
-            self.goal = zeros_p2.clone()
 
         # In-place package updates (copy_) so the fused path's cached wp handles
         # and the whole-step graph stay valid across resets; the grad path's
-        # _refresh still reassigns them (fresh tensors for the tape), which
-        # _sync_fused_handles catches on the next no-grad step.
+        # _refresh still reassigns them (fresh tensors for the tape), which the
+        # framework's handle resync catches on the next no-grad step.
+        w.write_state(env_mask, pos=spawn, vel=0.0)
         if env_mask is None:
-            w.state.pos.data.copy_(spawn)
-            w.state.vel.data.zero_()
             self.pkg_pos.copy_(pkg)
             self.pkg_vel.zero_()
             self.pkg_theta.zero_()
@@ -160,177 +153,109 @@ class TransportScenario(Scenario):
             self.goal.copy_(goal)
         else:
             m3 = env_mask.view(-1, 1, 1)
-            w.state.pos.data.copy_(torch.where(m3, spawn, w.state.pos.data))
-            w.state.vel.data.copy_(
-                torch.where(m3, torch.zeros_like(w.state.vel.data), w.state.vel.data)
-            )
+            m2 = env_mask.view(-1, 1)
+            zeros_p2 = torch.zeros_like(self.pkg_vel)
+            zeros_p = torch.zeros_like(self.pkg_theta)
             self.pkg_pos.copy_(torch.where(m3, pkg, self.pkg_pos))
             self.pkg_vel.copy_(torch.where(m3, zeros_p2, self.pkg_vel))
-            self.pkg_theta.copy_(torch.where(env_mask.view(-1, 1), zeros_p, self.pkg_theta))
-            self.pkg_ang_vel.copy_(torch.where(env_mask.view(-1, 1), zeros_p, self.pkg_ang_vel))
+            self.pkg_theta.copy_(torch.where(m2, zeros_p, self.pkg_theta))
+            self.pkg_ang_vel.copy_(torch.where(m2, zeros_p, self.pkg_ang_vel))
             self.goal.copy_(torch.where(m3, goal, self.goal))
 
         self._install_obstacles()
-        if self.fused_active:
-            self._ensure_fused(w.n_envs)
-            self._sync_fused_handles()  # this eager _launch_* uses cached handles
-            if env_mask is None:
-                self._f_resetmask.fill_(1)
-            else:
-                self._f_resetmask.copy_(env_mask)  # bool -> uint8
-            full = 0 if obs_only else 1
-            # No body integration on reset (integrate=False): recompute obs and
-            # rebase the shaping baseline only. reset_hit rebases prev_dist.
-            self._launch_obs()
-            self._launch_reward(advance_prev=0, full_pass=full)
-        else:
+        if not self.fused_active:
             self._prev_dist = None
-            self._refresh(reset_mask=env_mask, integrate=False)
+        self.finish_reset(env_mask, obs_only=obs_only)
 
     def _install_obstacles(self) -> None:
-        # Called from inside the captured whole-step graph (_graph_post_physics), so this
-        # must stay in the capture-safe regime of Stepper.set_obstacles: an unchanged
-        # obstacle count and a spec with no movable obstacles and no 1-D angle to broadcast.
-        # Constructing the spec is host-side bookkeeping only — no device allocation.
-        self.world.set_obstacles(Obstacles(self.pkg_pos.detach(), self._pkg_radius))
+        """Hand the current package poses to the engine as circular obstacles.
 
-    # -------------------------------------------------------- package physics
+        Called from inside the captured whole-step graph (see :meth:`launch_fused`), so it
+        must stay in the capture-safe regime of :meth:`wmas.core.stepper.Stepper.
+        set_obstacles`: an unchanged obstacle count, and a spec carrying no movable
+        obstacles and no 1-D ``angle`` to broadcast.
 
-    def post_step(self) -> None:
-        if self.fused_active:
-            # Same sequence the whole-step graph runs (keeps non-graph fused mode
-            # and CPU eager-persistent bit-identical).
-            self._pre_graph_step()
-            self._graph_post_physics()
-        else:
-            self._refresh(integrate=True)
+        The spec is built once, in ``make_world``, and **re-installed** rather than
+        rebuilt: it aliases ``pkg_pos``, and both ``Obstacles.resolve`` and
+        ``Obstacles.any_movable`` memoize, so a re-install allocates nothing and costs no
+        device->host sync. Building a fresh spec per call — as this used to — put
+        ``any_movable``'s reduction plus ``.item()`` on every step that reset an env under
+        ``auto_reset=True``.
+
+        The retained spec is rebuilt only when ``pkg_pos`` is *reassigned*, which is the
+        grad path integrating the package in torch (it needs fresh tensors for the tape).
+        That is a host-side pointer compare, and on the captured path the pointer never
+        moves, so the rebuild branch cannot fire inside a capture.
+        """
+        if self._obstacles.pos.data_ptr() != self.pkg_pos.data_ptr():
+            self._obstacles = Obstacles(self.pkg_pos.detach(), self._pkg_radius).resolve(
+                self.world.device, self.world.dtype
+            )
+        self.world.set_obstacles(self._obstacles)
+
+    # ---------------------------------------- torch reference path (parity oracle)
+
+    def post_step_torch(self) -> None:
+        self._refresh(integrate=True)
+
+    def reset_torch(self, env_mask: torch.Tensor | None) -> None:
+        self._refresh(reset_mask=env_mask, integrate=False)
 
     # --------------------------------------------------------- fused fast path
 
-    _PKG_ATTRS = ("pkg_pos", "pkg_vel", "pkg_theta", "pkg_ang_vel", "goal")
-
-    def _ensure_fused(self, n_envs: int) -> None:
-        """Allocate the persistent fused OUTPUT buffers + cached wp handles.
-
-        Package state (pkg_pos/vel/theta/ang_vel/goal) and prev_dist ARE cached
-        here (reset now updates them in place); the grad path reassigns them, and
-        _sync_fused_handles rebuilds any handle whose data_ptr moves."""
-        if self._fused_ready:
-            return
-        w = self.world
-        na, dev, dt = self.n_agents, w.device, w.dtype
-
-        def z(*shape, d=dt):
-            return torch.zeros(*shape, device=dev, dtype=d)
-
-        self._f_obs = z(n_envs, na, self.obs_dim)
-        self._f_reward = z(n_envs, na)
-        self._f_dist = z(n_envs, self.n_packages)
-        self._f_done = z(n_envs, d=torch.uint8)
-        self._f_resetmask = z(n_envs, d=torch.uint8)
-        if self._prev_dist is None:
-            self._prev_dist = z(n_envs, self.n_packages)
-        scalar = w.wp_dtype
-        self._wp = {
-            "obs": wp.from_torch(self._f_obs, dtype=scalar),
-            "reward": wp.from_torch(self._f_reward, dtype=scalar),
-            "dist": wp.from_torch(self._f_dist, dtype=scalar),
-            "done": wp.from_torch(self._f_done, dtype=wp.uint8),
-            "resetmask": wp.from_torch(self._f_resetmask, dtype=wp.uint8),
-        }
-        self._f_done_bool = self._f_done.view(torch.bool)
-        vec2 = VEC2[scalar]
-        self._pkg_dtype = {
-            "pkg_pos": vec2, "pkg_vel": vec2,
-            "pkg_theta": scalar, "pkg_ang_vel": scalar, "goal": vec2,
-        }
-        self._wp_pkg = {
-            k: wp.from_torch(getattr(self, k).contiguous(), dtype=self._pkg_dtype[k])
-            for k in self._PKG_ATTRS
-        }
-        self._wp_prev = wp.from_torch(self._prev_dist.contiguous(), dtype=scalar)
-        self._pkg_ptrs = {k: getattr(self, k).data_ptr() for k in self._PKG_ATTRS}
-        self._prev_ptr = self._prev_dist.data_ptr()
-        self._fused_ready = True
-
-    def _sync_fused_handles(self) -> None:
-        """Rebuild any cached package/prev handle whose backing tensor was
-        reallocated (grad-path reassignment); bumps ``_handle_version`` to force
-        recapture. Cheap pointer compare in steady state; runs outside capture."""
-        scalar = self.world.wp_dtype
-        changed = False
-        for k in self._PKG_ATTRS:
-            t = getattr(self, k)
-            if t.data_ptr() != self._pkg_ptrs[k]:
-                self._wp_pkg[k] = wp.from_torch(t.contiguous(), dtype=self._pkg_dtype[k])
-                self._pkg_ptrs[k] = t.data_ptr()
-                changed = True
-        if self._prev_dist.data_ptr() != self._prev_ptr:
-            self._wp_prev = wp.from_torch(self._prev_dist.contiguous(), dtype=scalar)
-            self._prev_ptr = self._prev_dist.data_ptr()
-            changed = True
-        if changed:
-            self._handle_version += 1
-
-    # ----------------------------------------------------- whole-step graph
-
-    def graph_capturable(self) -> bool:
-        return True
-
-    def graph_recapture_token(self) -> int:
-        return self._handle_version
-
-    def _graph_warmup_carries(self) -> list[torch.Tensor]:
-        # _launch_body advances the movable-body state in place; _launch_reward
-        # advances _prev_dist; _install_obstacles overwrites the stepper's
-        # obstacle-position buffer (read by the next step's physics) — snapshot a
-        # torch view of it so warm-up leaves step 0's obstacles correct.
-        return [
-            self.pkg_pos, self.pkg_vel, self.pkg_theta, self.pkg_ang_vel,
-            self._prev_dist, wp.to_torch(self.world.stepper.obs_pos),
-        ]
-
-    def _pre_graph_step(self) -> None:
-        self._ensure_fused(self.world.n_envs)
-        self._f_resetmask.zero_()  # a normal step resets no env
-        self._sync_fused_handles()
-
-    def _graph_post_physics(self) -> None:
-        self._launch_body()
-        self._install_obstacles()  # updated package pose for the next step
-        self._launch_obs()
-        self._launch_reward(advance_prev=1, full_pass=1)
-
-    def _state_wp(self):
-        """(pos, vel) agent state as Warp arrays for the fused kernels."""
-        w = self.world
-        vec2 = VEC2[w.wp_dtype]
-        if w._persistent and not w._detached:
-            s = w.runtime.state
-            return s.pos, s.vel
-        st = w.state
+    def fused_spec(self, n_envs: int) -> tuple[Buf, ...]:
+        ne, na, k = n_envs, self.n_agents, self.n_packages
         return (
-            wp.from_torch(st.pos.contiguous(), dtype=vec2),
-            wp.from_torch(st.vel.contiguous(), dtype=vec2),
+            Buf("obs", (ne, na, self.obs_dim)),
+            Buf("reward", (ne, na)),
+            Buf("dist", (ne, k)),
+            Buf("done", (ne,), "uint8", bool_view=True),
+            Buf("resetmask", (ne,), "uint8", reset_mask=True),
+            # Package state and goal: the scenario's own tensors, advanced in place by the
+            # body kernel and reassigned by the grad path's torch integrator.
+            Buf("pkg_pos", (ne, k, 2), "vec2", attr="pkg_pos", alloc="never", carry=True,
+                watch=True),
+            Buf("pkg_vel", (ne, k, 2), "vec2", attr="pkg_vel", alloc="never", carry=True,
+                watch=True),
+            Buf("pkg_theta", (ne, k), attr="pkg_theta", alloc="never", carry=True, watch=True),
+            Buf("pkg_ang_vel", (ne, k), attr="pkg_ang_vel", alloc="never", carry=True,
+                watch=True),
+            Buf("goal", (ne, k, 2), "vec2", attr="goal", alloc="never", watch=True),
+            Buf("prev", (ne, k), attr="_prev_dist", alloc="if_none", carry=True, watch=True),
         )
 
-    def _pkg_wp(self) -> dict:
-        """Cached Warp handles over the package tensors (rebuilt by
-        _sync_fused_handles when the grad path reassigns them)."""
-        return self._wp_pkg
+    def engine_carries(self) -> list[torch.Tensor]:
+        """The engine's obstacle positions: ``_install_obstacles`` overwrites them from
+        inside the hook, and the *next* step's physics reads them."""
+        return [self.world.obstacle_state_views()[0]]
+
+    def launch_fused(self, pass_: FusedPass) -> None:
+        """Integrate the package, re-install its pose, then obs and reward.
+
+        A reset skips the body integration (there is nothing to advance: the package was
+        just placed) and passes ``advance_prev=0`` so the reward kernel *rebases* the
+        shaping baseline for the reset envs instead of differencing against a stale one.
+        The ``_install_obstacles`` in the middle is an ordinary line here, running inside
+        ``wp.ScopedCapture`` on a step — see its docstring for why that is legal.
+        """
+        if pass_.is_step:
+            self._launch_body()
+            self._install_obstacles()  # updated package pose for the next step
+        self._launch_obs()
+        self._launch_reward(advance_prev=pass_.advance_prev, full_pass=pass_.full_pass)
 
     def _launch_body(self) -> None:
         w = self.world
         scalar = w.wp_dtype
-        pos, vel = self._state_wp()
-        pk = self._pkg_wp()
+        st = w.state_wp()
+        pk = self._wp
         bound = self.world_size - self.package_radius
         wp.launch(
             transport_body_kernel,
             dim=(w.n_envs, self.n_packages),
             inputs=[
-                pos,
-                vel,
+                st.pos,
+                st.vel,
                 wp.int32(self.n_agents),
                 scalar(self.agent_radius),
                 scalar(self.package_radius),
@@ -351,13 +276,17 @@ class TransportScenario(Scenario):
 
     def _launch_obs(self) -> None:
         w = self.world
-        self._ensure_fused(w.n_envs)
-        pos, vel = self._state_wp()
-        pk = self._pkg_wp()
+        st = w.state_wp()
         wp.launch(
             transport_obs_kernel,
             dim=(w.n_envs, self.n_agents),
-            inputs=[pos, vel, pk["pkg_pos"], pk["goal"], wp.int32(self.n_packages)],
+            inputs=[
+                st.pos,
+                st.vel,
+                self._wp["pkg_pos"],
+                self._wp["goal"],
+                wp.int32(self.n_packages),
+            ],
             outputs=[self._wp["obs"]],
             device=w.device,
             record_tape=False,
@@ -366,14 +295,12 @@ class TransportScenario(Scenario):
     def _launch_reward(self, advance_prev: int, full_pass: int) -> None:
         w = self.world
         scalar = w.wp_dtype
-        pk = self._pkg_wp()
-        prev = self._wp_prev
         wp.launch(
             transport_reward_kernel,
             dim=w.n_envs,
             inputs=[
-                pk["pkg_pos"],
-                pk["goal"],
+                self._wp["pkg_pos"],
+                self._wp["goal"],
                 self._wp["resetmask"],
                 wp.int32(self.n_agents),
                 wp.int32(self.n_packages),
@@ -383,7 +310,7 @@ class TransportScenario(Scenario):
                 wp.int32(advance_prev),
                 wp.int32(full_pass),
             ],
-            outputs=[prev, self._wp["reward"], self._wp["done"], self._wp["dist"]],
+            outputs=[self._wp["prev"], self._wp["reward"], self._wp["done"], self._wp["dist"]],
             device=w.device,
             record_tape=False,
         )
@@ -449,7 +376,7 @@ class TransportScenario(Scenario):
 
     def observations(self) -> torch.Tensor:
         if self.fused_active:
-            return self._f_obs
+            return self.fb["obs"]
         w = self.world
         s = w.state
         pkg_to_goal = (
@@ -468,15 +395,15 @@ class TransportScenario(Scenario):
 
     def rewards(self) -> torch.Tensor:
         if self.fused_active:
-            return self._f_reward
+            return self.fb["reward"]
         return super().rewards()
 
     def done(self) -> torch.Tensor:
         if self.fused_active:
-            return self._f_done_bool
+            return self.fb["done_bool"]
         return self._cache["on_goal"].all(dim=-1)
 
     def info(self) -> dict[str, Any]:
         if self.fused_active:
-            return {"package_dist_to_goal": self._f_dist}
+            return {"package_dist_to_goal": self.fb["dist"]}
         return {"package_dist_to_goal": self._cache["dist_to_goal"]}
