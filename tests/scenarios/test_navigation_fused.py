@@ -3,10 +3,32 @@
 import numpy as np
 import pytest
 import torch
-from conftest import DEVICES
+from conftest import (
+    DEVICES,
+    FusedSpec,
+    assert_fused_determinism,
+    assert_grad_falls_back_to_torch,
+    fused_env,
+    fused_rollout,
+)
 
-from wmas import Environment, NavigationScenario
+from wmas import NavigationScenario
 from wmas.dynamics.base import P_RADIUS, per_env_float_template
+
+SPEC = FusedSpec(
+    fields=(
+        "obs",
+        "rew",
+        "done",
+        "info:collisions",
+        "info:dist_to_goal",
+        "info:on_goal",
+        "info:neighbor_overflow",
+    ),
+    grad_steps=6,
+    grad_index=3,
+    grad_backprop="rew",  # navigation's reward is differentiable shaping
+)
 
 
 def _env(
@@ -14,7 +36,6 @@ def _env(
     fused,
     *,
     n_agents=5,
-    n_envs=24,
     shared_reward=False,
     neighbor_obs=2,
     world_size=0.6,
@@ -32,43 +53,11 @@ def _env(
     )
     if max_neighbors is not None:
         scen.neighbor_obs = neighbor_obs
-    env = Environment(
-        scen,
-        n_envs=n_envs,
-        device=device,
-        dt=0.05,
-        substeps=1,
-        seed=0,
-        auto_reset=True,
-        max_steps=5,
-        dtype=dtype,
-        fused=fused,
-    )
-    return env
+    return fused_env(scen, device, fused, spec=SPEC, dtype=dtype)
 
 
 def _run(env, n_steps, device, n_agents, dtype=torch.float32):
-    env.reset(seed=0)
-    gen = torch.Generator(device=device).manual_seed(2)
-    out = []
-    with torch.no_grad():
-        for _ in range(n_steps):
-            a = torch.empty(env.n_envs, n_agents, 2, device=device, dtype=dtype).uniform_(
-                -1, 1, generator=gen
-            )
-            obs, rew, done, info = env.step(a)
-            out.append(
-                (
-                    obs.clone(),
-                    rew.clone(),
-                    done.clone(),
-                    info["collisions"].clone(),
-                    info["dist_to_goal"].clone(),
-                    info["on_goal"].clone(),
-                    info["neighbor_overflow"].clone(),
-                )
-            )
-    return out
+    return fused_rollout(env, n_steps, device, n_agents, SPEC, dtype=dtype)
 
 
 @pytest.mark.parametrize("device", DEVICES)
@@ -111,8 +100,7 @@ def test_fused_dense_touching_parity(device):
 def test_fused_seeded_determinism(device):
     a = _run(_env(device, fused=True), 10, device, 5)
     b = _run(_env(device, fused=True), 10, device, 5)
-    for (o1, r1, d1, *_), (o2, r2, d2, *_) in zip(a, b, strict=True):
-        assert torch.equal(o1, o2) and torch.equal(r1, r2) and torch.equal(d1, d2)
+    assert_fused_determinism(a, b)
 
 
 @pytest.mark.parametrize("device", DEVICES)
@@ -158,19 +146,4 @@ def test_grad_interleave_shaping_continuous(device):
     differentiable reference. The fused-only run and the interleaved run agree on
     the shared-across-both steps (they share _prev_dist storage)."""
     env = _env(device, fused=True, n_agents=4, world_size=1.0)
-    env.reset(seed=0)
-    gen = torch.Generator(device=device).manual_seed(5)
-    for i in range(6):
-        act = torch.empty(env.n_envs, 4, 2, device=device).uniform_(-1, 1, generator=gen)
-        if i == 3:
-            # differentiable step: env.step under enable_grad uses the torch path
-            act = act.clone().requires_grad_(True)
-            with torch.enable_grad():
-                obs, rew, done, _ = env.step(act)
-            assert obs.requires_grad  # torch reference path was taken
-            rew.pow(2).sum().backward()
-            assert act.grad is not None
-        else:
-            with torch.no_grad():
-                obs, rew, done, _ = env.step(act)
-            assert torch.isfinite(rew).all()
+    assert_grad_falls_back_to_torch(env, device, 4, SPEC)

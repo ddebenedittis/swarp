@@ -2,41 +2,37 @@
 
 import pytest
 import torch
-from conftest import DEVICES
+from conftest import (
+    DEVICES,
+    FusedSpec,
+    assert_fused_determinism,
+    assert_grad_falls_back_to_torch,
+    fused_env,
+    fused_rollout,
+)
 
-from wmas import Environment, FlockingScenario
+from wmas import FlockingScenario
+
+SPEC = FusedSpec(
+    fields=("obs", "rew", "info:crowding"),
+    grad_steps=4,
+    grad_index=2,
+    grad_backprop="rew",  # flocking's reward is differentiable cohesion/alignment
+)
 
 
-def _env(device, fused, *, n_agents=6, n_envs=24, neighbor_obs=4, world_size=0.6):
+def _env(device, fused, *, n_agents=6, neighbor_obs=4, world_size=0.6):
     scen = FlockingScenario(
         n_agents=n_agents,
         neighbor_obs=neighbor_obs,
         world_size=world_size,
         neighbor_radius=0.4,
     )
-    return Environment(
-        scen,
-        n_envs=n_envs,
-        device=device,
-        dt=0.05,
-        substeps=1,
-        seed=0,
-        auto_reset=True,
-        max_steps=5,
-        fused=fused,
-    )
+    return fused_env(scen, device, fused, spec=SPEC)
 
 
 def _run(env, n_steps, device, n_agents):
-    env.reset(seed=0)
-    gen = torch.Generator(device=device).manual_seed(2)
-    out = []
-    with torch.no_grad():
-        for _ in range(n_steps):
-            a = torch.empty(env.n_envs, n_agents, 2, device=device).uniform_(-1, 1, generator=gen)
-            obs, rew, done, info = env.step(a)
-            out.append((obs.clone(), rew.clone(), info["crowding"].clone()))
-    return out
+    return fused_rollout(env, n_steps, device, n_agents, SPEC)
 
 
 @pytest.mark.parametrize("device", DEVICES)
@@ -72,26 +68,11 @@ def test_fused_dense_neighbors_parity(device):
 def test_fused_seeded_determinism(device):
     a = _run(_env(device, fused=True), 10, device, 6)
     b = _run(_env(device, fused=True), 10, device, 6)
-    for (o1, r1, c1), (o2, r2, c2) in zip(a, b, strict=True):
-        assert torch.equal(o1, o2) and torch.equal(r1, r2) and torch.equal(c1, c2)
+    assert_fused_determinism(a, b)
 
 
 @pytest.mark.parametrize("device", DEVICES)
 def test_grad_step_falls_back_to_torch(device):
     """A grad-enabled step must take the differentiable torch path (fused off)."""
     env = _env(device, fused=True, n_agents=4, world_size=1.0)
-    env.reset(seed=0)
-    gen = torch.Generator(device=device).manual_seed(5)
-    for i in range(4):
-        act = torch.empty(env.n_envs, 4, 2, device=device).uniform_(-1, 1, generator=gen)
-        if i == 2:
-            act = act.clone().requires_grad_(True)
-            with torch.enable_grad():
-                obs, rew, done, _ = env.step(act)
-            assert obs.requires_grad  # torch reference path was taken
-            rew.pow(2).sum().backward()
-            assert act.grad is not None
-        else:
-            with torch.no_grad():
-                obs, rew, done, _ = env.step(act)
-            assert torch.isfinite(rew).all()
+    assert_grad_falls_back_to_torch(env, device, 4, SPEC)

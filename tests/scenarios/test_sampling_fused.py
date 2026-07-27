@@ -8,48 +8,37 @@ bit-identical between the fused (2-launch read-then-scatter) and torch
 
 import pytest
 import torch
-from conftest import DEVICES
+from conftest import (
+    DEVICES,
+    FusedSpec,
+    assert_fused_determinism,
+    assert_grad_falls_back_to_torch,
+    fused_env,
+    fused_rollout,
+)
 
-from wmas import Environment, SamplingScenario
+from wmas import SamplingScenario
+
+SPEC = FusedSpec(
+    fields=("obs", "rew", "info:field", "info:consumed_frac"),
+    grad_steps=4,
+    grad_index=2,
+    grad_backprop="rew",  # the field reward is a differentiable gaussian mixture read
+)
 
 
-def _env(device, fused, *, n_agents=4, n_envs=24, grid_res=12, n_gaussians=3, world_size=1.0):
+def _env(device, fused, *, n_agents=4, grid_res=12, n_gaussians=3, world_size=1.0):
     scen = SamplingScenario(
         n_agents=n_agents,
         grid_res=grid_res,
         n_gaussians=n_gaussians,
         world_size=world_size,
     )
-    return Environment(
-        scen,
-        n_envs=n_envs,
-        device=device,
-        dt=0.05,
-        substeps=1,
-        seed=0,
-        auto_reset=True,
-        max_steps=5,
-        fused=fused,
-    )
+    return fused_env(scen, device, fused, spec=SPEC)
 
 
 def _run(env, n_steps, device, n_agents):
-    env.reset(seed=0)
-    gen = torch.Generator(device=device).manual_seed(2)
-    out = []
-    with torch.no_grad():
-        for _ in range(n_steps):
-            a = torch.empty(env.n_envs, n_agents, 2, device=device).uniform_(-1, 1, generator=gen)
-            obs, rew, done, info = env.step(a)
-            out.append(
-                (
-                    obs.clone(),
-                    rew.clone(),
-                    info["field"].clone(),
-                    info["consumed_frac"].clone(),
-                )
-            )
-    return out
+    return fused_rollout(env, n_steps, device, n_agents, SPEC)
 
 
 @pytest.mark.parametrize("device", DEVICES)
@@ -86,26 +75,10 @@ def test_fused_shared_cell_double_reward(device):
 def test_fused_seeded_determinism(device):
     a = _run(_env(device, fused=True), 10, device, 4)
     b = _run(_env(device, fused=True), 10, device, 4)
-    for (o1, r1, f1, c1), (o2, r2, f2, c2) in zip(a, b, strict=True):
-        assert torch.equal(o1, o2) and torch.equal(r1, r2)
-        assert torch.equal(f1, f2) and torch.equal(c1, c2)
+    assert_fused_determinism(a, b)
 
 
 @pytest.mark.parametrize("device", DEVICES)
 def test_grad_step_falls_back_to_torch(device):
     env = _env(device, fused=True, n_agents=4, world_size=1.0)
-    env.reset(seed=0)
-    gen = torch.Generator(device=device).manual_seed(5)
-    for i in range(4):
-        act = torch.empty(env.n_envs, 4, 2, device=device).uniform_(-1, 1, generator=gen)
-        if i == 2:
-            act = act.clone().requires_grad_(True)
-            with torch.enable_grad():
-                obs, rew, done, _ = env.step(act)
-            assert obs.requires_grad  # torch reference path was taken
-            rew.pow(2).sum().backward()
-            assert act.grad is not None
-        else:
-            with torch.no_grad():
-                obs, rew, done, _ = env.step(act)
-            assert torch.isfinite(rew).all()
+    assert_grad_falls_back_to_torch(env, device, 4, SPEC)

@@ -13,44 +13,33 @@ within ~1e-4 over 20 steps, which is what the tighter checks below assert.
 
 import pytest
 import torch
-from conftest import DEVICES
+from conftest import (
+    DEVICES,
+    FusedSpec,
+    assert_fused_determinism,
+    assert_grad_falls_back_to_torch,
+    fused_env,
+    fused_rollout,
+)
 
-from wmas import Environment, PushTScenario
+from wmas import PushTScenario
+
+SPEC = FusedSpec(
+    fields=("obs", "rew", "done", "info:tee_dist_to_goal", "info:tee_angle_error"),
+    grad_steps=4,
+    grad_index=2,
+    grad_backprop="obs",  # the reward is a difference of pose errors; obs is smooth
+    substeps=8,  # the scenario's operating point; contact_k 8000 needs it
+)
 
 
-def _env(device, fused, *, n_agents=4, n_envs=24, world_size=0.5):
+def _env(device, fused, *, n_agents=4, world_size=0.5):
     scen = PushTScenario(n_agents=n_agents, world_size=world_size)
-    return Environment(
-        scen,
-        n_envs=n_envs,
-        device=device,
-        dt=0.05,
-        substeps=8,  # the scenario's operating point; contact_k 8000 needs it
-        seed=0,
-        auto_reset=True,
-        max_steps=5,
-        fused=fused,
-    )
+    return fused_env(scen, device, fused, spec=SPEC)
 
 
 def _run(env, n_steps, device, n_agents):
-    env.reset(seed=0)
-    gen = torch.Generator(device=device).manual_seed(2)
-    out = []
-    with torch.no_grad():
-        for _ in range(n_steps):
-            a = torch.empty(env.n_envs, n_agents, 2, device=device).uniform_(-1, 1, generator=gen)
-            obs, rew, done, info = env.step(a)
-            out.append(
-                (
-                    obs.clone(),
-                    rew.clone(),
-                    done.clone(),
-                    info["tee_dist_to_goal"].clone(),
-                    info["tee_angle_error"].clone(),
-                )
-            )
-    return out
+    return fused_rollout(env, n_steps, device, n_agents, SPEC)
 
 
 @pytest.mark.parametrize("device", DEVICES)
@@ -80,26 +69,11 @@ def test_fused_matches_torch(device, n_agents):
 def test_fused_seeded_determinism(device):
     a = _run(_env(device, fused=True), 10, device, 4)
     b = _run(_env(device, fused=True), 10, device, 4)
-    for x, y in zip(a, b, strict=True):
-        for u, v in zip(x, y, strict=True):
-            assert torch.equal(u, v)
+    assert_fused_determinism(a, b)
 
 
 @pytest.mark.parametrize("device", DEVICES)
 def test_grad_step_falls_back_to_torch(device):
+    """The torch reference (differentiable body) path must be taken under enable_grad."""
     env = _env(device, fused=True, n_agents=4, world_size=1.0)
-    env.reset(seed=0)
-    gen = torch.Generator(device=device).manual_seed(5)
-    for i in range(4):
-        act = torch.empty(env.n_envs, 4, 2, device=device).uniform_(-1, 1, generator=gen)
-        if i == 2:
-            act = act.clone().requires_grad_(True)
-            with torch.enable_grad():
-                obs, rew, done, _ = env.step(act)
-            assert obs.requires_grad  # torch reference (differentiable body) path
-            obs.pow(2).sum().backward()
-            assert act.grad is not None
-        else:
-            with torch.no_grad():
-                obs, rew, done, _ = env.step(act)
-            assert torch.isfinite(rew).all()
+    assert_grad_falls_back_to_torch(env, device, 4, SPEC)
