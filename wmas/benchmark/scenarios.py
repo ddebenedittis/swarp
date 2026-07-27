@@ -7,8 +7,9 @@ graph + neighbor dedupe + slim-2D). Every config is parity-checked before timing
 (5-step seeded trajectory, optimized vs baseline, ``allclose`` obs/reward + exact
 ``done``) — the same gate that caught the CUDA-graph reuse bug.
 
-A single ``SCENARIO_FACTORIES`` registry drives both this CLI and the tests, so
-adding a scenario (or lighting up its fused kernels) surfaces it everywhere.
+The scenario registry lives in :mod:`wmas.scenarios` (``SCENARIOS``); this CLI is
+one of its consumers, so adding a scenario there (or lighting up its fused
+kernels) surfaces it here and in the tests at once.
 
 Run with::
 
@@ -29,36 +30,21 @@ from __future__ import annotations
 
 import argparse
 import csv as csvmod
-import inspect
 import time
 
 import torch
 
-from wmas import (
-    DiscoveryScenario,
-    DynamicsModel,
-    Environment,
-    FlockingScenario,
-    FormationScenario,
-    Lidar,
-    NavigationScenario,
-    PushTScenario,
-    SamplingScenario,
-    TransportScenario,
-)
+from wmas import DynamicsModel, Environment, Lidar
 from wmas.benchmark.ablation import _parity_ok, _sync
+from wmas.scenarios import (
+    SCENARIOS,
+    make_scenario,
+    resolve_scenarios,
+    supports_model,
+)
 
-# The one registry the CLI and tests share. Values are scenario classes; the
-# model axis is applied only to those whose __init__ accepts a ``model`` kwarg.
-SCENARIO_FACTORIES: dict[str, type] = {
-    "navigation": NavigationScenario,
-    "flocking": FlockingScenario,
-    "formation": FormationScenario,
-    "discovery": DiscoveryScenario,
-    "sampling": SamplingScenario,
-    "transport": TransportScenario,
-    "pusht": PushTScenario,
-}
+# Backwards-compatible alias for the registry, whose home is wmas.scenarios.
+SCENARIO_FACTORIES = SCENARIOS
 
 MODELS: dict[str, DynamicsModel] = {
     "holonomic": DynamicsModel.HOLONOMIC,
@@ -73,42 +59,17 @@ DEF_AGENTS = (16, 64)
 # --------------------------------------------------------------- registry helpers
 
 
-def _supports_model(cls: type) -> bool:
-    return "model" in inspect.signature(cls.__init__).parameters
-
-
-def resolve_scenarios(names: list[str]) -> list[str]:
-    """Expand the ``--scenarios`` selection (names or the literal ``all``).
-
-    Raises ``ValueError`` (listing the valid names) on any unknown name.
-    """
-    valid = list(SCENARIO_FACTORIES)
-    if names == ["all"] or "all" in names:
-        return valid
-    unknown = [n for n in names if n not in SCENARIO_FACTORIES]
-    if unknown:
-        raise ValueError(
-            f"unknown scenario(s) {unknown}; valid names are {valid} (or 'all')"
-        )
-    # de-dup while preserving order
-    seen: dict[str, None] = {}
-    for n in names:
-        seen.setdefault(n, None)
-    return list(seen)
-
-
 def build_scenario(name: str, n_agents: int, model_name: str | None):
-    """Construct a scenario; applies the model kwarg only where supported."""
-    cls = SCENARIO_FACTORIES[name]
+    """Construct a scenario; the model kwarg is dropped where unsupported."""
     kw: dict = {"n_agents": n_agents, "world_size": max(1.0, n_agents**0.5 / 4)}
-    if model_name is not None and _supports_model(cls):
+    if model_name is not None:
         kw["model"] = MODELS[model_name]
-    return cls(**kw)
+    return make_scenario(name, **kw)
 
 
 def _model_axis(name: str) -> list[str | None]:
     """Robot models to sweep for a scenario (holonomic-only -> [None])."""
-    if _supports_model(SCENARIO_FACTORIES[name]):
+    if supports_model(SCENARIOS[name]):
         return list(MODELS)
     return [None]
 

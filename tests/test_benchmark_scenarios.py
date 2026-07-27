@@ -6,13 +6,15 @@ import torch
 from wmas.benchmark.scenarios import (
     MODELS,
     SCENARIO_FACTORIES,
-    _supports_model,
     build_scenario,
     resolve_scenarios,
     run_config,
 )
+from wmas.scenarios import SCENARIOS, fused_scenarios, supports_model
 
-FUSED_SCENARIOS = ["navigation", "flocking", "formation", "sampling"]
+# Derived from the registry, never hand-listed: a scenario that ships fused
+# kernels is parity-gated the moment it is registered.
+FUSED_SCENARIOS = fused_scenarios()
 
 
 def test_registry_has_all_scenarios():
@@ -25,6 +27,16 @@ def test_registry_has_all_scenarios():
         "transport",
         "pusht",
     }
+
+
+def test_benchmark_reuses_the_shared_registry():
+    """The benchmark is a consumer of wmas.scenarios, not a second registry."""
+    assert SCENARIO_FACTORIES is SCENARIOS
+
+
+def test_fused_scenarios_is_derived_and_covers_every_scenario():
+    """Today every registered scenario is fused; the list must come from the classes."""
+    assert list(SCENARIOS) == FUSED_SCENARIOS
 
 
 def test_resolve_scenarios_single_and_all():
@@ -47,9 +59,9 @@ def test_resolve_scenarios_unknown_lists_valid():
 
 
 def test_only_navigation_supports_model():
-    assert _supports_model(SCENARIO_FACTORIES["navigation"])
+    assert supports_model(SCENARIO_FACTORIES["navigation"])
     for name in ("flocking", "formation", "discovery", "sampling", "transport", "pusht"):
-        assert not _supports_model(SCENARIO_FACTORIES[name])
+        assert not supports_model(SCENARIO_FACTORIES[name])
 
 
 def test_build_scenario_applies_model_only_where_supported():

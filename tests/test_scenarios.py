@@ -1,9 +1,17 @@
-"""Ported VMAS-style scenarios: API smoke, determinism, and reward-shape checks."""
+"""Ported VMAS-style scenarios: API smoke, determinism, and reward-shape checks.
+
+Also covers the registry front door (``wmas.scenarios.make_scenario`` / ``wmas.make``).
+"""
+
+import inspect
 
 import pytest
 import torch
 
-from wmas import Environment
+import wmas
+from wmas import DynamicsModel, Environment
+from wmas.scenarios import SCENARIOS as REGISTRY
+from wmas.scenarios import Scenario, fused_scenarios, make_scenario
 from wmas.scenarios.discovery import DiscoveryScenario
 from wmas.scenarios.flocking import FlockingScenario
 from wmas.scenarios.formation import FormationScenario
@@ -11,12 +19,85 @@ from wmas.scenarios.sampling import SamplingScenario
 
 DEVICES = ["cpu"] + (["cuda:0"] if torch.cuda.is_available() else [])
 
-SCENARIOS = {
-    "sampling": lambda: SamplingScenario(n_agents=4, n_gaussians=3, grid_res=10),
-    "discovery": lambda: DiscoveryScenario(n_agents=5, n_targets=4),
-    "flocking": lambda: FlockingScenario(n_agents=8),
-    "formation": lambda: FormationScenario(n_agents=5),
+# Registry names -> the small-but-nontrivial construction kwargs these checks use.
+# The class comes from the shared registry; only the kwargs (which are
+# scenario-specific and not expressible by the registry) live here.
+SCENARIO_KWARGS = {
+    "sampling": {"n_agents": 4, "n_gaussians": 3, "grid_res": 10},
+    "discovery": {"n_agents": 5, "n_targets": 4},
+    "flocking": {"n_agents": 8},
+    "formation": {"n_agents": 5},
 }
+
+
+def _build(name):
+    return make_scenario(name, **SCENARIO_KWARGS[name])
+
+
+def test_covered_names_are_registered():
+    """A registry rename must break this file loudly, not skip silently."""
+    assert set(SCENARIO_KWARGS) <= set(REGISTRY)
+
+
+def test_make_scenario_resolves_from_the_registry():
+    scen = make_scenario("sampling", n_agents=4, grid_res=8)
+    assert isinstance(scen, REGISTRY["sampling"])
+    assert scen.n_agents == 4
+
+
+def test_make_scenario_unknown_name_lists_valid():
+    with pytest.raises(ValueError, match="unknown scenario"):
+        make_scenario("bogus")
+
+
+class _PlainScenario(Scenario):
+    """A concrete scenario with no fused kernels (inherits fused_available -> False)."""
+
+    def make_world(self, n_envs, device, dt, substeps, dtype):
+        raise NotImplementedError
+
+    def reset_world(self, env_mask=None):
+        raise NotImplementedError
+
+    def observation(self, agent_idx):
+        raise NotImplementedError
+
+
+def test_fused_scenarios_is_derived_not_hardcoded(monkeypatch):
+    """A registered scenario without fused kernels is excluded, and one with them
+    is included, purely from ``fused_available()`` — no hand-maintained list."""
+    monkeypatch.setitem(REGISTRY, "plain", _PlainScenario)
+    names = fused_scenarios()
+    assert "plain" not in names
+    assert "navigation" in names
+
+
+def test_make_kwargs_split_is_unambiguous():
+    """``wmas.make`` routes kwargs by name; Environment's and the scenarios'
+    parameter names must stay disjoint for that to be well defined."""
+    env_params = set(inspect.signature(Environment.__init__).parameters) - {
+        "self",
+        "scenario",
+        "n_envs",
+    }
+    for name, cls in REGISTRY.items():
+        overlap = env_params & set(inspect.signature(cls.__init__).parameters)
+        assert not overlap, f"{name} shares kwargs with Environment: {sorted(overlap)}"
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_make_builds_a_working_environment(device):
+    env = wmas.make("flocking", n_envs=4, n_agents=3, device=device, dt=0.1, seed=0)
+    assert isinstance(env, Environment)
+    assert env.n_envs == 4 and env.n_agents == 3
+    assert env.device == device
+    obs = env.reset()
+    assert obs.shape[:2] == (4, 3) and torch.isfinite(obs).all()
+
+
+def test_make_drops_model_for_holonomic_only_scenarios():
+    env = wmas.make("flocking", n_envs=2, n_agents=2, device="cpu", model=DynamicsModel.DIFF_DRIVE)
+    assert env.n_agents == 2  # constructed despite the unsupported kwarg
 
 
 def _random_actions(env, gen):
@@ -28,9 +109,9 @@ def _random_actions(env, gen):
 
 
 @pytest.mark.parametrize("device", DEVICES)
-@pytest.mark.parametrize("name", list(SCENARIOS))
+@pytest.mark.parametrize("name", list(SCENARIO_KWARGS))
 def test_scenario_api_and_finiteness(device, name):
-    env = Environment(SCENARIOS[name](), n_envs=8, device=device, dt=0.1, seed=3)
+    env = Environment(_build(name), n_envs=8, device=device, dt=0.1, seed=3)
     obs = env.reset()
     assert obs.shape[:2] == (8, env.n_agents) and torch.isfinite(obs).all()
     gen = torch.Generator(device=device).manual_seed(0)
@@ -42,12 +123,12 @@ def test_scenario_api_and_finiteness(device, name):
 
 
 @pytest.mark.parametrize("device", DEVICES)
-@pytest.mark.parametrize("name", list(SCENARIOS))
+@pytest.mark.parametrize("name", list(SCENARIO_KWARGS))
 def test_scenario_determinism(device, name):
     """A seeded random-policy rollout is bit-for-bit reproducible."""
 
     def run():
-        env = Environment(SCENARIOS[name](), n_envs=6, device=device, dt=0.1, seed=11)
+        env = Environment(_build(name), n_envs=6, device=device, dt=0.1, seed=11)
         obs = env.reset(seed=11)
         gen = torch.Generator(device=device).manual_seed(5)
         traj = [obs]
