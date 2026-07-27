@@ -12,6 +12,8 @@ from wmas.render.renderer import render_frame
 from wmas.render.style import Style
 from wmas.render.video import frames_to_video, save_video
 
+pytestmark = pytest.mark.viz
+
 
 def make_env(n_envs=4, n_agents=3, n_obstacles=2, world_size=1.0, device="cpu"):
     scenario = NavigationScenario(n_agents=n_agents, n_obstacles=n_obstacles, world_size=world_size)

@@ -4,10 +4,13 @@ import logging
 
 import numpy as np
 import pygame
+import pytest
 
 from wmas import Environment, NavigationScenario
 from wmas.render.layout import compute_mosaic_layout, tile_at
 from wmas.render.viewer import Viewer
+
+pytestmark = pytest.mark.viz
 
 
 def make_env(n_envs=6, n_agents=3, n_obstacles=1, device="cpu"):

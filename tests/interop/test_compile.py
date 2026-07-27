@@ -90,7 +90,7 @@ def test_torch_compile_runs_and_matches():
     torch.testing.assert_close(compiled, eager)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.gpu
 def test_cuda_graph_matches_eager():
     """A CUDA-graph-captured step reproduces the eager no-grad step over a rollout."""
     world = WorldConfig(collisions=True, collision_k=50.0)  # small fleet -> brute neighbors

@@ -2,6 +2,7 @@
 
 import numpy as np
 import pygame
+import pytest
 import torch
 
 from wmas import Environment, NavigationScenario
@@ -10,6 +11,8 @@ from wmas.render.geometry import extract_geometry
 from wmas.render.input import InteractionController, ViewState
 from wmas.render.overlays import DEFAULT_ENABLED
 from wmas.render.viewer import Viewer
+
+pytestmark = pytest.mark.viz
 
 
 def make_env(n_envs=2, n_agents=2, n_obstacles=0, device="cpu"):

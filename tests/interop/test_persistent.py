@@ -2,7 +2,7 @@
 
 import pytest
 import torch
-from conftest import CUDA, DEVICES
+from conftest import DEVICES
 
 from wmas import (
     DiscoveryScenario,
@@ -61,7 +61,7 @@ def _run(env, n_steps, device, n_agents, dtype=torch.float32):
 # --------------------------------------------------------------- graph parity
 
 
-@pytest.mark.skipif(not CUDA, reason="CUDA graph capture needs a GPU")
+@pytest.mark.gpu(reason="CUDA graph capture needs a GPU")
 @pytest.mark.parametrize("auto_reset", [False, True])
 @pytest.mark.parametrize("n_obstacles", [0, 3])
 def test_graph_matches_eager(auto_reset, n_obstacles):
@@ -76,7 +76,7 @@ def test_graph_matches_eager(auto_reset, n_obstacles):
         assert torch.equal(dg, de)
 
 
-@pytest.mark.skipif(not CUDA, reason="CUDA graph capture needs a GPU")
+@pytest.mark.gpu(reason="CUDA graph capture needs a GPU")
 @pytest.mark.parametrize(
     "scen_factory",
     [
@@ -147,7 +147,7 @@ def test_state_view_identity_stable(device):
     assert env.world.state.pos is pos_obj
 
 
-@pytest.mark.skipif(not CUDA, reason="graph recapture counter is a CUDA-graph concept")
+@pytest.mark.gpu(reason="graph recapture counter is a CUDA-graph concept")
 def test_obstacle_reset_no_recapture():
     from wmas.dynamics.base import P_MASS, P_RADIUS, per_env_float_template
 
@@ -205,7 +205,7 @@ def _run_info(env, n_steps, device, n_agents):
     return out
 
 
-@pytest.mark.skipif(not CUDA, reason="CUDA graph capture needs a GPU")
+@pytest.mark.gpu(reason="CUDA graph capture needs a GPU")
 @pytest.mark.parametrize("auto_reset", [False, True])
 @pytest.mark.parametrize("n_obstacles", [0, 3])
 def test_whole_step_matches_fused_eager(auto_reset, n_obstacles):
@@ -229,7 +229,7 @@ def test_whole_step_matches_fused_eager(auto_reset, n_obstacles):
                 assert torch.equal(ig[k], ie[k]), k
 
 
-@pytest.mark.skipif(not CUDA, reason="CUDA graph capture needs a GPU")
+@pytest.mark.gpu(reason="CUDA graph capture needs a GPU")
 def test_no_double_post_step():
     # The whole-step graph fills the obs/reward buffers, so Environment must skip
     # the redundant torch post_step on a no-grad step; a grad step (torch path)
@@ -258,7 +258,7 @@ def test_no_double_post_step():
     assert calls["n"] == 1  # grad step took the torch path -> post_step ran
 
 
-@pytest.mark.skipif(not CUDA, reason="CUDA graph capture needs a GPU")
+@pytest.mark.gpu(reason="CUDA graph capture needs a GPU")
 @pytest.mark.parametrize("eager_trims", [True, False])
 def test_prev_dist_reassignment_recapture(eager_trims):
     # A grad step refreshes the shaping baseline: eager_trims=True writes it in

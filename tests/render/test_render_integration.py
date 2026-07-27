@@ -9,6 +9,8 @@ from conftest import _ffmpeg_available
 from wmas import Environment, NavigationScenario
 from wmas.render.geometry import extract_geometry
 
+pytestmark = pytest.mark.viz
+
 
 def make_env(n_envs=3, n_agents=3, n_obstacles=1, device="cpu"):
     scenario = NavigationScenario(n_agents=n_agents, n_obstacles=n_obstacles)

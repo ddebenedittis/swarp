@@ -1,7 +1,6 @@
 """The cross-scenario benchmark registry + parity gate."""
 
 import pytest
-import torch
 
 from wmas.benchmark.scenarios import (
     MODELS,
@@ -60,7 +59,7 @@ def test_build_scenario_applies_model_only_where_supported():
     assert flock.n_agents == 6
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="use_graph needs CUDA")
+@pytest.mark.gpu(reason="use_graph needs CUDA")
 @pytest.mark.parametrize("name", FUSED_SCENARIOS)
 def test_parity_gate_passes_for_fused_scenarios(name):
     """The optimized (fused + CUDA graph) path must match the baseline path."""

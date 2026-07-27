@@ -221,7 +221,7 @@ def test_grads_finite_when_clamped():
     assert actions.grad.abs().sum() == 0.0  # fully saturated -> zero grad
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.gpu
 def test_gpu_float32_matches_cpu_float64():
     cfgs = [
         AgentConfig(

@@ -63,7 +63,7 @@ def test_reset_no_host_transfer(device):
         env.reset_at(torch.zeros(env.n_envs, dtype=torch.bool, device=device))
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.gpu
 def test_no_memcpy_dtoh_in_profile():
     from torch.profiler import ProfilerActivity, profile
 
