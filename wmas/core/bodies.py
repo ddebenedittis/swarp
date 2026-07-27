@@ -43,10 +43,12 @@ from wmas.core.collisions import (
     _closest_on_segment,
     _pair_force,
 )
+from wmas.core.config import ObstacleKind
 from wmas.core.state import VEC2
 from wmas.dynamics.base import P_MASS, P_RADIUS
 
-KIND_MOVABLE = wp.constant(1)  # mirrors config.ObstacleKind.MOVABLE
+# Derived from the enum so the kernel tag and the public tag cannot drift.
+KIND_MOVABLE = wp.constant(int(ObstacleKind.MOVABLE))
 
 
 @wp.func
@@ -397,6 +399,7 @@ def launch_obstacle_dynamics(
     vel,
     params,
     stepper,
+    *,
     n_agents: int,
     k: float,
     c: float,
@@ -410,7 +413,11 @@ def launch_obstacle_dynamics(
     clamp_bounds: bool,
     dtype,
 ) -> None:
-    """Advance every movable obstacle by one substep (no-op when there are none)."""
+    """Advance every movable obstacle by one substep (no-op when there are none).
+
+    Everything past ``stepper`` is keyword-only: the tail is seven interchangeable floats
+    and a bool, where a swapped argument would be invisible at the call site.
+    """
     n_envs = pos.shape[0]
     wp.launch(
         obstacle_dynamics_kernel,
@@ -419,14 +426,14 @@ def launch_obstacle_dynamics(
             pos,
             vel,
             params,
-            stepper._obs_kind,
-            stepper._obs_type,
-            stepper._obs_radius,
-            stepper._obs_half,
-            stepper._obs_mass,
-            stepper._obs_inertia,
-            stepper._obs_body,
-            stepper._obs_body_off,
+            stepper.obs_kind,
+            stepper.obs_type,
+            stepper.obs_radius,
+            stepper.obs_half,
+            stepper.obs_mass,
+            stepper.obs_inertia,
+            stepper.obs_body,
+            stepper.obs_body_off,
             wp.int32(stepper.n_obstacles),
             wp.int32(n_agents),
             dtype(k),
@@ -441,14 +448,14 @@ def launch_obstacle_dynamics(
             wp.int32(1 if clamp_bounds else 0),
         ],
         outputs=[
-            stepper._body_pos,
-            stepper._body_angle,
-            stepper._body_vel,
-            stepper._body_ang_vel,
-            stepper._obs_pos,
-            stepper._obs_angle,
-            stepper._obs_vel,
-            stepper._obs_ang_vel,
+            stepper.body_pos,
+            stepper.body_angle,
+            stepper.body_vel,
+            stepper.body_ang_vel,
+            stepper.obs_pos,
+            stepper.obs_angle,
+            stepper.obs_vel,
+            stepper.obs_ang_vel,
         ],
         device=pos.device,
         record_tape=False,

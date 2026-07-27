@@ -6,7 +6,7 @@ import torch
 import warp as wp
 from conftest import DEVICES, _core, _map5, holo_cfgs
 
-from wmas.core.config import WorldConfig
+from wmas.core.config import Obstacles, WorldConfig
 from wmas.core.stepper import Stepper
 from wmas.dynamics.base import ControlMode
 from wmas.interop.autograd import TorchState, warp_step
@@ -95,8 +95,10 @@ def test_obstacle_repulsion_analytic(device):
     world = WorldConfig(collision_k=k, collision_c=0.0, collision_margin=margin)
     stepper = Stepper(holo_cfgs(1), dt=dt, device=device, dtype=wp.float64, world=world)
     stepper.set_obstacles(
-        pos=torch.tensor([[[0.3, 0.0]]], dtype=torch.float64, device=device),
-        radius=torch.tensor([0.15], dtype=torch.float64, device=device),
+        Obstacles(
+            pos=torch.tensor([[[0.3, 0.0]]], dtype=torch.float64, device=device),
+            radius=torch.tensor([0.15], dtype=torch.float64, device=device),
+        )
     )
     state = _map5(make_state([[0.1, 0.0]]), lambda t: t.to(device))
     actions = torch.zeros(1, 1, 2, dtype=torch.float64, device=device)

@@ -9,7 +9,7 @@ import pytest
 import torch
 from conftest import DEVICES
 
-from wmas.core.config import ObstacleKind, ObstacleShape, WorldConfig
+from wmas.core.config import ObstacleKind, Obstacles, ObstacleShape, WorldConfig
 from wmas.core.world import World
 from wmas.dynamics.base import AgentConfig, ControlMode, DynamicsModel
 
@@ -44,14 +44,16 @@ def _install(w, kinds, shape=ObstacleShape.CIRCLE, centers=None, half=0.08):
         centers = [[0.0, 0.0]] * n
     pos = torch.tensor(centers, device=dev, dtype=dt).unsqueeze(0).expand(w.n_envs, n, 2)
     w.set_obstacles(
-        pos.contiguous(),
-        torch.full((n,), 0.1, device=dev, dtype=dt),
-        shape=torch.full((n,), int(shape), device=dev, dtype=torch.int32),
-        angle=torch.zeros(w.n_envs, n, device=dev, dtype=dt),
-        half_extents=torch.full((n, 2), half, device=dev, dtype=dt),
-        kind=torch.tensor([int(k) for k in kinds], device=dev, dtype=torch.int32),
-        mass=torch.full((n,), 1.0, device=dev, dtype=dt),
-        inertia=torch.full((n,), 0.01, device=dev, dtype=dt),
+        Obstacles(
+            pos.contiguous(),
+            torch.full((n,), 0.1, device=dev, dtype=dt),
+            shape=torch.full((n,), int(shape), device=dev, dtype=torch.int32),
+            angle=torch.zeros(w.n_envs, n, device=dev, dtype=dt),
+            half_extents=torch.full((n, 2), half, device=dev, dtype=dt),
+            kind=torch.tensor([int(k) for k in kinds], device=dev, dtype=torch.int32),
+            mass=torch.full((n,), 1.0, device=dev, dtype=dt),
+            inertia=torch.full((n,), 0.01, device=dev, dtype=dt),
+        )
     )
 
 
@@ -65,7 +67,7 @@ def _push(w, steps=30, start=(-0.4, 0.0), heading=(1.0, 0.0)):
     act = torch.tensor([heading], device=dev, dtype=dt).unsqueeze(0).expand(w.n_envs, 1, 2)
     for _ in range(steps):
         w.step(act.contiguous())
-    return w.movable_obstacle_state()
+    return w.obstacle_state_views()
 
 
 @pytest.mark.parametrize("device", DEVICES)
@@ -131,18 +133,22 @@ def test_movable_box_stops_at_an_immovable_wall(device):
     w = _world(device, n_envs=1)
     dev, dt = device, torch.float32
     w.set_obstacles(
-        torch.tensor([[[0.0, 0.0], [0.6, 0.0]]], device=dev, dtype=dt),
-        torch.tensor([0.0, 0.04], device=dev, dtype=dt),
-        shape=torch.tensor(
-            [int(ObstacleShape.BOX), int(ObstacleShape.SEGMENT)], device=dev, dtype=torch.int32
-        ),
-        angle=torch.tensor([[0.0, 1.5707963]], device=dev, dtype=dt),  # wall across +x
-        half_extents=torch.tensor([[0.1, 0.1], [0.8, 0.0]], device=dev, dtype=dt),
-        kind=torch.tensor(
-            [int(ObstacleKind.MOVABLE), int(ObstacleKind.IMMOVABLE)], device=dev, dtype=torch.int32
-        ),
-        mass=torch.tensor([1.0, 1.0], device=dev, dtype=dt),
-        inertia=torch.tensor([0.02, 1.0], device=dev, dtype=dt),
+        Obstacles(
+            torch.tensor([[[0.0, 0.0], [0.6, 0.0]]], device=dev, dtype=dt),
+            torch.tensor([0.0, 0.04], device=dev, dtype=dt),
+            shape=torch.tensor(
+                [int(ObstacleShape.BOX), int(ObstacleShape.SEGMENT)], device=dev, dtype=torch.int32
+            ),
+            angle=torch.tensor([[0.0, 1.5707963]], device=dev, dtype=dt),  # wall across +x
+            half_extents=torch.tensor([[0.1, 0.1], [0.8, 0.0]], device=dev, dtype=dt),
+            kind=torch.tensor(
+                [int(ObstacleKind.MOVABLE), int(ObstacleKind.IMMOVABLE)],
+                device=dev,
+                dtype=torch.int32,
+            ),
+            mass=torch.tensor([1.0, 1.0], device=dev, dtype=dt),
+            inertia=torch.tensor([0.02, 1.0], device=dev, dtype=dt),
+        )
     )
     pos, _, _, _ = _push(w, steps=120, start=(-0.35, 0.0))
     # Box half-extent 0.1 + wall radius 0.04: its centre cannot get past ~0.46.
@@ -174,16 +180,18 @@ def test_compound_body_stays_rigid(device):
     off = torch.tensor([[0.0, 0.1], [0.0, -0.1]], device=dev, dtype=dt)
     centers = torch.tensor([[[0.0, 0.1], [0.0, -0.1]]], device=dev, dtype=dt)
     w.set_obstacles(
-        centers,
-        torch.zeros(2, device=dev, dtype=dt),
-        shape=torch.full((2,), int(ObstacleShape.BOX), device=dev, dtype=torch.int32),
-        angle=torch.zeros(1, 2, device=dev, dtype=dt),
-        half_extents=torch.tensor([[0.12, 0.05], [0.05, 0.12]], device=dev, dtype=dt),
-        kind=torch.full((2,), int(ObstacleKind.MOVABLE), device=dev, dtype=torch.int32),
-        mass=torch.full((2,), 1.0, device=dev, dtype=dt),
-        inertia=torch.full((2,), 0.02, device=dev, dtype=dt),
-        body=torch.zeros(2, device=dev, dtype=torch.int32),  # both shapes -> body 0
-        body_offset=off,
+        Obstacles(
+            centers,
+            torch.zeros(2, device=dev, dtype=dt),
+            shape=torch.full((2,), int(ObstacleShape.BOX), device=dev, dtype=torch.int32),
+            angle=torch.zeros(1, 2, device=dev, dtype=dt),
+            half_extents=torch.tensor([[0.12, 0.05], [0.05, 0.12]], device=dev, dtype=dt),
+            kind=torch.full((2,), int(ObstacleKind.MOVABLE), device=dev, dtype=torch.int32),
+            mass=torch.full((2,), 1.0, device=dev, dtype=dt),
+            inertia=torch.full((2,), 0.02, device=dev, dtype=dt),
+            body=torch.zeros(2, device=dev, dtype=torch.int32),  # both shapes -> body 0
+            body_offset=off,
+        )
     )
     d0 = (centers[0, 0] - centers[0, 1]).norm().item()
     pos, angle, _, _ = _push(w, steps=60, start=(-0.4, 0.06))

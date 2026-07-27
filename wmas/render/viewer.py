@@ -238,21 +238,28 @@ class Viewer:
             )
 
     def _write_obstacle_pos(self, obstacle_idx: int, world_xy) -> None:
-        """Move an obstacle in the focus env and refresh the stepper obstacle buffers."""
+        """Move an obstacle in the focus env and refresh the stepper obstacle buffers.
+
+        Re-installs the world's *retained* obstacle spec rather than a rebuilt partial one:
+        naming only pose fields would reset everything else to its default, which used to
+        turn every movable body into immovable scenery on the first drag.
+        """
         world = self.env.world
-        if world.obstacle_pos is None or world.obstacle_radius is None:
+        obstacles = world.obstacles
+        if obstacles is None:
             return
         with torch.no_grad():
-            world.obstacle_pos[self.state.focus_env, obstacle_idx] = torch.tensor(
+            # Adopt the engine's live pose first: a movable body has been integrated in the
+            # stepper's own arrays since it was installed, and re-installing the stale
+            # spec pose would teleport every *other* body back to where it started.
+            live_pos, live_angle, _, _ = world.obstacle_state_views()
+            obstacles.pos.copy_(live_pos)
+            if obstacles.angle is not None:
+                obstacles.angle.copy_(live_angle)
+            obstacles.pos[self.state.focus_env, obstacle_idx] = torch.tensor(
                 world_xy, dtype=self.env.dtype, device=self.env.device
             )
-            world.set_obstacles(
-                world.obstacle_pos,
-                world.obstacle_radius,
-                shape=world.obstacle_shape,
-                angle=world.obstacle_angle,
-                half_extents=world.obstacle_half_extents,
-            )
+            world.set_obstacles(obstacles)
 
     def _draw(
         self, surface, geometry, camera, style, *, hud: bool, fps=None, clear: bool = True

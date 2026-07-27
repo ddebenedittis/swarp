@@ -3,6 +3,7 @@
 import numpy as np
 import pytest
 import torch
+import warp as wp
 from conftest import _ffmpeg_available
 
 from wmas import Environment, NavigationScenario
@@ -296,17 +297,19 @@ def test_render_frame_trajectory_overlay_changes_pixels():
 
 def _shaped_obstacle_env(shape, angle=0.4, half=(0.25, 0.12), radius=0.05):
     """An env whose single obstacle is a BOX/SEGMENT rather than a circle."""
-    from wmas.core.config import ObstacleShape
+    from wmas.core.config import Obstacles, ObstacleShape
 
     env, scenario = make_env(n_agents=2, n_obstacles=1)
     world = env.world
     n_obs = 1
     env.world.set_obstacles(
-        torch.zeros(env.n_envs, n_obs, 2, dtype=env.dtype, device=env.device),
-        torch.full((n_obs,), radius, dtype=env.dtype, device=env.device),
-        shape=torch.full((n_obs,), int(shape), dtype=torch.int32, device=env.device),
-        angle=torch.full((n_obs,), angle, dtype=env.dtype, device=env.device),
-        half_extents=torch.tensor([half], dtype=env.dtype, device=env.device),
+        Obstacles(
+            torch.zeros(env.n_envs, n_obs, 2, dtype=env.dtype, device=env.device),
+            torch.full((n_obs,), radius, dtype=env.dtype, device=env.device),
+            shape=torch.full((n_obs,), int(shape), dtype=torch.int32, device=env.device),
+            angle=torch.full((n_obs,), angle, dtype=env.dtype, device=env.device),
+            half_extents=torch.tensor([half], dtype=env.dtype, device=env.device),
+        )
     )
     assert world.obstacle_shape is not None and ObstacleShape.CIRCLE == 0
     return env, scenario
@@ -341,6 +344,59 @@ def test_box_and_segment_obstacles_render_differently_from_circles():
         frame = render_frame(g, size=(240, 240), overlays={"obstacles"})
         assert not np.array_equal(frame, circles), shape
         assert len(np.unique(frame.reshape(-1, 3), axis=0)) > 1  # something was actually drawn
+
+
+def test_obstacle_drag_preserves_kind_mass_and_keeps_the_body_movable():
+    """Dragging an obstacle must not turn every movable body into permanent scenery.
+
+    ``Viewer._write_obstacle_pos`` used to rebuild a *partial* obstacle spec naming only
+    the pose fields, because ``World`` retained only six of the twelve. An absent ``kind``
+    means IMMOVABLE, so one mouse drag zeroed ``obs_kind``, cleared ``any_movable`` and
+    stopped the engine integrating any body — and since an in-place install bumps no
+    version, not even a CUDA-graph recapture would have surfaced it. The fix is that
+    ``World`` retains the whole resolved spec and the drag re-installs *that*.
+    """
+    from wmas.core.config import ObstacleKind
+    from wmas.render.viewer import Viewer
+    from wmas.scenarios.pusht import PushTScenario
+
+    scenario = PushTScenario(n_agents=1, agent_radius=0.05)
+    env = Environment(scenario, n_envs=2, device="cpu", dt=0.05, substeps=8, seed=0)
+    env.reset(seed=0)
+    world = env.world
+    viewer = Viewer(env, scenario=scenario)
+    assert world.stepper.any_movable
+
+    # Put the T at the origin, unrotated, so the push below is deterministic.
+    scenario.tee_pos.zero_()
+    scenario.tee_theta.zero_()
+    scenario.tee_vel.zero_()
+    scenario.tee_ang_vel.zero_()
+    scenario._install_obstacles()
+
+    # Drag the crossbar (the body root) slightly right: the body origin follows it.
+    crossbar_y = scenario.box_off[0][1]
+    viewer._write_obstacle_pos(0, (0.02, crossbar_y))
+
+    assert world.stepper.any_movable, "the drag froze every movable body"
+    assert int(world.obstacle_kind[0]) == int(ObstacleKind.MOVABLE)
+    assert world.obstacle_kind.shape == (scenario.n_boxes,)
+    np.testing.assert_allclose(
+        wp.to_torch(world.stepper.obs_mass).numpy(), scenario._obs_mass.numpy()
+    )
+    np.testing.assert_allclose(
+        wp.to_torch(world.stepper.obs_inertia).numpy(), scenario._obs_inertia.numpy()
+    )
+    # ...and the engine still pushes it: one agent driving +x into the stem moves the T.
+    world.state.pos.data[:, 0] = torch.tensor([-0.35, 0.0])
+    world.state.vel.data.zero_()
+    world.mark_pos_dirty()
+    act = torch.zeros(env.n_envs, scenario.n_agents, 2)
+    act[..., 0] = 1.0
+    with torch.no_grad():
+        for _ in range(40):
+            env.step(act)
+    assert scenario.tee_pos[0, 0].item() > 0.03, "a dragged movable body stopped being pushed"
 
 
 def test_circle_only_obstacle_rendering_ignores_absent_shape_arrays():

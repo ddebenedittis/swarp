@@ -18,7 +18,7 @@ from typing import Any
 import torch
 import warp as wp
 
-from wmas.core.config import WorldConfig
+from wmas.core.config import Obstacles, WorldConfig
 from wmas.core.state import VEC2
 from wmas.core.world import World
 from wmas.dynamics.base import AgentConfig, ControlMode, DynamicsModel
@@ -189,18 +189,21 @@ class NavigationScenario(Scenario):
         if self.n_obstacles > 0:
             lim = self.world_size - self.obstacle_radius
             obs_pos = w.sample_uniform((n, self.n_obstacles, 2), -lim, lim)
-            if w.obstacle_pos is None:
+            if w.obstacles is None:
+                tt = {"device": w.device, "dtype": w.dtype}
                 w.set_obstacles(
-                    torch.zeros(w.n_envs, self.n_obstacles, 2, device=w.device, dtype=w.dtype),
-                    torch.full(
-                        (self.n_obstacles,), self.obstacle_radius, device=w.device, dtype=w.dtype
-                    ),
+                    Obstacles(
+                        torch.zeros(w.n_envs, self.n_obstacles, 2, **tt),
+                        torch.full((self.n_obstacles,), self.obstacle_radius, **tt),
+                    )
                 )
             if env_mask is None:
                 w.obstacle_pos.copy_(obs_pos)
             else:
                 w.obstacle_pos.copy_(torch.where(env_mask.view(-1, 1, 1), obs_pos, w.obstacle_pos))
-            w.set_obstacles(w.obstacle_pos, w.obstacle_radius)
+            # Re-install the retained spec: the poses were written into its own tensor, and
+            # an unchanged count takes the in-place path (no graph recapture).
+            w.set_obstacles(w.obstacles)
 
         w.mark_pos_dirty()  # positions written out of band; force a fresh build
         self._nbr_cache = None

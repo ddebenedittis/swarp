@@ -100,7 +100,7 @@ def extract_geometry_batch(
     if world.obstacle_pos is not None:
         # Movable obstacles are advanced in place inside the stepper's own buffers, so
         # the live pose lives there, not in the tensor the scenario installed.
-        live_pos, live_angle, _, _ = world.movable_obstacle_state()
+        live_pos, live_angle, _, _ = world.obstacle_state_views()
         obstacle_pos = _to_np(live_pos.index_select(0, sel))
         obstacle_radius = _to_np(world.obstacle_radius)
         # Same for orientation, but only where orientation is meaningful: a circle-only

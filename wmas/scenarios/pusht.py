@@ -40,7 +40,7 @@ import torch
 import warp as wp
 
 from wmas.core.bodies import body_state_gather_kernel
-from wmas.core.config import ObstacleKind, ObstacleShape, WorldConfig
+from wmas.core.config import ObstacleKind, Obstacles, ObstacleShape, WorldConfig
 from wmas.core.state import VEC2
 from wmas.core.world import World
 from wmas.dynamics.base import AgentConfig, ControlMode, DynamicsModel
@@ -353,18 +353,20 @@ class PushTScenario(Scenario):
         )
         ang_vel = om.expand(-1, self.n_boxes)
         self.world.set_obstacles(
-            centers,
-            self._obs_radius,
-            shape=self._obs_shape,
-            angle=angles,  # per-env: the T rotates independently in each env
-            half_extents=self._obs_half,
-            vel=vel,
-            ang_vel=ang_vel,
-            kind=self._obs_kind,
-            mass=self._obs_mass,
-            inertia=self._obs_inertia,
-            body=self._obs_body,
-            body_offset=self._box_off_t,
+            Obstacles(
+                centers,
+                self._obs_radius,
+                shape=self._obs_shape,
+                angle=angles,  # per-env: the T rotates independently in each env
+                half_extents=self._obs_half,
+                vel=vel,
+                ang_vel=ang_vel,
+                kind=self._obs_kind,
+                mass=self._obs_mass,
+                inertia=self._obs_inertia,
+                body=self._obs_body,
+                body_offset=self._box_off_t,
+            )
         )
 
     def _sync_from_engine(self) -> None:
@@ -375,7 +377,7 @@ class PushTScenario(Scenario):
         than a step behind. These are four ``[n_envs]``-sized strided copies of the root
         body's slot; the fused obs/reward kernels keep reading ``tee_*`` unchanged.
         """
-        b_pos, b_angle, b_vel, b_ang_vel = self.world.movable_obstacle_state(body=True)
+        b_pos, b_angle, b_vel, b_ang_vel = self.world.obstacle_state_views(body=True)
         self.tee_pos.copy_(b_pos[:, 0])
         self.tee_theta.copy_(b_angle[:, 0])
         self.tee_vel.copy_(b_vel[:, 0])
@@ -518,10 +520,10 @@ class PushTScenario(Scenario):
         return [
             self.tee_pos, self.tee_vel, self.tee_theta, self.tee_ang_vel,
             self._prev_dist, self._prev_ang, self._prev_adist,
-            wp.to_torch(st._obs_pos), wp.to_torch(st._obs_angle),
-            wp.to_torch(st._obs_vel), wp.to_torch(st._obs_ang_vel),
-            wp.to_torch(st._body_pos), wp.to_torch(st._body_angle),
-            wp.to_torch(st._body_vel), wp.to_torch(st._body_ang_vel),
+            wp.to_torch(st.obs_pos), wp.to_torch(st.obs_angle),
+            wp.to_torch(st.obs_vel), wp.to_torch(st.obs_ang_vel),
+            wp.to_torch(st.body_pos), wp.to_torch(st.body_angle),
+            wp.to_torch(st.body_vel), wp.to_torch(st.body_ang_vel),
         ]
 
     def _pre_graph_step(self) -> None:
@@ -546,7 +548,7 @@ class PushTScenario(Scenario):
         wp.launch(
             body_state_gather_kernel,
             dim=w.n_envs,
-            inputs=[st._body_pos, st._body_angle, st._body_vel, st._body_ang_vel, wp.int32(0)],
+            inputs=[st.body_pos, st.body_angle, st.body_vel, st.body_ang_vel, wp.int32(0)],
             outputs=[bd["tee_pos"], bd["tee_theta"], bd["tee_vel"], bd["tee_ang_vel"]],
             device=w.device,
             record_tape=False,

@@ -29,15 +29,16 @@ from typing import Any
 
 import warp as wp
 
+from wmas.core.config import ObstacleShape
 from wmas.core.state import VEC2
 from wmas.dynamics.base import P_MASS, P_RADIUS, AgentParams
 
 _EPS2 = 1.0e-10  # distance^2 floor: keeps sqrt adjoint finite for coincident points
 
-# Obstacle shape tags (mirror wmas.core.config.ObstacleShape).
-SHAPE_CIRCLE = wp.constant(0)
-SHAPE_BOX = wp.constant(1)
-SHAPE_SEGMENT = wp.constant(2)
+# Kernel-side obstacle shape tags, derived from the enum so there is one source of truth.
+SHAPE_CIRCLE = wp.constant(int(ObstacleShape.CIRCLE))
+SHAPE_BOX = wp.constant(int(ObstacleShape.BOX))
+SHAPE_SEGMENT = wp.constant(int(ObstacleShape.SEGMENT))
 
 
 @wp.func
@@ -431,6 +432,8 @@ def launch_collision_forces(
     obs_half: wp.array,
     obs_vel: wp.array,  # 2d [n_envs, n_obs]
     obs_ang_vel: wp.array,  # 2d [n_envs, n_obs]
+    forces: wp.array,  # output
+    *,
     n_obstacles: int,
     k: float,
     c: float,
@@ -440,9 +443,11 @@ def launch_collision_forces(
     soft_walls: bool,
     bounds_min,
     bounds_max,
-    forces: wp.array,
     dtype,
 ) -> None:
+    """Launch the soft-contact force pass. Everything past the arrays is keyword-only:
+    the scalar tail is three floats and a bool in a row, where a swapped argument would be
+    invisible at the call site."""
     n_envs, n_agents = pos.shape
     if params.floats_per_env is None:
         kernel, floats = collision_forces_kernel, params.floats
