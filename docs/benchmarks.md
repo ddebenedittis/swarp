@@ -42,6 +42,16 @@ RTX 3070 Laptop GPU:
    16000        64      2.09      7,671,187     490,955,980
 ```
 
+> **Reproducing these requires a cold GPU.** On this laptop the eager (graph-off) path is
+> dominated by per-step launch overhead, which makes it acutely sensitive to SM clock. The
+> `4000×16` row above was measured at 6.08 M env-steps/s on an idle machine; the *same
+> commit* measures ~1.2–1.8 M after a sustained load has pulled the clock from 2100 MHz to
+> ~1700 MHz — a 4–5× swing with no code change, and a ~33% spread between consecutive runs.
+> Before reading any before/after comparison as a regression, re-measure both trees
+> **interleaved** in the same session and check the spread. The graph-on path does not have
+> this problem: a step is one graph replay, so `--graph` at `4000×16` reproduces within ~4%
+> (0.15 ms/step) regardless of thermal state.
+
 The tape-free hot path is allocation-free at steady state (recycled scratch plus a
 ping-pong output buffer), which is what makes almost every config land on the same
 ~0.65–0.8 ms/step host floor: up to 16,000 envs × 16 agents the step is latency-bound,
