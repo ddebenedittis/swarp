@@ -181,16 +181,33 @@ class FusedSpec:
         (``saw_touch`` / ``saw_crowd`` / ``saw_cover`` / ``saw_reward`` / ``moved`` /
         ``spun``) that passes *because of* its seed. Unify the seeds and those guards
         can pass vacuously -- a silent loss of coverage that no failure reports.
+    ``scenario``
+        The scenario class, read only for :attr:`rtol` / :attr:`atol`. The fused-vs-torch
+        tolerance is declared on the scenario (``Scenario.parity_rtol`` / ``parity_atol``)
+        because it is the scenario that knows why its two paths differ; both this harness
+        and ``wmas.benchmark``'s parity gate read it from there, so there is exactly one
+        number per scenario. A suite may still assert something *tighter* than the declared
+        bound for a field it knows more about -- push-t's pose checks do -- but nothing
+        re-declares a looser one.
     """
 
     fields: tuple[str, ...]
     grad_steps: int
     grad_index: int
     grad_backprop: str  # "rew" or "obs"
+    scenario: type | None = None
     action_seed: int = 2
     grad_action_seed: int = 5
     substeps: int = 1
     n_envs: int = 24
+
+    @property
+    def rtol(self) -> float:
+        return self.scenario.parity_rtol
+
+    @property
+    def atol(self) -> float:
+        return self.scenario.parity_atol
 
 
 def fused_env(scenario, device, fused, *, spec, dtype=torch.float32):

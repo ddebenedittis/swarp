@@ -14,6 +14,7 @@ from conftest import (
 from wmas import FormationScenario
 
 SPEC = FusedSpec(
+    scenario=FormationScenario,
     fields=("obs", "rew", "done", "info:multiobj_reward", "info:formation_error"),
     grad_steps=6,
     grad_index=3,
@@ -41,13 +42,14 @@ def test_fused_matches_torch(device):
     for t, (f, r) in enumerate(zip(fused, torchp, strict=True)):
         of, rf, df, mf, ef = f
         ot, rt, dt_, mt, et = r
-        torch.testing.assert_close(of, ot, rtol=1e-5, atol=1e-6, msg=f"obs@{t}")
-        torch.testing.assert_close(rf, rt, rtol=1e-5, atol=1e-6, msg=f"reward@{t}")
+        torch.testing.assert_close(of, ot, rtol=SPEC.rtol, atol=SPEC.atol, msg=f"obs@{t}")
+        torch.testing.assert_close(rf, rt, rtol=SPEC.rtol, atol=SPEC.atol, msg=f"reward@{t}")
         assert torch.equal(df, dt_), f"done@{t}"
         # multiobj_reward[..., 1] = collision_penalty * touching -> discrete, exact
         assert torch.equal(mf[..., 1], mt[..., 1]), f"collision term@{t}"
-        torch.testing.assert_close(mf[..., 0], mt[..., 0], rtol=1e-5, atol=1e-6, msg=f"shaping@{t}")
-        torch.testing.assert_close(ef, et, rtol=1e-5, atol=1e-6, msg=f"formation_error@{t}")
+        tol = {"rtol": SPEC.rtol, "atol": SPEC.atol}
+        torch.testing.assert_close(mf[..., 0], mt[..., 0], **tol, msg=f"shaping@{t}")
+        torch.testing.assert_close(ef, et, **tol, msg=f"formation_error@{t}")
 
 
 @pytest.mark.parametrize("device", DEVICES)
@@ -62,7 +64,7 @@ def test_fused_dense_touching_parity(device):
     for f_i, t_i in zip(f, t, strict=True):
         assert torch.equal(f_i[3][..., 1], t_i[3][..., 1])  # collision term (touching)
         assert torch.equal(f_i[2], t_i[2])  # done
-        torch.testing.assert_close(f_i[1], t_i[1], rtol=1e-5, atol=1e-6)  # reward
+        torch.testing.assert_close(f_i[1], t_i[1], rtol=SPEC.rtol, atol=SPEC.atol)  # reward
 
 
 @pytest.mark.parametrize("device", DEVICES)

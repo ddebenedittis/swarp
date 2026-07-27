@@ -25,6 +25,7 @@ from conftest import (
 from wmas import PushTScenario
 
 SPEC = FusedSpec(
+    scenario=PushTScenario,
     fields=("obs", "rew", "done", "info:tee_dist_to_goal", "info:tee_angle_error"),
     grad_steps=4,
     grad_index=2,
@@ -58,8 +59,12 @@ def test_fused_matches_torch(device, n_agents):
     for t, (f, r) in enumerate(zip(fused, torchp, strict=True)):
         of, rf, df, gf, af = f
         ot, rt, dt_, gt, at = r
+        # obs and the pose diagnostics are held *tighter* than PushTScenario's declared
+        # parity bound (SPEC.rtol/atol, which the reward below uses and which the benchmark
+        # parity gate reads): the pose itself stays within ~1e-4 over 20 steps, and only the
+        # reward — a difference of successive pose errors — needs the full bound.
         torch.testing.assert_close(of, ot, rtol=1e-3, atol=1e-3, msg=f"obs@{t}")
-        torch.testing.assert_close(rf, rt, rtol=1e-2, atol=5e-3, msg=f"reward@{t}")
+        torch.testing.assert_close(rf, rt, rtol=SPEC.rtol, atol=SPEC.atol, msg=f"reward@{t}")
         assert torch.equal(df, dt_), f"done@{t}"
         torch.testing.assert_close(gf, gt, rtol=1e-3, atol=1e-3, msg=f"tee_dist@{t}")
         torch.testing.assert_close(af, at, rtol=1e-3, atol=1e-3, msg=f"tee_angle@{t}")

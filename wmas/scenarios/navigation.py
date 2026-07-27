@@ -444,9 +444,6 @@ class NavigationScenario(FusedScenario):
             ]
         return torch.cat(feats, dim=-1)
 
-    def observation(self, agent_idx: int) -> torch.Tensor:
-        return self.observations()[:, agent_idx]
-
     def rewards(self) -> torch.Tensor:
         if self.fused_active:
             return self.fb["reward"]

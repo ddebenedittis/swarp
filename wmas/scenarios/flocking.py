@@ -74,9 +74,6 @@ class FlockingScenario(FusedScenario):
         self._k_obs = min(self.neighbor_obs, cfg.max_neighbors)
         return self.world
 
-    #: Flocking ships a fused Warp obs/reward kernel (2D, needs neighbors).
-    fused_available = True
-
     @property
     def obs_dim(self) -> int:
         return 4 + 5 * self._k_obs
@@ -206,16 +203,11 @@ class FlockingScenario(FusedScenario):
             dim=-1,
         )
 
-    def observation(self, agent_idx: int) -> torch.Tensor:
-        return self.observations()[:, agent_idx]
-
     def agent_reward(self, agent_idx: int) -> torch.Tensor:
         return self._cache["reward"][:, agent_idx]
 
     def rewards(self) -> torch.Tensor:
-        if self.fused_active:
-            return self.fb["reward"]
-        return super().rewards()
+        return self.fb["reward"] if self.fused_active else super().rewards()
 
     def info(self) -> dict[str, Any]:
         if self.fused_active:

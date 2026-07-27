@@ -197,9 +197,15 @@ def _trajectory(env: Environment, action_seq: list[torch.Tensor]) -> dict:
     return {"obs": obs_l, "reward": rew_l, "done": done_l}
 
 
-def _parity_ok(ref: dict, cur: dict, rtol: float = 1e-5, atol: float = 1e-5) -> tuple[bool, str]:
-    # atol 1e-5 tolerates the documented ulp-scale drift of the fused kernels vs
-    # the torch reference (sqrt/reduction order); a real regression is far larger.
+def _parity_ok(ref: dict, cur: dict, rtol: float, atol: float) -> tuple[bool, str]:
+    """Compare two trajectories field by field within ``(rtol, atol)``.
+
+    The tolerance is **the scenario's**, not this module's: it is the scenario that knows
+    why its optimized and reference paths differ (see
+    :attr:`wmas.scenarios.base.Scenario.parity_rtol`). This function used to hardcode a
+    flat 1e-5 for everything, which reported push-t as a parity failure for a divergence
+    its own test suite documents as by design.
+    """
     for key in ("obs", "reward"):
         for t, (r, c) in enumerate(zip(ref[key], cur[key], strict=True)):
             if r.shape != c.shape:
@@ -287,7 +293,8 @@ def bench_one(
         # Parity first (cheap, catches correctness regressions before timing).
         cur_traj = _trajectory(env, action_seq)
         if ref_traj is not None:
-            ok, why = _parity_ok(ref_traj, cur_traj)
+            scen = type(env.scenario)
+            ok, why = _parity_ok(ref_traj, cur_traj, scen.parity_rtol, scen.parity_atol)
             if not ok:
                 row["status"] = "parity-fail"
                 row["detail"] = why

@@ -83,9 +83,6 @@ class SamplingScenario(FusedScenario):
         self._cell_coord = (i + 0.5) / self.grid_res * 2.0 * self.world_size - self.world_size
         return self.world
 
-    #: Sampling ships fused Warp obs/reward kernels (2D holonomic).
-    fused_available = True
-
     @property
     def obs_dim(self) -> int:
         return 4 + 9  # pos, vel, 3x3 field samples
@@ -249,16 +246,11 @@ class SamplingScenario(FusedScenario):
         s = w.state
         return torch.cat([s.pos, s.vel, self._cache["samples"]], dim=-1)
 
-    def observation(self, agent_idx: int) -> torch.Tensor:
-        return self.observations()[:, agent_idx]
-
     def agent_reward(self, agent_idx: int) -> torch.Tensor:
         return self._cache["reward"][:, agent_idx]
 
     def rewards(self) -> torch.Tensor:
-        if self.fused_active:
-            return self.fb["reward"]
-        return super().rewards()
+        return self.fb["reward"] if self.fused_active else super().rewards()
 
     def info(self) -> dict[str, Any]:
         if self.fused_active:

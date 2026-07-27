@@ -83,9 +83,6 @@ class FormationScenario(FusedScenario):
         self.world.goals = torch.zeros(n_envs, self.n_agents, 2, device=device, dtype=dtype)
         return self.world
 
-    #: Formation ships fused Warp obs/reward kernels (2D holonomic).
-    fused_available = True
-
     @property
     def obs_dim(self) -> int:
         return 6
@@ -231,17 +228,12 @@ class FormationScenario(FusedScenario):
         s = w.state
         return torch.cat([s.pos, s.vel, w.goals - s.pos], dim=-1)
 
-    def observation(self, agent_idx: int) -> torch.Tensor:
-        return self.observations()[:, agent_idx]
-
     def agent_reward(self, agent_idx: int) -> torch.Tensor:
         c = self._cache
         return c["shaping"][:, agent_idx] + self.collision_penalty * c["touching"][:, agent_idx]
 
     def rewards(self) -> torch.Tensor:
-        if self.fused_active:
-            return self.fb["reward"]
-        return super().rewards()
+        return self.fb["reward"] if self.fused_active else super().rewards()
 
     def done(self) -> torch.Tensor:
         if self.fused_active:

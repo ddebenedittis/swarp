@@ -84,9 +84,6 @@ class DiscoveryScenario(FusedScenario):
         self._cache: dict[str, torch.Tensor] | None = None
         return self.world
 
-    #: Discovery ships fused Warp obs/reward kernels (2D holonomic).
-    fused_available = True
-
     @property
     def obs_dim(self) -> int:
         return 4 + 3 * self.n_targets
@@ -246,9 +243,6 @@ class DiscoveryScenario(FusedScenario):
         covered_flag = self.covered.to(w.dtype).unsqueeze(1).expand(-1, w.n_agents, -1)
         return torch.cat([s.pos, s.vel, self._cache["rel_targets"], covered_flag], dim=-1)
 
-    def observation(self, agent_idx: int) -> torch.Tensor:
-        return self.observations()[:, agent_idx]
-
     def agent_reward(self, agent_idx: int) -> torch.Tensor:
         c = self._cache
         return self.collision_penalty * c["touch"][
@@ -259,9 +253,7 @@ class DiscoveryScenario(FusedScenario):
         return self.covering_reward * self._cache["newly"].sum(dim=-1).to(self.world.dtype)
 
     def rewards(self) -> torch.Tensor:
-        if self.fused_active:
-            return self.fb["reward"]
-        return super().rewards()
+        return self.fb["reward"] if self.fused_active else super().rewards()
 
     def done(self) -> torch.Tensor:
         if self.fused_active:

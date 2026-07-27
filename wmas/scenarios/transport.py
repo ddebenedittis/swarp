@@ -120,9 +120,6 @@ class TransportScenario(FusedScenario):
         self._cache: dict[str, torch.Tensor] | None = None
         return self.world
 
-    #: Transport ships fused Warp obs/reward + movable-body kernels.
-    fused_available = True
-
     @property
     def obs_dim(self) -> int:
         return 4 + 4 * self.n_packages
@@ -386,17 +383,12 @@ class TransportScenario(FusedScenario):
         )
         return torch.cat([s.pos, s.vel, self._cache["pkg_rel"], pkg_to_goal], dim=-1)
 
-    def observation(self, agent_idx: int) -> torch.Tensor:
-        return self.observations()[:, agent_idx]
-
     def global_reward(self) -> torch.Tensor:
         c = self._cache
         return c["shaping"] + self.goal_reward * c["on_goal"].all(dim=-1).to(self.world.dtype)
 
     def rewards(self) -> torch.Tensor:
-        if self.fused_active:
-            return self.fb["reward"]
-        return super().rewards()
+        return self.fb["reward"] if self.fused_active else super().rewards()
 
     def done(self) -> torch.Tensor:
         if self.fused_active:

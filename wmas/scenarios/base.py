@@ -50,6 +50,20 @@ class Scenario(ABC):
     #: the Environment (:meth:`set_fused_active`); read by the scenario.
     fused_active: bool = False
 
+    # How far this scenario's fused path may legitimately differ from its torch reference
+    # path on the same seeded trajectory. It is the *scenario* that knows why its two
+    # paths differ, so the number lives here and both readers take it from here: the
+    # per-scenario benchmark's parity gate (``wmas.benchmark.ablation._parity_ok``, via
+    # ``wmas.benchmark.scenarios.run_config``) and the shared test harness
+    # (``tests/conftest.py``'s ``FusedSpec``). A second hardcoded table is what this
+    # replaces — the CLI's flat 1e-5 reported push-t as a parity failure for a difference
+    # its own test suite had documented as by design.
+    #
+    # The default covers the ordinary case: the two paths compute the same quantity, and
+    # they differ only by ulp-scale reassociation (sqrt, reduction order).
+    parity_rtol: float = 1e-5
+    parity_atol: float = 1e-6
+
     @property
     @abstractmethod
     def obs_dim(self) -> int:
@@ -145,19 +159,7 @@ class Scenario(ABC):
         free; see :class:`~wmas.core.hooks.WholeStepHook` for the contract each member
         has to honour.
         """
-        # TRANSITIONAL SHIM — deleted once all seven built-in scenarios are
-        # FusedScenarios. Adapts a scenario still carrying the old four undeclared
-        # private members (``graph_capturable`` / ``_pre_graph_step`` /
-        # ``_graph_post_physics`` / ``graph_recapture_token``) so the migration can
-        # land one scenario per commit with the suite green at every step.
-        if not getattr(self, "graph_capturable", None) or not self.graph_capturable():
-            return None
-        return WholeStepHook(
-            run=self._graph_post_physics,
-            prepare=self._pre_graph_step,
-            token=self.graph_recapture_token,
-            carries=getattr(self, "_graph_warmup_carries", lambda: []),
-        )
+        return None
 
     def render_extras(self, env_idx: int) -> dict[str, Any]:
         """Extra geometry for the viewer to overlay for env ``env_idx`` (default none).

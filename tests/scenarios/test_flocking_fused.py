@@ -14,6 +14,7 @@ from conftest import (
 from wmas import FlockingScenario
 
 SPEC = FusedSpec(
+    scenario=FlockingScenario,
     fields=("obs", "rew", "info:crowding"),
     grad_steps=4,
     grad_index=2,
@@ -44,9 +45,9 @@ def test_fused_matches_torch(device, neighbor_obs):
     for t, (f, r) in enumerate(zip(fused, torchp, strict=True)):
         of, rf, cf = f
         ot, rt, ct = r
-        torch.testing.assert_close(of, ot, rtol=1e-5, atol=1e-6, msg=f"obs@{t}")
-        torch.testing.assert_close(rf, rt, rtol=1e-5, atol=1e-6, msg=f"reward@{t}")
-        torch.testing.assert_close(cf, ct, rtol=1e-5, atol=1e-6, msg=f"crowding@{t}")
+        torch.testing.assert_close(of, ot, rtol=SPEC.rtol, atol=SPEC.atol, msg=f"obs@{t}")
+        torch.testing.assert_close(rf, rt, rtol=SPEC.rtol, atol=SPEC.atol, msg=f"reward@{t}")
+        torch.testing.assert_close(cf, ct, rtol=SPEC.rtol, atol=SPEC.atol, msg=f"crowding@{t}")
 
 
 @pytest.mark.parametrize("device", DEVICES)
@@ -59,9 +60,9 @@ def test_fused_dense_neighbors_parity(device):
     saw_crowd = any(step[2].abs().sum().item() > 0 for step in t)
     assert saw_crowd, "test config did not induce any crowding"
     for f_i, t_i in zip(f, t, strict=True):
-        torch.testing.assert_close(f_i[0], t_i[0], rtol=1e-5, atol=1e-6)
-        torch.testing.assert_close(f_i[1], t_i[1], rtol=1e-5, atol=1e-6)
-        torch.testing.assert_close(f_i[2], t_i[2], rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(f_i[0], t_i[0], rtol=SPEC.rtol, atol=SPEC.atol)
+        torch.testing.assert_close(f_i[1], t_i[1], rtol=SPEC.rtol, atol=SPEC.atol)
+        torch.testing.assert_close(f_i[2], t_i[2], rtol=SPEC.rtol, atol=SPEC.atol)
 
 
 @pytest.mark.parametrize("device", DEVICES)

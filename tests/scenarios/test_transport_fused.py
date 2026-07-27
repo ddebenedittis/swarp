@@ -19,6 +19,7 @@ from conftest import (
 from wmas import TransportScenario
 
 SPEC = FusedSpec(
+    scenario=TransportScenario,
     fields=("obs", "rew", "done", "info:package_dist_to_goal"),
     grad_steps=4,
     grad_index=2,
@@ -51,10 +52,10 @@ def test_fused_matches_torch(device, n_packages):
     for t, (f, r) in enumerate(zip(fused, torchp, strict=True)):
         of, rf, df, gf = f
         ot, rt, dt_, gt = r
-        torch.testing.assert_close(of, ot, rtol=1e-5, atol=1e-5, msg=f"obs@{t}")
-        torch.testing.assert_close(rf, rt, rtol=1e-5, atol=1e-5, msg=f"reward@{t}")
+        torch.testing.assert_close(of, ot, rtol=SPEC.rtol, atol=SPEC.atol, msg=f"obs@{t}")
+        torch.testing.assert_close(rf, rt, rtol=SPEC.rtol, atol=SPEC.atol, msg=f"reward@{t}")
         assert torch.equal(df, dt_), f"done@{t}"
-        torch.testing.assert_close(gf, gt, rtol=1e-5, atol=1e-5, msg=f"pkg_dist@{t}")
+        torch.testing.assert_close(gf, gt, rtol=SPEC.rtol, atol=SPEC.atol, msg=f"pkg_dist@{t}")
 
 
 @pytest.mark.parametrize("device", DEVICES)

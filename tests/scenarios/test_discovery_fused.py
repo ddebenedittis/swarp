@@ -20,6 +20,7 @@ from conftest import (
 from wmas import DiscoveryScenario
 
 SPEC = FusedSpec(
+    scenario=DiscoveryScenario,
     fields=("obs", "rew", "done", "info:covered_frac"),
     grad_steps=4,
     grad_index=2,
@@ -55,8 +56,8 @@ def test_fused_matches_torch(device, n_targets):
     for t, (f, r) in enumerate(zip(fused, torchp, strict=True)):
         of, rf, df, cff = f
         ot, rt, dt_, cft = r
-        torch.testing.assert_close(of, ot, rtol=1e-5, atol=1e-6, msg=f"obs@{t}")
-        torch.testing.assert_close(rf, rt, rtol=1e-5, atol=1e-6, msg=f"reward@{t}")
+        torch.testing.assert_close(of, ot, rtol=SPEC.rtol, atol=SPEC.atol, msg=f"obs@{t}")
+        torch.testing.assert_close(rf, rt, rtol=SPEC.rtol, atol=SPEC.atol, msg=f"reward@{t}")
         assert torch.equal(df, dt_), f"done@{t}"
         assert torch.equal(cff, cft), f"covered_frac@{t}"  # discrete latch, exact
 
@@ -70,7 +71,7 @@ def test_fused_dense_touching_parity(device):
     for f_i, t_i in zip(f, t, strict=True):
         assert torch.equal(f_i[2], t_i[2])  # done
         assert torch.equal(f_i[3], t_i[3])  # covered_frac
-        torch.testing.assert_close(f_i[1], t_i[1], rtol=1e-5, atol=1e-6)  # reward
+        torch.testing.assert_close(f_i[1], t_i[1], rtol=SPEC.rtol, atol=SPEC.atol)  # reward
 
 
 @pytest.mark.parametrize("device", DEVICES)

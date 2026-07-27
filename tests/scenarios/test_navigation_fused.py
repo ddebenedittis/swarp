@@ -16,6 +16,7 @@ from wmas import NavigationScenario
 from wmas.dynamics.base import P_RADIUS, per_env_float_template
 
 SPEC = FusedSpec(
+    scenario=NavigationScenario,
     fields=(
         "obs",
         "rew",
@@ -70,14 +71,14 @@ def test_fused_matches_torch(device, shared_reward, neighbor_obs):
     for t, (f, r) in enumerate(zip(fused, torchp, strict=True)):
         of, rf, df, cf, gf, ogf, ovf = f
         ot, rt, dt_, ct, gt, ogt, ovt = r
-        torch.testing.assert_close(of, ot, rtol=1e-5, atol=1e-6, msg=f"obs@{t}")
-        torch.testing.assert_close(rf, rt, rtol=1e-5, atol=1e-6, msg=f"reward@{t}")
+        torch.testing.assert_close(of, ot, rtol=SPEC.rtol, atol=SPEC.atol, msg=f"obs@{t}")
+        torch.testing.assert_close(rf, rt, rtol=SPEC.rtol, atol=SPEC.atol, msg=f"reward@{t}")
         assert torch.equal(df, dt_), f"done@{t}"
         # touching / on_goal are discrete; must match exactly on non-degenerate configs
         assert torch.equal(cf, ct), f"collisions@{t}"
         assert torch.equal(ogf, ogt), f"on_goal@{t}"
         assert torch.equal(ovf, ovt), f"overflow@{t}"
-        torch.testing.assert_close(gf, gt, rtol=1e-5, atol=1e-6, msg=f"dist@{t}")
+        torch.testing.assert_close(gf, gt, rtol=SPEC.rtol, atol=SPEC.atol, msg=f"dist@{t}")
 
 
 @pytest.mark.parametrize("device", DEVICES)
@@ -93,7 +94,7 @@ def test_fused_dense_touching_parity(device):
     for f_i, t_i in zip(f, t, strict=True):
         assert torch.equal(f_i[3], t_i[3])  # collisions/touching
         assert torch.equal(f_i[6], t_i[6])  # overflow
-        torch.testing.assert_close(f_i[1], t_i[1], rtol=1e-5, atol=1e-6)  # reward
+        torch.testing.assert_close(f_i[1], t_i[1], rtol=SPEC.rtol, atol=SPEC.atol)  # reward
 
 
 @pytest.mark.parametrize("device", DEVICES)
@@ -134,8 +135,8 @@ def test_fused_per_env_params(device):
         outs.append(steps)
     for (of, rf, cf), (ot, rt, ct) in zip(outs[0], outs[1], strict=True):
         assert torch.equal(cf, ct)
-        torch.testing.assert_close(of, ot, rtol=1e-5, atol=1e-6)
-        torch.testing.assert_close(rf, rt, rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(of, ot, rtol=SPEC.rtol, atol=SPEC.atol)
+        torch.testing.assert_close(rf, rt, rtol=SPEC.rtol, atol=SPEC.atol)
 
 
 @pytest.mark.parametrize("device", DEVICES)

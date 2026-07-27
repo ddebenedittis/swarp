@@ -5,7 +5,11 @@ rays} and, for each config, times an un-optimized *baseline* (all opts off) vs
 the fully *optimized* default (fused obs/reward where available + physics CUDA
 graph + neighbor dedupe + slim-2D). Every config is parity-checked before timing
 (5-step seeded trajectory, optimized vs baseline, ``allclose`` obs/reward + exact
-``done``) — the same gate that caught the CUDA-graph reuse bug.
+``done``) — the same gate that caught the CUDA-graph reuse bug. The tolerance comes from
+the scenario class (``Scenario.parity_rtol`` / ``parity_atol``), since a scenario whose two
+paths run deliberately different physics — push-t integrates its body at
+``body_substeps`` in torch and at ``Stepper.substeps`` in the engine — cannot be held to
+the ulp-scale bound the others meet.
 
 The scenario registry lives in :mod:`wmas.scenarios` (``SCENARIOS``); this CLI is
 one of its consumers, so adding a scenario there (or lighting up its fused
@@ -158,9 +162,15 @@ def run_config(
     try:
         base = make_env(name, n_envs, n_agents, model_name, optimized=False, device=device)
         opt = make_env(name, n_envs, n_agents, model_name, optimized=True, device=device)
-        # Parity gate: optimized must match baseline on a 5-step seeded rollout.
+        # Parity gate: optimized must match baseline on a 5-step seeded rollout, within the
+        # tolerance the *scenario* declares (Scenario.parity_rtol / parity_atol) — the same
+        # numbers tests/conftest.py's FusedSpec reads.
+        cls = SCENARIOS[name]
         ok, why = _parity_ok(
-            _trajectory(base, n_agents, device), _trajectory(opt, n_agents, device)
+            _trajectory(base, n_agents, device),
+            _trajectory(opt, n_agents, device),
+            cls.parity_rtol,
+            cls.parity_atol,
         )
         if not ok:
             row["status"] = "parity-fail"
