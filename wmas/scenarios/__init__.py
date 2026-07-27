@@ -18,18 +18,23 @@ from wmas.scenarios.base import Scenario
 from wmas.scenarios.discovery import DiscoveryScenario
 from wmas.scenarios.flocking import FlockingScenario
 from wmas.scenarios.formation import FormationScenario
+from wmas.scenarios.fused import Buf, FusedPass, FusedScenario
 from wmas.scenarios.navigation import NavigationScenario
 from wmas.scenarios.pusht import PushTScenario
 from wmas.scenarios.sampling import SamplingScenario
 from wmas.scenarios.transport import TransportScenario
 
 __all__ = [
+    "SCENARIOS",
+    # The two base classes a scenario author subclasses, and the fused vocabulary.
+    "Buf",
     "DiscoveryScenario",
     "FlockingScenario",
     "FormationScenario",
+    "FusedPass",
+    "FusedScenario",
     "NavigationScenario",
     "PushTScenario",
-    "SCENARIOS",
     "SamplingScenario",
     "Scenario",
     "TransportScenario",

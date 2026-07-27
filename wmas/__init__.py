@@ -49,9 +49,12 @@ from wmas.dynamics.base import (
 from wmas.interop.autograd import TorchState, rollout, warp_step
 from wmas.scenarios import (
     SCENARIOS,
+    Buf,
     DiscoveryScenario,
     FlockingScenario,
     FormationScenario,
+    FusedPass,
+    FusedScenario,
     NavigationScenario,
     PushTScenario,
     SamplingScenario,
@@ -99,12 +102,15 @@ def make(name: str, n_envs: int, **kwargs) -> Environment:
 
 __all__ = [
     "AgentConfig",
+    "Buf",
     "ControlMode",
     "DiscoveryScenario",
     "DynamicsModel",
     "Environment",
     "FlockingScenario",
     "FormationScenario",
+    "FusedPass",
+    "FusedScenario",
     "Integrator",
     "Lidar",
     "NUM_PARAMS",
