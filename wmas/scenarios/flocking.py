@@ -76,15 +76,16 @@ class FlockingScenario(Scenario):
         self._fused_ready = False
         return self.world
 
-    def fused_available(self) -> bool:
-        """Flocking ships a fused Warp obs/reward kernel (2D, needs neighbors)."""
-        return True
+    #: Flocking ships a fused Warp obs/reward kernel (2D, needs neighbors).
+    fused_available = True
 
     @property
     def obs_dim(self) -> int:
         return 4 + 5 * self._k_obs
 
-    def reset_world(self, env_mask: torch.Tensor | None = None) -> None:
+    def reset_world(
+        self, env_mask: torch.Tensor | None = None, *, obs_only: bool = False
+    ) -> None:
         w = self.world
         n = w.n_envs
         lim = self.world_size - 2.0 * self.agent_radius
@@ -97,17 +98,17 @@ class FlockingScenario(Scenario):
             m3 = env_mask.view(-1, 1, 1)
             w.state.pos.data.copy_(torch.where(m3, spawn, w.state.pos.data))
             w.state.vel.data.copy_(torch.where(m3, vel, w.state.vel.data))
-        if self._fused_active:
+        if self.fused_active:
             # full_pass=0 on the mid-step auto-reset obs-only pass (don't clobber
             # the reward/info already returned this step); 1 on a standalone reset.
             # _launch rebuilds neighbors on the new state, mirroring the torch
             # _refresh (which also calls w.neighbors()); no mark_pos_dirty needed.
-            self._launch(full_pass=0 if self._fused_obs_only else 1)
+            self._launch(full_pass=0 if obs_only else 1)
         else:
             self._refresh()
 
     def post_step(self) -> None:
-        if self._fused_active:
+        if self.fused_active:
             # Same sequence the whole-step graph runs (keeps non-graph fused mode
             # and CPU eager-persistent bit-identical).
             self._pre_graph_step()
@@ -234,7 +235,7 @@ class FlockingScenario(Scenario):
         }
 
     def observations(self) -> torch.Tensor:
-        if self._fused_active:
+        if self.fused_active:
             return self._f_obs
         w = self.world
         s = w.state
@@ -258,11 +259,11 @@ class FlockingScenario(Scenario):
         return self._cache["reward"][:, agent_idx]
 
     def rewards(self) -> torch.Tensor:
-        if self._fused_active:
+        if self.fused_active:
             return self._f_reward
         return super().rewards()
 
     def info(self) -> dict[str, Any]:
-        if self._fused_active:
+        if self.fused_active:
             return {"crowding": self._f_crowd}
         return {"crowding": self._cache["crowd"]}

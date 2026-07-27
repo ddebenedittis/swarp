@@ -82,15 +82,16 @@ class FormationScenario(Scenario):
         self._handle_version = 0
         return self.world
 
-    def fused_available(self) -> bool:
-        """Formation ships fused Warp obs/reward kernels (2D holonomic)."""
-        return True
+    #: Formation ships fused Warp obs/reward kernels (2D holonomic).
+    fused_available = True
 
     @property
     def obs_dim(self) -> int:
         return 6
 
-    def reset_world(self, env_mask: torch.Tensor | None = None) -> None:
+    def reset_world(
+        self, env_mask: torch.Tensor | None = None, *, obs_only: bool = False
+    ) -> None:
         w = self.world
         n = w.n_envs
         lim = self.world_size - 2.0 * self.agent_radius
@@ -112,20 +113,20 @@ class FormationScenario(Scenario):
                 torch.where(m3, torch.zeros_like(w.state.vel.data), w.state.vel.data)
             )
             w.goals.copy_(torch.where(m3, goals, w.goals))
-        if self._fused_active:
+        if self.fused_active:
             self._ensure_fused(w.n_envs)
             self._sync_fused_handles()  # this eager _launch_obs uses cached handles
             if env_mask is None:
                 self._f_resetmask.fill_(1)
             else:
                 self._f_resetmask.copy_(env_mask)  # bool -> uint8
-            full = 0 if self._fused_obs_only else 1
+            full = 0 if obs_only else 1
             self._launch_obs(advance_prev=0, full_pass=full)
         else:
             self._refresh(reset_mask=env_mask)
 
     def post_step(self) -> None:
-        if self._fused_active:
+        if self.fused_active:
             # Same sequence the whole-step graph runs (keeps non-graph fused mode
             # and CPU eager-persistent bit-identical).
             self._pre_graph_step()
@@ -323,7 +324,7 @@ class FormationScenario(Scenario):
         }
 
     def observations(self) -> torch.Tensor:
-        if self._fused_active:
+        if self.fused_active:
             return self._f_obs
         w = self.world
         s = w.state
@@ -337,17 +338,17 @@ class FormationScenario(Scenario):
         return c["shaping"][:, agent_idx] + self.collision_penalty * c["touching"][:, agent_idx]
 
     def rewards(self) -> torch.Tensor:
-        if self._fused_active:
+        if self.fused_active:
             return self._f_reward
         return super().rewards()
 
     def done(self) -> torch.Tensor:
-        if self._fused_active:
+        if self.fused_active:
             return self._f_done_bool
         return self._cache["in_formation"].all(dim=-1)
 
     def info(self) -> dict[str, Any]:
-        if self._fused_active:
+        if self.fused_active:
             return {
                 "multiobj_reward": self._f_multiobj,
                 "formation_error": self._f_ferror,

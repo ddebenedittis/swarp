@@ -117,9 +117,8 @@ class TransportScenario(Scenario):
         self._handle_version = 0
         return self.world
 
-    def fused_available(self) -> bool:
-        """Transport ships fused Warp obs/reward + movable-body kernels."""
-        return True
+    #: Transport ships fused Warp obs/reward + movable-body kernels.
+    fused_available = True
 
     @property
     def obs_dim(self) -> int:
@@ -127,7 +126,9 @@ class TransportScenario(Scenario):
 
     # ------------------------------------------------------------------ reset
 
-    def reset_world(self, env_mask: torch.Tensor | None = None) -> None:
+    def reset_world(
+        self, env_mask: torch.Tensor | None = None, *, obs_only: bool = False
+    ) -> None:
         w = self.world
         n = w.n_envs
         lim = self.world_size - 2.0 * self.agent_radius
@@ -170,14 +171,14 @@ class TransportScenario(Scenario):
             self.goal.copy_(torch.where(m3, goal, self.goal))
 
         self._install_obstacles()
-        if self._fused_active:
+        if self.fused_active:
             self._ensure_fused(w.n_envs)
             self._sync_fused_handles()  # this eager _launch_* uses cached handles
             if env_mask is None:
                 self._f_resetmask.fill_(1)
             else:
                 self._f_resetmask.copy_(env_mask)  # bool -> uint8
-            full = 0 if self._fused_obs_only else 1
+            full = 0 if obs_only else 1
             # No body integration on reset (integrate=False): recompute obs and
             # rebase the shaping baseline only. reset_hit rebases prev_dist.
             self._launch_obs()
@@ -196,7 +197,7 @@ class TransportScenario(Scenario):
     # -------------------------------------------------------- package physics
 
     def post_step(self) -> None:
-        if self._fused_active:
+        if self.fused_active:
             # Same sequence the whole-step graph runs (keeps non-graph fused mode
             # and CPU eager-persistent bit-identical).
             self._pre_graph_step()
@@ -447,7 +448,7 @@ class TransportScenario(Scenario):
     # ------------------------------------------------------------ obs/rewards
 
     def observations(self) -> torch.Tensor:
-        if self._fused_active:
+        if self.fused_active:
             return self._f_obs
         w = self.world
         s = w.state
@@ -466,16 +467,16 @@ class TransportScenario(Scenario):
         return c["shaping"] + self.goal_reward * c["on_goal"].all(dim=-1).to(self.world.dtype)
 
     def rewards(self) -> torch.Tensor:
-        if self._fused_active:
+        if self.fused_active:
             return self._f_reward
         return super().rewards()
 
     def done(self) -> torch.Tensor:
-        if self._fused_active:
+        if self.fused_active:
             return self._f_done_bool
         return self._cache["on_goal"].all(dim=-1)
 
     def info(self) -> dict[str, Any]:
-        if self._fused_active:
+        if self.fused_active:
             return {"package_dist_to_goal": self._f_dist}
         return {"package_dist_to_goal": self._cache["dist_to_goal"]}

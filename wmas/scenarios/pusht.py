@@ -220,9 +220,8 @@ class PushTScenario(Scenario):
         self._handle_version = 0
         return self.world
 
-    def fused_available(self) -> bool:
-        """Push-T ships fused Warp obs/reward + movable-body kernels."""
-        return True
+    #: Push-T ships fused Warp obs/reward + movable-body kernels.
+    fused_available = True
 
     @property
     def obs_dim(self) -> int:
@@ -231,7 +230,9 @@ class PushTScenario(Scenario):
 
     # ------------------------------------------------------------------ reset
 
-    def reset_world(self, env_mask: torch.Tensor | None = None) -> None:
+    def reset_world(
+        self, env_mask: torch.Tensor | None = None, *, obs_only: bool = False
+    ) -> None:
         w = self.world
         n = w.n_envs
         lim = self.world_size - 2.0 * self.agent_radius
@@ -303,14 +304,14 @@ class PushTScenario(Scenario):
             self.goal_theta.copy_(torch.where(env_mask, goal_th, self.goal_theta))
 
         self._install_obstacles()
-        if self._fused_active:
+        if self.fused_active:
             self._ensure_fused(w.n_envs)
             self._sync_fused_handles()  # this eager _launch_* uses cached handles
             if env_mask is None:
                 self._f_resetmask.fill_(1)
             else:
                 self._f_resetmask.copy_(env_mask)  # bool -> uint8
-            full = 0 if self._fused_obs_only else 1
+            full = 0 if obs_only else 1
             # No body integration on reset: recompute obs and rebase the shaping
             # baselines only. reset_hit rebases prev_dist/prev_ang.
             self._launch_obs()
@@ -393,7 +394,7 @@ class PushTScenario(Scenario):
         the differentiable torch reference (``_refresh``), because the engine advances body
         state with ``record_tape=False`` and is skipped on taped steps.
         """
-        if self._fused_active:
+        if self.fused_active:
             # Same sequence the whole-step graph runs (keeps non-graph fused mode
             # and CPU eager-persistent bit-identical).
             self._pre_graph_step()
@@ -773,7 +774,7 @@ class PushTScenario(Scenario):
     # ------------------------------------------------------------ obs/rewards
 
     def observations(self) -> torch.Tensor:
-        if self._fused_active:
+        if self.fused_active:
             return self._f_obs
         w = self.world
         s = w.state
@@ -799,12 +800,12 @@ class PushTScenario(Scenario):
         return c["shaping"] + self.goal_reward * c["on_goal"].to(self.world.dtype)
 
     def rewards(self) -> torch.Tensor:
-        if self._fused_active:
+        if self.fused_active:
             return self._f_reward
         return self._cache["agent_shaping"] + self.global_reward().unsqueeze(1)
 
     def done(self) -> torch.Tensor:
-        if self._fused_active:
+        if self.fused_active:
             return self._f_done_bool
         return self._cache["on_goal"]
 
@@ -827,7 +828,7 @@ class PushTScenario(Scenario):
         return {"goal_pose": rows}
 
     def info(self) -> dict[str, Any]:
-        if self._fused_active:
+        if self.fused_active:
             return {"tee_dist_to_goal": self._f_dist, "tee_angle_error": self._f_ang}
         return {
             "tee_dist_to_goal": self._cache["dist_to_goal"],

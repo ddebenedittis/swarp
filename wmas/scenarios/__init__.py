@@ -70,28 +70,14 @@ def supports_model(cls: type[Scenario]) -> bool:
     return "model" in inspect.signature(cls.__init__).parameters
 
 
-def _class_fused_available(cls: type[Scenario]) -> bool:
-    """Query ``fused_available`` without paying for a constructed scenario.
-
-    ``Scenario.fused_available`` is an *instance* method (a class-level declaration
-    would be cleaner, but changing that contract belongs to the fused-scenario
-    refactor). None of the implementations read ``self`` — they return a literal —
-    so an uninitialized instance is enough. The ``cls()`` fallback covers a future
-    implementation that does look at instance state; nothing is swallowed, so a
-    scenario that cannot answer fails loudly instead of silently reporting False.
-    """
-    try:
-        return bool(cls.fused_available(cls.__new__(cls)))
-    except (AttributeError, TypeError):
-        return bool(cls().fused_available())
-
-
 def fused_scenarios() -> list[str]:
     """Registered scenarios that ship fused Warp obs/reward kernels.
 
-    Derived from ``fused_available()`` on every registered class, in registry order.
+    Read straight off :attr:`~wmas.scenarios.base.Scenario.fused_available`, which is a
+    class attribute (``True`` for every :class:`~wmas.scenarios.fused.FusedScenario`)
+    precisely so this needs no instance and no hand-maintained list.
     """
-    return [name for name, cls in SCENARIOS.items() if _class_fused_available(cls)]
+    return [name for name, cls in SCENARIOS.items() if cls.fused_available]
 
 
 def resolve_scenarios(names: list[str]) -> list[str]:

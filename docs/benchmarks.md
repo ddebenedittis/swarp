@@ -20,7 +20,9 @@ The benchmark entry points (`wmas/benchmark/`):
 (dynamics, neighbor lists, soft collisions, obs/reward) under `torch.no_grad()` with
 random actions kept on-device. Measurement conditions: **100 timed steps per config**
 (after 10 warm-up steps), float32, `dt=0.05`, `substeps=1`, fused Warp obs/reward kernels
-and no CUDA-graph capture (`Environment(use_graph=False)`, the current default), on the
+and no CUDA-graph capture (`use_graph=False`, which `throughput.py` pins so this table
+stays comparable across commits — `Environment`'s own default is now `use_graph="auto"`,
+i.e. capture *on* for a fused scenario on a CUDA device; `--graph` measures that), on the
 RTX 3070 Laptop GPU:
 
 ```
@@ -195,8 +197,9 @@ where launch overhead is the binding constraint.
 
 These numbers are higher than the [Throughput](#throughput) table's because this task is
 obstacle-free open-field navigation (matched to what the other simulators do), and
-because the top configuration adds CUDA-graph capture, which `Environment` does not yet
-enable by default (`use_graph=False`).
+because the top configuration adds CUDA-graph capture. That is now `Environment`'s
+default (`use_graph="auto"` — on for a fused scenario on a CUDA device); the
+[Throughput](#throughput) table above deliberately pins it off.
 
 ### wmas (optimized) vs the field — matched task & observations
 

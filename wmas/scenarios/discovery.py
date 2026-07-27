@@ -79,15 +79,16 @@ class DiscoveryScenario(Scenario):
         self._fused_ready = False
         return self.world
 
-    def fused_available(self) -> bool:
-        """Discovery ships fused Warp obs/reward kernels (2D holonomic)."""
-        return True
+    #: Discovery ships fused Warp obs/reward kernels (2D holonomic).
+    fused_available = True
 
     @property
     def obs_dim(self) -> int:
         return 4 + 3 * self.n_targets
 
-    def reset_world(self, env_mask: torch.Tensor | None = None) -> None:
+    def reset_world(
+        self, env_mask: torch.Tensor | None = None, *, obs_only: bool = False
+    ) -> None:
         w = self.world
         n = w.n_envs
         lim = self.world_size - 2.0 * self.agent_radius
@@ -112,7 +113,7 @@ class DiscoveryScenario(Scenario):
             )
             self.targets.copy_(torch.where(m3, targets, self.targets))
             self.covered.copy_(torch.where(env_mask.view(-1, 1), covered, self.covered))
-        if self._fused_active:
+        if self.fused_active:
             self._ensure_fused(w.n_envs)
             # A reset recomputes coverage/obs on the new state (updating the
             # covered latch, as the reference _refresh does) but never the reward
@@ -123,7 +124,7 @@ class DiscoveryScenario(Scenario):
             self._refresh()
 
     def post_step(self) -> None:
-        if self._fused_active:
+        if self.fused_active:
             # Same sequence the whole-step graph runs (keeps non-graph fused mode
             # and CPU eager-persistent bit-identical).
             self._pre_graph_step()
@@ -293,7 +294,7 @@ class DiscoveryScenario(Scenario):
     # ------------------------------------------------------------ obs/rewards
 
     def observations(self) -> torch.Tensor:
-        if self._fused_active:
+        if self.fused_active:
             return self._f_obs
         w = self.world
         s = w.state
@@ -313,16 +314,16 @@ class DiscoveryScenario(Scenario):
         return self.covering_reward * self._cache["newly"].sum(dim=-1).to(self.world.dtype)
 
     def rewards(self) -> torch.Tensor:
-        if self._fused_active:
+        if self.fused_active:
             return self._f_reward
         return super().rewards()
 
     def done(self) -> torch.Tensor:
-        if self._fused_active:
+        if self.fused_active:
             return self._f_done_bool
         return self.covered.all(dim=-1)
 
     def info(self) -> dict[str, Any]:
-        if self._fused_active:
+        if self.fused_active:
             return {"covered_frac": self.covered.float().mean(-1)}
         return {"covered_frac": self._cache["covered_frac"]}

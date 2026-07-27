@@ -78,9 +78,8 @@ class SamplingScenario(Scenario):
         self._cell_coord = (i + 0.5) / self.grid_res * 2.0 * self.world_size - self.world_size
         return self.world
 
-    def fused_available(self) -> bool:
-        """Sampling ships fused Warp obs/reward kernels (2D holonomic)."""
-        return True
+    #: Sampling ships fused Warp obs/reward kernels (2D holonomic).
+    fused_available = True
 
     @property
     def obs_dim(self) -> int:
@@ -106,7 +105,9 @@ class SamplingScenario(Scenario):
 
     # ------------------------------------------------------------------ reset
 
-    def reset_world(self, env_mask: torch.Tensor | None = None) -> None:
+    def reset_world(
+        self, env_mask: torch.Tensor | None = None, *, obs_only: bool = False
+    ) -> None:
         w = self.world
         n = w.n_envs
         lim = self.world_size - 2.0 * self.agent_radius
@@ -133,13 +134,13 @@ class SamplingScenario(Scenario):
             )
             self.centers.copy_(torch.where(m3, centers, self.centers))
             self.consumed.copy_(torch.where(env_mask.view(-1, 1), consumed, self.consumed))
-        if self._fused_active:
+        if self.fused_active:
             self._ensure_fused(w.n_envs)
             # full_pass=0 on the mid-step auto-reset obs-only pass (don't clobber
             # the reward/field already returned this step); 1 on a standalone
             # reset. The scatter always runs (mirrors the reference _refresh,
             # which marks the current cells consumed on every reset too).
-            self._launch_obs_reward(full_pass=0 if self._fused_obs_only else 1)
+            self._launch_obs_reward(full_pass=0 if obs_only else 1)
             self._launch_scatter()
         else:
             self._refresh()
@@ -147,7 +148,7 @@ class SamplingScenario(Scenario):
     # -------------------------------------------------------- per-step caching
 
     def post_step(self) -> None:
-        if self._fused_active:
+        if self.fused_active:
             # Same sequence the whole-step graph runs (keeps non-graph fused mode
             # and CPU eager-persistent bit-identical).
             self._pre_graph_step()
@@ -288,7 +289,7 @@ class SamplingScenario(Scenario):
     # ------------------------------------------------------------ obs/rewards
 
     def observations(self) -> torch.Tensor:
-        if self._fused_active:
+        if self.fused_active:
             return self._f_obs
         w = self.world
         s = w.state
@@ -301,11 +302,11 @@ class SamplingScenario(Scenario):
         return self._cache["reward"][:, agent_idx]
 
     def rewards(self) -> torch.Tensor:
-        if self._fused_active:
+        if self.fused_active:
             return self._f_reward
         return super().rewards()
 
     def info(self) -> dict[str, Any]:
-        if self._fused_active:
+        if self.fused_active:
             return {"field": self._f_field, "consumed_frac": self.consumed.float().mean(-1)}
         return {"field": self._cache["field"], "consumed_frac": self.consumed.float().mean(-1)}

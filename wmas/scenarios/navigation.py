@@ -122,9 +122,8 @@ class NavigationScenario(Scenario):
         self._handle_version = 0
         return self.world
 
-    def fused_available(self) -> bool:
-        """Navigation ships fused Warp obs/reward kernels (2D, needs neighbors)."""
-        return True
+    #: Navigation ships fused Warp obs/reward kernels (2D, needs neighbors).
+    fused_available = True
 
     @property
     def obs_dim(self) -> int:
@@ -150,7 +149,9 @@ class NavigationScenario(Scenario):
             pos = torch.where(conflict, resampled, pos)
         return pos
 
-    def reset_world(self, env_mask: torch.Tensor | None = None) -> None:
+    def reset_world(
+        self, env_mask: torch.Tensor | None = None, *, obs_only: bool = False
+    ) -> None:
         """Reset all envs (``env_mask=None``) or the ``True`` entries of a
         boolean ``[n_envs]`` mask. Host-sync-free: the full batch is always
         sampled and blended with ``torch.where`` so no variable-length gather or
@@ -207,7 +208,7 @@ class NavigationScenario(Scenario):
 
         w.mark_pos_dirty()  # positions written out of band; force a fresh build
         self._nbr_cache = None
-        if self._fused_active:
+        if self.fused_active:
             self._ensure_fused(w.n_envs)
             self._sync_fused_handles()  # this eager _launch_obs uses cached handles
             if env_mask is None:
@@ -218,7 +219,7 @@ class NavigationScenario(Scenario):
             # buffers already returned this step: obs-only pass (full_pass=0). A
             # standalone reset recomputes everything (full_pass=1) so info() is
             # populated. Either way the shaping baseline rebases only reset envs.
-            full = 0 if self._fused_obs_only else 1
+            full = 0 if obs_only else 1
             self._launch_obs(advance_prev=0, full_pass=full)
         else:
             self._refresh_step_cache(reset_mask=env_mask)
@@ -404,7 +405,7 @@ class NavigationScenario(Scenario):
     # ------------------------------------------------------- per-step caching
 
     def post_step(self) -> None:
-        if self._fused_active:
+        if self.fused_active:
             # Same sequence the whole-step graph runs; delegating keeps non-graph
             # fused mode and CPU eager-persistent bit-identical to graph mode.
             self._pre_graph_step()
@@ -521,7 +522,7 @@ class NavigationScenario(Scenario):
 
     def observations(self) -> torch.Tensor:
         """Fully batched observations [n_envs, n_agents, obs_dim]."""
-        if self._fused_active:
+        if self.fused_active:
             return self._f_obs
         w = self.world
         s = w.state
@@ -555,7 +556,7 @@ class NavigationScenario(Scenario):
         return self.observations()[:, agent_idx]
 
     def rewards(self) -> torch.Tensor:
-        if self._fused_active:
+        if self.fused_active:
             return self._f_reward
         cache = self._nbr_cache
         rew = self.collision_penalty * cache["touching"]
@@ -581,12 +582,12 @@ class NavigationScenario(Scenario):
         return rew
 
     def done(self) -> torch.Tensor:
-        if self._fused_active:
+        if self.fused_active:
             return self._f_done_bool
         return self._nbr_cache["on_goal"].all(dim=-1)
 
     def info(self) -> dict[str, Any]:
-        if self._fused_active:
+        if self.fused_active:
             return {
                 "dist_to_goal": self._f_dist,
                 "on_goal": self._f_ongoal_bool,

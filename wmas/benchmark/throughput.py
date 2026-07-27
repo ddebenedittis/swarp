@@ -5,6 +5,11 @@ Run with:  python -m wmas.benchmark.throughput [--device cuda:0] [--steps 100]
 Steps the NavigationScenario hot path (dynamics + hash-grid neighbors + soft
 collisions + obs/reward) under ``torch.no_grad()`` with random actions kept
 on-device.
+
+``use_graph`` is pinned rather than left at ``Environment``'s ``"auto"`` so this
+benchmark keeps measuring one fixed configuration and its numbers stay comparable
+across commits. ``--graph`` adds whole-step CUDA-graph capture (what ``"auto"`` now
+selects on a CUDA device); ``wmas.benchmark.scenarios`` reports both side by side.
 """
 
 from __future__ import annotations
@@ -20,9 +25,13 @@ ENV_COUNTS = (1_000, 4_000, 8_000, 16_000)
 AGENT_COUNTS = (4, 16, 64)
 
 
-def bench_one(n_envs: int, n_agents: int, device: str, steps: int, warmup: int = 10) -> dict:
+def bench_one(
+    n_envs: int, n_agents: int, device: str, steps: int, warmup: int = 10, use_graph: bool = False
+) -> dict:
     scenario = NavigationScenario(n_agents=n_agents, world_size=max(1.0, n_agents**0.5 / 4))
-    env = Environment(scenario, n_envs=n_envs, device=device, dt=0.05, substeps=1, seed=0)
+    env = Environment(
+        scenario, n_envs=n_envs, device=device, dt=0.05, substeps=1, seed=0, use_graph=use_graph
+    )
     env.reset(seed=0)
     gen = torch.Generator(device=device).manual_seed(0)
     actions = torch.empty(n_envs, n_agents, 2, device=device)
@@ -58,6 +67,11 @@ def main() -> None:
     default_device = "cuda:0" if torch.cuda.is_available() else "cpu"
     parser.add_argument("--device", default=default_device)
     parser.add_argument("--steps", type=int, default=100)
+    parser.add_argument(
+        "--graph",
+        action="store_true",
+        help="fold obs/reward into a whole-step CUDA graph (Environment's 'auto' default)",
+    )
     args = parser.parse_args()
 
     if args.device.startswith("cuda"):
@@ -65,7 +79,8 @@ def main() -> None:
         print(f"device: {args.device} ({name})")
     else:
         print("device: cpu (no GPU in use — throughput will be far below GPU numbers)")
-    print(f"timed steps per config: {args.steps}\n")
+    print(f"timed steps per config: {args.steps}")
+    print(f"whole-step CUDA graph: {'on' if args.graph else 'off'}\n")
 
     header = (
         f"{'n_envs':>8} {'n_agents':>9} {'ms/step':>9} {'env-steps/s':>14} {'agent-steps/s':>15}"
@@ -75,7 +90,7 @@ def main() -> None:
     for n_envs in ENV_COUNTS:
         for n_agents in AGENT_COUNTS:
             try:
-                r = bench_one(n_envs, n_agents, args.device, args.steps)
+                r = bench_one(n_envs, n_agents, args.device, args.steps, use_graph=args.graph)
             except torch.cuda.OutOfMemoryError:
                 print(f"{n_envs:>8} {n_agents:>9} {'OOM':>9}")
                 torch.cuda.empty_cache()
