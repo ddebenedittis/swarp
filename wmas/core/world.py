@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import NamedTuple
+
 import torch
 import warp as wp
 
@@ -12,6 +14,21 @@ from wmas.dynamics.base import AgentConfig, action_dim
 from wmas.interop.autograd import TorchState, warp_step
 
 TORCH_TO_WP = {torch.float32: wp.float32, torch.float64: wp.float64}
+
+
+class AgentStateWp(NamedTuple):
+    """The five 2D agent-state fields as Warp arrays — see :meth:`World.state_wp`.
+
+    A ``NamedTuple`` rather than a :class:`~wmas.core.state.WorldState`, which has nine
+    fields: the four extra drone ones are allocation-only for a 2D fleet, and what a
+    scenario's fused kernels take is exactly these five.
+    """
+
+    pos: wp.array
+    theta: wp.array
+    vel: wp.array
+    speed: wp.array
+    ang_vel: wp.array
 
 
 class World:
@@ -131,6 +148,69 @@ class World:
         self.state = self.runtime.state_views
         self._persistent = True
         self._detached = False
+
+    def write_state(
+        self,
+        mask: torch.Tensor | None = None,
+        *,
+        pos: torch.Tensor | None = None,
+        theta: torch.Tensor | None = None,
+        vel: torch.Tensor | None = None,
+        speed: torch.Tensor | None = None,
+        ang_vel: torch.Tensor | None = None,
+    ) -> None:
+        """Write agent state fields in place, optionally only into the masked envs.
+
+        This is the reset primitive every scenario needs: ``mask`` is a ``[n_envs]`` bool
+        (``None`` = every env), each given field is blended with ``torch.where`` and written
+        with ``copy_`` — in place, so persistent buffers, their zero-copy views and any
+        captured graph stay valid — and :meth:`mark_pos_dirty` is called once if ``pos`` was
+        among them. Forgetting that call is a silent stale-neighbor-list bug, which is the
+        main reason to route a reset through here rather than hand-rolling the blend.
+
+        Values broadcast against the destination, so a Python scalar or anything that
+        broadcasts to ``[n_envs, n_agents, ...]`` is accepted.
+        """
+        fields = (
+            ("pos", pos),
+            ("theta", theta),
+            ("vel", vel),
+            ("speed", speed),
+            ("ang_vel", ang_vel),
+        )
+        for name, value in fields:
+            if value is None:
+                continue
+            dst = getattr(self.state, name).data
+            if mask is None:
+                dst.copy_(value.expand_as(dst) if torch.is_tensor(value) else value)
+            else:
+                m = mask.view(-1, *([1] * (dst.dim() - 1)))
+                dst.copy_(torch.where(m, value, dst))
+        if pos is not None:
+            self.mark_pos_dirty()
+
+    def state_wp(self) -> AgentStateWp:
+        """The current agent state as Warp arrays, whichever execution mode is active.
+
+        In persistent mode this returns the runtime's **own** arrays — not a re-wrap — so
+        the handles stay pointer-stable, which is what lets a fused kernel cache them and a
+        CUDA graph bake them in. Otherwise the live torch state is wrapped zero-copy, and
+        the wraps are fresh objects valid only until the next step reassigns ``self.state``.
+        """
+        if self._persistent and not self._detached:
+            s = self.runtime.state
+            return AgentStateWp(s.pos, s.theta, s.vel, s.speed, s.ang_vel)
+        st = self.state
+        vec2 = VEC2[self.wp_dtype]
+        scalar = self.wp_dtype
+        return AgentStateWp(
+            wp.from_torch(st.pos.contiguous(), dtype=vec2),
+            wp.from_torch(st.theta.contiguous(), dtype=scalar),
+            wp.from_torch(st.vel.contiguous(), dtype=vec2),
+            wp.from_torch(st.speed.contiguous(), dtype=scalar),
+            wp.from_torch(st.ang_vel.contiguous(), dtype=scalar),
+        )
 
     def reset_state(self) -> None:
         """Reset the state to zeros. In persistent mode this zeroes the buffers
