@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 import torch
 import warp as wp
+from conftest import _core, _map5
 
 from wmas.core.config import WorldConfig
 from wmas.core.stepper import Stepper
@@ -35,16 +36,6 @@ def make_state(n_envs, n_agents, device="cpu", dtype=torch.float64, requires_gra
         speed=t(n_envs, n_agents),
         ang_vel=t(n_envs, n_agents),
     )
-
-
-def _core(state):
-    """The five 2D state tensors (drops the optional drone fields)."""
-    return (state.pos, state.theta, state.vel, state.speed, state.ang_vel)
-
-
-def _map5(state, f):
-    """Apply ``f`` to the five 2D fields, leaving the drone fields at default."""
-    return TorchState(*(f(t) for t in _core(state)))
 
 
 MODEL_CASES = [

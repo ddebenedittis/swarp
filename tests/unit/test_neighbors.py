@@ -2,12 +2,10 @@
 
 import numpy as np
 import pytest
-import torch
 import warp as wp
+from conftest import DEVICES
 
 from wmas.core.neighbors import NeighborGrid
-
-DEVICES = ["cpu"] + (["cuda:0"] if torch.cuda.is_available() else [])
 
 
 def neighbor_sets(idx: np.ndarray, cnt: np.ndarray) -> list[list[set]]:

@@ -7,8 +7,8 @@ action first, pose then integrated with the new velocities), in float64.
 
 import numpy as np
 import pytest
-import torch
 import warp as wp
+from conftest import DEVICES
 
 from wmas.core.state import WorldState
 from wmas.dynamics.base import (
@@ -19,8 +19,6 @@ from wmas.dynamics.base import (
     build_agent_params,
 )
 from wmas.dynamics.kernels import launch_integrate
-
-DEVICES = ["cpu"] + (["cuda:0"] if torch.cuda.is_available() else [])
 
 
 def clamp_norm(v: np.ndarray, limit: float) -> np.ndarray:

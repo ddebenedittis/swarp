@@ -8,10 +8,9 @@ paths across auto-resets.
 
 import pytest
 import torch
+from conftest import DEVICES
 
 from wmas import DiscoveryScenario, Environment
-
-DEVICES = ["cpu"] + (["cuda:0"] if torch.cuda.is_available() else [])
 
 
 def _env(device, fused, *, n_agents=6, n_targets=3, n_envs=24, world_size=0.5, covering_range=0.25):

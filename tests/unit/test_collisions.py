@@ -4,13 +4,12 @@ import numpy as np
 import pytest
 import torch
 import warp as wp
+from conftest import DEVICES, _core, _map5, holo_cfgs
 
 from wmas.core.config import WorldConfig
 from wmas.core.stepper import Stepper
-from wmas.dynamics.base import AgentConfig, ControlMode, DynamicsModel
+from wmas.dynamics.base import ControlMode
 from wmas.interop.autograd import TorchState, warp_step
-
-DEVICES = ["cpu"] + (["cuda:0"] if torch.cuda.is_available() else [])
 
 
 def make_state(pos, vel=None, dtype=torch.float64):
@@ -19,29 +18,6 @@ def make_state(pos, vel=None, dtype=torch.float64):
     z = torch.zeros(1, n, dtype=dtype)
     v = torch.zeros_like(pos) if vel is None else torch.as_tensor(vel, dtype=dtype).unsqueeze(0)
     return TorchState(pos=pos, theta=z.clone(), vel=v, speed=z.clone(), ang_vel=z.clone())
-
-
-def _core(state):
-    """The five 2D state tensors (drops the optional drone fields)."""
-    return (state.pos, state.theta, state.vel, state.speed, state.ang_vel)
-
-
-def _map5(state, f):
-    """Apply ``f`` to the five 2D fields, leaving the drone fields at default."""
-    return TorchState(*(f(t) for t in _core(state)))
-
-
-def holo_cfgs(n, radius=0.1, mode=ControlMode.VELOCITY):
-    return [
-        AgentConfig(
-            model=DynamicsModel.HOLONOMIC,
-            ctrl_mode=mode,
-            radius=radius,
-            max_speed=100.0,
-            max_accel=100.0,
-        )
-        for _ in range(n)
-    ]
 
 
 @pytest.mark.parametrize("device", DEVICES)

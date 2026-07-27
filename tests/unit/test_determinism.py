@@ -2,10 +2,9 @@
 
 import pytest
 import torch
+from conftest import DEVICES
 
 from wmas import Environment, NavigationScenario
-
-DEVICES = ["cpu"] + (["cuda:0"] if torch.cuda.is_available() else [])
 
 
 def run_trajectory(device, seed, T=100):

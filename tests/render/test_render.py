@@ -3,6 +3,7 @@
 import numpy as np
 import pytest
 import torch
+from conftest import _ffmpeg_available, _imageio_available
 
 from wmas import Environment, NavigationScenario
 from wmas.render.camera import Camera
@@ -10,15 +11,6 @@ from wmas.render.geometry import RenderGeometry, extract_geometry
 from wmas.render.renderer import render_frame
 from wmas.render.style import Style
 from wmas.render.video import frames_to_video, save_video
-
-
-def _ffmpeg_available() -> bool:
-    try:
-        import imageio_ffmpeg  # noqa: F401
-
-        return True
-    except Exception:
-        return False
 
 
 def make_env(n_envs=4, n_agents=3, n_obstacles=2, world_size=1.0, device="cpu"):
@@ -674,6 +666,7 @@ def test_save_video_webm_has_one_frame_per_step(tmp_path):
     assert len(imageio.mimread(out)) == 6
 
 
+@pytest.mark.skipif(not _imageio_available(), reason="imageio not installed")
 def test_save_video_rejects_gif(tmp_path):
     env, _ = make_env(n_agents=2)
     with pytest.raises(ValueError, match="mp4|webm"):

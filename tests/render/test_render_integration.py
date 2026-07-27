@@ -4,6 +4,7 @@ import os
 
 import numpy as np
 import pytest
+from conftest import _ffmpeg_available
 
 from wmas import Environment, NavigationScenario
 from wmas.render.geometry import extract_geometry
@@ -124,6 +125,7 @@ def test_record_frames_returns_one_frame_per_step():
     assert frames[0].shape == (60, 80, 3)
 
 
+@pytest.mark.skipif(not _ffmpeg_available(), reason="imageio-ffmpeg not installed")
 def test_to_html5_video_embeds_mp4():
     import base64
 
@@ -138,15 +140,6 @@ def test_to_html5_video_embeds_mp4():
 
 
 # -------------------------------------------------------------------- demo
-
-
-def _ffmpeg_available() -> bool:
-    try:
-        import imageio_ffmpeg  # noqa: F401
-
-        return True
-    except Exception:
-        return False
 
 
 @pytest.mark.skipif(not _ffmpeg_available(), reason="imageio-ffmpeg not installed")

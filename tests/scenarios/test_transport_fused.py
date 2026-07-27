@@ -7,10 +7,9 @@ kept bounded by the damping. Discrete flags (done/on_goal) still match.
 
 import pytest
 import torch
+from conftest import DEVICES
 
 from wmas import Environment, TransportScenario
-
-DEVICES = ["cpu"] + (["cuda:0"] if torch.cuda.is_available() else [])
 
 
 def _env(device, fused, *, n_agents=4, n_packages=1, n_envs=24, world_size=0.5):

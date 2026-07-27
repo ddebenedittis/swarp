@@ -2,10 +2,9 @@
 
 import pytest
 import torch
+from conftest import DEVICES
 
 from wmas import Environment, FlockingScenario
-
-DEVICES = ["cpu"] + (["cuda:0"] if torch.cuda.is_available() else [])
 
 
 def _env(device, fused, *, n_agents=6, n_envs=24, neighbor_obs=4, world_size=0.6):

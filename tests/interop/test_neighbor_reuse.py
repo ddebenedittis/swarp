@@ -2,10 +2,9 @@
 
 import pytest
 import torch
+from conftest import DEVICES
 
 from wmas import Environment, NavigationScenario
-
-DEVICES = ["cpu"] + (["cuda:0"] if torch.cuda.is_available() else [])
 
 
 def _make_env(device, reuse, n_agents=4, n_envs=16, substeps=1, n_obstacles=0, auto_reset=False):

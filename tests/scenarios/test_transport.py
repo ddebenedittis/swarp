@@ -2,11 +2,10 @@
 
 import pytest
 import torch
+from conftest import DEVICES
 
 from wmas import Environment
 from wmas.scenarios.transport import TransportScenario
-
-DEVICES = ["cpu"] + (["cuda:0"] if torch.cuda.is_available() else [])
 
 
 def _env(device, n_envs=4, **kw):

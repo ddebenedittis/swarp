@@ -9,24 +9,12 @@ import numpy as np
 import pytest
 import torch
 import warp as wp
+from conftest import DEVICES, _core, _map5
 
 from wmas.core.config import ObstacleShape, WorldConfig
 from wmas.core.stepper import Stepper
 from wmas.dynamics.base import AgentConfig, ControlMode, DynamicsModel
 from wmas.interop.autograd import TorchState, warp_step
-
-DEVICES = ["cpu"] + (["cuda:0"] if torch.cuda.is_available() else [])
-
-
-def _core(state):
-    """The five 2D state tensors (drops the optional drone fields)."""
-    return (state.pos, state.theta, state.vel, state.speed, state.ang_vel)
-
-
-def _map5(state, f):
-    """Apply ``f`` to the five 2D fields, leaving the drone fields at default."""
-    return TorchState(*(f(t) for t in _core(state)))
-
 
 K, DT = 100.0, 0.1
 

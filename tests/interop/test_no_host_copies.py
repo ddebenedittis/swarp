@@ -13,6 +13,7 @@ from unittest import mock
 import pytest
 import torch
 import warp as wp
+from conftest import DEVICES
 
 from wmas import Environment, NavigationScenario
 
@@ -37,9 +38,6 @@ def forbid_host_transfers():
         mock.patch.object(wp.array, "numpy", _raise),
     ):
         yield
-
-
-DEVICES = ["cpu"] + (["cuda:0"] if torch.cuda.is_available() else [])
 
 
 @pytest.mark.parametrize("device", DEVICES)

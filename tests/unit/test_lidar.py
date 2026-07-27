@@ -5,11 +5,11 @@ import math
 import numpy as np
 import pytest
 import torch
+from conftest import DEVICES
 
 from wmas.sensors.lidar import Lidar, lidar_scan
 from wmas.sensors.lidar_kernels import lidar_scan_warp
 
-DEVICES = ["cpu"] + (["cuda:0"] if torch.cuda.is_available() else [])
 MAXR = 2.0
 
 # Warp vs torch differ only at transcendental ULP level (own sin/cos/sqrt),

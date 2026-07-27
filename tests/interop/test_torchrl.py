@@ -5,14 +5,13 @@ import torch
 
 pytest.importorskip("torchrl")
 
+from conftest import DEVICES
 from torchrl.envs.utils import check_env_specs  # noqa: E402
 
 from wmas import Environment, NavigationScenario  # noqa: E402
 from wmas.interop.torchrl import WmasEnv  # noqa: E402
 from wmas.scenarios.formation import FormationScenario  # noqa: E402
 from wmas.scenarios.sampling import SamplingScenario  # noqa: E402
-
-DEVICES = ["cpu"] + (["cuda:0"] if torch.cuda.is_available() else [])
 
 
 def _make(device, scenario):

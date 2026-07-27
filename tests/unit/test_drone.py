@@ -10,13 +10,12 @@ import numpy as np
 import pytest
 import torch
 import warp as wp
+from conftest import DEVICES
 
 from wmas.core.state import VEC2, WorldState
 from wmas.dynamics.base import AgentConfig, DynamicsModel, build_agent_params
 from wmas.dynamics.kernels import launch_integrate
 from wmas.interop.autograd import TorchState, warp_step
-
-DEVICES = ["cpu"] + (["cuda:0"] if torch.cuda.is_available() else [])
 
 PRM = dict(
     mass=1.0,

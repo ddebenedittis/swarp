@@ -2,10 +2,9 @@
 
 import pytest
 import torch
+from conftest import DEVICES
 
 from wmas import Environment, FormationScenario
-
-DEVICES = ["cpu"] + (["cuda:0"] if torch.cuda.is_available() else [])
 
 
 def _env(device, fused, *, n_agents=5, n_envs=24, world_size=0.6, formation_radius=0.3):

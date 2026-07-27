@@ -2,6 +2,7 @@
 
 import pytest
 import torch
+from conftest import CUDA, DEVICES
 
 from wmas import (
     DiscoveryScenario,
@@ -14,9 +15,6 @@ from wmas import (
     TransportScenario,
 )
 from wmas.dynamics.base import ControlMode, DynamicsModel
-
-CUDA = torch.cuda.is_available()
-DEVICES = ["cpu"] + (["cuda:0"] if CUDA else [])
 
 
 def _mk(

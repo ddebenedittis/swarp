@@ -7,12 +7,11 @@ same agent contacts, so they can be pushed, spun, and shoved into each other.
 
 import pytest
 import torch
+from conftest import DEVICES
 
 from wmas.core.config import ObstacleKind, ObstacleShape, WorldConfig
 from wmas.core.world import World
 from wmas.dynamics.base import AgentConfig, ControlMode, DynamicsModel
-
-DEVICES = ["cpu"] + (["cuda:0"] if torch.cuda.is_available() else [])
 
 
 def _world(device, n_envs=2, substeps=4, **cfg_kw):

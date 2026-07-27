@@ -3,11 +3,10 @@
 import numpy as np
 import pytest
 import torch
+from conftest import DEVICES
 
 from wmas import Environment, NavigationScenario
 from wmas.dynamics.base import P_RADIUS, per_env_float_template
-
-DEVICES = ["cpu"] + (["cuda:0"] if torch.cuda.is_available() else [])
 
 
 def _env(

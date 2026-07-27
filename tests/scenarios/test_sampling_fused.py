@@ -8,10 +8,9 @@ bit-identical between the fused (2-launch read-then-scatter) and torch
 
 import pytest
 import torch
+from conftest import DEVICES
 
 from wmas import Environment, SamplingScenario
-
-DEVICES = ["cpu"] + (["cuda:0"] if torch.cuda.is_available() else [])
 
 
 def _env(device, fused, *, n_agents=4, n_envs=24, grid_res=12, n_gaussians=3, world_size=1.0):

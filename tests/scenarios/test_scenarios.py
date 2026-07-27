@@ -2,14 +2,13 @@
 
 import pytest
 import torch
+from conftest import DEVICES
 
 from wmas import Environment
 from wmas.scenarios.discovery import DiscoveryScenario
 from wmas.scenarios.flocking import FlockingScenario
 from wmas.scenarios.formation import FormationScenario
 from wmas.scenarios.sampling import SamplingScenario
-
-DEVICES = ["cpu"] + (["cuda:0"] if torch.cuda.is_available() else [])
 
 SCENARIOS = {
     "sampling": lambda: SamplingScenario(n_agents=4, n_gaussians=3, grid_res=10),
