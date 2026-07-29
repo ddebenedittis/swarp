@@ -5,7 +5,7 @@ import pytest
 import warp as wp
 from conftest import DEVICES
 
-from wmas.core.neighbors import NeighborGrid
+from swarp.core.neighbors import NeighborGrid
 
 
 def neighbor_sets(idx: np.ndarray, cnt: np.ndarray) -> list[list[set]]:

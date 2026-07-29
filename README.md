@@ -1,11 +1,9 @@
-# wmas — Warp Multi-Agent Simulator
+# swarp — Swarm simulation on NVIDIA Warp
 
 A fast, GPU-resident, **differentiable**, vectorized multi-agent simulator for 2D robotic
 vehicles, built on [NVIDIA Warp](https://github.com/NVIDIA/warp) with zero-copy PyTorch
 interop. Conceptually: [VMAS](https://github.com/proroklab/VectorizedMultiAgentSimulator),
 but compiled as Warp kernels instead of PyTorch tensor ops.
-
-*(The name `wmas` is provisional.)*
 
 ## What you get
 
@@ -61,7 +59,7 @@ but compiled as Warp kernels instead of PyTorch tensor ops.
 Requires Python ≥ 3.12. A CUDA GPU is optional — everything also runs on CPU.
 
 ```bash
-git clone <this-repo> wmas && cd wmas
+git clone <this-repo> swarp && cd swarp
 uv venv
 uv pip install -e . --group dev
 uv run pytest          # dynamics, gradients, neighbors, collisions, determinism, ...
@@ -72,7 +70,7 @@ uv pip install -e '.[viz]'   # optional: interactive viewer + video export
 
 ```python
 import torch
-from wmas import Environment, NavigationScenario
+from swarp import Environment, NavigationScenario
 
 scenario = NavigationScenario(n_agents=8, n_obstacles=2)
 env = Environment(scenario, n_envs=4096, device="cuda:0", dt=0.05, seed=0)
@@ -102,7 +100,7 @@ Optimize an action sequence by gradient descent through the physics
 
 ```python
 import torch, warp as wp
-from wmas import AgentConfig, DynamicsModel, Stepper, TorchState, WorldConfig, rollout
+from swarp import AgentConfig, DynamicsModel, Stepper, TorchState, WorldConfig, rollout
 
 cfgs = [AgentConfig(model=DynamicsModel.DIFF_DRIVE, max_speed=1.0) for _ in range(4)]
 stepper = Stepper(cfgs, dt=0.1, device="cuda:0", world=WorldConfig(collision_k=50.0))
@@ -123,11 +121,11 @@ structure, so gradients flow through contact geometry, not through neighbor memb
 
 ## Writing a scenario
 
-Subclass `wmas.Scenario` and implement four members (mirroring VMAS `BaseScenario`):
+Subclass `swarp.Scenario` and implement four members (mirroring VMAS `BaseScenario`):
 
 ```python
 import torch
-from wmas import AgentConfig, DynamicsModel, Scenario, World, WorldConfig
+from swarp import AgentConfig, DynamicsModel, Scenario, World, WorldConfig
 
 class MyScenario(Scenario):
     obs_dim = 4                                # per-agent observation width
@@ -170,8 +168,8 @@ renders one env of the batch — or a mosaic of the whole batch — either headl
 interactive window.
 
 ```python
-from wmas import Environment, NavigationScenario
-from wmas.render import Viewer, save_video
+from swarp import Environment, NavigationScenario
+from swarp.render import Viewer, save_video
 
 env = Environment(NavigationScenario(n_agents=5, n_obstacles=2), n_envs=16, device="cpu")
 env.reset()
@@ -188,9 +186,9 @@ Rendering is opt-in, read-only, and off the differentiable hot path — one devi
 per frame. Try it straight away:
 
 ```bash
-python -m wmas.render.demo               # interactive window (goal-seeking demo policy)
-python -m wmas.render.demo --mosaic      # grid of all envs + a focus pane
-python -m wmas.render.demo --save nav.webm --steps 200
+python -m swarp.render.demo               # interactive window (goal-seeking demo policy)
+python -m swarp.render.demo --mosaic      # grid of all envs + a focus pane
+python -m swarp.render.demo --save nav.webm --steps 200
 ```
 
 **Controls** — wheel zoom, middle-drag pan, hover an agent to inspect it, `[` / `]` to step
@@ -202,7 +200,7 @@ right-click to move its goal (writes into the shown env only).
 In a notebook, embed a rollout inline:
 
 ```python
-from wmas.render import animate
+from swarp.render import animate
 animate(env, n_steps=200)   # returns an HTML5 <video>
 ```
 
@@ -217,34 +215,34 @@ Almost every batch size lands on the same ~0.65–0.8 ms/step host floor, so rai
 `n_agents` is close to free until the neighbor/force kernels saturate the GPU.
 
 ```bash
-python -m wmas.benchmark.throughput      # the full (n_envs, n_agents) grid
-python -m wmas.benchmark.compare_vmas    # vs VMAS: --metric {throughput,memory,both}
-python -m wmas.benchmark.compare_sims    # vs VMAS, JaxMARL, and CAMAR
+python -m swarp.benchmark.throughput      # the full (n_envs, n_agents) grid
+python -m swarp.benchmark.compare_vmas    # vs VMAS: --metric {throughput,memory,both}
+python -m swarp.benchmark.compare_sims    # vs VMAS, JaxMARL, and CAMAR
 ```
 
 Full tables, the head-to-heads against VMAS / JaxMARL / CAMAR, the optimization ablation,
 and the multi-venv setup those comparisons need are in
 **[docs/benchmarks.md](docs/benchmarks.md)**.
 
-wmas is *API-compatible in spirit, not trajectory-compatible* with VMAS: the dynamics,
+swarp is *API-compatible in spirit, not trajectory-compatible* with VMAS: the dynamics,
 collision constants, and observation model differ by design, so identical actions do not
 reproduce VMAS trajectories.
 
 ## Layout
 
 ```
-wmas/core        state (SoA), stepper (THE substep pipeline), neighbors, collisions,
+swarp/core       state (SoA), stepper (THE substep pipeline), neighbors, collisions,
                  movable rigid bodies, world, environment, config
-wmas/dynamics    model tags/configs, unified integrate kernel (2D vehicles + drone)
-wmas/interop     torch.autograd bridge + BPTT rollout, torch.compile custom op,
+swarp/dynamics   model tags/configs, unified integrate kernel (2D vehicles + drone)
+swarp/interop    torch.autograd bridge + BPTT rollout, torch.compile custom op,
                  CUDA-graph capture, TorchRL EnvBase wrapper
-wmas/scenarios   Scenario ABC + 7 scenarios (navigation, flocking, formation, discovery,
+swarp/scenarios  Scenario ABC + 7 scenarios (navigation, flocking, formation, discovery,
                  sampling, transport, pusht), each with its fused *_kernels.py
-wmas/sensors     opt-in differentiable observation sensors (lidar: torch + Warp backends)
-wmas/render      optional pygame viewer: renderer, overlays, camera, HUD, input handling,
+swarp/sensors    opt-in differentiable observation sensors (lidar: torch + Warp backends)
+swarp/render     optional pygame viewer: renderer, overlays, camera, HUD, input handling,
                  mosaic layout, video export, notebook embed, demo entry point
-wmas/benchmark   throughput, optimization ablation, per-scenario sweep, and two
-                 cross-simulator comparisons (+ _adapters/ for wmas/vmas/jaxmarl/camar)
+swarp/benchmark  throughput, optimization ablation, per-scenario sweep, and two
+                 cross-simulator comparisons (+ _adapters/ for swarp/vmas/jaxmarl/camar)
 examples/        standalone scripts: action optimization, Push-T eval, Push-T + TorchRL
 docs/            benchmarks, scenario-authoring notes
 tests/           pytest suite
@@ -266,12 +264,12 @@ Design invariants worth knowing before extending:
 
 ## Non-goals (current scope)
 
-wmas deliberately does **not** aim to be a drop-in physics clone of VMAS. Out of scope
+swarp deliberately does **not** aim to be a drop-in physics clone of VMAS. Out of scope
 for now:
 
 - **Trajectory parity with VMAS** — see the parity caveat above.
 - **Movable bodies on the adjoint tape.** Movable rigid bodies themselves are *not* out of
-  scope any more: `ObstacleKind.MOVABLE` bodies are integrated by `wmas/core/bodies.py`
+  scope any more: `ObstacleKind.MOVABLE` bodies are integrated by `swarp/core/bodies.py`
   inside the substep loop, with rotation and with compound multi-shape bodies
   (`PushTScenario`). What is missing is differentiability *through* them — that
   integration runs with `record_tape=False`, so no gradient flows through a body's motion.

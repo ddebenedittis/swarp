@@ -4,9 +4,9 @@ A scenario defines a task: what the world is made of, how it resets, and what th
 observe and are rewarded for. There are two tiers, and you only pay for the second if you
 want it.
 
-1. **`Scenario`** (`wmas/scenarios/base.py`) — plain torch. Everything is differentiable
+1. **`Scenario`** (`swarp/scenarios/base.py`) — plain torch. Everything is differentiable
    end-to-end with the Warp dynamics step, and there is nothing else to implement.
-2. **`FusedScenario`** (`wmas/scenarios/fused.py`) — adds fused Warp obs/reward kernels for
+2. **`FusedScenario`** (`swarp/scenarios/fused.py`) — adds fused Warp obs/reward kernels for
    the no-grad hot path, foldable into the whole-step CUDA graph. Worth 2.5–5× (see
    [benchmarks](benchmarks.md)); costs you a kernel module and a buffer spec.
 
@@ -70,7 +70,7 @@ everything, so `info()` is populated.
 
 ## Tier 2: `FusedScenario`
 
-Write your kernels in `wmas/scenarios/<name>_kernels.py`, then implement four members:
+Write your kernels in `swarp/scenarios/<name>_kernels.py`, then implement four members:
 
 ```python
 class MyScenario(FusedScenario):
@@ -247,7 +247,7 @@ parity_rtol: float = 1e-2
 parity_atol: float = 5e-3
 ```
 
-Both the benchmark parity gate (`wmas.benchmark.scenarios`) and the test harness
+Both the benchmark parity gate (`swarp.benchmark.scenarios`) and the test harness
 (`tests/conftest.py`'s `FusedSpec`) read those, so there is one number per scenario rather
 than two tables that drift.
 
@@ -255,7 +255,7 @@ than two tables that drift.
 
 ## Registering it
 
-Add the class to `SCENARIOS` in `wmas/scenarios/__init__.py`. That is the single registry:
-`wmas.make(name, ...)`, the benchmark CLIs and the tests all read it, and
+Add the class to `SCENARIOS` in `swarp/scenarios/__init__.py`. That is the single registry:
+`swarp.make(name, ...)`, the benchmark CLIs and the tests all read it, and
 `fused_scenarios()` derives fused capability from `cls.fused_available` — which
 `FusedScenario` sets — so there is no second list to keep in step.

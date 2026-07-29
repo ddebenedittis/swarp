@@ -4,11 +4,11 @@ import pytest
 import torch
 import warp as wp
 
-from wmas.core.config import WorldConfig
-from wmas.core.stepper import Stepper
-from wmas.dynamics.base import AgentConfig, ControlMode, DynamicsModel
-from wmas.interop.autograd import TorchState, warp_step
-from wmas.interop.compile import CudaGraphStep, compiled_warp_step
+from swarp.core.config import WorldConfig
+from swarp.core.stepper import Stepper
+from swarp.dynamics.base import AgentConfig, ControlMode, DynamicsModel
+from swarp.interop.autograd import TorchState, warp_step
+from swarp.interop.compile import CudaGraphStep, compiled_warp_step
 
 BIG = 100.0
 

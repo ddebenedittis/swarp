@@ -2,7 +2,7 @@
 
 The seven ``tests/scenarios/test_*_fused.py`` suites check that each scenario's fused
 kernels agree with its torch reference. This file checks the layer *underneath* them: that
-the declarative :class:`~wmas.scenarios.fused.Buf` spec does what it says, and that the
+the declarative :class:`~swarp.scenarios.fused.Buf` spec does what it says, and that the
 mistakes it exists to prevent are now errors rather than silent corruption.
 """
 
@@ -11,9 +11,9 @@ import torch
 import warp as wp
 from conftest import DEVICES
 
-from wmas.core.hooks import WholeStepHook
-from wmas.scenarios import SCENARIOS
-from wmas.scenarios.fused import STEP, Buf, FusedPass, FusedScenario
+from swarp.core.hooks import WholeStepHook
+from swarp.scenarios import SCENARIOS
+from swarp.scenarios.fused import STEP, Buf, FusedPass, FusedScenario
 
 FUSED = list(SCENARIOS.values())
 IDS = list(SCENARIOS)
@@ -55,7 +55,7 @@ def test_every_registered_scenario_implements_the_same_member_set(cls):
 
 @pytest.mark.parametrize("cls", FUSED, ids=IDS)
 def test_spec_shapes_and_dtypes_match_the_allocated_buffers(cls):
-    from wmas import Environment
+    from swarp import Environment
 
     env = Environment(cls(n_agents=3), n_envs=5, device="cpu", dt=0.05, seed=0)
     scen = env.scenario
@@ -80,7 +80,7 @@ def test_spec_shapes_and_dtypes_match_the_allocated_buffers(cls):
 @pytest.mark.parametrize("cls", FUSED, ids=IDS)
 def test_adopted_state_is_the_scenario_s_own_tensor_not_a_copy(cls):
     """``alloc="never"`` must adopt, never allocate a shadow copy."""
-    from wmas import Environment
+    from swarp import Environment
 
     env = Environment(cls(n_agents=3), n_envs=5, device="cpu", dt=0.05, seed=0)
     scen = env.scenario
@@ -93,7 +93,7 @@ def test_adopted_state_is_the_scenario_s_own_tensor_not_a_copy(cls):
 
 @pytest.mark.parametrize("cls", FUSED, ids=IDS)
 def test_graph_hook_is_wired_and_the_token_starts_at_zero(cls):
-    from wmas import Environment
+    from swarp import Environment
 
     env = Environment(cls(n_agents=3), n_envs=5, device="cpu", dt=0.05, seed=0)
     hook = env.scenario.graph_hook()
@@ -108,8 +108,8 @@ def test_graph_hook_is_wired_and_the_token_starts_at_zero(cls):
 def test_scenarios_without_a_watched_buffer_pin_the_token_structurally():
     """Flocking/sampling/discovery have no watched buffer, so no edit can move their
     token — as opposed to a hand-written ``return 0`` that a later edit invalidates."""
-    from wmas import Environment
-    from wmas.scenarios import DiscoveryScenario, FlockingScenario, SamplingScenario
+    from swarp import Environment
+    from swarp.scenarios import DiscoveryScenario, FlockingScenario, SamplingScenario
 
     for cls in (FlockingScenario, SamplingScenario, DiscoveryScenario):
         env = Environment(cls(n_agents=3), n_envs=4, device="cpu", dt=0.05, seed=0)
@@ -123,7 +123,7 @@ def test_scenarios_without_a_watched_buffer_pin_the_token_structurally():
 
 @pytest.mark.parametrize("device", DEVICES)
 def test_reset_mask_is_zeroed_before_a_step_and_stamped_on_a_reset(device):
-    from wmas import Environment, NavigationScenario
+    from swarp import Environment, NavigationScenario
 
     env = Environment(NavigationScenario(n_agents=3), n_envs=4, device=device, dt=0.05, seed=0)
     scen = env.scenario

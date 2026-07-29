@@ -8,14 +8,14 @@ pytest.importorskip("torchrl")
 from conftest import DEVICES
 from torchrl.envs.utils import check_env_specs  # noqa: E402
 
-from wmas import Environment, NavigationScenario  # noqa: E402
-from wmas.interop.torchrl import WmasEnv  # noqa: E402
-from wmas.scenarios.formation import FormationScenario  # noqa: E402
-from wmas.scenarios.sampling import SamplingScenario  # noqa: E402
+from swarp import Environment, NavigationScenario  # noqa: E402
+from swarp.interop.torchrl import SwarpEnv  # noqa: E402
+from swarp.scenarios.formation import FormationScenario  # noqa: E402
+from swarp.scenarios.sampling import SamplingScenario  # noqa: E402
 
 
 def _make(device, scenario):
-    return WmasEnv(Environment(scenario, n_envs=8, device=device, dt=0.1, seed=0))
+    return SwarpEnv(Environment(scenario, n_envs=8, device=device, dt=0.1, seed=0))
 
 
 @pytest.mark.parametrize("device", DEVICES)
@@ -110,10 +110,10 @@ def test_wrapper_info_path_no_host_transfer(device):
 
 @pytest.mark.parametrize("device", DEVICES)
 def test_step_matches_underlying_env(device):
-    """A step through the wrapper matches the underlying wmas Environment."""
+    """A step through the wrapper matches the underlying swarp Environment."""
     scenario = NavigationScenario(n_agents=3)
     base = Environment(scenario, n_envs=8, device=device, dt=0.1, seed=0)
-    wrapped = WmasEnv(base)
+    wrapped = SwarpEnv(base)
     td = wrapped.reset()
     gen = torch.Generator(device=device).manual_seed(1)
     action = torch.rand(8, 3, wrapped.act_dim, generator=gen, device=device) * 2 - 1

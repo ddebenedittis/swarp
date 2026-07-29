@@ -6,8 +6,8 @@ import numpy as np
 import pytest
 from conftest import _ffmpeg_available
 
-from wmas import Environment, NavigationScenario
-from wmas.render.geometry import extract_geometry
+from swarp import Environment, NavigationScenario
+from swarp.render.geometry import extract_geometry
 
 pytestmark = pytest.mark.viz
 
@@ -40,7 +40,7 @@ def test_render_extras_override_flows_into_geometry():
 
 
 def test_demo_visualization_scenario_emits_lidar_and_comm_lines():
-    from wmas.render.demo import build_env
+    from swarp.render.demo import build_env
 
     env = build_env(1, 3, 1, "cpu", lidar_rays=4, lidar_range=1.0)
     extras = env.scenario.render_extras(0)
@@ -51,9 +51,9 @@ def test_demo_visualization_scenario_emits_lidar_and_comm_lines():
 
 
 def test_demo_mixed_model_env_exposes_distinct_agent_models():
-    from wmas.dynamics.base import DynamicsModel
-    from wmas.render.demo import build_env, goal_seeking_policy
-    from wmas.render.geometry import extract_geometry
+    from swarp.dynamics.base import DynamicsModel
+    from swarp.render.demo import build_env, goal_seeking_policy
+    from swarp.render.geometry import extract_geometry
 
     env = build_env(1, 4, 0, "cpu", model="mixed")
     g = extract_geometry(env.world, 0, scenario=env.scenario)
@@ -70,10 +70,10 @@ def test_demo_drone_env_flies_to_its_goal_and_holds_altitude():
     """The demo's drone controller must be stable: `--model drone` has to be watchable."""
     import torch
 
-    from wmas.dynamics.base import DynamicsModel
-    from wmas.render.demo import _DRONE_HOVER_Z, build_env, goal_seeking_policy
-    from wmas.render.geometry import extract_geometry
-    from wmas.render.renderer import render_frame
+    from swarp.dynamics.base import DynamicsModel
+    from swarp.render.demo import _DRONE_HOVER_Z, build_env, goal_seeking_policy
+    from swarp.render.geometry import extract_geometry
+    from swarp.render.renderer import render_frame
 
     env = build_env(2, 3, 1, "cpu", model="drone")
     assert env.world.act_dim == 4  # four per-rotor thrusts
@@ -119,7 +119,7 @@ def test_environment_render_human_smoke(monkeypatch):
 
 
 def test_record_frames_returns_one_frame_per_step():
-    from wmas.render.video import record_frames
+    from swarp.render.video import record_frames
 
     env, _ = make_env(n_agents=3)
     frames = record_frames(env, n_steps=4, size=(80, 60))
@@ -131,7 +131,7 @@ def test_record_frames_returns_one_frame_per_step():
 def test_to_html5_video_embeds_mp4():
     import base64
 
-    from wmas.render.notebook import to_html5_video
+    from swarp.render.notebook import to_html5_video
 
     frames = [np.full((32, 48, 3), fill, dtype=np.uint8) for fill in (20, 120, 220, 60)]
     html = to_html5_video(frames, fps=8)
@@ -146,7 +146,7 @@ def test_to_html5_video_embeds_mp4():
 
 @pytest.mark.skipif(not _ffmpeg_available(), reason="imageio-ffmpeg not installed")
 def test_demo_save_path_writes_file(tmp_path):
-    from wmas.render.demo import main
+    from swarp.render.demo import main
 
     out = main(
         [
@@ -169,7 +169,7 @@ def test_demo_save_path_writes_file(tmp_path):
 
 
 def test_package_exposes_public_api():
-    import wmas.render as render
+    import swarp.render as render
 
     for name in (
         "Viewer",

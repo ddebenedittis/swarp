@@ -1,7 +1,7 @@
 """Immovable vs movable obstacles.
 
 Immovable obstacles are infinite-mass scenery. Movable ones carry a mass/inertia and are
-integrated by :mod:`wmas.core.bodies` inside the substep loop from the reaction of the
+integrated by :mod:`swarp.core.bodies` inside the substep loop from the reaction of the
 same agent contacts, so they can be pushed, spun, and shoved into each other.
 """
 
@@ -9,9 +9,9 @@ import pytest
 import torch
 from conftest import DEVICES
 
-from wmas.core.config import ObstacleKind, Obstacles, ObstacleShape, WorldConfig
-from wmas.core.world import World
-from wmas.dynamics.base import AgentConfig, ControlMode, DynamicsModel
+from swarp.core.config import ObstacleKind, Obstacles, ObstacleShape, WorldConfig
+from swarp.core.world import World
+from swarp.dynamics.base import AgentConfig, ControlMode, DynamicsModel
 
 
 def _world(device, n_envs=2, substeps=4, **cfg_kw):
@@ -215,7 +215,7 @@ def test_movable_obstacle_determinism(device):
 
 @pytest.mark.parametrize("device", DEVICES)
 def test_render_geometry_reports_kind_and_live_pose(device):
-    from wmas.render.geometry import extract_geometry
+    from swarp.render.geometry import extract_geometry
 
     w = _world(device)
     _install(w, [ObstacleKind.MOVABLE, ObstacleKind.IMMOVABLE], centers=[[0.0, 0.0], [1.2, 0.0]])

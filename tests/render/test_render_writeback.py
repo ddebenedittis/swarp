@@ -5,12 +5,12 @@ import pygame
 import pytest
 import torch
 
-from wmas import Environment, NavigationScenario
-from wmas.render.camera import Camera
-from wmas.render.geometry import extract_geometry
-from wmas.render.input import InteractionController, ViewState
-from wmas.render.overlays import DEFAULT_ENABLED
-from wmas.render.viewer import Viewer
+from swarp import Environment, NavigationScenario
+from swarp.render.camera import Camera
+from swarp.render.geometry import extract_geometry
+from swarp.render.input import InteractionController, ViewState
+from swarp.render.overlays import DEFAULT_ENABLED
+from swarp.render.viewer import Viewer
 
 pytestmark = pytest.mark.viz
 

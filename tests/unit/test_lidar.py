@@ -7,8 +7,8 @@ import pytest
 import torch
 from conftest import DEVICES
 
-from wmas.sensors.lidar import Lidar, lidar_scan
-from wmas.sensors.lidar_kernels import lidar_scan_warp
+from swarp.sensors.lidar import Lidar, lidar_scan
+from swarp.sensors.lidar_kernels import lidar_scan_warp
 
 MAXR = 2.0
 
@@ -168,9 +168,9 @@ def test_lidar_backend_validation():
 
 
 def _tiny_world(dtype=torch.float32):
-    from wmas.core.config import WorldConfig
-    from wmas.core.world import World
-    from wmas.dynamics.base import AgentConfig, DynamicsModel
+    from swarp.core.config import WorldConfig
+    from swarp.core.world import World
+    from swarp.dynamics.base import AgentConfig, DynamicsModel
 
     cfgs = [AgentConfig(model=DynamicsModel.HOLONOMIC, radius=0.05) for _ in range(3)]
     return World(cfgs, WorldConfig(collisions=True), n_envs=4, device="cpu", dtype=dtype)

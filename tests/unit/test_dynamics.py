@@ -10,15 +10,15 @@ import pytest
 import warp as wp
 from conftest import DEVICES
 
-from wmas.core.state import WorldState
-from wmas.dynamics.base import (
+from swarp.core.state import WorldState
+from swarp.dynamics.base import (
     AgentConfig,
     ControlMode,
     DynamicsModel,
     Integrator,
     build_agent_params,
 )
-from wmas.dynamics.kernels import launch_integrate
+from swarp.dynamics.kernels import launch_integrate
 
 
 def clamp_norm(v: np.ndarray, limit: float) -> np.ndarray:
@@ -335,7 +335,7 @@ def test_float32_matches_float64_loosely():
 
 def test_drone_config_builds():
     """The 6-DOF drone is a first-class model now (see tests/test_drone.py)."""
-    from wmas.dynamics.drone import drone_config
+    from swarp.dynamics.drone import drone_config
 
     cfg = drone_config()
     assert cfg.model == DynamicsModel.DRONE

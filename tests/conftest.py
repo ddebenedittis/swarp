@@ -66,9 +66,9 @@ from dataclasses import dataclass
 import pytest
 import torch
 
-from wmas import Environment
-from wmas.dynamics.base import AgentConfig, ControlMode, DynamicsModel
-from wmas.interop.autograd import TorchState
+from swarp import Environment
+from swarp.dynamics.base import AgentConfig, ControlMode, DynamicsModel
+from swarp.interop.autograd import TorchState
 
 CUDA = torch.cuda.is_available()
 DEVICES = ["cpu"] + (["cuda:0"] if CUDA else [])
@@ -185,7 +185,7 @@ class FusedSpec:
         The scenario class, read only for :attr:`rtol` / :attr:`atol`. The fused-vs-torch
         tolerance is declared on the scenario (``Scenario.parity_rtol`` / ``parity_atol``)
         because it is the scenario that knows why its two paths differ; both this harness
-        and ``wmas.benchmark``'s parity gate read it from there, so there is exactly one
+        and ``swarp.benchmark``'s parity gate read it from there, so there is exactly one
         number per scenario. A suite may still assert something *tighter* than the declared
         bound for a field it knows more about -- push-t's pose checks do -- but nothing
         re-declares a looser one.

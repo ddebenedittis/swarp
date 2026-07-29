@@ -11,8 +11,8 @@ import torch
 import warp as wp
 from conftest import DEVICES, holo_cfgs
 
-from wmas.core.config import ObstacleKind, Obstacles, WorldConfig
-from wmas.core.world import AgentStateWp, World
+from swarp.core.config import ObstacleKind, Obstacles, WorldConfig
+from swarp.core.world import AgentStateWp, World
 
 FIELDS = ("pos", "theta", "vel", "speed", "ang_vel")
 

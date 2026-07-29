@@ -4,7 +4,7 @@ Two things are pinned here.
 
 **Capture safety** (``test_in_place_install_*``). ``TransportScenario`` re-installs its
 package obstacles from *inside* the captured whole-step graph — torch code inside
-``wp.ScopedCapture``, see ``wmas/interop/persistent.py``'s ``set_post_physics`` contract.
+``wp.ScopedCapture``, see ``swarp/interop/persistent.py``'s ``set_post_physics`` contract.
 That is legal only because the steady-state in-place install allocates nothing, launches
 nothing on torch's stream, and never reads the device back to the host. Nothing used to
 test it, so an innocuous edit to ``set_obstacles`` could silently corrupt transport's graph.
@@ -25,10 +25,10 @@ import torch
 import warp as wp
 from conftest import CUDA, DEVICES, holo_cfgs
 
-from wmas.core.config import ObstacleKind, Obstacles, ObstacleShape, WorldConfig
-from wmas.core.stepper import Stepper
-from wmas.core.world import World
-from wmas.dynamics.base import AgentConfig, ControlMode, DynamicsModel
+from swarp.core.config import ObstacleKind, Obstacles, ObstacleShape, WorldConfig
+from swarp.core.stepper import Stepper
+from swarp.core.world import World
+from swarp.dynamics.base import AgentConfig, ControlMode, DynamicsModel
 
 # --------------------------------------------------------------------------- helpers
 

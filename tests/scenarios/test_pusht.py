@@ -6,8 +6,8 @@ import pytest
 import torch
 from conftest import DEVICES
 
-from wmas import Environment
-from wmas.scenarios.pusht import PushTScenario
+from swarp import Environment
+from swarp.scenarios.pusht import PushTScenario
 
 
 def _env(device, n_envs=4, **kw):

@@ -17,7 +17,7 @@ from conftest import (
     fused_rollout,
 )
 
-from wmas import DiscoveryScenario
+from swarp import DiscoveryScenario
 
 SPEC = FusedSpec(
     scenario=DiscoveryScenario,

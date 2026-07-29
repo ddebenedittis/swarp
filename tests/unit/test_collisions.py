@@ -6,10 +6,10 @@ import torch
 import warp as wp
 from conftest import DEVICES, _core, _map5, holo_cfgs
 
-from wmas.core.config import Obstacles, WorldConfig
-from wmas.core.stepper import Stepper
-from wmas.dynamics.base import ControlMode
-from wmas.interop.autograd import TorchState, warp_step
+from swarp.core.config import Obstacles, WorldConfig
+from swarp.core.stepper import Stepper
+from swarp.dynamics.base import ControlMode
+from swarp.interop.autograd import TorchState, warp_step
 
 
 def make_state(pos, vel=None, dtype=torch.float64):
@@ -54,7 +54,7 @@ def test_two_agent_spring_damper_analytic():
         out = warp_step(stepper, state, actions)
     # agent0: n = (-1,0), overlap 0.07, rel_v = (1,0), dot(rel_v,n) = -1
     # The damping is linearly implicit, so the scalar coefficient carries the
-    # 1 + c*sub_dt/m denominator (see wmas.core.collisions):
+    # 1 + c*sub_dt/m denominator (see swarp.core.collisions):
     #   coeff = (k*0.07 - c*(-1)) / (1 + 2*0.1/1) = 9 / 1.2 = 7.5
     #   F0 = 7.5*(-1, 0) = (-7.5, 0)
     # accel mode, zero action: v_new = v + F/m*dt = 0.5 - 0.75 = -0.25

@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to `wmas`. Newest first. Nothing has been released yet — version is
+All notable changes to `swarp`. Newest first. Nothing has been released yet — version is
 `0.1.0` and the API is pre-1.0, so anything here may still change.
 
 ## Unreleased
@@ -9,14 +9,14 @@ All notable changes to `wmas`. Newest first. Nothing has been released yet — v
 
 - **Push-T** (`PushTScenario`): agents push a T-shaped **movable compound rigid body** to a
   target pose. Two oriented `BOX` shapes share one body id and are placed by body-frame
-  offsets, so `wmas.core.bodies` integrates a single rigid pose (position *and* rotation)
+  offsets, so `swarp.core.bodies` integrates a single rigid pose (position *and* rotation)
   for the pair from the reaction of the very same agent contacts — inside the substep loop,
   so the pose an agent collides against is at most one substep old. Mass splits by area and
   inertia comes from the parallel-axis theorem about the area centroid, which makes the
   orientation half of the task solvable.
 - **Movable obstacles** (`ObstacleKind.MOVABLE`): obstacles that carry mass and inertia and
   are advanced from agent-contact reaction forces (Newton's third law of one shared force)
-  by `wmas/core/bodies.py`, gather-style with a thread per `(env, obstacle)` and no atomics.
+  by `swarp/core/bodies.py`, gather-style with a thread per `(env, obstacle)` and no atomics.
   Obstacle-vs-obstacle contacts are modelled for every pair in which at least one body is
   round; box-box is not (that needs a polygon manifold, not an SDF against a disc).
 - **Transport** (`TransportScenario`): a first movable circular package agents push to a
@@ -37,7 +37,7 @@ All notable changes to `wmas`. Newest first. Nothing has been released yet — v
   the no-grad path, bit-identical to a fresh build), slim-2D state paths, eager trims, and
   an allocation-free no-grad step at steady state.
 - **CUDA-graph capture of the no-grad hot path** as a standalone wrapper
-  (`wmas.interop.persistent.CudaGraphStep`).
+  (`swarp.interop.persistent.CudaGraphStep`).
 - A **batched uniform-grid neighbor backend** (`neighbor_method="uniform_grid"`,
   radix-sort based) that stays linear in `n_envs` and beats brute force past ~512
   agents/env (~4× at 1k, ~10× at 4k on an RTX 3070).
@@ -55,7 +55,7 @@ All notable changes to `wmas`. Newest first. Nothing has been released yet — v
 
 - **Warp-kernel lidar backend** for flat-memory high-ray-count scans, alongside the
   original torch implementation.
-- **Lidar sensor** (`wmas.Lidar`): a differentiable, vectorized ray-cast returning per-ray
+- **Lidar sensor** (`swarp.Lidar`): a differentiable, vectorized ray-cast returning per-ray
   ranges against circular agents and obstacles, opt-in as an observation component a
   scenario concatenates.
 - **6-DOF quadrotor drone** model: quaternion attitude and body-rate dynamics with four
@@ -72,9 +72,9 @@ All notable changes to `wmas`. Newest first. Nothing has been released yet — v
 
 ### Interop
 
-- **TorchRL `EnvBase` wrapper** (`wmas.interop.torchrl.WmasEnv`, `--group torchrl`):
+- **TorchRL `EnvBase` wrapper** (`swarp.interop.torchrl.SwarpEnv`, `--group torchrl`):
   batched `TensorDict` specs, passes TorchRL's `check_env_specs`.
-- **`torch.compile`-compatible step** (`wmas.interop.compile.compiled_warp_step`): a
+- **`torch.compile`-compatible step** (`swarp.interop.compile.compiled_warp_step`): a
   `torch.library.custom_op` with fake-tensor and autograd rules.
 
 ### Core
@@ -86,9 +86,9 @@ All notable changes to `wmas`. Newest first. Nothing has been released yet — v
 - **Arbitrary action arity**: the action tensor is `[n_envs, n_agents, act_dim]` with
   `act_dim` the max over agent models, decoupling the action space from the geometry.
 - **Neighbor-list overflow is surfaced**, not silently truncated.
-- Cross-simulator throughput benchmark (`wmas.benchmark.compare_sims`: wmas vs VMAS vs
+- Cross-simulator throughput benchmark (`swarp.benchmark.compare_sims`: swarp vs VMAS vs
   JaxMARL vs CAMAR, one subprocess per simulator) and a VMAS head-to-head
-  (`wmas.benchmark.compare_vmas`). See [docs/benchmarks.md](docs/benchmarks.md).
+  (`swarp.benchmark.compare_vmas`). See [docs/benchmarks.md](docs/benchmarks.md).
 
 ### Repo
 

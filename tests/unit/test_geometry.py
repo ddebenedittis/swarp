@@ -11,10 +11,10 @@ import torch
 import warp as wp
 from conftest import DEVICES, _core, _map5
 
-from wmas.core.config import Obstacles, ObstacleShape, WorldConfig
-from wmas.core.stepper import Stepper
-from wmas.dynamics.base import AgentConfig, ControlMode, DynamicsModel
-from wmas.interop.autograd import TorchState, warp_step
+from swarp.core.config import Obstacles, ObstacleShape, WorldConfig
+from swarp.core.stepper import Stepper
+from swarp.dynamics.base import AgentConfig, ControlMode, DynamicsModel
+from swarp.interop.autograd import TorchState, warp_step
 
 K, DT = 100.0, 0.1
 

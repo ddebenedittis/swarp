@@ -3,9 +3,9 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "wmas"
+name = "swarp"
 version = "0.1.0"
-description = "Warp Multi-Agent Simulator: a GPU-resident, differentiable, vectorized 2D multi-agent simulator built on NVIDIA Warp with zero-copy PyTorch interop."
+description = "Swarm simulation on NVIDIA Warp: a GPU-resident, differentiable, vectorized 2D multi-agent simulator built on NVIDIA Warp with zero-copy PyTorch interop."
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "MIT" }
@@ -18,7 +18,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Interactive/headless visualization. Install with `pip install wmas[viz]` or
+# Interactive/headless visualization. Install with `pip install swarp[viz]` or
 # `uv pip install -e '.[viz]'`. Kept out of the core so the simulator stays lean.
 viz = [
     "pygame-ce>=2.5",
@@ -31,13 +31,13 @@ dev = [
     "pytest>=8.0",
     "ruff>=0.8",
 ]
-# VMAS comparison benchmark (wmas/benchmark/compare_vmas.py). VMAS pulls in gym,
+# VMAS comparison benchmark (swarp/benchmark/compare_vmas.py). VMAS pulls in gym,
 # which requires numpy < 2. Falls back to an optional (gitignored) local
 # ./VectorizedMultiAgentSimulator clone if `vmas` is not importable.
 bench = [
     "vmas>=1.5",
 ]
-# Cross-simulator throughput benchmark (wmas/benchmark/compare_sims.py). JaxMARL
+# Cross-simulator throughput benchmark (swarp/benchmark/compare_sims.py). JaxMARL
 # and CAMAR are JAX-based and want recent numpy, so they CANNOT share the `bench`
 # venv (vmas pins numpy < 2). Each is installed into its own Python 3.12 venv and
 # the orchestrator drives one subprocess per simulator with that venv's
@@ -49,7 +49,7 @@ bench-jaxmarl = [
 bench-camar = [
     "camar[cuda12]",
 ]
-# TorchRL EnvBase wrapper (wmas/interop/torchrl.py). Optional: the core install
+# TorchRL EnvBase wrapper (swarp/interop/torchrl.py). Optional: the core install
 # stays lean and only depends on warp + torch + numpy.
 torchrl = [
     "torchrl>=0.5",
@@ -57,7 +57,7 @@ torchrl = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["wmas"]
+packages = ["swarp"]
 
 [tool.ruff]
 line-length = 100

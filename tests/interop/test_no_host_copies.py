@@ -15,7 +15,7 @@ import torch
 import warp as wp
 from conftest import DEVICES
 
-from wmas import Environment, NavigationScenario
+from swarp import Environment, NavigationScenario
 
 
 def make_env(device, n_envs=32):
@@ -62,7 +62,7 @@ def test_transport_obstacle_reinstall_no_host_transfer(device):
     rather than rebuild it per call. Auto-reset is on with a short ``max_steps`` so the
     guarded window crosses several resets, which is where the rebuild used to happen.
     """
-    from wmas import TransportScenario
+    from swarp import TransportScenario
 
     scen = TransportScenario(n_agents=4, n_packages=2)
     env = Environment(

@@ -33,7 +33,7 @@ jobs:
       # The `viz` extra is installed so the renderer/video tests actually run
       # instead of skipping: they are pure-CPU (pygame headless + imageio) and are
       # the part of the tree least covered by the physics suite.
-      - name: Install wmas + dev + viz
+      - name: Install swarp + dev + viz
         run: uv pip install -e '.[viz]' --group dev
 
       - name: Lint

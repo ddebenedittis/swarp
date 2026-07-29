@@ -12,8 +12,8 @@ from conftest import (
     fused_rollout,
 )
 
-from wmas import NavigationScenario
-from wmas.dynamics.base import P_RADIUS, per_env_float_template
+from swarp import NavigationScenario
+from swarp.dynamics.base import P_RADIUS, per_env_float_template
 
 SPEC = FusedSpec(
     scenario=NavigationScenario,

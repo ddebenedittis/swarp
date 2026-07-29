@@ -5,18 +5,18 @@ import pygame
 import pytest
 import torch
 
-from wmas import Environment, NavigationScenario
-from wmas.render.camera import Camera
-from wmas.render.geometry import extract_geometry
-from wmas.render.input import (
+from swarp import Environment, NavigationScenario
+from swarp.render.camera import Camera
+from swarp.render.geometry import extract_geometry
+from swarp.render.input import (
     SPEED_LADDER,
     InteractionController,
     ViewState,
     pick_agent,
     pick_obstacle,
 )
-from wmas.render.overlays import DEFAULT_ENABLED
-from wmas.render.viewer import Viewer
+from swarp.render.overlays import DEFAULT_ENABLED
+from swarp.render.viewer import Viewer
 
 pytestmark = pytest.mark.viz
 
@@ -89,7 +89,7 @@ def test_supersampling_does_not_disturb_picking_or_the_viewers_camera():
     The interaction controller holds that exact object and feeds it raw window pixels, so a
     scaled camera leaking back would break picking, panning and zoom-under-cursor.
     """
-    from wmas.render.style import Style
+    from swarp.render.style import Style
 
     env, scenario = make_env(n_agents=3)
     viewer = Viewer(env, size=(300, 300), scenario=scenario, style=Style(supersample=3))
@@ -318,8 +318,8 @@ def test_up_down_keys_walk_the_speed_ladder_and_clamp():
 def test_speed_badge_shows_only_off_1x():
     import pygame as pg
 
-    from wmas.render.hud import draw_speed_badge
-    from wmas.render.style import Style
+    from swarp.render.hud import draw_speed_badge
+    from swarp.render.style import Style
 
     style = Style()
     state = ViewState(n_envs=1, enabled=set())
@@ -360,8 +360,8 @@ def test_plain_l_toggles_the_lidar_overlay_while_shift_l_cycles_the_mode():
 def test_reward_hud_draws_and_no_ops_on_thin_data():
     import pygame as pg
 
-    from wmas.render.hud import draw_reward_hud
-    from wmas.render.style import Style
+    from swarp.render.hud import draw_reward_hud
+    from swarp.render.style import Style
 
     env, scenario = make_env(n_agents=3)
     g = extract_geometry(env.world, 0, scenario=scenario)
@@ -383,7 +383,7 @@ def test_reward_hud_draws_and_no_ops_on_thin_data():
 
 
 def test_viewer_reward_hud_changes_pixels_once_samples_accumulate():
-    from wmas.render.style import Style
+    from swarp.render.style import Style
 
     env, scenario = make_env(n_agents=3, n_envs=2)
     viewer = Viewer(env, size=(320, 240), scenario=scenario, style=Style(reward_hud=True))
@@ -396,7 +396,7 @@ def test_viewer_reward_hud_changes_pixels_once_samples_accumulate():
 
 def test_focus_env_change_clears_the_trail_and_reward_buffers():
     """Both buffers hold one env's history, so switching env must not smear them together."""
-    from wmas.render.style import Style
+    from swarp.render.style import Style
 
     env, scenario = make_env(n_envs=3, n_agents=2)
     viewer = Viewer(

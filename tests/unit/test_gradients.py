@@ -10,10 +10,10 @@ import torch
 import warp as wp
 from conftest import _core, _map5
 
-from wmas.core.config import WorldConfig
-from wmas.core.stepper import Stepper
-from wmas.dynamics.base import AgentConfig, ControlMode, DynamicsModel, Integrator
-from wmas.interop.autograd import TorchState, rollout, warp_step
+from swarp.core.config import WorldConfig
+from swarp.core.stepper import Stepper
+from swarp.dynamics.base import AgentConfig, ControlMode, DynamicsModel, Integrator
+from swarp.interop.autograd import TorchState, rollout, warp_step
 
 BIG = 100.0  # limits far away from any test action
 

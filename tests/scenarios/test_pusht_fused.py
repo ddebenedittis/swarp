@@ -22,7 +22,7 @@ from conftest import (
     fused_rollout,
 )
 
-from wmas import PushTScenario
+from swarp import PushTScenario
 
 SPEC = FusedSpec(
     scenario=PushTScenario,

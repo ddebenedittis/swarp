@@ -6,12 +6,12 @@ import torch
 import warp as wp
 from conftest import _ffmpeg_available
 
-from wmas import Environment, NavigationScenario
-from wmas.render.camera import Camera
-from wmas.render.geometry import RenderGeometry, extract_geometry
-from wmas.render.renderer import render_frame
-from wmas.render.style import Style
-from wmas.render.video import frames_to_video, save_video
+from swarp import Environment, NavigationScenario
+from swarp.render.camera import Camera
+from swarp.render.geometry import RenderGeometry, extract_geometry
+from swarp.render.renderer import render_frame
+from swarp.render.style import Style
+from swarp.render.video import frames_to_video, save_video
 
 pytestmark = pytest.mark.viz
 
@@ -113,7 +113,7 @@ def test_camera_scaled_is_an_exact_magnification():
 
 
 def test_batch_extraction_matches_per_env_extraction():
-    from wmas.render.geometry import extract_geometry_batch
+    from swarp.render.geometry import extract_geometry_batch
 
     env, scenario = make_env(n_envs=5, n_agents=4)
     idx = [0, 2, 4]
@@ -129,7 +129,7 @@ def test_batch_extraction_matches_per_env_extraction():
 
 
 def test_batch_extraction_can_skip_edges_and_extras():
-    from wmas.render.geometry import extract_geometry_batch
+    from swarp.render.geometry import extract_geometry_batch
 
     env, scenario = make_env(n_envs=4, n_agents=4)
     calls = 0
@@ -150,7 +150,7 @@ def test_batch_extraction_can_skip_edges_and_extras():
 
 def test_batch_extraction_of_empty_index_list():
     env, scenario = make_env()
-    from wmas.render.geometry import extract_geometry_batch
+    from swarp.render.geometry import extract_geometry_batch
 
     assert extract_geometry_batch(env.world, [], scenario=scenario) == []
 
@@ -182,14 +182,14 @@ def test_style_field_partition_is_exhaustive():
     Guards Style.scaled(): an unclassified size would stay 1px in a supersampled buffer
     and downscale to a washed-out pixel, so adding a field must force the decision.
     """
-    from wmas.render.style import _PX_FIELDS, _UNSCALED_FIELDS, style_field_names
+    from swarp.render.style import _PX_FIELDS, _UNSCALED_FIELDS, style_field_names
 
     assert _PX_FIELDS.isdisjoint(_UNSCALED_FIELDS)
     assert style_field_names() == _PX_FIELDS | _UNSCALED_FIELDS
 
 
 def test_style_scaled_multiplies_pixel_fields_only():
-    from wmas.render.style import _PX_FIELDS, _UNSCALED_FIELDS
+    from swarp.render.style import _PX_FIELDS, _UNSCALED_FIELDS
 
     base = Style()
     big = base.scaled(3)
@@ -205,7 +205,7 @@ def test_style_scaled_multiplies_pixel_fields_only():
 
 
 def test_style_themes_differ_and_accept_overrides():
-    from wmas.render.style import THEMES
+    from swarp.render.style import THEMES
 
     light, dark = Style.light(), Style.dark()
     assert light == Style()
@@ -265,7 +265,7 @@ def test_render_frame_lidar_endpoint_dot_changes_pixels():
 
 
 def test_render_frame_lidar_area_mode_changes_pixels():
-    from wmas.render.style import Style
+    from swarp.render.style import Style
 
     g = _geometry(n_agents=1)
     g.extras["lidar"] = np.asarray([[[0.0, 0.0], [0.4, 0.0]], [[0.0, 0.0], [0.0, 0.4]]])
@@ -278,7 +278,7 @@ def test_render_frame_lidar_area_mode_changes_pixels():
 
 
 def test_render_frame_trajectory_overlay_changes_pixels():
-    from wmas.render.style import Style
+    from swarp.render.style import Style
 
     g = _geometry(n_agents=1)
     g.extras["trajectories"] = np.asarray([[[0.0, 0.0], [0.2, 0.0], [0.3, 0.2]]])
@@ -297,7 +297,7 @@ def test_render_frame_trajectory_overlay_changes_pixels():
 
 def _shaped_obstacle_env(shape, angle=0.4, half=(0.25, 0.12), radius=0.05):
     """An env whose single obstacle is a BOX/SEGMENT rather than a circle."""
-    from wmas.core.config import Obstacles, ObstacleShape
+    from swarp.core.config import Obstacles, ObstacleShape
 
     env, scenario = make_env(n_agents=2, n_obstacles=1)
     world = env.world
@@ -316,7 +316,7 @@ def _shaped_obstacle_env(shape, angle=0.4, half=(0.25, 0.12), radius=0.05):
 
 
 def test_extract_geometry_carries_obstacle_shape_angle_and_extents():
-    from wmas.core.config import ObstacleShape
+    from swarp.core.config import ObstacleShape
 
     env, scenario = _shaped_obstacle_env(ObstacleShape.BOX)
     g = extract_geometry(env.world, 0, scenario=scenario)
@@ -335,7 +335,7 @@ def test_extract_geometry_leaves_shape_fields_none_for_circle_only_scenarios():
 
 
 def test_box_and_segment_obstacles_render_differently_from_circles():
-    from wmas.core.config import ObstacleShape
+    from swarp.core.config import ObstacleShape
 
     circles = render_frame(_geometry(n_obstacles=1), size=(240, 240), overlays={"obstacles"})
     for shape in (ObstacleShape.BOX, ObstacleShape.SEGMENT):
@@ -356,9 +356,9 @@ def test_obstacle_drag_preserves_kind_mass_and_keeps_the_body_movable():
     version, not even a CUDA-graph recapture would have surfaced it. The fix is that
     ``World`` retains the whole resolved spec and the drag re-installs *that*.
     """
-    from wmas.core.config import ObstacleKind
-    from wmas.render.viewer import Viewer
-    from wmas.scenarios.pusht import PushTScenario
+    from swarp.core.config import ObstacleKind
+    from swarp.render.viewer import Viewer
+    from swarp.scenarios.pusht import PushTScenario
 
     scenario = PushTScenario(n_agents=1, agent_radius=0.05)
     env = Environment(scenario, n_envs=2, device="cpu", dt=0.05, substeps=8, seed=0)
@@ -413,7 +413,7 @@ def test_circle_only_obstacle_rendering_ignores_absent_shape_arrays():
 
 
 def test_extract_geometry_exposes_the_applied_action_and_agent_params():
-    from wmas.dynamics.base import NUM_PARAMS
+    from swarp.dynamics.base import NUM_PARAMS
 
     env, scenario = make_env(n_agents=3)
     g = extract_geometry(env.world, 0, scenario=scenario)
@@ -436,7 +436,7 @@ def test_action_overlay_is_noop_before_the_first_step():
 
 
 def test_action_overlay_draws_for_every_dynamics_model():
-    from wmas.render.demo import build_env, goal_seeking_policy
+    from swarp.render.demo import build_env, goal_seeking_policy
 
     for model in ("holonomic", "diff-drive", "bicycle", "mixed"):
         env = build_env(2, 3, 1, "cpu", model=model)
@@ -467,7 +467,7 @@ def test_depth_cue_modes_change_pixels_for_overlapping_agents():
 
 
 def test_contact_mask_flags_both_endpoints_of_an_overlapping_pair():
-    from wmas.render.overlays import _contact_mask
+    from swarp.render.overlays import _contact_mask
 
     g = _geometry(n_agents=3)
     style = Style()
@@ -543,7 +543,7 @@ def test_non_holonomic_bodies_differ_from_a_plain_circle(model):
 
 
 def test_bicycle_front_wheel_follows_the_commanded_steering():
-    from wmas.dynamics.base import P_MAX_STEER
+    from swarp.dynamics.base import P_MAX_STEER
 
     g = _single_agent_geometry(2)
     max_steer = float(g.agent_params[0, P_MAX_STEER])
@@ -558,8 +558,8 @@ def test_bicycle_front_wheel_follows_the_commanded_steering():
 
 
 def test_bicycle_axles_follow_l_f_over_l_r():
-    from wmas.dynamics.base import P_LF, P_LR
-    from wmas.render.overlays import _BICYCLE_AXLE_SPAN, _bicycle_axles
+    from swarp.dynamics.base import P_LF, P_LR
+    from swarp.render.overlays import _BICYCLE_AXLE_SPAN, _bicycle_axles
 
     g = _single_agent_geometry(2)
     g.agent_params[0, P_LF] = g.agent_params[0, P_LR] = 0.1
@@ -576,8 +576,8 @@ def test_bicycle_axles_follow_l_f_over_l_r():
 
 
 def test_steer_angle_is_clamped_and_zero_without_an_action():
-    from wmas.dynamics.base import P_MAX_STEER
-    from wmas.render.overlays import _steer_angle
+    from swarp.dynamics.base import P_MAX_STEER
+    from swarp.render.overlays import _steer_angle
 
     g = _single_agent_geometry(2)
     max_steer = float(g.agent_params[0, P_MAX_STEER])
@@ -589,7 +589,7 @@ def test_steer_angle_is_clamped_and_zero_without_an_action():
 
 
 def test_rounded_rect_factors_stay_inside_the_box_and_smooth_the_corners():
-    from wmas.render.overlays import _rounded_rect_factors
+    from swarp.render.overlays import _rounded_rect_factors
 
     pts = _rounded_rect_factors(1.6, 0.75, 0.45)
     assert len(pts) > 4  # corners are sampled, not cut
@@ -604,7 +604,7 @@ def test_rounded_rect_factors_stay_inside_the_box_and_smooth_the_corners():
 
 
 def test_hover_panel_names_the_dynamics_model():
-    from wmas.render.hud import _model_name
+    from swarp.render.hud import _model_name
 
     assert _model_name(0) == "holonomic"
     assert _model_name(2) == "kinematic_bicycle"
@@ -613,7 +613,7 @@ def test_hover_panel_names_the_dynamics_model():
 
 
 def test_dashed_segments_cover_the_line_in_periodic_pieces():
-    from wmas.render.overlays import _dashed_segments
+    from swarp.render.overlays import _dashed_segments
 
     segs = _dashed_segments((0, 0), (100, 0), dash_px=6, gap_px=4)
     assert len(segs) == 10  # period 10 over a 100px span
@@ -645,7 +645,7 @@ def test_reached_goal_renders_differently_from_a_distant_one():
 
 
 def test_pts_is_pixel_identical_to_the_scalar_transform():
-    from wmas.render.overlays import _p, _pts
+    from swarp.render.overlays import _p, _pts
 
     cam = Camera(bounds=(-1.0, 2.0, -1.0, 1.0), viewport=(5, 7, 333, 211), zoom=1.3)
     cam.pan(11.0, -23.0)
@@ -676,7 +676,7 @@ def test_supersampled_frame_is_deterministic():
 def test_alpha_layer_is_reused_and_cleared():
     import pygame
 
-    from wmas.render.overlays import _alpha_layer
+    from swarp.render.overlays import _alpha_layer
 
     first = _alpha_layer("t", (16, 16))
     pygame.draw.rect(first, (255, 0, 0, 255), pygame.Rect(0, 0, 8, 8))

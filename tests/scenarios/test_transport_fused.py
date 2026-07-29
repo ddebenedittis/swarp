@@ -16,7 +16,7 @@ from conftest import (
     fused_rollout,
 )
 
-from wmas import TransportScenario
+from swarp import TransportScenario
 
 SPEC = FusedSpec(
     scenario=TransportScenario,

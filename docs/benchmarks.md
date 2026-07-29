@@ -4,19 +4,19 @@ All figures below were measured on a single **NVIDIA GeForce RTX 3070 Laptop GPU
 sm_86), float32. They are only comparable to each other on that machine — treat them as
 ratios and orders of magnitude, not absolutes.
 
-The benchmark entry points (`wmas/benchmark/`):
+The benchmark entry points (`swarp/benchmark/`):
 
 | command | what it measures |
 |---------|------------------|
-| `python -m wmas.benchmark.throughput` | wmas alone: NavigationScenario hot path across a `(n_envs, n_agents)` grid |
-| `python -m wmas.benchmark.compare_vmas` | wmas vs VMAS (throughput and/or peak device memory) |
-| `python -m wmas.benchmark.compare_sims` | wmas vs VMAS vs JaxMARL vs CAMAR, one subprocess per simulator |
-| `python -m wmas.benchmark.ablation` | cumulative optimization ablation of the same hot path, one feature per row, parity-gated |
-| `python -m wmas.benchmark.scenarios` | all 7 scenarios × robot model × lidar rays: baseline vs optimized, parity-gated |
+| `python -m swarp.benchmark.throughput` | swarp alone: NavigationScenario hot path across a `(n_envs, n_agents)` grid |
+| `python -m swarp.benchmark.compare_vmas` | swarp vs VMAS (throughput and/or peak device memory) |
+| `python -m swarp.benchmark.compare_sims` | swarp vs VMAS vs JaxMARL vs CAMAR, one subprocess per simulator |
+| `python -m swarp.benchmark.ablation` | cumulative optimization ablation of the same hot path, one feature per row, parity-gated |
+| `python -m swarp.benchmark.scenarios` | all 7 scenarios × robot model × lidar rays: baseline vs optimized, parity-gated |
 
 ## Throughput
 
-`python -m wmas.benchmark.throughput` steps the full NavigationScenario hot path
+`python -m swarp.benchmark.throughput` steps the full NavigationScenario hot path
 (dynamics, neighbor lists, soft collisions, obs/reward) under `torch.no_grad()` with
 random actions kept on-device. Measurement conditions: **100 timed steps per config**
 (after 10 warm-up steps), float32, `dt=0.05`, `substeps=1`, fused Warp obs/reward kernels
@@ -66,7 +66,7 @@ kernels whose thread count grows with agents, not a Python loop whose *length* d
 
 ## vs. VMAS
 
-`python -m wmas.benchmark.compare_vmas` pits wmas against
+`python -m swarp.benchmark.compare_vmas` pits swarp against
 [VMAS](https://github.com/proroklab/VectorizedMultiAgentSimulator) on the navigation
 scenario (the one both implement), across a `(n_envs, n_agents)` grid. Install the
 comparison deps first: `uv pip install -e . --group bench` (pulls in `vmas`; the script
@@ -78,25 +78,25 @@ VMAS's default navigation (collisions + 12-ray lidar); `vmas-simple` disables bo
 lidar-free lower bound:
 
 ```
- n_envs n_agents |          wmas |    vmas-lidar |   vmas-simple | wmas/lidar  wmas/simple
-   16384        4 |    18,751,408 |     2,094,070 |     8,163,160 |      8.95x        2.30x
-   16384       16 |     6,970,898 |       143,174 |     2,275,756 |     48.69x        3.06x
-    1024        4 |     1,232,014 |       186,642 |       544,501 |      6.60x        2.26x
-    1024       16 |     1,247,845 |        20,672 |       154,476 |     60.36x        8.08x
+ n_envs n_agents |         swarp |    vmas-lidar |   vmas-simple | swarp/lidar  swarp/simple
+   16384        4 |    18,751,408 |     2,094,070 |     8,163,160 |       8.95x         2.30x
+   16384       16 |     6,970,898 |       143,174 |     2,275,756 |      48.69x         3.06x
+    1024        4 |     1,232,014 |       186,642 |       544,501 |       6.60x         2.26x
+    1024       16 |     1,247,845 |        20,672 |       154,476 |      60.36x         8.08x
 ```
 
-> **Note.** The `wmas` column here predates the current hot path (it was measured before
+> **Note.** The `swarp` column here predates the current hot path (it was measured before
 > whole-step CUDA-graph capture and the fused obs/reward work), so the ratios are a
 > *lower bound* on today's margin. The VMAS columns are unaffected. Re-run the script for
 > current figures.
 
-wmas is ~6–9× faster than VMAS's default navigation at 4 agents and ~40–75× at 16 agents:
+swarp is ~6–9× faster than VMAS's default navigation at 4 agents and ~40–75× at 16 agents:
 its whole step is ~3 fused Warp kernels regardless of agent count, whereas VMAS dispatches
 per-entity (and O(entities²) pairwise) PyTorch ops in Python, and its lidar raycasts every
 agent against every entity. Peak device memory is comparable to VMAS-with-lidar and small in
 absolute terms (≤ ~300 MiB across the grid), so throughput — not memory — is the constraint.
 
-**Parity caveat.** wmas is *API-compatible in spirit, not trajectory-compatible* with
+**Parity caveat.** swarp is *API-compatible in spirit, not trajectory-compatible* with
 VMAS. The dynamics (semi-implicit Euler, no drag, force-as-velocity-contribution for the
 nonholonomic models), collision constants, and observation model (padded neighbor lists,
 not lidar) differ by design, so identical actions do **not** reproduce VMAS trajectories.
@@ -105,13 +105,13 @@ more.
 
 ## vs. JaxMARL & CAMAR
 
-`python -m wmas.benchmark.compare_sims` broadens the head-to-head to the JAX-based field:
-wmas vs [VMAS](https://github.com/proroklab/VectorizedMultiAgentSimulator),
+`python -m swarp.benchmark.compare_sims` broadens the head-to-head to the JAX-based field:
+swarp vs [VMAS](https://github.com/proroklab/VectorizedMultiAgentSimulator),
 [JaxMARL](https://github.com/flairox/jaxmarl) (`MPE_simple_spread_v3`, continuous
 cooperative navigation), and [CAMAR](https://github.com/AIRI-Institute/CAMAR)
 (`random_grid` + `HolonomicDynamic` continuous navigation). All four run the same
 env-steps/s measurement on the one scenario they share — continuous 2D
-navigation-to-goal with collision avoidance — anchored on wmas.
+navigation-to-goal with collision avoidance — anchored on swarp.
 
 ### Setting up the venvs
 
@@ -122,7 +122,7 @@ subprocess (JAX and torch never share a process, so they don't fight over VRAM):
 
 ```bash
 for v in .venv .venv-jaxmarl .venv-camar; do uv venv --python 3.12 $v; done
-VIRTUAL_ENV=.venv         uv pip install -e . --group dev --group bench     # wmas + vmas
+VIRTUAL_ENV=.venv         uv pip install -e . --group dev --group bench     # swarp + vmas
 VIRTUAL_ENV=.venv-jaxmarl uv pip install -e . --group bench-jaxmarl         # jaxmarl
 VIRTUAL_ENV=.venv-camar   uv pip install -e . --group bench-camar           # camar
 ```
@@ -160,40 +160,40 @@ One combined command drives all three subprocesses via a per-sim interpreter map
 prints a single table (the numpy split lives entirely at the subprocess boundary):
 
 ```bash
-.venv/bin/python -m wmas.benchmark.compare_sims --device cuda:0 \
+.venv/bin/python -m swarp.benchmark.compare_sims --device cuda:0 \
     --envs 1024 4096 16384 --agents 3 16 \
     --python jaxmarl=.venv-jaxmarl/bin/python \
     --python camar=.venv-camar/bin/python
 ```
 
-The launching interpreter (`.venv/bin/python` here) runs `wmas` and `vmas` in-process
+The launching interpreter (`.venv/bin/python` here) runs `swarp` and `vmas` in-process
 by default; `--python SIM=PATH` overrides the interpreter for a given simulator, and
 any sim without an override uses the launcher (or `--python-default PATH`). To compare
-**just wmas vs JaxMARL**, restrict the sims and point JaxMARL at its venv:
+**just swarp vs JaxMARL**, restrict the sims and point JaxMARL at its venv:
 
 ```bash
-.venv/bin/python -m wmas.benchmark.compare_sims --device cuda:0 \
-    --sims wmas jaxmarl --agents 3 16 \
+.venv/bin/python -m swarp.benchmark.compare_sims --device cuda:0 \
+    --sims swarp jaxmarl --agents 3 16 \
     --python jaxmarl=.venv-jaxmarl/bin/python
 ```
 
-`--sims` picks which simulators to run (`wmas` is the anchor and should stay in);
+`--sims` picks which simulators to run (`swarp` is the anchor and should stay in);
 `--agents`/`--envs` set the sweep. JaxMARL's `MPE_simple_spread_v3` honors any agent
 count (`num_agents` is configurable), so no cell is skipped for an agent mismatch; if a
 simulator ever cannot match the requested count, its number is flagged with `*` and the
 realized count is listed under the table. You can drop the JaxMARL comparison entirely
 by omitting it from `--sims`.
 
-### wmas configurations
+### swarp configurations
 
-The three `wmas` entries are hot-path *configurations* of the same simulator, so the
-benchmark doubles as an optimization ablation: `wmas-eager` (torch obs/reward, no
-CUDA graph — the baseline), `wmas-fused` (fused Warp obs/reward kernels), and `wmas`
+The three `swarp` entries are hot-path *configurations* of the same simulator, so the
+benchmark doubles as an optimization ablation: `swarp-eager` (torch obs/reward, no
+CUDA graph — the baseline), `swarp-fused` (fused Warp obs/reward kernels), and `swarp`
 (fused **+** CUDA-graph capture). env-steps/s on the RTX 3070 Laptop GPU (float32,
 60 timed steps):
 
 ```
-  n_envs  n_agents |  wmas-eager  wmas-fused        wmas |  fused/eager  opt/eager
+  n_envs  n_agents | swarp-eager swarp-fused       swarp |  fused/eager  opt/eager
     4096         3 |   5,838,664   7,877,854  15,945,297 |       1.35x      2.73x
    16384         3 |  21,772,740  30,814,526  61,718,330 |       1.42x      2.83x
     4096        16 |   5,998,275   6,783,331  15,094,932 |       1.13x      2.52x
@@ -211,7 +211,7 @@ because the top configuration adds CUDA-graph capture. That is now `Environment`
 default (`use_graph="auto"` — on for a fused scenario on a CUDA device); the
 [Throughput](#throughput) table above deliberately pins it off.
 
-### wmas (optimized) vs the field — matched task & observations
+### swarp (optimized) vs the field — matched task & observations
 
 To make it as apples-to-apples as a four-engine comparison can be, the **default**
 `--sims` set controls for the two biggest asymmetries: all four run **obstacle-free**
@@ -219,7 +219,7 @@ open-field navigation with **raycasting-free, relative-position observations**:
 
 | sim | config for the matched comparison |
 |-----|-----------------------------------|
-| `wmas` | optimized (fused Warp kernels + CUDA graph); neighbor-list obs, no obstacles |
+| `swarp` | optimized (fused Warp kernels + CUDA graph); neighbor-list obs, no obstacles |
 | `vmas-nolidar` | VMAS navigation, `collisions=False` → no 12-ray lidar, relative-position obs |
 | `jaxmarl` | `MPE_simple_spread_v3` continuous — relative-position obs (already raycast-free) |
 | `camar` | **open arena** (`string_grid`, no obstacles, `frameskip=1`) instead of the default ~800-obstacle `random_grid` |
@@ -229,17 +229,17 @@ them, and JIT/XLA compile is excluded via warmup at the timed length. Both
 `env-steps/s` and `agent-steps/s` (= env-steps/s × agents) are reported:
 
 > **What this measures.** These figures are the *simulator* step only — physics +
-> obs + reward — not a full RL loop. wmas folds that whole step (physics, neighbor
+> obs + reward — not a full RL loop. swarp folds that whole step (physics, neighbor
 > query, and fused obs/reward) into a single CUDA graph, so a step is one graph
 > replay with no per-launch host floor. In policy-in-the-loop RL the JAX sims
-> `jit` the policy *and* env together into one XLA program, whereas wmas replays
+> `jit` the policy *and* env together into one XLA program, whereas swarp replays
 > the env graph and runs the policy as separate launches; the end-to-end training
 > throughput of each therefore depends on how the policy is compiled alongside the
 > simulator, which this benchmark does not capture.
 
 ```
 metric: env-steps/s
-  n_envs  n_agents |         wmas  vmas-nolidar      jaxmarl        camar | vnl/w   jax/w  camar/w
+  n_envs  n_agents |        swarp  vmas-nolidar      jaxmarl        camar | vnl/s   jax/s  camar/s
     1024         3 |    4,717,415       633,305   13,731,386   11,644,687 | 0.13x   2.91x    2.47x
     4096         3 |   16,942,170     2,489,270   38,760,087   33,327,778 | 0.15x   2.29x    1.97x
    16384         3 |   63,640,378     9,946,801   65,213,783   67,508,356 | 0.16x   1.02x    1.06x
@@ -248,7 +248,7 @@ metric: env-steps/s
    16384        16 |   35,647,177     2,122,258    1,423,262    3,682,337 | 0.06x   0.04x    0.10x
 
 metric: agent-steps/s
-  n_envs  n_agents |         wmas  vmas-nolidar      jaxmarl        camar | vnl/w   jax/w  camar/w
+  n_envs  n_agents |        swarp  vmas-nolidar      jaxmarl        camar | vnl/s   jax/s  camar/s
     1024         3 |   14,152,244     1,899,916   41,194,157   34,934,061 | 0.13x   2.91x    2.47x
     4096         3 |   50,826,510     7,467,809  116,280,262   99,983,333 | 0.15x   2.29x    1.97x
    16384         3 |  190,921,134    29,840,404  195,641,349  202,525,067 | 0.16x   1.02x    1.06x
@@ -263,12 +263,12 @@ Reading it, once the task and obs are matched:
 
 - **The two JAX sims (JaxMARL, CAMAR) win at few agents + low envs** (~2–3× at 3 agents,
   1024–4096 envs), because they run the whole rollout as one jitted `lax.scan` with no
-  per-step launch floor. **wmas is latency-bound there** — its step floors at ~0.24 ms
+  per-step launch floor. **swarp is latency-bound there** — its step floors at ~0.24 ms
   regardless of `n_envs` (1024→16384) *or* agent count (3→16), a Python-per-step-loop cost
   the JAX fused rollout doesn't pay. This is the real reason JAX leads at low occupancy.
-- **They converge by 16384 envs** at 3 agents (all within ~6% — wmas 63.6 M, JaxMARL 65.2 M,
-  CAMAR 67.5 M) as wmas's launch floor amortizes across more work.
-- **wmas dominates at 16 agents** (JAX sims fall to 0.04–0.68×). wmas's step is a fixed
+- **They converge by 16384 envs** at 3 agents (all within ~6% — swarp 63.6 M, JaxMARL 65.2 M,
+  CAMAR 67.5 M) as swarp's launch floor amortizes across more work.
+- **swarp dominates at 16 agents** (JAX sims fall to 0.04–0.68×). swarp's step is a fixed
   handful of fused Warp kernels, nearly insensitive to agent count — its `agent-steps/s`
   climbs from ~14 M (3 agents) to ~570 M (16 agents), ~40×, doing far more work in about
   the same wall time — whereas MPE/CAMAR per-step cost grows with agents.
@@ -281,4 +281,4 @@ CAMAR here is 20–120× faster than that (`--sims camar-grid` reproduces the he
 task). Residual, deliberate differences: exact obs dimensionality still differs per sim;
 `vmas-nolidar` also loses agent-agent collision physics (VMAS gates collisions and lidar
 on one flag); dynamics/collision constants differ so trajectories won't match. Use
-`--sims wmas vmas jaxmarl camar-grid` to compare each engine in its *native* setup instead.
+`--sims swarp vmas jaxmarl camar-grid` to compare each engine in its *native* setup instead.

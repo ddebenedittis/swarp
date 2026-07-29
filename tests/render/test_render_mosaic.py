@@ -6,9 +6,9 @@ import numpy as np
 import pygame
 import pytest
 
-from wmas import Environment, NavigationScenario
-from wmas.render.layout import compute_mosaic_layout, tile_at
-from wmas.render.viewer import Viewer
+from swarp import Environment, NavigationScenario
+from swarp.render.layout import compute_mosaic_layout, tile_at
+from swarp.render.viewer import Viewer
 
 pytestmark = pytest.mark.viz
 
@@ -37,7 +37,7 @@ def test_mosaic_layout_tile_count_and_within_window():
 
 
 def test_mosaic_layout_truncates_and_logs_when_over_max(caplog):
-    with caplog.at_level(logging.WARNING, logger="wmas.render"):
+    with caplog.at_level(logging.WARNING, logger="swarp.render"):
         lay = compute_mosaic_layout((800, 600), n_envs=100, max_tiles=16)
     assert len(lay.tiles) == 16
     assert lay.tile_envs == list(range(16))
@@ -96,7 +96,7 @@ def test_mosaic_render_rebuilds_neighbor_grid_at_most_once_per_frame():
 
 
 def test_mosaic_supersampled_render_keeps_shape_and_changes_pixels():
-    from wmas.render.style import Style
+    from swarp.render.style import Style
 
     env, _ = make_env(n_envs=6, n_agents=3)
     plain = Viewer(env, size=(240, 180), mosaic=True, max_tiles=6, style=Style(supersample=1))
@@ -107,7 +107,7 @@ def test_mosaic_supersampled_render_keeps_shape_and_changes_pixels():
 
 
 def test_click_on_tile_sets_focus_env():
-    from wmas.render.input import InteractionController
+    from swarp.render.input import InteractionController
 
     env, _ = make_env(n_envs=6, n_agents=3)
     viewer = Viewer(env, size=(480, 360), mosaic=True, max_tiles=6)

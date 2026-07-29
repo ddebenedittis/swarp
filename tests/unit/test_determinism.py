@@ -4,7 +4,7 @@ import pytest
 import torch
 from conftest import DEVICES
 
-from wmas import Environment, NavigationScenario
+from swarp import Environment, NavigationScenario
 
 
 def run_trajectory(device, seed, T=100):

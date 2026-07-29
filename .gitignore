@@ -25,7 +25,7 @@ htmlcov/
 # OS
 .DS_Store
 
-# Optional local VMAS clone used only as a fallback by wmas/benchmark/compare_vmas.py.
+# Optional local VMAS clone used only as a fallback by swarp/benchmark/compare_vmas.py.
 # Not a submodule and not part of this package -- clone it here yourself if you want the
 # comparison without installing the `bench` group.
 VectorizedMultiAgentSimulator/

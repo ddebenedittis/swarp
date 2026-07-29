@@ -13,9 +13,9 @@ import torch
 import warp as wp
 from conftest import DEVICES, _core, _map5, holo_cfgs
 
-from wmas.core.config import Obstacles, WorldConfig
-from wmas.core.stepper import Stepper
-from wmas.dynamics.base import (
+from swarp.core.config import Obstacles, WorldConfig
+from swarp.core.stepper import Stepper
+from swarp.dynamics.base import (
     NUM_PARAMS,
     P_MASS,
     P_RADIUS,
@@ -24,7 +24,7 @@ from wmas.dynamics.base import (
     DynamicsModel,
     per_env_float_template,
 )
-from wmas.interop.autograd import TorchState, warp_step
+from swarp.interop.autograd import TorchState, warp_step
 
 
 def make_state(pos, vel=None, n_envs=1, dtype=torch.float64):

@@ -11,7 +11,7 @@ from conftest import (
     fused_rollout,
 )
 
-from wmas import FlockingScenario
+from swarp import FlockingScenario
 
 SPEC = FusedSpec(
     scenario=FlockingScenario,

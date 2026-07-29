@@ -12,10 +12,10 @@ import torch
 import warp as wp
 from conftest import DEVICES
 
-from wmas.core.state import VEC2, WorldState
-from wmas.dynamics.base import AgentConfig, DynamicsModel, build_agent_params
-from wmas.dynamics.kernels import launch_integrate
-from wmas.interop.autograd import TorchState, warp_step
+from swarp.core.state import VEC2, WorldState
+from swarp.dynamics.base import AgentConfig, DynamicsModel, build_agent_params
+from swarp.dynamics.kernels import launch_integrate
+from swarp.interop.autograd import TorchState, warp_step
 
 PRM = dict(
     mass=1.0,
@@ -206,7 +206,7 @@ def test_drone_matches_numpy_reference(device):
 def test_drone_gradcheck():
     """The full 6-DOF drone step is differentiable w.r.t. state and rotor commands."""
     stepper_cfg = drone_cfg()
-    from wmas.core.stepper import Stepper
+    from swarp.core.stepper import Stepper
 
     stepper = Stepper([stepper_cfg], dt=0.02, device="cpu", dtype=wp.float64)
     hover = PRM["mass"] * PRM["gravity"] / 4.0

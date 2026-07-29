@@ -4,7 +4,7 @@ import pytest
 import torch
 from conftest import DEVICES
 
-from wmas import Environment, NavigationScenario
+from swarp import Environment, NavigationScenario
 
 
 def _make_env(device, reuse, n_agents=4, n_envs=16, substeps=1, n_obstacles=0, auto_reset=False):
@@ -89,7 +89,7 @@ def test_mark_pos_dirty_forces_rebuild(device):
 
 @pytest.mark.parametrize("device", DEVICES)
 def test_grad_step_never_reuses(device):
-    from wmas.interop.autograd import warp_step
+    from swarp.interop.autograd import warp_step
 
     env = _make_env(device, reuse=True)
     env.reset(seed=0)

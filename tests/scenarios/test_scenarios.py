@@ -1,6 +1,6 @@
 """Ported VMAS-style scenarios: API smoke, determinism, and reward-shape checks.
 
-Also covers the registry front door (``wmas.scenarios.make_scenario`` / ``wmas.make``).
+Also covers the registry front door (``swarp.scenarios.make_scenario`` / ``swarp.make``).
 """
 
 import inspect
@@ -9,14 +9,14 @@ import pytest
 import torch
 from conftest import DEVICES
 
-import wmas
-from wmas import DynamicsModel, Environment
-from wmas.scenarios import SCENARIOS as REGISTRY
-from wmas.scenarios import Scenario, fused_scenarios, make_scenario
-from wmas.scenarios.discovery import DiscoveryScenario
-from wmas.scenarios.flocking import FlockingScenario
-from wmas.scenarios.formation import FormationScenario
-from wmas.scenarios.sampling import SamplingScenario
+import swarp
+from swarp import DynamicsModel, Environment
+from swarp.scenarios import SCENARIOS as REGISTRY
+from swarp.scenarios import Scenario, fused_scenarios, make_scenario
+from swarp.scenarios.discovery import DiscoveryScenario
+from swarp.scenarios.flocking import FlockingScenario
+from swarp.scenarios.formation import FormationScenario
+from swarp.scenarios.sampling import SamplingScenario
 
 # Registry names -> the small-but-nontrivial construction kwargs these checks use.
 # The class comes from the shared registry; only the kwargs (which are
@@ -72,7 +72,7 @@ def test_fused_scenarios_is_derived_not_hardcoded(monkeypatch):
 
 
 def test_make_kwargs_split_is_unambiguous():
-    """``wmas.make`` routes kwargs by name; Environment's and the scenarios'
+    """``swarp.make`` routes kwargs by name; Environment's and the scenarios'
     parameter names must stay disjoint for that to be well defined."""
     env_params = set(inspect.signature(Environment.__init__).parameters) - {
         "self",
@@ -86,7 +86,7 @@ def test_make_kwargs_split_is_unambiguous():
 
 @pytest.mark.parametrize("device", DEVICES)
 def test_make_builds_a_working_environment(device):
-    env = wmas.make("flocking", n_envs=4, n_agents=3, device=device, dt=0.1, seed=0)
+    env = swarp.make("flocking", n_envs=4, n_agents=3, device=device, dt=0.1, seed=0)
     assert isinstance(env, Environment)
     assert env.n_envs == 4 and env.n_agents == 3
     assert env.device == device
@@ -95,7 +95,7 @@ def test_make_builds_a_working_environment(device):
 
 
 def test_make_drops_model_for_holonomic_only_scenarios():
-    env = wmas.make("flocking", n_envs=2, n_agents=2, device="cpu", model=DynamicsModel.DIFF_DRIVE)
+    env = swarp.make("flocking", n_envs=2, n_agents=2, device="cpu", model=DynamicsModel.DIFF_DRIVE)
     assert env.n_agents == 2  # constructed despite the unsupported kwarg
 
 

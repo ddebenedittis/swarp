@@ -1,9 +1,9 @@
 """MAPPO on Push-T: N robots learn to push a T to a target pose, via TorchRL.
 
-Wraps :class:`~wmas.scenarios.pusht.PushTScenario` in the batched TorchRL ``EnvBase``
-from :mod:`wmas.interop.torchrl` and runs a small on-policy PPO loop with a shared
+Wraps :class:`~swarp.scenarios.pusht.PushTScenario` in the batched TorchRL ``EnvBase``
+from :mod:`swarp.interop.torchrl` and runs a small on-policy PPO loop with a shared
 actor and a centralised critic. Everything stays on-device: the collector drives the
-vectorized wmas step directly, no per-env Python loop.
+vectorized swarp step directly, no per-env Python loop.
 
 Needs the optional torchrl group::
 
@@ -50,8 +50,8 @@ position/rotation terms):
 The contact is stiff (``contact_k`` 8000) and the engine's contact law is implicit and
 relative-velocity based, which is why ``--substeps`` defaults to 8 — below that this
 stiffness is unstable. The T itself is a movable compound obstacle integrated inside the
-substep loop; see :class:`~wmas.scenarios.pusht.PushTScenario`, ``wmas/core/bodies.py``
-and ``wmas/core/collisions.py``. Learning is
+substep loop; see :class:`~swarp.scenarios.pusht.PushTScenario`, ``swarp/core/bodies.py``
+and ``swarp/core/collisions.py``. Learning is
 slower early on than with a soft contact — agents can no longer sink into the T and drag
 it — but the end policy is much better, because a crisp, well-posed contact makes push
 direction map predictably onto T motion.
@@ -75,12 +75,12 @@ from torchrl.data import LazyTensorStorage, ReplayBuffer, SamplerWithoutReplacem
 from torchrl.modules import MultiAgentMLP, NormalParamExtractor, ProbabilisticActor, TanhNormal
 from torchrl.objectives import ClipPPOLoss, ValueEstimators
 
-from wmas import Environment, PushTScenario
-from wmas.interop.torchrl import WmasEnv
+from swarp import Environment, PushTScenario
+from swarp.interop.torchrl import SwarpEnv
 
 N_AGENTS = 4  # default team size; override with --n-agents (1 = single-robot Push-T)
 
-# WmasEnv is flat (no ("agents", ...) group) and emits one shared done per env,
+# SwarpEnv is flat (no ("agents", ...) group) and emits one shared done per env,
 # [n_envs, 1], while reward is per-agent [n_envs, n_agents, 1]. GAE needs the two
 # broadcastable, so we expand done/terminated into these dedicated keys each batch
 # and point the value estimator at them.
@@ -173,7 +173,7 @@ def main() -> None:
 
     device = args.device
     n_agents = args.n_agents
-    env = WmasEnv(
+    env = SwarpEnv(
         Environment(
             PushTScenario(
                 n_agents=n_agents,
@@ -286,7 +286,7 @@ def main() -> None:
     for it, batch in enumerate(collector):
         dist = batch.get(("next", "info", "tee_dist_to_goal"))
         ang = batch.get(("next", "info", "tee_angle_error"))
-        # `WmasEnv` reports the max_steps time limit as `terminated`, which would make
+        # `SwarpEnv` reports the max_steps time limit as `terminated`, which would make
         # GAE cut the value bootstrap at every truncation. Recover the *task*
         # termination (the on-goal condition) from info so only real terminals cut,
         # and keep the wrapper's flag as `done` (terminated | truncated).

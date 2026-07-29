@@ -4,7 +4,7 @@ import pytest
 import torch
 from conftest import DEVICES
 
-from wmas import (
+from swarp import (
     DiscoveryScenario,
     Environment,
     FlockingScenario,
@@ -14,7 +14,7 @@ from wmas import (
     SamplingScenario,
     TransportScenario,
 )
-from wmas.dynamics.base import ControlMode, DynamicsModel
+from swarp.dynamics.base import ControlMode, DynamicsModel
 
 
 def _mk(
@@ -149,7 +149,7 @@ def test_state_view_identity_stable(device):
 
 @pytest.mark.gpu(reason="graph recapture counter is a CUDA-graph concept")
 def test_obstacle_reset_no_recapture():
-    from wmas.dynamics.base import P_MASS, P_RADIUS, per_env_float_template
+    from swarp.dynamics.base import P_MASS, P_RADIUS, per_env_float_template
 
     dev = "cuda:0"
     env = _mk(dev, True, n_obstacles=3, auto_reset=True)
@@ -331,7 +331,7 @@ def test_cpu_whole_step_eager(device):
 def test_grad_step_in_persistent_env(device):
     # A grad step through a use_graph env must match the same step on a plain env
     # (persistent mode detaches+clones so the tape uses fresh arrays).
-    from wmas.interop.autograd import warp_step
+    from swarp.interop.autograd import warp_step
 
     def grads(use_graph):
         env = _mk(device, use_graph)
@@ -403,7 +403,7 @@ def test_slim_leaves_drone_fields_zero():
 
 @pytest.mark.parametrize("device", DEVICES)
 def test_gradring_matches_no_ring_and_reuses(device):
-    from wmas.interop.autograd import GradRing, rollout
+    from swarp.interop.autograd import GradRing, rollout
 
     env = _mk(device, False)
     env.reset(seed=0)
@@ -433,7 +433,7 @@ def test_gradring_matches_no_ring_and_reuses(device):
 
 
 def test_gradring_capacity_guard():
-    from wmas.interop.autograd import GradRing
+    from swarp.interop.autograd import GradRing
 
     dev = DEVICES[-1]
     env = _mk(dev, False)

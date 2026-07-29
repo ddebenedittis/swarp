@@ -4,7 +4,7 @@ import pytest
 import torch
 from conftest import DEVICES
 
-from wmas import DynamicsModel, Environment, NavigationScenario
+from swarp import DynamicsModel, Environment, NavigationScenario
 
 
 def make_env(device, n_envs=8, n_agents=3, **kw):

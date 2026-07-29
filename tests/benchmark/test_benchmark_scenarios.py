@@ -2,14 +2,14 @@
 
 import pytest
 
-from wmas.benchmark.scenarios import (
+from swarp.benchmark.scenarios import (
     MODELS,
     SCENARIO_FACTORIES,
     build_scenario,
     resolve_scenarios,
     run_config,
 )
-from wmas.scenarios import SCENARIOS, fused_scenarios, supports_model
+from swarp.scenarios import SCENARIOS, fused_scenarios, supports_model
 
 # Derived from the registry, never hand-listed: a scenario that ships fused
 # kernels is parity-gated the moment it is registered.
@@ -29,7 +29,7 @@ def test_registry_has_all_scenarios():
 
 
 def test_benchmark_reuses_the_shared_registry():
-    """The benchmark is a consumer of wmas.scenarios, not a second registry."""
+    """The benchmark is a consumer of swarp.scenarios, not a second registry."""
     assert SCENARIO_FACTORIES is SCENARIOS
 
 
