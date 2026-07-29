@@ -13,7 +13,7 @@ import argparse
 import torch
 import warp as wp
 
-from wmas import AgentConfig, ControlMode, DynamicsModel, Stepper, TorchState, WorldConfig, rollout
+from swarp import AgentConfig, ControlMode, DynamicsModel, Stepper, TorchState, WorldConfig, rollout
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")

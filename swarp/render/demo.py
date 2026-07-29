@@ -1,0 +1,305 @@
+"""Runnable demo: ``python -m swarp.render.demo``.
+
+With no ``--save`` it opens the interactive window (pan/zoom, toggle overlays with the
+per-overlay keys, ``[`` / ``]`` to switch env, drag an agent, right-click to move its goal,
+space to pause). With ``--save PATH`` it renders a rollout to a video (.mp4/.webm) headlessly.
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+
+import numpy as np
+import torch
+
+from swarp import Environment, NavigationScenario
+from swarp.core.world import World
+from swarp.dynamics.base import AgentConfig, ControlMode, DynamicsModel
+from swarp.render.overlays import DEFAULT_ENABLED
+from swarp.render.style import THEMES
+from swarp.sensors import Lidar
+
+MODEL_CHOICES = ("holonomic", "diff-drive", "bicycle", "drone", "mixed")
+MODEL_BY_NAME = {
+    "holonomic": DynamicsModel.HOLONOMIC,
+    "diff-drive": DynamicsModel.DIFF_DRIVE,
+    "bicycle": DynamicsModel.KINEMATIC_BICYCLE,
+    "drone": DynamicsModel.DRONE,
+}
+
+# The drone's attitude loop is far stiffer than the 2D models': with inertia ~1e-2 kg m^2 a
+# 10 Hz control step diverges. Substepping the physics keeps the demo's dt while integrating
+# the quadrotor at 100 Hz.
+_DRONE_SUBSTEPS = 10
+_DRONE_HOVER_Z = 1.0  # altitude the demo controller holds, in metres
+
+
+class VisualizationScenario(NavigationScenario):
+    """Navigation demo scenario with viewer-only lidar rays and communication links."""
+
+    def __init__(self, *args, lidar_rays: int = 16, lidar_range: float = 1.0, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.lidar = Lidar(n_rays=lidar_rays, max_range=lidar_range, backend="warp")
+        self.comm_range = self.neighbor_radius or lidar_range
+
+    def render_extras(self, env_idx: int) -> dict[str, np.ndarray]:
+        with torch.no_grad():
+            world = self.world
+            ranges = self.lidar.scan(world)[env_idx]
+            pos = world.state.pos[env_idx]
+            theta = world.state.theta[env_idx]
+            offsets = self.lidar.angle_start + torch.arange(
+                self.lidar.n_rays, device=pos.device, dtype=pos.dtype
+            ) * (2.0 * math.pi / self.lidar.n_rays)
+            angles = theta.unsqueeze(-1) + offsets
+            dirs = torch.stack((torch.cos(angles), torch.sin(angles)), dim=-1)
+            starts = pos.unsqueeze(1).expand(-1, self.lidar.n_rays, -1)
+            ends = starts + ranges.unsqueeze(-1) * dirs
+            lidar = torch.stack((starts, ends), dim=2).reshape(-1, 2, 2).cpu().numpy()
+
+            diff = pos[:, None, :] - pos[None, :, :]
+            dist = torch.linalg.norm(diff, dim=-1)
+            mask = torch.triu(dist <= self.comm_range, diagonal=1)
+            pairs = torch.nonzero(mask, as_tuple=False)
+            if pairs.numel() == 0:
+                comm_lines = np.empty((0, 2, 2), dtype=np.float64)
+            else:
+                comm_lines = torch.stack((pos[pairs[:, 0]], pos[pairs[:, 1]]), dim=1).cpu().numpy()
+        return {
+            "lidar": lidar,
+            "lidar_by_agent": lidar.reshape(self.n_agents, self.lidar.n_rays, 2, 2),
+            "comm_lines": comm_lines,
+        }
+
+
+class MixedVisualizationScenario(VisualizationScenario):
+    """Navigation demo with heterogeneous 2D dynamics models.
+
+    The whole scenario is the fleet composition, so it overrides only
+    :meth:`~swarp.scenarios.navigation.NavigationScenario._agent_configs`. It used to
+    reimplement ``make_world``, which meant a verbatim copy of navigation's world config
+    *and* of its fused/graph bookkeeping — out of tree, and silently stale the moment
+    either changed.
+    """
+
+    _CYCLE = (
+        DynamicsModel.HOLONOMIC,
+        DynamicsModel.DIFF_DRIVE,
+        DynamicsModel.KINEMATIC_BICYCLE,
+    )
+
+    def _agent_configs(self) -> list[AgentConfig]:
+        return [
+            AgentConfig(
+                model=self._CYCLE[i % len(self._CYCLE)],
+                ctrl_mode=ControlMode.VELOCITY,
+                radius=self.agent_radius,
+                max_speed=self.max_speed,
+                max_accel=2.0 * self.max_speed,
+            )
+            for i in range(self.n_agents)
+        ]
+
+
+def build_env(
+    n_envs: int,
+    n_agents: int,
+    n_obstacles: int,
+    device: str,
+    lidar_rays: int = 16,
+    lidar_range: float = 1.0,
+    model: str = "holonomic",
+) -> Environment:
+    scenario_cls = MixedVisualizationScenario if model == "mixed" else VisualizationScenario
+    scenario = scenario_cls(
+        n_agents=n_agents,
+        n_obstacles=n_obstacles,
+        world_size=1.0,
+        neighbor_radius=0.6,
+        lidar_rays=lidar_rays,
+        lidar_range=lidar_range,
+        model=MODEL_BY_NAME.get(model, DynamicsModel.HOLONOMIC),
+    )
+    substeps = _DRONE_SUBSTEPS if model == "drone" else 1
+    env = Environment(scenario, n_envs=n_envs, device=device, dt=0.1, substeps=substeps, seed=0)
+    env.reset()
+    return env
+
+
+def _drone_hover_action(world: World, i: int, cfg: AgentConfig, to_goal) -> torch.Tensor:
+    """Cascaded position -> tilt -> rotor-thrust controller for one drone agent.
+
+    Near-hover linearization: a horizontal acceleration ``a`` needs a tilt of ``a / g``, tracked
+    by a PD on (desired angle, body rate). The resulting body torques are inverted through the
+    "+"-layout mixer of ``dynamics.kernels._drone_rates`` — rotors 0/2 on the body x-axis, 1/3
+    on y — and clamped to the per-rotor thrust limit the kernel enforces anyway.
+    """
+    st = world.state
+    opts = {"device": to_goal.device, "dtype": to_goal.dtype}
+    zeros = torch.zeros(to_goal.shape[0], **opts)
+    # The drone fields are None until the first step materializes them (fill_state_defaults).
+    z = st.z[:, i] if st.z is not None else zeros
+    vz = st.vz[:, i] if st.vz is not None else zeros
+    rates = st.body_rates[:, i] if st.body_rates is not None else zeros[:, None].expand(-1, 3)
+    if st.attitude is not None:
+        qx, qy, qz, qw = (st.attitude[:, i, k] for k in range(4))
+    else:
+        qx, qy, qz, qw = zeros, zeros, zeros, torch.ones_like(zeros)  # identity attitude
+
+    roll = torch.atan2(2.0 * (qw * qx + qy * qz), 1.0 - 2.0 * (qx * qx + qy * qy))
+    pitch = torch.asin(torch.clamp(2.0 * (qw * qy - qz * qx), -1.0, 1.0))
+
+    # Position -> desired horizontal acceleration -> desired tilt (small angle, yaw ~ 0).
+    accel = torch.clamp(2.0 * to_goal - 3.0 * st.vel[:, i], -0.5 * cfg.gravity, 0.5 * cfg.gravity)
+    max_tilt = 0.35
+    pitch_des = torch.clamp(accel[:, 0] / cfg.gravity, -max_tilt, max_tilt)
+    roll_des = torch.clamp(-accel[:, 1] / cfg.gravity, -max_tilt, max_tilt)
+
+    kp_att, kd_att = 40.0, 8.0  # stiff, hence _DRONE_SUBSTEPS
+    tau_x = cfg.inertia_xx * (kp_att * (roll_des - roll) - kd_att * rates[:, 0])
+    tau_y = cfg.inertia_yy * (kp_att * (pitch_des - pitch) - kd_att * rates[:, 1])
+    tau_z = cfg.inertia_zz * (-kd_att * rates[:, 2])  # no yaw target: just damp it
+
+    # Altitude hold, divided back out by the lean that tilts thrust away from world +z.
+    lean = torch.clamp(torch.cos(roll) * torch.cos(pitch), min=0.5)
+    thrust = cfg.mass * (cfg.gravity + 4.0 * (_DRONE_HOVER_Z - z) - 3.0 * vz) / lean
+
+    # Invert the mixer: T = sum(f), tau_x = arm(f1 - f3), tau_y = arm(f2 - f0),
+    # tau_z = kappa(f0 - f1 + f2 - f3).
+    quarter = 0.25 * thrust
+    roll_pair = tau_x / (2.0 * cfg.arm_length)
+    pitch_pair = tau_y / (2.0 * cfg.arm_length)
+    yaw_quarter = tau_z / (4.0 * cfg.torque_coeff)
+    rotors = torch.stack(
+        (
+            quarter - pitch_pair + yaw_quarter,
+            quarter + roll_pair - yaw_quarter,
+            quarter + pitch_pair + yaw_quarter,
+            quarter - roll_pair - yaw_quarter,
+        ),
+        dim=-1,
+    )
+    return rotors.clamp(0.0, cfg.thrust_max)
+
+
+def goal_seeking_policy(env: Environment):
+    """A trivial proportional controller so the demo actually moves."""
+
+    def policy(_obs):
+        world = env.world
+        to_goal = world.goals - world.state.pos
+        dist = torch.linalg.norm(to_goal, dim=-1).clamp_min(1e-6)
+        desired = torch.atan2(to_goal[..., 1], to_goal[..., 0])
+        heading_err = torch.atan2(
+            torch.sin(desired - world.state.theta), torch.cos(desired - world.state.theta)
+        )
+        actions = torch.zeros(
+            env.n_envs, env.n_agents, world.act_dim, dtype=env.dtype, device=env.device
+        )
+        for i, cfg in enumerate(world.agent_configs):
+            if cfg.model == DynamicsModel.HOLONOMIC:
+                actions[:, i, :2] = torch.clamp(to_goal[:, i], -1.0, 1.0)
+            elif cfg.model == DynamicsModel.DIFF_DRIVE:
+                actions[:, i, 0] = torch.clamp(dist[:, i], -cfg.max_speed, cfg.max_speed)
+                actions[:, i, 1] = torch.clamp(
+                    2.5 * heading_err[:, i], -cfg.max_ang_vel, cfg.max_ang_vel
+                )
+            elif cfg.model == DynamicsModel.KINEMATIC_BICYCLE:
+                actions[:, i, 0] = torch.clamp(
+                    dist[:, i] - world.state.speed[:, i], -cfg.max_accel, cfg.max_accel
+                )
+                actions[:, i, 1] = torch.clamp(heading_err[:, i], -cfg.max_steer, cfg.max_steer)
+            elif cfg.model == DynamicsModel.DRONE:
+                actions[:, i, :4] = _drone_hover_action(world, i, cfg, to_goal[:, i])
+        return actions
+
+    return policy
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="swarp viewer demo")
+    parser.add_argument(
+        "--save", default=None, help="write a video (.mp4 or .webm) here instead of a window"
+    )
+    parser.add_argument("--steps", type=int, default=200)
+    parser.add_argument("--envs", type=int, default=4)
+    parser.add_argument("--agents", type=int, default=5)
+    parser.add_argument("--obstacles", type=int, default=2)
+    parser.add_argument("--size", type=int, default=700)
+    # Two independent rates: how often the window redraws, and how fast the sim plays. The
+    # step rate is also the saved video's fps (save_video steps once per frame).
+    parser.add_argument("--fps", type=int, default=60, help="window redraw rate")
+    parser.add_argument("--step-rate", type=float, default=30.0, help="sim steps per second")
+    parser.add_argument("--mosaic", action="store_true", help="grid of all envs + focus pane")
+    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--lidar-rays", type=int, default=16)
+    parser.add_argument("--lidar-range", type=float, default=1.0)
+    parser.add_argument("--model", choices=MODEL_CHOICES, default="holonomic")
+    parser.add_argument("--color-mode", choices=("agent", "model"), default="agent")
+    parser.add_argument("--lidar-mode", choices=("none", "rays", "area", "both"), default="rays")
+    parser.add_argument("--trajectory", choices=("none", "trail", "fade"), default="none")
+    parser.add_argument("--trail-len", type=int, default=80)
+    parser.add_argument("--theme", choices=tuple(THEMES), default="light")
+    parser.add_argument(
+        "--reward-hud", action="store_true", help="per-agent reward sparkline (adds a D2H copy)"
+    )
+    parser.add_argument(
+        "--supersample", type=int, default=2, help="offscreen AA factor (1 disables)"
+    )
+    args = parser.parse_args(argv)
+
+    env = build_env(
+        args.envs,
+        args.agents,
+        args.obstacles,
+        args.device,
+        lidar_rays=args.lidar_rays,
+        lidar_range=args.lidar_range,
+        model=args.model,
+    )
+    policy = goal_seeking_policy(env)
+    size = (args.size, args.size)
+    overlays = set(DEFAULT_ENABLED) | {"comm_lines", "lidar", "trajectories", "action"}
+    style = THEMES[args.theme](
+        color_mode=args.color_mode,
+        lidar_mode=args.lidar_mode,
+        trajectory_mode=args.trajectory,
+        trajectory_len=args.trail_len,
+        supersample=args.supersample,
+        reward_hud=args.reward_hud,
+    )
+
+    if args.save:
+        from swarp.render.video import save_video
+
+        out = save_video(
+            env,
+            args.save,
+            action_fn=policy,
+            n_steps=args.steps,
+            fps=max(1, round(args.step_rate)),
+            size=size,
+            overlays=overlays,
+            style=style,
+        )
+        print(f"saved {out}")
+        return out
+
+    from swarp.render.viewer import Viewer
+
+    viewer = Viewer(
+        env,
+        size=size,
+        mosaic=args.mosaic,
+        fps=args.fps,
+        steps_per_frame=args.step_rate / args.fps,
+        overlays=overlays,
+        style=style,
+    )
+    viewer.run(action_fn=policy)
+    return None
+
+
+if __name__ == "__main__":
+    main()

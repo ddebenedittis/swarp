@@ -20,7 +20,7 @@ real time by default — ``--speed 0.25`` crawls, and in the window up/down chan
 live (anything off 1x shows as a badge in the corner). ``--fps`` sets how often the window
 redraws, independently of the playback rate.
 
-``--window`` hands the loop to :class:`~wmas.render.viewer.Viewer`, so the usual controls
+``--window`` hands the loop to :class:`~swarp.render.viewer.Viewer`, so the usual controls
 work: space pauses, ``.`` steps once while paused, ``r`` resets, ``?`` lists the rest.
 
 Also plots ``metrics.csv`` written by the trainer::
@@ -47,7 +47,7 @@ import torch
 from pusht_torchrl import build_policy
 from tensordict import TensorDict
 
-from wmas import Environment, PushTScenario
+from swarp import Environment, PushTScenario
 
 
 def _pose(scen) -> tuple[torch.Tensor, torch.Tensor]:
@@ -217,7 +217,7 @@ def main() -> None:
             f"respawning every {args.episode_steps}"
         )
         if args.video:
-            from wmas.render.video import save_video
+            from swarp.render.video import save_video
 
             # save_video steps once per frame, so the file's fps *is* its playback rate.
             video_fps = max(1, round(step_rate))
@@ -232,7 +232,7 @@ def main() -> None:
             # The window redraws at --fps regardless of the playback rate; steps_per_frame
             # carries the dt->wall-clock conversion, so panning and dragging stay smooth even
             # at 0.25x (they were stuck at the 10 fps that --speed 0.5 used to imply).
-            from wmas.render.viewer import Viewer
+            from swarp.render.viewer import Viewer
 
             env.reset(seed=args.seed)
             Viewer(env, fps=args.fps, steps_per_frame=step_rate / args.fps).run(
