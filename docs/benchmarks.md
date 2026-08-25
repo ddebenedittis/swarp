@@ -69,7 +69,7 @@ kernels whose thread count grows with agents, not a Python loop whose *length* d
 `python -m swarp.benchmark.compare_vmas` pits swarp against
 [VMAS](https://github.com/proroklab/VectorizedMultiAgentSimulator) on the navigation
 scenario (the one both implement), across a `(n_envs, n_agents)` grid. Install the
-comparison deps first: `uv pip install -e . --group bench` (pulls in `vmas`; the script
+comparison deps first: `uv pip install -e '.[bench]'` (pulls in `vmas`; the script
 also falls back to a `./VectorizedMultiAgentSimulator` clone if present). Use
 `--metric memory` for peak device memory and `--metric both` for both.
 
@@ -122,9 +122,9 @@ subprocess (JAX and torch never share a process, so they don't fight over VRAM):
 
 ```bash
 for v in .venv .venv-jaxmarl .venv-camar; do uv venv --python 3.12 $v; done
-VIRTUAL_ENV=.venv         uv pip install -e . --group dev --group bench     # swarp + vmas
-VIRTUAL_ENV=.venv-jaxmarl uv pip install -e . --group bench-jaxmarl         # jaxmarl
-VIRTUAL_ENV=.venv-camar   uv pip install -e . --group bench-camar           # camar
+VIRTUAL_ENV=.venv         uv pip install -e '.[bench]' --group dev            # swarp + vmas
+VIRTUAL_ENV=.venv-jaxmarl uv pip install -e '.[bench-jaxmarl]'         # jaxmarl
+VIRTUAL_ENV=.venv-camar   uv pip install -e '.[bench-camar]'           # camar
 ```
 
 ### Getting JaxMARL onto the GPU (do this — it silently runs on CPU otherwise)

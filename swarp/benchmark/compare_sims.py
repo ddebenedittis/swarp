@@ -25,9 +25,9 @@ boundary; the final table is a single combined report anchored on swarp.
 Install one Python 3.12 venv per simulator (VMAS shares swarp's)::
 
     for v in .venv .venv-jaxmarl .venv-camar; do uv venv --python 3.12 $v; done
-    VIRTUAL_ENV=.venv         uv pip install -e . --group dev --group bench
-    VIRTUAL_ENV=.venv-jaxmarl uv pip install -e . --group bench-jaxmarl
-    VIRTUAL_ENV=.venv-camar   uv pip install -e . --group bench-camar
+    VIRTUAL_ENV=.venv         uv pip install -e '.[bench]' --group dev
+    VIRTUAL_ENV=.venv-jaxmarl uv pip install -e '.[bench-jaxmarl]'
+    VIRTUAL_ENV=.venv-camar   uv pip install -e '.[bench-camar]'
 
 If JaxMARL pulls a CPU-only jaxlib, add the matching CUDA build into its venv,
 e.g. ``VIRTUAL_ENV=.venv-jaxmarl uv pip install "jax[cuda12]==<jaxmarl's jax>"``.

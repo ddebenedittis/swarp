@@ -20,7 +20,7 @@ uv pip install -e '.[viz]'                 # optional: viewer/video tests stop s
 uv run pytest                              # dynamics, gradients, neighbors, collisions, determinism
 uv run pytest -m "not gpu"                 # what CI runs (no CUDA device on the runners)
 python -m swarp.benchmark.throughput        # NavigationScenario hot-path env-steps/s
-python -m swarp.benchmark.compare_vmas      # vs VMAS; needs `--group bench` (pulls in vmas, numpy<2)
+python -m swarp.benchmark.compare_vmas      # vs VMAS; needs `.[bench]` (pulls in vmas, numpy<2)
 ```
 
 Markers declared in `pyproject.toml`: `gpu` (needs CUDA), `slow`, `viz` (needs the `viz`

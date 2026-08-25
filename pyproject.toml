@@ -25,11 +25,14 @@ viz = [
     "imageio[ffmpeg]>=2.34",
     "pillow>=10",
 ]
-
-[dependency-groups]
-dev = [
-    "pytest>=8.0",
-    "ruff>=0.8",
+# TorchRL EnvBase wrapper (swarp/interop/torchrl.py) and the MAPPO training
+# examples (examples/pusht_torchrl.py). Optional: the core install stays lean
+# and only depends on warp + torch + numpy. torchrl pulls in tensordict itself,
+# but it's pinned explicitly here so `pip install -e '.[torchrl]'` resolves a
+# version compatible with the rest of the stack in one shot.
+torchrl = [
+    "torchrl>=0.5",
+    "tensordict>=0.5",
 ]
 # VMAS comparison benchmark (swarp/benchmark/compare_vmas.py). VMAS pulls in gym,
 # which requires numpy < 2. Falls back to an optional (gitignored) local
@@ -41,7 +44,7 @@ bench = [
 # and CAMAR are JAX-based and want recent numpy, so they CANNOT share the `bench`
 # venv (vmas pins numpy < 2). Each is installed into its own Python 3.12 venv and
 # the orchestrator drives one subprocess per simulator with that venv's
-# interpreter (see `--python SIM=PATH`). Kept as two groups because jaxmarl and
+# interpreter (see `--python SIM=PATH`). Kept as two extras because jaxmarl and
 # camar may pin conflicting jax versions; collapse into one venv if they resolve.
 bench-jaxmarl = [
     "jaxmarl",
@@ -49,11 +52,11 @@ bench-jaxmarl = [
 bench-camar = [
     "camar[cuda12]",
 ]
-# TorchRL EnvBase wrapper (swarp/interop/torchrl.py). Optional: the core install
-# stays lean and only depends on warp + torch + numpy.
-torchrl = [
-    "torchrl>=0.5",
-    "tensordict>=0.5",
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.8",
 ]
 
 [tool.hatch.build.targets.wheel]

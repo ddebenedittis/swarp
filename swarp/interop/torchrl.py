@@ -5,9 +5,9 @@ Exposes a batched (``batch_size=[n_envs]``), GPU-resident environment with
 driven by TorchRL collectors and policies. Everything stays on-device; the swarp
 step already returns stacked device tensors, so ``_step``/``_reset`` are thin.
 
-Requires the optional ``torchrl`` dependency group (``uv pip install -e .
---group torchrl``). Import this module only when you need the wrapper — the core
-package does not depend on torchrl.
+Requires the optional ``torchrl`` extra (``uv pip install -e '.[torchrl]'``).
+Import this module only when you need the wrapper — the core package does not
+depend on torchrl.
 """
 
 from __future__ import annotations

@@ -16,7 +16,7 @@ which is why ``vmas-simple`` is included as a lidar-free lower bound.
 
 Requires the ``bench`` dependency group (installs ``vmas``)::
 
-    uv pip install -e . --group bench
+    uv pip install -e '.[bench]'
     uv run python -m swarp.benchmark.compare_vmas            # throughput grid
     uv run python -m swarp.benchmark.compare_vmas --metric memory
     uv run python -m swarp.benchmark.compare_vmas --metric both
@@ -53,7 +53,7 @@ def _ensure_vmas() -> None:
         sys.path.insert(0, str(vendored))
         return
     raise ImportError(
-        "vmas not found. Install the bench group (`uv pip install -e . --group bench`) "
+        "vmas not found. Install the bench group (`uv pip install -e '.[bench]'`) "
         "or place a VMAS checkout at ./VectorizedMultiAgentSimulator."
     )
 

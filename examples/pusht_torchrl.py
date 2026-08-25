@@ -7,7 +7,7 @@ vectorized swarp step directly, no per-env Python loop.
 
 Needs the optional torchrl group::
 
-    uv pip install -e . --group torchrl
+    uv pip install -e '.[torchrl]'
 
 Run with::
 
