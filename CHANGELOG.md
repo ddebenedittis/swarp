@@ -88,11 +88,11 @@ All notable changes to `swarp`. Newest first. Nothing has been released yet — 
 - **Neighbor-list overflow is surfaced**, not silently truncated.
 - Cross-simulator throughput benchmark (`swarp.benchmark.compare_sims`: swarp vs VMAS vs
   JaxMARL vs CAMAR, one subprocess per simulator) and a VMAS head-to-head
-  (`swarp.benchmark.compare_vmas`). See [docs/benchmarks.md](docs/benchmarks.md).
+  (`swarp.benchmark.compare_vmas`). See the [benchmarks](https://ddebenedittis.github.io/swarp/benchmarks.html) page.
 
 ### Repo
 
 - MIT `LICENSE`, GitHub Actions CI (ruff + the CPU test suite on Python 3.12), a tracked
   `uv.lock`, and `docs/` split out of the README.
 
-What is planned next lives in the README's [Roadmap](README.md#roadmap) section.
+What is planned next lives in the docs' [Roadmap](https://ddebenedittis.github.io/swarp/architecture.html#roadmap) section.

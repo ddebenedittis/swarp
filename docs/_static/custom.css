@@ -1,0 +1,40 @@
+/* swarp docs — small tweaks on top of the Read the Docs theme. */
+
+/* The logo is a wide wordmark-less glyph; the theme's default cramps it. */
+.wy-side-nav-search > a img.logo {
+    max-width: 62%;
+    padding: 0.4rem 0;
+}
+.wy-side-nav-search {
+    background-color: #12191f;
+}
+.wy-side-nav-search input[type="text"] {
+    border-color: #96fa02;
+}
+
+/* Accent links and inline literals with the logo green's darker, readable cousin. */
+a, a:visited {
+    color: #2f7d00;
+}
+a:hover {
+    color: #4aa300;
+}
+.rst-content code.literal, .rst-content tt.literal {
+    color: #12191f;
+}
+
+/* Screenshots and the demo clip: full width, rounded, never overflowing. */
+.rst-content img, .rst-content video {
+    max-width: 100%;
+    height: auto;
+    border-radius: 6px;
+}
+
+/* Keep wide benchmark tables scrollable instead of clipped. */
+.rst-content table.docutils {
+    display: table;
+    width: 100%;
+}
+.wy-table-responsive {
+    overflow-x: auto;
+}

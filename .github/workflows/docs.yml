@@ -1,0 +1,58 @@
+name: Docs
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Build on every push and PR, so a broken cross-reference fails before it ships.
+  # The site carries no autodoc, so this needs neither torch nor warp -- only the
+  # `docs` dependency group, which installs in seconds.
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Install the docs toolchain
+        run: uv sync --only-group docs
+
+      # -W turns warnings into errors: a dead link or an orphaned page fails here.
+      - name: Build
+        run: uv run --no-sync sphinx-build -b html -W --keep-going docs docs/_build/html
+
+      - name: Upload the Pages artifact
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/_build/html
+
+  # Deploy only from main. Requires Settings -> Pages -> Source: "GitHub Actions".
+  deploy:
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

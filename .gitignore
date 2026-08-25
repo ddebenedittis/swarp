@@ -32,3 +32,6 @@ VectorizedMultiAgentSimulator/
 
 # Benchmark / experiment output
 runs/
+
+# Sphinx build output (docs/, see .github/workflows/docs.yml).
+docs/_build/

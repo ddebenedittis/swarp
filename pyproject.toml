@@ -58,6 +58,16 @@ dev = [
     "pytest>=8.0",
     "ruff>=0.8",
 ]
+# Sphinx documentation site (docs/, published to GitHub Pages by .github/workflows/docs.yml).
+# Deliberately free of swarp itself: the site carries no autodoc, so the docs runner never
+# has to install torch/warp. `uv sync --only-group docs` is all the build needs.
+docs = [
+    "sphinx>=8.1",
+    "sphinx-rtd-theme>=3.0",
+    "myst-parser>=4.0",
+    "sphinx-copybutton>=0.5",
+    "sphinx-design>=0.6",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["swarp"]
