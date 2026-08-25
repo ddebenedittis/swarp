@@ -145,6 +145,7 @@ class InteractionController:
         on_cycle_trajectory: Callable[[], None] | None = None,
         on_cycle_lidar: Callable[[], None] | None = None,
         on_cycle_color: Callable[[], None] | None = None,
+        on_resize_window: Callable[[int], None] | None = None,
     ) -> None:
         self.state = state
         self.camera = camera
@@ -156,6 +157,7 @@ class InteractionController:
         self._on_cycle_trajectory = on_cycle_trajectory
         self._on_cycle_lidar = on_cycle_lidar
         self._on_cycle_color = on_cycle_color
+        self._on_resize_window = on_resize_window
         self._panning = False
         self._dragging_agent: int | None = None
         self._dragging_obstacle: int | None = None
@@ -253,6 +255,10 @@ class InteractionController:
             s.paused = not s.paused
         elif key == pygame.K_r:
             s.reset_requested = True
+        elif key in (pygame.K_EQUALS, pygame.K_KP_PLUS) and self._on_resize_window is not None:
+            self._on_resize_window(+1)
+        elif key in (pygame.K_MINUS, pygame.K_KP_MINUS) and self._on_resize_window is not None:
+            self._on_resize_window(-1)
         elif _is_help_key(event):
             s.show_help = not s.show_help
         elif key in (pygame.K_ESCAPE, pygame.K_q):

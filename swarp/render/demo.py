@@ -54,8 +54,9 @@ class VisualizationScenario(NavigationScenario):
             ) * (2.0 * math.pi / self.lidar.n_rays)
             angles = theta.unsqueeze(-1) + offsets
             dirs = torch.stack((torch.cos(angles), torch.sin(angles)), dim=-1)
-            starts = pos.unsqueeze(1).expand(-1, self.lidar.n_rays, -1)
-            ends = starts + ranges.unsqueeze(-1) * dirs
+            radius = world.agent_radius
+            starts = pos.unsqueeze(1) + radius.unsqueeze(-1).unsqueeze(-1) * dirs
+            ends = pos.unsqueeze(1) + ranges.unsqueeze(-1) * dirs
             lidar = torch.stack((starts, ends), dim=2).reshape(-1, 2, 2).cpu().numpy()
 
             diff = pos[:, None, :] - pos[None, :, :]

@@ -28,14 +28,30 @@ class Camera:
 
         self.wcx = 0.5 * (x_min + x_max)
         self.wcy = 0.5 * (y_min + y_max)
+        self._fit_viewport()
+
+    def _fit_viewport(self) -> None:
+        x_min, x_max, y_min, y_max = self.bounds
         world_w = max(x_max - x_min, 1e-12)
         world_h = max(y_max - y_min, 1e-12)
-        avail_w = self.vw * (1.0 - 2.0 * margin_frac)
-        avail_h = self.vh * (1.0 - 2.0 * margin_frac)
+        avail_w = self.vw * (1.0 - 2.0 * self.margin_frac)
+        avail_h = self.vh * (1.0 - 2.0 * self.margin_frac)
         self._base_scale = min(avail_w / world_w, avail_h / world_h)
-
         self.vcx = self.vx + 0.5 * self.vw
         self.vcy = self.vy + 0.5 * self.vh
+
+    def resize_viewport(self, viewport: tuple[float, float, float, float]) -> None:
+        """Re-fit scale/center to a new pixel viewport in place, resetting pan.
+
+        Used when the window is resized: an existing pixel-space pan offset would otherwise
+        misalign once the viewport it was computed against no longer exists. The camera
+        object's identity is preserved, since :class:`InteractionController` holds a
+        reference to it directly rather than re-fetching it each frame.
+        """
+        self.vx, self.vy, self.vw, self.vh = viewport
+        self._fit_viewport()
+        self.pan_x = 0.0
+        self.pan_y = 0.0
 
     @property
     def scale(self) -> float:

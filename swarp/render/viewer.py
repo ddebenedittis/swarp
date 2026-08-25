@@ -106,6 +106,31 @@ class Viewer:
             self._camera = Camera(bounds, viewport=self._focus_viewport())
         return self._camera
 
+    def _handle_resize(self, pygame, size: tuple[int, int]) -> None:
+        """Re-fit the window surface, layout and camera to ``size``.
+
+        The camera is resized in place (not rebuilt) since the interaction controller holds
+        a direct reference to it.
+        """
+        self.size = (max(1, int(size[0])), max(1, int(size[1])))
+        self._window = pygame.display.set_mode(self.size)
+        self._layout = None
+        if self._camera is not None:
+            self._camera.resize_viewport(self._focus_viewport())
+
+    def _resize_window_step(self, direction: int, step: int = 80, min_size: int = 200) -> None:
+        """Grow/shrink the window by ``step`` px per axis (keyboard-driven, see ``input.py``).
+
+        Live OS-drag resizing (``pygame.RESIZABLE`` + ``VIDEORESIZE``) turned out to make SDL
+        destroy and recreate the actual window on every event fired mid-drag on some Linux
+        window managers. A single explicit ``set_mode`` call per keypress avoids that failure
+        mode entirely, at the cost of resizing in discrete steps instead of a live drag.
+        """
+        w, h = self.size
+        w = max(min_size, w + direction * step)
+        h = max(min_size, h + direction * step)
+        self._handle_resize(_ensure_pygame(), (w, h))
+
     def _tile_env_at(self, screen_xy) -> int | None:
         return tile_at(self._ensure_layout(), screen_xy) if self.mosaic else None
 
@@ -122,6 +147,7 @@ class Viewer:
                 on_cycle_trajectory=self._cycle_trajectory,
                 on_cycle_lidar=self._cycle_lidar,
                 on_cycle_color=self._cycle_color,
+                on_resize_window=self._resize_window_step,
             )
         return self._controller
 
@@ -399,7 +425,7 @@ class Viewer:
         """
         pygame = _ensure_pygame()
         pygame.display.init()
-        window = pygame.display.set_mode(self.size)
+        self._window = pygame.display.set_mode(self.size)
         pygame.display.set_caption("swarp viewer")
         clock = pygame.time.Clock()
         camera = self._camera_for(self._geometry())
@@ -422,7 +448,7 @@ class Viewer:
                     if max_steps is not None and self._step_count >= max_steps:
                         done = True
                         break
-                self._render_onto(pygame, window, hud=True, fps=clock.get_fps())
+                self._render_onto(pygame, self._window, hud=True, fps=clock.get_fps())
                 pygame.display.flip()
                 clock.tick(self.fps)
                 if done and close_when_done:

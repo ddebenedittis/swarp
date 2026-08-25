@@ -89,7 +89,7 @@ class Style:
     # ------------------------------------------------------------ pixel sizes
     line_width: int = 2
     edge_width: int = 1
-    lidar_hit_px: int = 2
+    lidar_hit_px: int = 3
     lidar_ray_width: int = 1
     goal_ring_width: int = 3
     goal_dot_px: int = 2

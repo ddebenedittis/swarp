@@ -117,6 +117,7 @@ def draw_help(surface, state: ViewState, style: Style, *, top_offset: int = 0) -
         "mouse wheel: zoom",
         "middle drag: pan",
         "[ / ]: focus env",
+        "+ / -: resize window",
         "F1 or ?: toggle help",
         "q/esc: quit",
         "",
