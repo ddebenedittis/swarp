@@ -6,6 +6,7 @@ from typing import Any
 
 import torch
 
+from swarp.dynamics.base import action_bounds
 from swarp.scenarios.base import Scenario
 
 
@@ -127,6 +128,32 @@ class Environment:
     def act_dim(self) -> int:
         """Env-level action width (max arity over the agent models)."""
         return self.world.act_dim
+
+    @property
+    def action_bounds(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """The action box the dynamics kernels clamp against: ``(low, high)``, each
+        ``[n_agents, act_dim]`` on this env's device and dtype.
+
+        Actions are **physical**, never normalized — the kernels clamp to the per-agent
+        limits in :class:`~swarp.dynamics.base.AgentConfig`, so a fleet with
+        ``max_speed=3.0`` accepts ``[-3, 3]`` and a quadrotor accepts ``[0, thrust_max]``
+        per rotor. Feed this to an RL wrapper rather than assuming ``[-1, 1]``; see
+        :class:`swarp.interop.torchrl.SwarpEnv`.
+
+        Slots past an agent's model arity are reported as ``[0, 0]``: they exist only
+        because ``act_dim`` is the max over a mixed fleet, and the agent's branch ignores
+        them. A zero-width slot is what tells a policy not to spend capacity there.
+        Rows are per *agent*, not per env: per-env randomized limits
+        (:meth:`~swarp.core.stepper.Stepper.set_agent_params_per_env`) are not reflected.
+        """
+        na, ad = self.n_agents, self.world.act_dim
+        low = torch.zeros(na, ad, device=self.device, dtype=self.dtype)
+        high = torch.zeros_like(low)
+        for i, cfg in enumerate(self.world.agent_configs):
+            lo, hi = action_bounds(cfg)
+            low[i, : len(lo)] = torch.tensor(lo, device=self.device, dtype=self.dtype)
+            high[i, : len(hi)] = torch.tensor(hi, device=self.device, dtype=self.dtype)
+        return low, high
 
     # ------------------------------------------------------------------- API
 

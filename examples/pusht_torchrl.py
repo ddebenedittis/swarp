@@ -173,21 +173,23 @@ def main() -> None:
 
     device = args.device
     n_agents = args.n_agents
-    env = SwarpEnv(
-        Environment(
-            PushTScenario(
-                n_agents=n_agents,
-                pos_shaping_factor=args.pos_shaping,
-                rot_shaping_factor=args.rot_shaping,
-            ),
-            n_envs=args.n_envs,
-            device=device,
-            dt=0.05,
-            substeps=args.substeps,
-            seed=0,
-            max_steps=args.max_steps,
-        )
+    sim = Environment(
+        PushTScenario(
+            n_agents=n_agents,
+            pos_shaping_factor=args.pos_shaping,
+            rot_shaping_factor=args.rot_shaping,
+        ),
+        n_envs=args.n_envs,
+        device=device,
+        dt=0.05,
+        substeps=args.substeps,
+        seed=0,
+        max_steps=args.max_steps,
     )
+    # swarp actions are physical, so spec the action space from the limits the kernels
+    # clamp against rather than SwarpEnv's [-1, 1] default. Push-T's holonomic
+    # max_speed=1.0 fleet happens to coincide with it; most fleets do not.
+    env = SwarpEnv(sim, *sim.action_bounds)
     obs_dim, act_dim = env.obs_dim, env.act_dim
 
     # Decentralised actor (shared weights), centralised critic — the usual MAPPO split.

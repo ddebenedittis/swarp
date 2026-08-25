@@ -66,12 +66,18 @@ The op is functional: the forward allocates fresh outputs (no buffer recycling, 
 ```python
 from swarp.interop.torchrl import SwarpEnv
 
-env = SwarpEnv(swarp.make("navigation", n_envs=4096, device="cuda:0"))
+sim = swarp.make("navigation", n_envs=4096, device="cuda:0")
+env = SwarpEnv(sim, *sim.action_bounds)   # the box the kernels actually clamp to
 ```
 
 - `batch_size=[n_envs]`, everything on-device.
-- `"observation"` `[n_envs, n_agents, obs_dim]`; `"action"` `[n_envs, n_agents, act_dim]` bounded to the normalized `[-1, 1]` range the kernels clamp against; `reward` `[n_envs, n_agents, 1]`; a shared per-env `done` `[n_envs, 1]`.
+- `"observation"` `[n_envs, n_agents, obs_dim]`; `"action"` `[n_envs, n_agents, act_dim]`; `reward` `[n_envs, n_agents, 1]`; a shared per-env `done` `[n_envs, 1]`.
 - A non-empty scenario `info()` is spec'd and forwarded as a nested `info` composite, reachable at the **flat** path `("next", "info", <key>)`.
+
+:::{warning}
+`action_low`/`action_high` **default to `[-1, 1]`**, which is the right box only for a holonomic `VELOCITY` fleet with `max_speed == 1.0`.
+swarp actions are physical, so pass `env.action_bounds` (as above) for anything else — see [Action bounds are physical](environment.md#action-bounds-are-physical).
+:::
 
 :::{warning}
 `SwarpEnv` is flat — there is no `("agents", …)` group — so info is at `("next", "info", <key>)`, **not** the group-nested path TorchRL's `VmasEnv` uses.

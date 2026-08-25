@@ -44,6 +44,7 @@ from swarp.dynamics.base import (
     ControlMode,
     DynamicsModel,
     Integrator,
+    action_bounds,
     per_env_float_template,
 )
 from swarp.interop.autograd import TorchState, rollout, warp_step
@@ -143,6 +144,7 @@ __all__ = [
     "World",
     "WorldConfig",
     "WorldState",
+    "action_bounds",
     "fused_scenarios",
     "lidar_scan",
     "make",

@@ -24,9 +24,40 @@ class SwarpEnv(EnvBase):
     """A swarp ``Environment`` as a batched TorchRL ``EnvBase``.
 
     Observations are keyed ``"observation"`` ``[n_envs, n_agents, obs_dim]``;
-    actions ``"action"`` ``[n_envs, n_agents, act_dim]`` (bounded to the
-    normalized ``[-1, 1]`` range the swarp kernels clamp against); reward
+    actions ``"action"`` ``[n_envs, n_agents, act_dim]``; reward
     ``[n_envs, n_agents, 1]``; a shared per-env ``done`` ``[n_envs, 1]``.
+
+    Action bounds
+    -------------
+    swarp actions are **physical, not normalized**: the kernels clamp them to the
+    per-agent limits in :class:`~swarp.dynamics.base.AgentConfig`, and nothing rescales
+    them on the way in. The ``[-1, 1]`` default here is therefore correct **only** for a
+    holonomic fleet with ``max_speed == 1.0`` under
+    :attr:`~swarp.dynamics.base.ControlMode.VELOCITY` — which is what every built-in
+    scenario except ``navigation(model=...)`` happens to use. Outside that case the
+    default silently mis-specifies the action space:
+
+    - ``max_speed=3.0`` throttles the policy to a third of the achievable velocity;
+    - ``ControlMode.ACCELERATION`` bounds against ``max_accel``, which the built-ins set
+      to ``2 * max_speed``;
+    - the kinematic bicycle's second slot is a steering *angle* (``±max_steer``,
+      default ``pi/4``), not a speed;
+    - a quadrotor's four slots are per-rotor thrusts in ``[0, thrust_max]``, so under
+      ``[-1, 1]`` **the drone cannot reach hover** (``mass * gravity`` needs ~2.45 N per
+      rotor against a declared cap of 1.0) and the whole negative half of the box maps
+      to identical, zero-gradient dynamics.
+
+    Pass :attr:`~swarp.core.environment.Environment.action_bounds` to get the box the
+    kernels actually enforce::
+
+        low, high = env.action_bounds          # [n_agents, act_dim] each
+        tenv = SwarpEnv(env, action_low=low, action_high=high)
+
+    The bounds accept a scalar (broadcast over every agent and slot) or any tensor
+    broadcastable to ``[n_envs, n_agents, act_dim]`` — a single scalar pair cannot
+    express the bicycle's or the drone's box, which is why per-slot tensors are allowed.
+    The default stays ``[-1, 1]`` for backward compatibility; it is not the physically
+    correct answer, only the historical one.
 
     Scenario ``info()``
     -------------------
@@ -51,7 +82,10 @@ class SwarpEnv(EnvBase):
     """
 
     def __init__(
-        self, env: Environment, action_low: float = -1.0, action_high: float = 1.0
+        self,
+        env: Environment,
+        action_low: float | torch.Tensor = -1.0,
+        action_high: float | torch.Tensor = 1.0,
     ) -> None:
         super().__init__(device=env.device, batch_size=torch.Size([env.n_envs]))
         self._env = env
@@ -65,10 +99,39 @@ class SwarpEnv(EnvBase):
         self._info_keys = list(info.keys())
         self._make_specs(action_low, action_high, obs.dtype, info)
 
+    def _action_bound(self, val: float | torch.Tensor, dtype: torch.dtype):
+        """Normalize one action bound to what ``Bounded`` wants.
+
+        A scalar is passed straight through (so the ``[-1, 1]`` default produces exactly
+        the spec it always did); anything else is broadcast to the full
+        ``[n_envs, n_agents, act_dim]`` action shape, which is the only form that can
+        carry a per-slot box (bicycle: accel + steering angle; drone: four one-sided
+        rotor thrusts).
+        """
+        shape = (self._env.n_envs, self.n_agents, self.act_dim)
+        if not isinstance(val, torch.Tensor):
+            return float(val)
+        t = val.to(device=self.device, dtype=dtype)
+        if t.ndim == 0:
+            return float(t)
+        try:
+            return t.expand(shape).contiguous()
+        except RuntimeError as exc:
+            raise ValueError(
+                f"action bound of shape {tuple(t.shape)} is not broadcastable to the "
+                f"action shape {shape}. Environment.action_bounds returns "
+                f"[n_agents, act_dim] tensors, which are."
+            ) from exc
+
     def _make_specs(
-        self, low: float, high: float, dtype: torch.dtype, info: dict[str, torch.Tensor]
+        self,
+        low: float | torch.Tensor,
+        high: float | torch.Tensor,
+        dtype: torch.dtype,
+        info: dict[str, torch.Tensor],
     ) -> None:
         ne, na = self._env.n_envs, self.n_agents
+        low, high = self._action_bound(low, dtype), self._action_bound(high, dtype)
         self.observation_spec = Composite(
             observation=Unbounded(shape=(ne, na, self.obs_dim), dtype=dtype, device=self.device),
             shape=(ne,),

@@ -31,7 +31,7 @@ MODEL_ACTION_DIM = {
 
 
 def action_dim(model: DynamicsModel) -> int:
-    """Action arity for a dynamics model."""
+    """Action arity for a dynamics model. See :func:`action_bounds` for the limits."""
     return MODEL_ACTION_DIM[model.name]
 
 
@@ -130,6 +130,50 @@ class AgentConfig:
             self.torque_coeff,
             self.gravity,
         ]
+
+
+#: Which ``AgentConfig`` limit each model's integrate branch clamps each action slot
+#: against, as ``(low, high)`` field names per slot. ``None`` low means "the negation of
+#: the high field"; a literal float is used as-is. This is the table
+#: :func:`~swarp.dynamics.kernels._step_2d` and
+#: :func:`~swarp.dynamics.kernels._integrate_agent` implement — keep the two in step.
+_ACTION_LIMITS: dict[tuple[str, str], tuple[tuple[float | None, str], ...]] = {
+    # holonomic clamps the action *vector*, so both slots share one limit
+    ("HOLONOMIC", "VELOCITY"): ((None, "max_speed"), (None, "max_speed")),
+    ("HOLONOMIC", "ACCELERATION"): ((None, "max_accel"), (None, "max_accel")),
+    ("DIFF_DRIVE", "VELOCITY"): ((None, "max_speed"), (None, "max_ang_vel")),
+    ("DIFF_DRIVE", "ACCELERATION"): ((None, "max_accel"), (None, "max_ang_accel")),
+    # the bicycle and drone ignore ctrl_mode, so both modes map to one row
+    ("KINEMATIC_BICYCLE", "VELOCITY"): ((None, "max_accel"), (None, "max_steer")),
+    ("KINEMATIC_BICYCLE", "ACCELERATION"): ((None, "max_accel"), (None, "max_steer")),
+    # per-rotor thrust is one-sided: a rotor cannot pull
+    ("DRONE", "VELOCITY"): ((0.0, "thrust_max"),) * 4,
+    ("DRONE", "ACCELERATION"): ((0.0, "thrust_max"),) * 4,
+}
+
+
+def action_bounds(cfg: AgentConfig) -> tuple[list[float], list[float]]:
+    """The per-slot action box the integrate kernels clamp ``cfg``'s action to.
+
+    Returns ``(low, high)``, each ``action_dim(cfg.model)`` long. These are
+    **physical** limits, not a normalized range: a holonomic velocity-mode agent with
+    ``max_speed=3.0`` is clamped to ``[-3, 3]``, and a drone's four rotor commands to
+    ``[0, thrust_max]`` — actions are never rescaled on the way in.
+
+    Two caveats on the box:
+
+    - For the holonomic model the kernel clamps the action's *norm*
+      (``clamp_norm(a, max_speed)``), so the true feasible set is the disc inscribed in
+      this box. The box edges are still exact along each axis, which is what a
+      per-slot bound can express.
+    - Slots past a model's arity are ignored by its branch; the padded-out width is a
+      caller concern (see :meth:`swarp.core.environment.Environment.action_bounds`).
+    """
+    key = (DynamicsModel(cfg.model).name, ControlMode(cfg.ctrl_mode).name)
+    slots = _ACTION_LIMITS[key]
+    high = [getattr(cfg, field) for _, field in slots]
+    low = [-h if lo is None else lo for (lo, _), h in zip(slots, high, strict=True)]
+    return low, high
 
 
 @dataclass

@@ -29,6 +29,29 @@ Inside the kernel each action is clamped to that agent's configured limits, so o
 
 What the two or four slots *mean* is set by the agent's `ControlMode`; see [Dynamics models](dynamics.md).
 
+### Action bounds are physical
+
+Actions are in **physical units and are never rescaled** on the way in: the kernel clamps them against the agent's own `AgentConfig` limits, not against a normalized `[-1, 1]` box.
+A fleet with `max_speed=3.0` therefore accepts `[-3, 3]`, an `ACCELERATION`-mode fleet is bounded by `max_accel`, the bicycle's second slot is a steering *angle* (`±max_steer`, default π/4), and a quadrotor's four slots are per-rotor thrusts in `[0, thrust_max]` — one-sided, because a rotor cannot pull.
+
+`env.action_bounds` returns that box, as a `(low, high)` pair of `[n_agents, act_dim]` tensors:
+
+```python
+low, high = env.action_bounds          # what the kernels actually clamp to
+```
+
+Slots past an agent's model arity read `[0, 0]`: they exist only because `act_dim` is the max over a mixed fleet, and that agent's branch ignores them.
+Rows are per *agent*; per-env randomized limits (`Stepper.set_agent_params_per_env`) are not reflected.
+
+Hand this to any wrapper that needs an action space — `swarp.interop.torchrl.SwarpEnv` still **defaults** to `[-1, 1]`, which is correct only for a holonomic `VELOCITY` fleet with `max_speed == 1.0`:
+
+```python
+low, high = env.action_bounds
+tenv = SwarpEnv(env, action_low=low, action_high=high)
+```
+
+Getting this wrong is silent — the policy simply trains against a throttled or over-declared box. The sharpest case is the quadrotor: under `[-1, 1]` its four rotors cap out at 4 N against a `mass * gravity` weight of ~9.81 N, so it cannot hover, and the whole negative half of the declared box clamps to zero thrust with zero gradient.
+
 ## Returns
 
 ```python
