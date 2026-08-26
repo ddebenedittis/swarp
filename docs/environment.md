@@ -43,14 +43,15 @@ low, high = env.action_bounds          # what the kernels actually clamp to
 Slots past an agent's model arity read `[0, 0]`: they exist only because `act_dim` is the max over a mixed fleet, and that agent's branch ignores them.
 Rows are per *agent*; per-env randomized limits (`Stepper.set_agent_params_per_env`) are not reflected.
 
-Hand this to any wrapper that needs an action space — `swarp.interop.torchrl.SwarpEnv` still **defaults** to `[-1, 1]`, which is correct only for a holonomic `VELOCITY` fleet with `max_speed == 1.0`:
+Hand this to any wrapper that needs an action space. `swarp.interop.torchrl.SwarpEnv` does it for you — this box is its **default** action spec, so there is nothing to pass:
 
 ```python
-low, high = env.action_bounds
-tenv = SwarpEnv(env, action_low=low, action_high=high)
+tenv = SwarpEnv(env)                  # action_spec == env.action_bounds
 ```
 
-Getting this wrong is silent — the policy simply trains against a throttled or over-declared box. The sharpest case is the quadrotor: under `[-1, 1]` its four rotors cap out at 4 N against a `mass * gravity` weight of ~9.81 N, so it cannot hover, and the whole negative half of the declared box clamps to zero thrust with zero gradient.
+Pass an explicit scalar pair to opt back out to a normalized box (`SwarpEnv(env, action_low=-1.0, action_high=1.0)`), and note that leaving just one bound at `None` keeps the physical value on the other side rather than reverting it to a guess.
+
+The default used to be a fixed `[-1, 1]`, which is correct only for a holonomic `VELOCITY` fleet with `max_speed == 1.0` — every built-in scenario, as it happens, so the box was right until anything changed and then wrong in silence: the policy simply trained against a throttled or over-declared space. The sharpest case is the quadrotor: under `[-1, 1]` its four rotors cap out at 4 N against a `mass * gravity` weight of ~9.81 N, so it cannot hover, and the whole negative half of the declared box clamps to zero thrust with zero gradient.
 
 ## Returns
 
@@ -113,7 +114,7 @@ overflow = env.world.neighbor_overflow()  # [E, A] bool
 edges = env.radius_graph()              # [2, E_edges] COO, for a GNN policy
 ```
 
-The neighbour lists are padded to `WorldConfig.max_neighbors`, and `neighbor_overflow()` flags any agent whose true in-radius count exceeded that width — truncation is never silent.
+The neighbor lists are padded to `WorldConfig.max_neighbors`, and `neighbor_overflow()` flags any agent whose true in-radius count exceeded that width — truncation is never silent.
 `radius_graph()` reuses the grid `step` already built, so it costs one sync to materialize the edge count and no rebuild.
 Both views are overwritten by the next call: gather from them within the step.
 

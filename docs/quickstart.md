@@ -16,7 +16,7 @@ for _ in range(100):
     obs, reward, term, trunc, info = env.step(actions)  # every tensor stays on the GPU
 ```
 
-`make` routes its keyword arguments by name: those the `Environment` constructor accepts (`device`, `dt`, `substeps`, `dtype`, `max_steps`, `seed`, `auto_reset`, `use_graph`, `clone_outputs`, `fused`) go to it, and everything else (`n_agents`, `world_size`, `model`, …) goes to the scenario constructor.
+`make` routes its keyword arguments by name: those the `Environment` constructor accepts (`device`, `dt`, `substeps`, `dtype`, `max_steps`, `seed`, `auto_reset`, `use_graph`, `clone_outputs`, `fused`, `world_config`) go to it, and everything else (`n_agents`, `world_size`, `model`, …) goes to the scenario constructor.
 The two parameter sets are disjoint, so the split is unambiguous.
 Valid names are the keys of `swarp.SCENARIOS`: `navigation`, `flocking`, `formation`, `discovery`, `sampling`, `transport`, `pusht`.
 

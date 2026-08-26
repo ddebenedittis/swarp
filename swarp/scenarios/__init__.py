@@ -13,6 +13,7 @@ listed by hand.
 from __future__ import annotations
 
 import inspect
+import warnings
 
 from swarp.scenarios.base import Scenario
 from swarp.scenarios.discovery import DiscoveryScenario
@@ -154,12 +155,25 @@ def resolve_scenarios(names: list[str]) -> list[str]:
 def make_scenario(name: str, **kwargs) -> Scenario:
     """Construct a registered scenario by name.
 
-    ``model=`` is dropped for scenarios whose ``__init__`` does not accept it
-    (the holonomic-only ones), so a caller sweeping the robot-model axis over the
-    whole registry — the benchmark does exactly this — needs no special-casing.
+    ``model=`` is dropped for scenarios whose ``__init__`` does not accept it (the
+    holonomic-only ones), so a caller sweeping the robot-model axis over the whole
+    registry needs no special-casing. Dropping it **warns**, though: the alternative is
+    ``swarp.make("flocking", model=DynamicsModel.DRONE)`` handing back a holonomic env
+    with no signal at all, which reads as a silent no-op rather than a design choice.
+
+    A sweep that expects the drop should filter on :func:`supports_model` first — the
+    benchmark's scenario sweep does — and then the warning never fires.
+
     All other kwargs are forwarded verbatim.
     """
     cls = scenario_class(name)
     if "model" in kwargs and not supports_model(cls):
+        dropped = kwargs["model"]
         kwargs = {k: v for k, v in kwargs.items() if k != "model"}
+        warnings.warn(
+            f"scenario {name!r} is holonomic-only: its __init__ takes no 'model', so "
+            f"model={dropped!r} was dropped and the fleet stays holonomic. Filter with "
+            "swarp.scenarios.supports_model() to sweep this axis without the warning.",
+            stacklevel=2,
+        )
     return cls(**kwargs)

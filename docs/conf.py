@@ -15,7 +15,7 @@ _PYPROJECT = tomllib.loads((_ROOT / "pyproject.toml").read_text())["project"]
 
 project = "swarp"
 author = "Davide De Benedittis"
-copyright = "2025, Davide De Benedittis"  # noqa: A001
+copyright = "2025, Davide De Benedittis"  # shadows the builtin; Sphinx requires this name
 version = release = _PYPROJECT["version"]
 
 extensions = [

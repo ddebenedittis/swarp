@@ -5,6 +5,13 @@ least ``agents_per_target`` agents are within ``covering_range`` of it; the team
 earns a one-off shared reward the step a target is first covered. Agents also pay
 a small per-step time penalty and a per-contact collision penalty. Coverage is
 computed with ``torch.cdist`` over agent/target positions.
+
+**Scaling.** That ``cdist`` — and the matching loop in the fused kernels — is
+**O(n_agents * n_targets)** all-pairs work, and the inter-agent observation is
+**O(n_agents^2)**; neither consults the neighbor list. Deliberate: the fused path is
+tested for bit-exact parity against this torch path, and the neighbor list is truncated
+at ``max_neighbors``, so using it would make the two disagree by construction on
+overflow. Budget for the quadratic term before scaling ``n_agents`` into the hundreds.
 """
 
 from __future__ import annotations

@@ -13,6 +13,7 @@ neighbors (relative position/velocity + validity mask, padded-list order).
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import torch
@@ -65,6 +66,10 @@ class NavigationScenario(FusedScenario):
             min_spawn_separation if min_spawn_separation is not None else 3.0 * agent_radius
         )
         self.neighbor_method = neighbor_method
+        # Provisional obs width so ``obs_dim`` answers before ``make_world``: it mirrors
+        # this scenario's own ``max_neighbors`` default. ``make_world`` re-derives it
+        # from the *resolved* config, so a ``world_config`` override still wins.
+        self._k_obs = min(self.neighbor_obs, min(32, max(4, self.n_agents)))
 
     # ------------------------------------------------------------------ world
 
@@ -149,25 +154,57 @@ class NavigationScenario(FusedScenario):
     def obs_dim(self) -> int:
         return 9 + 5 * self._k_obs
 
-    def _sample_separated(self, n_envs: int, n_points: int, min_dist: float, tries: int = 16):
-        """Uniform positions with pairwise separation via bounded resampling.
+    #: Cells per spawn point the stratified sampler aims for. More cells keep the choice
+    #: of cell closer to uniform; the cap that actually binds is jitter room per cell.
+    _SPAWN_CELL_OVERSAMPLE = 8
 
-        Host-sync-free: runs a fixed ``tries`` iterations with no early-exit
-        ``.any()`` check, so it never forces a device→host round-trip (safe to
-        call inside a masked reset on the step loop).
+    def _sample_separated(self, n_envs: int, n_points: int, min_dist: float):
+        """Positions with a **guaranteed** pairwise separation of ``min_dist``.
+
+        Stratified jittered-cell sampling. The spawn square is cut into a ``g x g`` grid of
+        cells of side ``s``; each env draws ``n_points`` *distinct* cells, and each point is
+        jittered uniformly inside a centred sub-square of side ``s - min_dist``. Two points
+        in different cells then differ by at least ``min_dist`` along whichever axis
+        separates their cells, so the separation holds *by construction*.
+
+        That replaces a fixed 16-iteration ``torch.cdist`` rejection loop, which cost a
+        batched distance matrix per iteration and could still return overlapping points.
+        Under ``auto_reset`` this runs on every step, for the whole batch (the reset is
+        masked device-side, so there is no host-side "is anything done?" gate to skip it) —
+        making it cheap is the only lever, and it was worth ~300x on the step time at
+        4096x8. See ``docs/performance.md``.
+
+        Host-sync-free (``torch.rand`` / ``argsort`` / arithmetic on ``world.generator``),
+        so it stays safe inside a masked reset on the step loop.
+
+        Falls back to plain uniform sampling when no grid can both hold ``n_points`` cells
+        and leave jitter room — i.e. when the requested separation is at the packing limit
+        for this world. Better an honest uniform draw than a grid silently packed so tight
+        that every point sits pinned at its cell centre.
         """
         w = self.world
         lim = self.world_size - 2.0 * self.agent_radius
-        pos = w.sample_uniform((n_envs, n_points, 2), -lim, lim)
-        if n_points == 1:
-            return pos
-        eye = torch.eye(n_points, device=w.device, dtype=w.dtype) * 1e9
-        for _ in range(tries):
-            d = torch.cdist(pos, pos) + eye
-            conflict = (d.min(dim=-1).values < min_dist).unsqueeze(-1)  # [n_envs, n_points, 1]
-            resampled = w.sample_uniform((n_envs, n_points, 2), -lim, lim)
-            pos = torch.where(conflict, resampled, pos)
-        return pos
+        shape = (n_envs, n_points, 2)
+        if n_points == 1 or min_dist <= 0.0:
+            return w.sample_uniform(shape, -lim, lim)
+
+        side = 2.0 * lim
+        g = math.ceil(math.sqrt(n_points * self._SPAWN_CELL_OVERSAMPLE))
+        g = min(g, int(side // (2.0 * min_dist)))  # keep at least min_dist of jitter room
+        g = max(g, math.ceil(math.sqrt(n_points)))  # ...but the points have to fit
+        if side / g <= min_dist:
+            return w.sample_uniform(shape, -lim, lim)
+        s = side / g
+        jitter = s - min_dist
+
+        # n_points distinct cells per env. argsort of random keys is a batched partial
+        # permutation: distinctness is structural, where a rejection loop only ever
+        # approaches it. Cheap because g*g stays O(n_points), not O(world / min_dist).
+        cell = w.sample_uniform((n_envs, g * g), 0.0, 1.0).argsort(dim=-1)[:, :n_points]
+        col = (cell % g).to(w.dtype)
+        row = torch.div(cell, g, rounding_mode="floor").to(w.dtype)
+        centers = torch.stack([col, row], dim=-1) * s + (0.5 * s - lim)
+        return centers + (w.sample_uniform(shape, 0.0, 1.0) - 0.5) * jitter
 
     def reset_world(
         self, env_mask: torch.Tensor | None = None, *, obs_only: bool = False

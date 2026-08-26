@@ -7,16 +7,20 @@ per row::
     baseline -> +eager-trims -> +nbr-dedupe -> +slim-2d -> +fused-obs-rew -> +cuda-graph
 
 Each variant is defined by the feature toggles it enables on top of the previous
-one. Toggles that the current checkout does not yet expose make the row report
-``n/a`` (genuine feature-detection), so this script is useful from the very
-first commit while the stages land incrementally.
+one. All five toggles now ship, so every row is timed on a current checkout; the
+feature probing behind the ``n/a`` status is kept because it costs nothing and is
+what lets this script run against an *older* checkout — bisecting a throughput
+regression is exactly when you want the stages that do not exist yet to report
+``n/a`` rather than crash.
 
 Two guarantees are enforced before a row is timed:
 
 * **Parity** — every variant replays the same seeded 5-step trajectory from
-  ``reset(seed=0)`` and is compared against the ``baseline`` variant
-  (``allclose`` on obs/reward at f32 rtol 1e-5, exact match on ``done``). A
-  mismatch prints a loud ``PARITY FAIL`` and skips timing for that row.
+  ``reset(seed=0)`` and is compared against the ``baseline`` variant (``allclose``
+  on obs/reward, exact match on ``done``). The tolerance is the *scenario's*
+  :attr:`~swarp.scenarios.base.Scenario.parity_rtol`, not a constant of this module
+  — see :func:`parity_ok`. A mismatch prints a loud ``PARITY FAIL`` and skips
+  timing for that row.
 * **Neighbor builds/step** — the ``NeighborGrid.build_count`` delta across the
   timed window is reported (``builds`` column), so the neighbor-dedupe stage can
   be seen to drop it from 2 to 1 per step at ``substeps=1``.

@@ -64,7 +64,13 @@ DEF_AGENTS = (16, 64)
 
 
 def build_scenario(name: str, n_agents: int, model_name: str | None):
-    """Construct a scenario; the model kwarg is dropped where unsupported."""
+    """Construct a scenario for the sweep.
+
+    ``model_name is None`` means "this scenario is holonomic-only" — :func:`_model_axis`
+    has already filtered on :func:`~swarp.scenarios.supports_model`, so no ``model``
+    kwarg is passed at all. That is deliberate: ``make_scenario`` *warns* when it has to
+    drop one, and a sweep should not be generating warnings it knows are expected.
+    """
     kw: dict = {"n_agents": n_agents, "world_size": max(1.0, n_agents**0.5 / 4)}
     if model_name is not None:
         kw["model"] = MODELS[model_name]
@@ -185,7 +191,7 @@ def run_config(
         row["status"] = "OOM"
         if device.startswith("cuda"):
             torch.cuda.empty_cache()
-    except Exception as exc:  # noqa: BLE001 — one bad config must not sink the sweep
+    except Exception as exc:  # one bad config must not sink the sweep
         row["status"] = "ERR"
         row["detail"] = f"{type(exc).__name__}: {str(exc)[:80]}"
     return row
@@ -199,7 +205,7 @@ def _warmup_all(selected: list[str], device: str) -> None:
                 try:
                     env = make_env(name, 64, 8, model_name, optimized, device)
                     time_env(env, 8, device, steps=3, warmup=3)
-                except Exception:  # noqa: BLE001, S110 — warmup is best-effort
+                except Exception:  # warmup is best-effort
                     pass
     sync_device(device)
 

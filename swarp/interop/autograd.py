@@ -311,7 +311,9 @@ def rollout(
 
     Args:
         state: initial state.
-        actions_seq: ``[T, n_envs, n_agents, 2]`` action sequence.
+        actions_seq: ``[T, n_envs, n_agents, act_dim]`` action sequence. ``act_dim``
+            is the max arity over the fleet's models — 2 for every 2D vehicle, 4 for a
+            drone's per-rotor thrusts.
         ring: optional :class:`GradRing` supplying reusable taped scratch; its
             ``capacity`` must be ``>= T``. Reused across iterations with no new
             allocations. ``None`` allocates fresh scratch each step.

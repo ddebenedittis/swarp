@@ -67,16 +67,16 @@ The op is functional: the forward allocates fresh outputs (no buffer recycling, 
 from swarp.interop.torchrl import SwarpEnv
 
 sim = swarp.make("navigation", n_envs=4096, device="cuda:0")
-env = SwarpEnv(sim, *sim.action_bounds)   # the box the kernels actually clamp to
+env = SwarpEnv(sim)                       # action_spec == sim.action_bounds
 ```
 
 - `batch_size=[n_envs]`, everything on-device.
 - `"observation"` `[n_envs, n_agents, obs_dim]`; `"action"` `[n_envs, n_agents, act_dim]`; `reward` `[n_envs, n_agents, 1]`; a shared per-env `done` `[n_envs, 1]`.
 - A non-empty scenario `info()` is spec'd and forwarded as a nested `info` composite, reachable at the **flat** path `("next", "info", <key>)`.
 
-:::{warning}
-`action_low`/`action_high` **default to `[-1, 1]`**, which is the right box only for a holonomic `VELOCITY` fleet with `max_speed == 1.0`.
-swarp actions are physical, so pass `env.action_bounds` (as above) for anything else — see [Action bounds are physical](environment.md#action-bounds-are-physical).
+:::{note}
+swarp actions are physical, so the action spec defaults to `env.action_bounds` — the box the kernels actually clamp to.
+Pass an explicit scalar pair (`action_low=-1.0, action_high=1.0`) if you want a normalized box instead — see [Action bounds are physical](environment.md#action-bounds-are-physical).
 :::
 
 :::{warning}
@@ -95,6 +95,24 @@ Two knobs with real cost:
 
 - `substeps` multiplies the physics work linearly. Only raise it for stiff contacts (Push-T derives `substeps >= 8` at `dt=0.05` in its own `make_world`).
 - `max_neighbors` sets the padded list width. Too small silently truncates — except that it does not, because `World.neighbor_overflow()` flags it; check that flag once when tuning rather than guessing.
+
+## The cost of `auto_reset`
+
+`auto_reset=True` is **not** free, and the reason is structural rather than incidental. `done` is a device tensor and the step promises no device→host round-trip, so there is no host-side "is anything done?" gate: the scenario's `reset_world` runs on **every** step, over the **whole** batch, and the per-env `reset_mask` selects what actually lands. Resetting one env out of 4096 therefore costs the same as resetting all of them.
+
+That makes the reset path's own cost the thing to watch. At 4096x8 on an RTX 3070 Laptop:
+
+| | ms/step |
+|---|---|
+| `auto_reset=False` | 0.13 |
+| `auto_reset=True` | 3.9 |
+
+Navigation's spawn sampler used to dominate that second row: a fixed 16-iteration `torch.cdist` rejection loop, run twice per reset (spawns, then goals), for 40.8 ms/step — 315x the plain step. It is now stratified jittered-cell sampling (`NavigationScenario._sample_separated`), which gets the pairwise separation by construction in a single draw: 10.6x faster, and the separation is now guaranteed rather than merely likely.
+
+Two things follow for anyone writing a scenario:
+
+- Whatever `reset_world` does, it does on every step under `auto_reset`. Budget it as hot-path work, not as setup.
+- If you only need resets at episode boundaries you control, leave `auto_reset=False` and call `env.reset_at` yourself with a mask — you then pay the reset cost only on the steps that need it.
 
 ## Running the benchmarks
 

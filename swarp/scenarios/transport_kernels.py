@@ -180,9 +180,7 @@ def transport_reward_kernel(
             shaping_sum += ps
         if full_pass == 1:
             dist_out[e, k] = d
-            if d < goal_tolerance:
-                pass
-            else:
+            if d >= goal_tolerance:
                 all_og = wp.uint8(0)
     if full_pass == 1:
         bonus = zero

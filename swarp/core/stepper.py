@@ -54,7 +54,25 @@ class StepBuffers:
 
 
 class Stepper:
-    """Owns per-agent parameters, interaction config, and the substep pipeline."""
+    """Owns per-agent parameters, interaction config, and the substep pipeline.
+
+    This is the **Warp-facing** layer, and its vocabulary reflects that rather than
+    :class:`~swarp.core.world.World`'s:
+
+    - ``world`` here is a :class:`~swarp.core.config.WorldConfig`, not a ``World``. The
+      stepper is what a ``World`` owns, so it holds the *config* it was built from —
+      hence the mirror-image ``world.stepper`` / ``stepper.world`` pair.
+    - ``dtype`` is a **Warp** dtype (``wp.float32`` / ``wp.float64``), where ``World``
+      takes a torch one. Kernels are instantiated per Warp dtype via ``wp.overload``, so
+      a Warp dtype is the honest type at this boundary; ``torch_dtype`` is the derived
+      torch view of it.
+
+    Several per-``n_envs`` caches hang off this object (``_cached_buffers``,
+    ``_out_states``, the neighbor grids). They are keyed by batch size and expected to
+    hold **one** entry in intended use — an ``Environment`` has a fixed ``n_envs`` for its
+    lifetime. Driving one stepper across many batch sizes therefore grows memory linearly
+    in the number of distinct sizes, which is the right trade for the common case.
+    """
 
     def __init__(
         self,
@@ -484,7 +502,8 @@ class Stepper:
     def output_state(self, n_envs: int) -> WorldState:
         """Ping-pong output buffer for the tape-free hot path (two states cycled
         per batch size), so steady-state stepping allocates no output arrays —
-        also the fixed buffer a future CUDA-graph capture needs.
+        also the fixed buffer the whole-step CUDA-graph capture in
+        :class:`~swarp.interop.persistent.StepRuntime` replays into.
 
         The returned tensors stay valid until this method is called twice more
         for the same ``n_envs`` (the two-buffer cycle guarantees a step's input

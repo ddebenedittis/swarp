@@ -31,6 +31,19 @@ class Environment:
     in-place via a host-sync-free masked path (no ``.any()``/``.nonzero()``
     round-trip), so the whole loop can stay on device.
 
+    Two consequences of ``auto_reset=True`` worth knowing before you rely on it:
+
+    - **There is no terminal observation.** Gym's ``final_observation`` has no
+      counterpart here: the ``obs`` returned alongside a ``True`` ``terminated`` /
+      ``truncated`` is already the **new** episode's first observation, not the state the
+      episode ended in. An algorithm that needs the terminal state (n-step returns
+      bootstrapping off it, for instance) must run with ``auto_reset=False`` and reset
+      itself, or capture the state before the step that ends the episode.
+    - **The reset runs every step.** Because the mask is applied device-side with no
+      host-side "is anything done?" gate, the scenario's ``reset_world`` executes on every
+      step over the whole batch, whether or not any env is done — see
+      "The cost of ``auto_reset``" in ``docs/performance.md``.
+
     Args:
         use_graph: persistent-buffer execution backed by a whole-step CUDA graph.
             ``"auto"`` (the default) enables it whenever it can actually pay off — a
@@ -38,12 +51,17 @@ class Environment:
             which is the configuration ``docs/benchmarks.md`` measures at 2.5-5x.
             Pass ``False`` to force the plain functional step, ``True`` to demand
             persistent execution even where capture is unavailable (it then falls back
-            to eager persistent execution with a warning).
-        clone_outputs: clone ``obs``/``reward``/``terminated``/``truncated`` before
-            returning them. Off by default, so :meth:`step` hands back **zero-copy views
-            of buffers the next step overwrites** — fine for a policy that consumes them
-            immediately, wrong for anything that retains them (a replay buffer, a
-            trajectory list). Turn this on, or clone at the call site.
+            to eager persistent execution **with a warning**, since you asked for
+            something you did not get). ``"auto"`` never warns: capture also needs the
+            ``brute``/``uniform_grid`` neighbor backend, which ``"auto"`` does not check,
+            and eager persistent execution is still faster than the functional step — so
+            the fallback there is the intended outcome, not a degradation.
+            :attr:`graph_mode` reports what is actually in play.
+        clone_outputs: clone ``obs``/``reward``/``terminated``/``truncated`` and the
+            ``info`` values before returning them. Off by default, so :meth:`step` hands
+            back **zero-copy views of buffers the next step overwrites** — fine for a
+            policy that consumes them immediately, wrong for anything that retains them
+            (a replay buffer, a trajectory list). Turn this on, or clone at the call site.
         fused: use the scenario's fused Warp obs/reward kernels on the no-grad path.
             ``"auto"`` follows :attr:`~swarp.scenarios.base.Scenario.fused_available`;
             grad mode always falls back to the differentiable torch path.
@@ -73,9 +91,14 @@ class Environment:
         fused: bool | str = "auto",
         world_config: WorldConfig | None = None,
     ) -> None:
+        if n_envs < 1:
+            raise ValueError(f"n_envs must be >= 1, got {n_envs}")
         self.scenario = scenario
         self.n_envs = n_envs
-        self.device = device
+        # Normalized to a string: it is consumed as one (``.startswith("cuda")`` below,
+        # Warp device names downstream), so a ``torch.device`` has to be accepted here.
+        self.device = str(device)
+        device = self.device
         self.dtype = dtype
         self.max_steps = max_steps
         self.auto_reset = auto_reset
@@ -103,10 +126,16 @@ class Environment:
         # use_graph: persistent execution is only the *advertised* fast path when the
         # obs/reward launches can ride along inside the same graph.
         self._hook = scenario.graph_hook() if self._fused else None
+        # Whether the *caller* demanded capture, as opposed to us inferring it. Only an
+        # explicit request warns when capture turns out to be unavailable: "auto" also
+        # gates on a whole-step hook and a CUDA device, but not on the neighbor backend,
+        # so warning here would scold a user for a default they never chose — and the
+        # eager persistent fallback is still faster than the functional step.
+        graph_requested = use_graph is True
         if use_graph == "auto":
             use_graph = self._hook is not None and device.startswith("cuda")
         if use_graph:
-            self.world.enable_persistent(use_graph=True)
+            self.world.enable_persistent(use_graph=True, graph_requested=graph_requested)
         runtime = self.world.runtime
         self._whole_step = self._hook is not None and runtime is not None
         if self._whole_step:
@@ -134,7 +163,18 @@ class Environment:
         """Fused kernels run only on the untaped path (a taped step uses the torch ref)."""
         self.scenario.set_fused_active(self._fused and not self._taped_step(actions))
 
+    def seed(self, seed: int) -> None:
+        """Reseed the world RNG **without** touching episode state.
+
+        ``reset(seed=...)`` also reseeds, but restarts every episode as a side effect.
+        This is the one to call when only the RNG stream should move — TorchRL's
+        ``_set_seed`` contract, which collectors invoke during worker setup.
+        """
+        self._seed(seed)
+
     def _seed(self, seed: int) -> None:
+        # Called from ``__init__`` before ``_step_count`` exists: must stay
+        # RNG-only, never reach for episode state.
         self.world.generator = torch.Generator(device=self.device)
         self.world.generator.manual_seed(seed)
 
@@ -199,6 +239,12 @@ class Environment:
         Host-sync-free: the scenario samples the full batch and blends the
         selected envs with ``torch.where``; unselected envs are untouched.
         Returns stacked observations for all envs.
+
+        Unlike :meth:`reset` this does **not** clear ``world.action``, and cannot: the
+        action tensor is ``[n_envs, n_agents, act_dim]`` but it is one *shared* handle
+        rather than per-env state, so there is nothing to mask. It does not matter —
+        :meth:`step` overwrites ``world.action`` before any reward path reads it, so a
+        reset env never sees the pre-reset action.
         """
         self._set_fused_active()
         with torch.no_grad():
@@ -279,6 +325,9 @@ class Environment:
         if self.clone_outputs:
             obs, reward = obs.clone(), reward.clone()
             terminated, truncated = terminated.clone(), truncated.clone()
+            # ``info`` values are views into the scenario's fused buffers, so they alias
+            # just like obs/reward do — the flag has to cover them to mean anything.
+            info = {k: v.clone() if torch.is_tensor(v) else v for k, v in info.items()}
         return obs, reward, terminated, truncated, info
 
     def radius_graph(self) -> torch.Tensor:

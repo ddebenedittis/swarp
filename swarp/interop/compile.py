@@ -51,9 +51,6 @@ def register_stepper(stepper: Stepper) -> int:
     return handle
 
 
-_NFIELDS = len(TorchState._fields)
-
-
 @torch.library.custom_op("swarp::step", mutates_args=())
 def _step_op(
     stepper_id: int,

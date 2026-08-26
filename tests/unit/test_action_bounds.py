@@ -6,8 +6,9 @@ kernel enforces — so the checks here are behavioural rather than a second copy
 table: commanding the reported bound saturates the state, and commanding twice the
 bound changes nothing.
 
-The TorchRL half pins the deliberately non-breaking part of that API: ``SwarpEnv``
-still defaults to ``[-1, 1]``, which is why the physical bounds have to be reachable.
+The TorchRL half pins the default: ``SwarpEnv`` specs ``env.action_bounds``, so a policy
+sampling inside its own action space can actually reach what the kernels allow — and an
+explicit scalar pair is still the way to opt back out to a normalized box.
 """
 
 import math
@@ -107,12 +108,13 @@ def test_drone_bounds_are_one_sided():
 
 
 def test_drone_bounds_admit_hover_while_unit_bounds_do_not():
-    """The reason P1 matters: ``[-1, 1]`` caps a quadrotor below its own weight."""
+    """Why a normalized box is the wrong default: ``[-1, 1]`` caps a quadrotor below its
+    own weight, so the reported physical box is the only one that can hover."""
     cfg = drone_config()  # mass 1.0, gravity 9.81 -> ~2.45 N per rotor to hover
     _, high = action_bounds(cfg)
     weight = cfg.mass * cfg.gravity
     assert sum(high) > weight  # the physical box can hover
-    assert weight > 4 * 1.0  # the SwarpEnv default cannot
+    assert weight > 4 * 1.0  # a unit box cannot
 
 
 # --------------------------------------------------- the kernel's actual clamp
@@ -159,7 +161,7 @@ def test_bicycle_steering_slot_is_an_angle(device):
     env = _env(_fleet(DynamicsModel.KINEMATIC_BICYCLE, ControlMode.VELOCITY), device)
     _, high = env.action_bounds
     assert high[0, 1].item() == pytest.approx(math.pi / 4)
-    assert high[0, 1].item() < 1.0  # what the [-1, 1] default over-declares
+    assert high[0, 1].item() < 1.0  # what a [-1, 1] box would over-declare
 
 
 @pytest.mark.parametrize("device", DEVICES)
@@ -211,14 +213,67 @@ def test_padded_slots_report_zero_width(device):
 
 
 @pytest.mark.parametrize("device", DEVICES)
-def test_swarpenv_default_bounds_stay_unit(device):
-    """The non-breaking promise: the default spec is still exactly ``[-1, 1]``."""
+@pytest.mark.parametrize("model,mode", MODELS)
+def test_swarpenv_defaults_to_the_physical_box(model, mode, device):
+    """The promise: with no bounds argument the spec **is** ``env.action_bounds``.
+
+    ``_fleet`` uses ``max_speed=1.7`` precisely so this can tell the physical box apart
+    from the ``[-1, 1]`` convention that used to be the default.
+    """
     pytest.importorskip("torchrl")
     from swarp.interop.torchrl import SwarpEnv
 
-    tenv = SwarpEnv(_env(_fleet(DynamicsModel.HOLONOMIC, ControlMode.VELOCITY), device))
-    space = tenv.action_spec.space
+    env = _env(_fleet(model, mode), device)
+    low, high = env.action_bounds
+    space = SwarpEnv(env).action_spec.space
+    torch.testing.assert_close(space.low, low.expand_as(space.low).contiguous())
+    torch.testing.assert_close(space.high, high.expand_as(space.high).contiguous())
+    assert (space.high != 1.0).any()  # not the old unit box
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_swarpenv_explicit_scalars_still_override(device):
+    """The opt-out: an explicit scalar pair is passed straight through, unit box included."""
+    pytest.importorskip("torchrl")
+    from swarp.interop.torchrl import SwarpEnv
+
+    env = _env(_fleet(DynamicsModel.HOLONOMIC, ControlMode.VELOCITY), device)
+    space = SwarpEnv(env, action_low=-1.0, action_high=1.0).action_spec.space
     assert (space.low == -1.0).all() and (space.high == 1.0).all()
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_swarpenv_one_sided_override_keeps_the_physical_other_side(device):
+    """Overriding one bound must not silently revert the other to a guess."""
+    pytest.importorskip("torchrl")
+    from swarp.interop.torchrl import SwarpEnv
+
+    env = _env(_fleet(DynamicsModel.HOLONOMIC, ControlMode.VELOCITY), device)
+    _, high = env.action_bounds
+    space = SwarpEnv(env, action_low=0.0).action_spec.space
+    assert (space.low == 0.0).all()
+    torch.testing.assert_close(space.high, high.expand_as(space.high).contiguous())
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_swarpenv_default_drone_spec_admits_hover(device):
+    """The failure this fix removes: under the old ``[-1, 1]`` default a quadrotor's spec
+    capped total thrust at 4 N against a ~9.81 N weight, so no policy sampling inside the
+    spec could hover. The default spec must now contain the hover action."""
+    pytest.importorskip("torchrl")
+    from swarp.interop.torchrl import SwarpEnv
+
+    class Drones(NavigationScenario):
+        def _agent_configs(self):
+            return [drone_config(radius=self.agent_radius) for _ in range(self.n_agents)]
+
+    env = _env(Drones(n_agents=2, n_obstacles=0), device)
+    space = SwarpEnv(env).action_spec.space
+    cfg = drone_config()
+    hover_per_rotor = cfg.mass * cfg.gravity / 4.0
+    assert (space.low <= 0.0).all()  # a rotor cannot pull
+    assert (space.high >= hover_per_rotor).all()  # ...but it can hold the aircraft up
+    assert space.high.sum(-1).min().item() > cfg.mass * cfg.gravity
 
 
 @pytest.mark.parametrize("device", DEVICES)

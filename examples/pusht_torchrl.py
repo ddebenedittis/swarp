@@ -186,10 +186,9 @@ def main() -> None:
         seed=0,
         max_steps=args.max_steps,
     )
-    # swarp actions are physical, so spec the action space from the limits the kernels
-    # clamp against rather than SwarpEnv's [-1, 1] default. Push-T's holonomic
-    # max_speed=1.0 fleet happens to coincide with it; most fleets do not.
-    env = SwarpEnv(sim, *sim.action_bounds)
+    # swarp actions are physical, and SwarpEnv specs sim.action_bounds by default — the
+    # limits the kernels actually clamp against. Nothing to pass.
+    env = SwarpEnv(sim)
     obs_dim, act_dim = env.obs_dim, env.act_dim
 
     # Decentralised actor (shared weights), centralised critic — the usual MAPPO split.

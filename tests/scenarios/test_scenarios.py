@@ -4,6 +4,7 @@ Also covers the registry front door (``swarp.scenarios.make_scenario`` / ``swarp
 """
 
 import inspect
+import warnings
 
 import pytest
 import torch
@@ -136,8 +137,54 @@ def test_make_builds_a_working_environment(device):
 
 
 def test_make_drops_model_for_holonomic_only_scenarios():
-    env = swarp.make("flocking", n_envs=2, n_agents=2, device="cpu", model=DynamicsModel.DIFF_DRIVE)
+    """The drop still happens — but it warns, so it reads as a design choice rather than
+    a request that vanished."""
+    with pytest.warns(UserWarning, match="holonomic-only"):
+        env = swarp.make(
+            "flocking", n_envs=2, n_agents=2, device="cpu", model=DynamicsModel.DIFF_DRIVE
+        )
     assert env.n_agents == 2  # constructed despite the unsupported kwarg
+
+
+def test_make_does_not_warn_when_the_scenario_takes_a_model():
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        swarp.make(
+            "navigation", n_envs=2, n_agents=2, device="cpu", model=DynamicsModel.DIFF_DRIVE
+        )
+
+
+def test_benchmark_model_sweep_emits_no_drop_warnings():
+    """The cross-scenario sweep filters on ``supports_model`` rather than leaning on the
+    drop, so turning the drop into a warning must not make the benchmark noisy."""
+    from swarp.benchmark.scenarios import _model_axis, build_scenario
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        for name in REGISTRY:
+            for model_name in _model_axis(name):
+                build_scenario(name, 2, model_name)
+
+
+@pytest.mark.parametrize("name", ["drone", "diff_drive", "holonomic"])
+def test_model_accepts_a_string(name):
+    """Every other string-ish option in the API takes a string; ``model`` now does too."""
+    scen = make_scenario("navigation", n_agents=2, model=name)
+    env = Environment(scen, n_envs=2, device="cpu", seed=0)
+    try:
+        assert env.world.agent_configs[0].model is DynamicsModel[name.upper()]
+    finally:
+        env.close()
+
+
+def test_unknown_model_string_lists_the_valid_names():
+    with pytest.raises(ValueError, match="holonomic"):
+        Environment(
+            make_scenario("navigation", n_agents=2, model="hovercraft"),
+            n_envs=2,
+            device="cpu",
+            seed=0,
+        )
 
 
 # Engine settings no scenario exposes as a constructor argument. All six are set away

@@ -32,33 +32,36 @@ class SwarpEnv(EnvBase):
     -------------
     swarp actions are **physical, not normalized**: the kernels clamp them to the
     per-agent limits in :class:`~swarp.dynamics.base.AgentConfig`, and nothing rescales
-    them on the way in. The ``[-1, 1]`` default here is therefore correct **only** for a
-    holonomic fleet with ``max_speed == 1.0`` under
-    :attr:`~swarp.dynamics.base.ControlMode.VELOCITY` — which is what every built-in
-    scenario except ``navigation(model=...)`` happens to use. Outside that case the
-    default silently mis-specifies the action space:
+    them on the way in. So the default action spec is
+    :attr:`~swarp.core.environment.Environment.action_bounds` — the box the kernels
+    actually enforce, per agent and per slot. No argument needed::
 
-    - ``max_speed=3.0`` throttles the policy to a third of the achievable velocity;
+        tenv = SwarpEnv(env)                  # spec == env.action_bounds
+
+    That matters because a fixed ``[-1, 1]`` box (what this used to default to) is correct
+    *only* for a holonomic fleet with ``max_speed == 1.0`` under
+    :attr:`~swarp.dynamics.base.ControlMode.VELOCITY`. Every built-in scenario happens to
+    use exactly that, so the old default was right out of the box and went wrong silently
+    the moment anything changed:
+
+    - ``max_speed=3.0`` throttled the policy to a third of the achievable velocity;
     - ``ControlMode.ACCELERATION`` bounds against ``max_accel``, which the built-ins set
       to ``2 * max_speed``;
     - the kinematic bicycle's second slot is a steering *angle* (``±max_steer``,
       default ``pi/4``), not a speed;
     - a quadrotor's four slots are per-rotor thrusts in ``[0, thrust_max]``, so under
-      ``[-1, 1]`` **the drone cannot reach hover** (``mass * gravity`` needs ~2.45 N per
-      rotor against a declared cap of 1.0) and the whole negative half of the box maps
-      to identical, zero-gradient dynamics.
+      ``[-1, 1]`` **the drone could not reach hover** (``mass * gravity`` needs ~2.45 N
+      per rotor against a declared cap of 1.0) and the whole negative half of the box
+      mapped to identical, zero-gradient dynamics.
 
-    Pass :attr:`~swarp.core.environment.Environment.action_bounds` to get the box the
-    kernels actually enforce::
+    To override, pass a scalar (broadcast over every agent and slot) or any tensor
+    broadcastable to ``[n_envs, n_agents, act_dim]`` — a single scalar pair cannot express
+    the bicycle's or the drone's box, which is why per-slot tensors are allowed::
 
-        low, high = env.action_bounds          # [n_agents, act_dim] each
-        tenv = SwarpEnv(env, action_low=low, action_high=high)
+        tenv = SwarpEnv(env, action_low=-1.0, action_high=1.0)   # opt back in to a unit box
 
-    The bounds accept a scalar (broadcast over every agent and slot) or any tensor
-    broadcastable to ``[n_envs, n_agents, act_dim]`` — a single scalar pair cannot
-    express the bicycle's or the drone's box, which is why per-slot tensors are allowed.
-    The default stays ``[-1, 1]`` for backward compatibility; it is not the physically
-    correct answer, only the historical one.
+    Either bound left ``None`` takes its side from ``env.action_bounds``, so overriding
+    one does not revert the other to a guess.
 
     Termination
     -----------
@@ -94,9 +97,17 @@ class SwarpEnv(EnvBase):
     def __init__(
         self,
         env: Environment,
-        action_low: float | torch.Tensor = -1.0,
-        action_high: float | torch.Tensor = 1.0,
+        action_low: float | torch.Tensor | None = None,
+        action_high: float | torch.Tensor | None = None,
     ) -> None:
+        # Default to the box the kernels actually clamp against. Either bound left None
+        # takes its side from ``env.action_bounds``, so overriding one does not silently
+        # revert the other to a guess.
+        lo_default, hi_default = env.action_bounds
+        if action_low is None:
+            action_low = lo_default
+        if action_high is None:
+            action_high = hi_default
         super().__init__(device=env.device, batch_size=torch.Size([env.n_envs]))
         self._env = env
         self.n_agents = env.n_agents
@@ -112,11 +123,11 @@ class SwarpEnv(EnvBase):
     def _action_bound(self, val: float | torch.Tensor, dtype: torch.dtype):
         """Normalize one action bound to what ``Bounded`` wants.
 
-        A scalar is passed straight through (so the ``[-1, 1]`` default produces exactly
-        the spec it always did); anything else is broadcast to the full
+        A scalar is passed straight through, so an explicit scalar pair still produces a
+        plain scalar-bounded spec; anything else is broadcast to the full
         ``[n_envs, n_agents, act_dim]`` action shape, which is the only form that can
         carry a per-slot box (bicycle: accel + steering angle; drone: four one-sided
-        rotor thrusts).
+        rotor thrusts) — and therefore the form the ``env.action_bounds`` default takes.
         """
         shape = (self._env.n_envs, self.n_agents, self.act_dim)
         if not isinstance(val, torch.Tensor):
@@ -240,5 +251,7 @@ class SwarpEnv(EnvBase):
         )
 
     def _set_seed(self, seed: int | None) -> None:
+        # TorchRL's contract is "set the RNG state", and collectors call this during
+        # worker setup — so it must not restart the episode the way reset(seed=...) does.
         if seed is not None:
-            self._env.reset(seed=seed)
+            self._env.seed(seed)

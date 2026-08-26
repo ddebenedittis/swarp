@@ -42,12 +42,24 @@ class StepRuntime:
         n_envs: batch size (fixed for the runtime's lifetime).
         act_dim: env-level action width.
         use_graph: attempt CUDA-graph capture. Falls back to eager persistent
-            execution (with a one-time warning) when the device is CPU or the
-            neighbor backend allocates during a build (the ``wp.HashGrid``
-            ``"grid"`` method).
+            execution when the device is CPU or the neighbor backend allocates
+            during a build (the ``wp.HashGrid`` ``"grid"`` method).
+        warn_on_fallback: whether that fallback warns. True when the caller *asked*
+            for capture — they demanded something they did not get, and should hear
+            about it. False when capture was inferred (``Environment``'s
+            ``use_graph="auto"``), where the fallback is the intended behaviour and a
+            warning would only tell the user off for a default they never chose.
     """
 
-    def __init__(self, stepper: Stepper, n_envs: int, act_dim: int, use_graph: bool = True) -> None:
+    def __init__(
+        self,
+        stepper: Stepper,
+        n_envs: int,
+        act_dim: int,
+        use_graph: bool = True,
+        *,
+        warn_on_fallback: bool = True,
+    ) -> None:
         self.stepper = stepper
         self.n_envs = n_envs
         self.act_dim = act_dim
@@ -74,13 +86,12 @@ class StepRuntime:
         )
 
         # Capture eligibility: CUDA + an allocation-free neighbor backend.
-        self._want_graph = use_graph
         self._can_graph = use_graph and self.device.startswith("cuda")
         if self._can_graph and stepper.collisions:
             method = stepper.grid(n_envs).method
             if method not in ("brute", "uniform_grid"):
                 self._can_graph = False
-        if use_graph and not self._can_graph:
+        if use_graph and not self._can_graph and warn_on_fallback:
             warnings.warn(
                 "CUDA-graph capture unavailable (needs a CUDA device and the "
                 "brute/uniform_grid neighbor backend); using eager persistent "
@@ -267,8 +278,12 @@ class CudaGraphStep:
     with ``wp.ScopedCapture``; each call copies the incoming state+actions into
     the fixed inputs, replays the graph, and returns cloned outputs. The step
     must be allocation-free during capture, so it requires a CUDA device and a
-    non-allocating neighbor path (the brute-force backend, i.e. the default for
-    up to a few hundred agents/env; the hash / uniform-grid builders allocate).
+    neighbor backend that does not allocate *during a build*: ``brute`` and
+    ``uniform_grid`` both qualify — the latter allocates its sort scratch lazily on the
+    first build and reuses it thereafter, which the warm-up above forces before capture.
+    Only the ``wp.HashGrid`` ``"grid"`` backend is ineligible, because Warp reserves
+    inside every ``build``. This is the same eligibility rule :class:`StepRuntime`
+    applies, and where it gets its ``brute``/``uniform_grid`` allow-list.
     Determinism and no-host-copy behaviour are unchanged (same kernels).
     """
 

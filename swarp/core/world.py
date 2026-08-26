@@ -49,11 +49,19 @@ class World:
         substeps: int = 1,
         dtype: torch.dtype = torch.float32,
     ) -> None:
+        if n_envs < 1:
+            raise ValueError(f"n_envs must be >= 1, got {n_envs}")
         self.n_envs = n_envs
         self.n_agents = len(agent_configs)
-        self.device = device
+        self.device = str(device)
         self.dtype = dtype
-        self.wp_dtype = TORCH_TO_WP[dtype]
+        try:
+            self.wp_dtype = TORCH_TO_WP[dtype]
+        except KeyError:
+            supported = ", ".join(str(k) for k in TORCH_TO_WP)
+            raise TypeError(
+                f"unsupported dtype {dtype!r} for World; supported: {supported}"
+            ) from None
         self.agent_configs = agent_configs
         # Env-level action width: max arity over agent models (models ignore
         # slots beyond their own). All current 2D vehicle models use 2.
@@ -137,17 +145,29 @@ class World:
             self.state = warp_step(self.stepper, self.state, actions)
             self.ran_post_physics = False
 
-    def enable_persistent(self, use_graph: bool = True) -> None:
+    def enable_persistent(self, use_graph: bool = True, *, graph_requested: bool = True) -> None:
         """Switch to persistent-buffer execution (optionally CUDA-graph-backed).
 
         Builds a :class:`~swarp.interop.persistent.StepRuntime`, seeds it with the
         current state, and rebinds ``self.state`` to the runtime's stable
         zero-copy views. The no-grad :meth:`step` then routes through the runtime;
         grad steps transparently fall back to the functional path.
+
+        ``graph_requested=False`` says ``use_graph`` was *inferred* rather than asked for
+        (``Environment``'s ``use_graph="auto"``), which suppresses the warning when
+        capture turns out to be unavailable — see ``StepRuntime``'s ``warn_on_fallback``.
+        Eager persistent execution is still a real win over the functional step, so the
+        fallback is the intended outcome there, not a degradation worth reporting.
         """
         from swarp.interop.persistent import StepRuntime
 
-        self.runtime = StepRuntime(self.stepper, self.n_envs, self.act_dim, use_graph=use_graph)
+        self.runtime = StepRuntime(
+            self.stepper,
+            self.n_envs,
+            self.act_dim,
+            use_graph=use_graph,
+            warn_on_fallback=graph_requested,
+        )
         self.runtime.load_state(self.state)
         self.state = self.runtime.state_views
         self._persistent = True

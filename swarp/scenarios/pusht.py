@@ -217,6 +217,32 @@ class PushTScenario(FusedScenario):
         self.tee_ang_vel = torch.zeros(n_envs, **tt)
         self.goal_pos = torch.zeros(n_envs, 2, **tt)
         self.goal_theta = torch.zeros(n_envs, **tt)
+        # The per-shape world poses handed to the engine. These are *derived* from
+        # ``tee_*`` (unlike transport's package poses, which the obstacle spec can alias
+        # directly), so they get buffers of their own that ``_install_obstacles`` writes
+        # into. Persistent, because the ``Obstacles`` spec built just below aliases them:
+        # that is what lets every later install re-use one already-resolved spec.
+        self._box_centers = torch.zeros(n_envs, self.n_boxes, 2, **tt)
+        self._box_angles = torch.zeros(n_envs, self.n_boxes, **tt)
+        self._box_vel = torch.zeros(n_envs, self.n_boxes, 2, **tt)
+        self._box_ang_vel = torch.zeros(n_envs, self.n_boxes, **tt)
+        # Built and resolved once. ``resolve`` is a no-op for a field that is already on
+        # the right device/dtype and contiguous, so the resolved spec's tensors *share
+        # storage* with the four buffers above — writing them is writing the spec.
+        self._obstacles = Obstacles(
+            self._box_centers,
+            self._obs_radius,
+            shape=self._obs_shape,
+            angle=self._box_angles,  # per-env: the T rotates independently in each env
+            half_extents=self._obs_half,
+            vel=self._box_vel,
+            ang_vel=self._box_ang_vel,
+            kind=self._obs_kind,
+            mass=self._obs_mass,
+            inertia=self._obs_inertia,
+            body=self._obs_body,
+            body_offset=self._box_off_t,
+        ).resolve(self.world.device, self.world.dtype)
         # Shaping baselines: left None so the first refresh seeds them from the fresh pose
         # (shaping 0) rather than from zeros; the spec adopts them with alloc="if_none".
         self._prev_dist: torch.Tensor | None = None
@@ -308,15 +334,20 @@ class PushTScenario(FusedScenario):
 
     def _box_poses(self) -> tuple[torch.Tensor, torch.Tensor]:
         """The two box centres ``[n_envs, n_boxes, 2]`` and angles ``[n_envs, n_boxes]``
-        for the current T pose (torch; the fused path does this inside the body kernel)."""
+        for the current T pose, written **into** the persistent pose buffers.
+
+        Torch (the fused path does this inside the body kernel). Returns the buffers so the
+        caller can go on using them as plain tensors.
+        """
         th = self.tee_theta.detach()
         ca, sa = torch.cos(th), torch.sin(th)  # [E]
         ox, oy = self._box_off_t[:, 0], self._box_off_t[:, 1]  # [B]
         # rotate each local offset into world: R(theta) @ off
         wx = ca.unsqueeze(1) * ox - sa.unsqueeze(1) * oy  # [E, B]
         wy = sa.unsqueeze(1) * ox + ca.unsqueeze(1) * oy
-        centers = self.tee_pos.detach().unsqueeze(1) + torch.stack([wx, wy], dim=-1)
-        return centers, th.unsqueeze(1).expand(-1, self.n_boxes)
+        self._box_centers.copy_(self.tee_pos.detach().unsqueeze(1) + torch.stack([wx, wy], dim=-1))
+        self._box_angles.copy_(th.unsqueeze(1).expand(-1, self.n_boxes))
+        return self._box_centers, self._box_angles
 
     def _install_obstacles(self) -> None:
         """Seed the engine's movable body from ``tee_*``.
@@ -325,34 +356,34 @@ class PushTScenario(FusedScenario):
         body instead of the engine). The engine derives the body's own pose from the root
         shape and takes its velocity from the root, so writing the shapes' world poses is
         enough to hand over the whole state.
+
+        The spec is built once, in ``make_world``, and **re-installed** rather than
+        rebuilt: it aliases the four ``_box_*`` buffers this method writes, and both
+        ``Obstacles.resolve`` and ``Obstacles.any_movable`` memoize, so the re-install
+        neither allocates a 12-field spec nor pays ``any_movable``'s reduction plus
+        ``.item()`` device->host sync. Building a fresh spec per call — as this used to —
+        put that sync on every reset, i.e. on every step under ``auto_reset=True``.
+
+        Unlike transport's, this install is *never* inside a graph capture: the T is a
+        movable body, so ``Stepper._install`` always derives the body group in torch. It
+        therefore has to be sync-free, not capture-safe. ``_box_*`` are framework-side
+        buffers that nothing outside this method reassigns — the grad path reassigns
+        ``tee_*``, which these are *derived from* rather than aliases of — so the retained
+        spec can never go stale and needs no pointer re-check.
         """
-        centers, angles = self._box_poses()
+        centers, _ = self._box_poses()
         # Each box's own velocity: the body's linear velocity plus omega x r, where r is
         # the lever from the T centroid to that box centre. Contact damping needs it —
         # without it the agents are damped against their absolute velocity and the
         # moving T applies drag unrelated to the contact.
         r = centers - self.tee_pos.detach().unsqueeze(1)  # [E, B, 2]
         om = self.tee_ang_vel.detach().unsqueeze(1)  # [E, 1]
-        vel = self.tee_vel.detach().unsqueeze(1) + torch.stack(
-            [-om * r[..., 1], om * r[..., 0]], dim=-1
+        self._box_vel.copy_(
+            self.tee_vel.detach().unsqueeze(1)
+            + torch.stack([-om * r[..., 1], om * r[..., 0]], dim=-1)
         )
-        ang_vel = om.expand(-1, self.n_boxes)
-        self.world.set_obstacles(
-            Obstacles(
-                centers,
-                self._obs_radius,
-                shape=self._obs_shape,
-                angle=angles,  # per-env: the T rotates independently in each env
-                half_extents=self._obs_half,
-                vel=vel,
-                ang_vel=ang_vel,
-                kind=self._obs_kind,
-                mass=self._obs_mass,
-                inertia=self._obs_inertia,
-                body=self._obs_body,
-                body_offset=self._box_off_t,
-            )
-        )
+        self._box_ang_vel.copy_(om.expand(-1, self.n_boxes))
+        self.world.set_obstacles(self._obstacles)
 
     def _sync_from_engine(self) -> None:
         """Copy the engine's body state into ``tee_*`` (the obs/reward inputs).

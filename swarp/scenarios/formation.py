@@ -5,6 +5,14 @@ radius ``formation_radius`` centred at a per-env point. The reward is
 position-shaping toward the assigned slot (``(prev_dist - dist) * factor``, the
 same shaping NavigationScenario uses) plus a soft collision penalty, so the team
 converges onto — and holds — the shape.
+
+**Scaling.** Both the torch path and the fused kernels do the inter-agent part of the
+observation as **O(n_agents^2)** all-pairs work rather than walking the neighbor list.
+That is deliberate: the fused path exists to match the torch parity oracle bit-for-bit,
+and the neighbor list is truncated at ``max_neighbors``, so reading it would make the two
+paths disagree by construction whenever the list overflowed. The quadratic term is the
+price of that guarantee — fine at the tens-of-agents this scenario is written for, and
+worth knowing about before pushing ``n_agents`` into the hundreds.
 """
 
 from __future__ import annotations

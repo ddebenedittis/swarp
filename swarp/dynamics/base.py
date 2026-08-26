@@ -30,9 +30,32 @@ MODEL_ACTION_DIM = {
 }
 
 
-def action_dim(model: DynamicsModel) -> int:
+def _coerce(enum_cls, val, argname: str):
+    """``val`` as a member of ``enum_cls``, accepting the member, its name or its value.
+
+    Every other string-ish option in the API takes a string — ``neighbor_method``,
+    ``bounds_mode``, ``use_graph``, the scenario name — so ``model="drone"`` has to work
+    too. Names are matched case-insensitively with ``-`` and ``_`` interchangeable, which
+    is what lets a CLI ``--model diff-drive`` reach the enum unaltered.
+    """
+    if isinstance(val, enum_cls):
+        return val
+    if isinstance(val, str):
+        key = val.strip().upper().replace("-", "_")
+        try:
+            return enum_cls[key]
+        except KeyError:
+            valid = ", ".join(m.name.lower() for m in enum_cls)
+            raise ValueError(
+                f"unknown {argname} {val!r}; valid names are {valid} "
+                f"(or a {enum_cls.__name__} member)"
+            ) from None
+    return enum_cls(val)  # an int, or anything else the enum accepts by value
+
+
+def action_dim(model: DynamicsModel | str) -> int:
     """Action arity for a dynamics model. See :func:`action_bounds` for the limits."""
-    return MODEL_ACTION_DIM[model.name]
+    return MODEL_ACTION_DIM[_coerce(DynamicsModel, model, "model").name]
 
 
 class ControlMode(IntEnum):
@@ -112,8 +135,12 @@ P_GRAVITY = _COL["gravity"]  # gravitational acceleration (m/s^2)
 class AgentConfig:
     """Static per-agent definition: model, shape, and actuation limits."""
 
-    model: DynamicsModel = DynamicsModel.HOLONOMIC
-    ctrl_mode: ControlMode = ControlMode.VELOCITY
+    #: Accepts the enum member, its name as a string (``"drone"``, ``"diff-drive"``), or
+    #: its int value; ``__post_init__`` normalizes it to the member. Same for
+    #: ``ctrl_mode``. This is the one boundary every scenario's fleet passes through, so
+    #: coercing here is what makes ``swarp.make("navigation", model="drone")`` work.
+    model: DynamicsModel | str | int = DynamicsModel.HOLONOMIC
+    ctrl_mode: ControlMode | str | int = ControlMode.VELOCITY
     radius: float = 0.05
     mass: float = 1.0
     max_speed: float = 1.0
@@ -133,6 +160,8 @@ class AgentConfig:
     gravity: float = 9.81
 
     def __post_init__(self) -> None:
+        self.model = _coerce(DynamicsModel, self.model, "model")
+        self.ctrl_mode = _coerce(ControlMode, self.ctrl_mode, "ctrl_mode")
         if self.l_f + self.l_r <= 0.0:
             raise ValueError("Bicycle wheelbase l_f + l_r must be positive.")
         for name in ("radius", "mass", "max_speed", "max_accel", "max_ang_vel", "max_ang_accel"):

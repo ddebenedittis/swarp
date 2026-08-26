@@ -44,6 +44,10 @@ class FlockingScenario(FusedScenario):
         self.alignment = alignment
         self.separation = separation
         self.separation_dist = separation_dist
+        # Provisional obs width so ``obs_dim`` answers before ``make_world``: it mirrors
+        # this scenario's own ``max_neighbors`` default. ``make_world`` re-derives it
+        # from the *resolved* config, so a ``world_config`` override still wins.
+        self._k_obs = min(self.neighbor_obs, min(32, max(4, self.n_agents)))
 
     def make_world(self, n_envs, device, dt, substeps, dtype, world_config=None) -> World:
         cfgs = [

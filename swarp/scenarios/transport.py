@@ -16,6 +16,14 @@ The package integration is plain torch, so gradients flow package->agent->action
 across a rollout (BPTT); the intra-step agent-avoids-package force is not taped
 (obstacles are constants inside a Warp step), a documented limitation of this
 first pass vs. a full in-tape rigid body.
+
+The three steps above describe the **torch reference path** — the parity oracle, and the
+only path that carries gradients. The no-grad hot path does the same physics in
+``transport_body_kernel`` (:mod:`swarp.scenarios.transport_kernels`) instead: the force
+gather, the integration and the pose write-back all happen on-device inside the fused
+whole-step hook, so nothing crosses back into torch per step and the whole step stays
+capturable as one CUDA graph. The two are tested against each other in
+``tests/scenarios/test_transport_fused.py``.
 """
 
 from __future__ import annotations

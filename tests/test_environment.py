@@ -1,10 +1,12 @@
 """Environment + NavigationScenario API behavior."""
 
+import warnings
+
 import pytest
 import torch
 from conftest import DEVICES
 
-from swarp import DynamicsModel, Environment, NavigationScenario
+from swarp import DynamicsModel, Environment, NavigationScenario, WorldConfig
 
 
 def make_env(device, n_envs=8, n_agents=3, **kw):
@@ -241,6 +243,33 @@ def test_default_step_outputs_alias_and_clone_outputs_snapshots(device):
 
 
 @pytest.mark.parametrize("device", DEVICES)
+def test_clone_outputs_also_clones_info(device):
+    """``info`` values are views into the scenario's fused buffers, exactly like obs and
+    reward, and the docs list them among the zero-copy returns the flag remedies. So the
+    flag has to cover them — it used to hand back the scenario's live dict."""
+    cloned = make_env(device, n_envs=4, n_agents=2, clone_outputs=True)
+    cloned.reset(seed=0)
+    act = torch.full((4, 2, cloned.act_dim), 0.5, device=device)
+    with torch.no_grad():
+        info = cloned.step(act)[4]
+        tensors = {k: v for k, v in info.items() if torch.is_tensor(v)}
+        assert tensors, "navigation reports info tensors; the check is vacuous without them"
+        snapshot = {k: v.clone() for k, v in tensors.items()}
+        cloned.step(act * -1.0)  # a different action, so the buffers really do move
+    for k, before in snapshot.items():
+        assert torch.equal(tensors[k], before), f"info[{k!r}] was not cloned"
+
+    # ...and without the flag they alias, which is the documented default.
+    aliased = make_env(device, n_envs=4, n_agents=2)
+    aliased.reset(seed=0)
+    with torch.no_grad():
+        live = {k: v for k, v in aliased.step(act)[4].items() if torch.is_tensor(v)}
+        snap = {k: v.clone() for k, v in live.items()}
+        aliased.step(act * -1.0)
+    assert any(not torch.equal(live[k], snap[k]) for k in snap)
+
+
+@pytest.mark.parametrize("device", DEVICES)
 def test_env_forwards_obs_dim_and_act_dim(device):
     env = make_env(device, n_envs=4, n_agents=3, neighbor_obs=2)
     assert env.obs_dim == env.scenario.obs_dim
@@ -268,6 +297,25 @@ def test_use_graph_auto_is_on_for_a_capturable_fused_scenario():
     # graph is not what the 2.5-5x in docs/benchmarks.md measures.
     plain = make_env("cuda:0", n_envs=4, n_agents=2, fused=False)
     assert plain.world.runtime is None
+
+
+@pytest.mark.gpu(reason="the capture-eligibility gate only exists on CUDA")
+def test_auto_use_graph_does_not_warn_about_a_capture_nobody_asked_for():
+    """``"auto"`` gates on a hook and a CUDA device but *not* on the neighbor backend, so
+    the ``"grid"`` backend lands in eager persistent execution. That is the intended
+    outcome — eager persistent still beats the functional step — and warning about it
+    would scold the user for a default they never chose."""
+    cfg = WorldConfig(neighbor_method="grid")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        auto = make_env("cuda:0", n_envs=8, n_agents=2, world_config=cfg)
+    assert auto.world.runtime is not None  # persistent...
+    assert not auto.graph_mode  # ...but not captured
+
+    # An explicit request still warns: that caller demanded capture and did not get it.
+    with pytest.warns(UserWarning, match="CUDA-graph capture unavailable"):
+        asked = make_env("cuda:0", n_envs=8, n_agents=2, use_graph=True, world_config=cfg)
+    assert asked.world.runtime is not None and not asked.graph_mode
 
 
 def test_public_exports_are_importable_and_sorted():

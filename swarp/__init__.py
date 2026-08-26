@@ -90,12 +90,12 @@ def make(name: str, n_envs: int, **kwargs) -> Environment:
 
     Remaining keywords are routed by name: those the ``Environment`` constructor
     accepts (``device``, ``dt``, ``substeps``, ``dtype``, ``max_steps``, ``seed``,
-    ``auto_reset``, ``use_graph``, ``clone_outputs``, ``fused``) go to it, and every
-    other keyword goes to the scenario constructor (``n_agents``, ``world_size``,
-    ``model``, ...). The two parameter sets are disjoint — a test pins that — so
-    the split is unambiguous; construct the scenario yourself to bypass it.
+    ``auto_reset``, ``use_graph``, ``clone_outputs``, ``fused``, ``world_config``) go to
+    it, and every other keyword goes to the scenario constructor (``n_agents``,
+    ``world_size``, ``model``, ...). The two parameter sets are disjoint — a test pins
+    that — so the split is unambiguous; construct the scenario yourself to bypass it.
 
-    ``model=`` is dropped for holonomic-only scenarios (see
+    ``model=`` is dropped, with a warning, for holonomic-only scenarios (see
     :func:`swarp.scenarios.make_scenario`).
     """
     env_kwargs = {k: v for k, v in kwargs.items() if k in _ENV_KWARGS}

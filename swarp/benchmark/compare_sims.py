@@ -142,7 +142,7 @@ def _child(sim, scenario, n_envs, n_agents, steps, warmup, device) -> None:
     except CpuOnlyError:
         print("CPU-only")
         return
-    except Exception as e:  # noqa: BLE001 — sentinel for the parent; traceback -> stderr
+    except Exception as e:  # sentinel for the parent; traceback -> stderr
         if _is_oom(e):
             print("OOM")
             return

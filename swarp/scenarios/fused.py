@@ -245,7 +245,6 @@ class FusedScenario(Scenario):
                     "framework-owned buffer is never reassigned, so nothing can move"
                 )
             self._fused_bind(b, self._fused_acquire(b, n_envs))
-        self._fused_spec = spec
         self._fused_carries = tuple(b for b in spec if b.carry)
         self._fused_watch = tuple(b for b in spec if b.watch)
         self._fused_mask = masks[0].name if masks else None
