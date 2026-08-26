@@ -40,6 +40,7 @@ __all__ = [
     "TransportScenario",
     "fused_scenarios",
     "make_scenario",
+    "register_scenario",
     "resolve_scenarios",
     "scenario_class",
     "supports_model",
@@ -55,6 +56,50 @@ SCENARIOS: dict[str, type[Scenario]] = {
     "transport": TransportScenario,
     "pusht": PushTScenario,
 }
+
+
+# -------------------------------------------------------------------- registration
+
+
+def register_scenario(name: str, cls: type[Scenario], *, overwrite: bool = False) -> None:
+    """Register an out-of-tree scenario under ``name``.
+
+    This is how a scenario that lives outside the package reaches everything that reads
+    the registry — :func:`swarp.make`, :func:`make_scenario`, :func:`scenario_class`,
+    :func:`fused_scenarios`, :func:`resolve_scenarios`, and the benchmark CLIs that take
+    ``--scenario`` — without editing (or forking) the installed package::
+
+        from swarp.scenarios import register_scenario
+
+        register_scenario("my_task", MyTaskScenario)
+        env = swarp.make("my_task", n_envs=4096, n_agents=8)
+
+    Built-in scenarios are entries in the :data:`SCENARIOS` literal instead; this is the
+    door for everyone else. The registry is process-global, so call it at import time of
+    the module defining the scenario.
+
+    Args:
+        name: the short name callers will pass.
+        cls: a :class:`~swarp.scenarios.base.Scenario` subclass (the class, not an
+            instance — the registry constructs it per environment).
+        overwrite: allow replacing an existing entry. Off by default so a name
+            collision — including shadowing a built-in — is an error rather than a
+            silent swap.
+
+    Raises:
+        TypeError: ``cls`` is not a ``Scenario`` subclass.
+        ValueError: ``name`` is empty, or already registered and ``overwrite`` is False.
+    """
+    if not name:
+        raise ValueError("scenario name must be a non-empty string")
+    if not (isinstance(cls, type) and issubclass(cls, Scenario)):
+        raise TypeError(f"cls must be a Scenario subclass, got {cls!r}")
+    if name in SCENARIOS and not overwrite:
+        raise ValueError(
+            f"scenario {name!r} is already registered as {SCENARIOS[name].__name__}; "
+            "pass overwrite=True to replace it"
+        )
+    SCENARIOS[name] = cls
 
 
 # ------------------------------------------------------------------ introspection

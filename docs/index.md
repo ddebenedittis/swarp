@@ -71,7 +71,7 @@ env = swarp.make("navigation", n_envs=4096, n_agents=8, device="cuda:0")
 obs = env.reset()
 for _ in range(100):
     actions = torch.rand(4096, 8, 2, device="cuda:0") * 2 - 1
-    obs, reward, done, info = env.step(actions)
+    obs, reward, term, trunc, info = env.step(actions)
 ```
 
 [Installation](installation.md) covers the extras (viewer, TorchRL, benchmarks); [Quickstart](quickstart.md) walks the loop above line by line.

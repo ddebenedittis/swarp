@@ -25,7 +25,8 @@ class SwarpEnv(EnvBase):
 
     Observations are keyed ``"observation"`` ``[n_envs, n_agents, obs_dim]``;
     actions ``"action"`` ``[n_envs, n_agents, act_dim]``; reward
-    ``[n_envs, n_agents, 1]``; a shared per-env ``done`` ``[n_envs, 1]``.
+    ``[n_envs, n_agents, 1]``; shared per-env ``done``/``terminated``/``truncated``
+    ``[n_envs, 1]``.
 
     Action bounds
     -------------
@@ -58,6 +59,15 @@ class SwarpEnv(EnvBase):
     express the bicycle's or the drone's box, which is why per-slot tensors are allowed.
     The default stays ``[-1, 1]`` for backward compatibility; it is not the physically
     correct answer, only the historical one.
+
+    Termination
+    -----------
+    ``terminated`` is the scenario's own terminal condition; ``truncated`` is the
+    ``max_steps`` time limit; ``done`` is their OR, which is what TorchRL's resetters
+    key off. Because the time limit no longer masquerades as a terminal state, GAE and
+    the other value estimators bootstrap correctly through a timeout instead of
+    truncating the return at every episode boundary — a scenario with a ``max_steps``
+    no longer needs to reconstruct its real terminal condition from ``info``.
 
     Scenario ``info()``
     -------------------
@@ -162,10 +172,11 @@ class SwarpEnv(EnvBase):
             shape=(ne,),
             device=self.device,
         )
-        # A single shared done/terminated per env.
+        # A single shared done/terminated/truncated per env.
         self.done_spec = Composite(
             done=Unbounded(shape=(ne, 1), dtype=torch.bool, device=self.device),
             terminated=Unbounded(shape=(ne, 1), dtype=torch.bool, device=self.device),
+            truncated=Unbounded(shape=(ne, 1), dtype=torch.bool, device=self.device),
             shape=(ne,),
             device=self.device,
         )
@@ -185,6 +196,7 @@ class SwarpEnv(EnvBase):
                 "observation": obs,
                 "done": torch.zeros(ne, 1, dtype=torch.bool, device=self.device),
                 "terminated": torch.zeros(ne, 1, dtype=torch.bool, device=self.device),
+                "truncated": torch.zeros(ne, 1, dtype=torch.bool, device=self.device),
             },
             batch_size=self.batch_size,
             device=self.device,
@@ -198,17 +210,19 @@ class SwarpEnv(EnvBase):
 
     def _step(self, tensordict: TensorDict) -> TensorDict:
         action = tensordict.get("action")
-        obs, reward, done, info = self._env.step(action)
+        obs, reward, terminated, truncated, info = self._env.step(action)
         # Fused / graph-mode outputs are zero-copy views into persistent buffers
         # overwritten next step; collectors hold refs across steps, so clone.
-        obs, reward, done = obs.clone(), reward.clone(), done.clone()
-        done = done.reshape(-1, 1)
+        obs, reward = obs.clone(), reward.clone()
+        terminated = terminated.clone().reshape(-1, 1)
+        truncated = truncated.clone().reshape(-1, 1)
         out = TensorDict(
             {
                 "observation": obs,
                 "reward": reward.unsqueeze(-1),
-                "done": done,
-                "terminated": done,
+                "done": terminated | truncated,
+                "terminated": terminated,
+                "truncated": truncated,
             },
             batch_size=self.batch_size,
             device=self.device,

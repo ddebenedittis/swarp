@@ -252,8 +252,8 @@ def fused_rollout(env, n_steps, device, n_agents, spec, *, dtype=torch.float32):
             a = torch.empty(env.n_envs, n_agents, 2, device=device, dtype=dtype).uniform_(
                 -1, 1, generator=gen
             )
-            obs, rew, done, info = env.step(a)
-            out.append(tuple(_pick(f, obs, rew, done, info).clone() for f in spec.fields))
+            obs, rew, term, trunc, info = env.step(a)
+            out.append(tuple(_pick(f, obs, rew, term | trunc, info).clone() for f in spec.fields))
     return out
 
 
@@ -277,12 +277,12 @@ def assert_grad_falls_back_to_torch(env, device, n_agents, spec):
         if i == spec.grad_index:
             act = act.clone().requires_grad_(True)
             with torch.enable_grad():
-                obs, rew, done, _ = env.step(act)
+                obs, rew, *_ = env.step(act)
             assert obs.requires_grad  # torch reference path was taken
             target = rew if spec.grad_backprop == "rew" else obs
             target.pow(2).sum().backward()
             assert act.grad is not None
         else:
             with torch.no_grad():
-                obs, rew, done, _ = env.step(act)
+                obs, rew, *_ = env.step(act)
             assert torch.isfinite(rew).all()

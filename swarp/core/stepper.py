@@ -428,6 +428,9 @@ class Stepper:
                 grid_dim=self.world.grid_dim,
                 method=self.world.neighbor_method,
                 uniform_bins=self.world.uniform_bins,
+                # A pinned world rectangle lets the uniform grid skip its per-build
+                # bounds reduction; None (no declared bounds) keeps the adaptive path.
+                bounds=self.world.bounds,
             )
             self._grids[n_envs] = g
         return g

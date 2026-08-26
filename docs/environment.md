@@ -13,7 +13,7 @@ obs = env.reset()
 with torch.no_grad():
     for _ in range(1000):
         actions = policy(obs)
-        obs, reward, done, info = env.step(actions)
+        obs, reward, term, trunc, info = env.step(actions)
 ```
 
 `step` is differentiable end-to-end when called with grads enabled, and takes a tape-free hot path under `torch.no_grad()` — same kernels, no per-step allocations.
@@ -55,15 +55,21 @@ Getting this wrong is silent — the policy simply trains against a throttled or
 ## Returns
 
 ```python
-obs, reward, done, info = env.step(actions)
+obs, reward, terminated, truncated, info = env.step(actions)
 ```
+
+This is the Gymnasium 5-tuple.
 
 - `obs` — `[n_envs, n_agents, obs_dim]`, the scenario's observation after any auto-reset.
 - `reward` — `[n_envs, n_agents]`, the scenario's per-agent term plus its shared global term.
-- `done` — `[n_envs]` bool, one flag per env (agents in an env terminate together), OR-ed with the `max_steps` timeout when one is set.
+- `terminated` — `[n_envs]` bool, the scenario's own terminal condition (`Scenario.done`), one flag per env (agents in an env terminate together).
+- `truncated` — `[n_envs]` bool, the `max_steps` time limit. When `max_steps is None` this is a cached all-false buffer, so the hot path allocates nothing.
 - `info` — a dict of whatever the scenario chooses to expose; navigation reports `dist_to_goal`, Push-T reports the pose error, and so on.
 
-Reward, done and info describe the transition that was just taken — the terminal state — while `obs` is already the next episode's first observation for any env that auto-reset.
+Episode end — for `auto_reset` and for the internal step counter — is `terminated | truncated`.
+Keeping the two apart is what lets a value estimator bootstrap through a timeout instead of treating it as a real terminal state; `swarp.interop.torchrl.SwarpEnv` forwards both, plus their OR as `done`.
+
+Reward, the two flags and info describe the transition that was just taken — the terminal state — while `obs` is already the next episode's first observation for any env that auto-reset.
 
 :::{warning}
 `clone_outputs` is `False` by default, so these are **zero-copy views of buffers the next step overwrites**.
@@ -122,3 +128,15 @@ Determinism does **not** carry across devices or precisions — float32-on-CUDA 
 
 `env.render(mode="rgb_array", env_index=0)` returns an `(H, W, 3)` uint8 frame and `mode="human"` drives a persistent window; both need the `viz` extra.
 [Visualization](visualization.md) covers the viewer, the overlays and video export.
+
+## Closing
+
+```python
+env.close()
+```
+
+Releases what the env holds outside its own tensors: the render window, and the persistent runtime's captured CUDA graph, whose device-side resources are otherwise pinned for the env's lifetime.
+Useful when a script keeps many environments alive, or hands the GPU to something else.
+
+It is idempotent and **not** a destructor — the state, the buffers and the scenario survive, so stepping afterwards simply recaptures the graph on the next step.
+`env.close_viewer()` still closes only the window.

@@ -130,7 +130,7 @@ def test_fused_per_env_params(device):
         with torch.no_grad():
             for _ in range(10):
                 act = torch.empty(env.n_envs, 5, 2, device=device).uniform_(-1, 1, generator=gen)
-                o, r, d, info = env.step(act)
+                o, r, _, _, info = env.step(act)
                 steps.append((o.clone(), r.clone(), info["collisions"].clone()))
         outs.append(steps)
     for (of, rf, cf), (ot, rt, ct) in zip(outs[0], outs[1], strict=True):

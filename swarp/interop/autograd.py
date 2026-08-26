@@ -67,8 +67,15 @@ def fill_state_defaults(state: TorchState) -> TorchState:
     return state._replace(z=z, vz=vz, attitude=att, body_rates=br)
 
 
-def _wrap_input_state(tensors: TorchState, scalar, with_grad: bool):
-    """Wrap torch tensors as Warp arrays; optionally attach fresh grad buffers."""
+def wrap_input_state(tensors: TorchState, scalar, with_grad: bool):
+    """Wrap torch tensors as Warp arrays; optionally attach fresh grad buffers.
+
+    Part of this module's reusable torch<->Warp bridge, alongside
+    :func:`wrap_actions` and :func:`torch_stream_scope`: anything driving the
+    kernels from torch outside :class:`_WarpStepFn` (``swarp.interop.compile``'s
+    custom op does exactly this) needs the same wrapping to stay consistent with
+    what the adjoint replay expects.
+    """
     n = len(TorchState._fields)
     grads = TorchState(*(torch.zeros_like(t) for t in tensors)) if with_grad else None
     arrays = {}
@@ -83,8 +90,11 @@ def _wrap_input_state(tensors: TorchState, scalar, with_grad: bool):
     return WorldState(**arrays), grads
 
 
-def _wrap_actions(actions: torch.Tensor, scalar, with_grad: bool):
+def wrap_actions(actions: torch.Tensor, scalar, with_grad: bool):
     """Wrap ``[n_envs, n_agents, act_dim]`` actions as a scalar ``array3d``.
+
+    The action-side counterpart to :func:`wrap_input_state`, and public for the same
+    reason: an alternative front end to the step has to wrap actions the same way.
 
     Action arity is decoupled from geometry (``vec2``): the integrate kernel
     reads the scalar slots each model needs, so ``act_dim`` may exceed 2.
@@ -104,7 +114,13 @@ def _wrap_actions(actions: torch.Tensor, scalar, with_grad: bool):
 _STREAM_CACHE: dict[tuple[str, int], object] = {}
 
 
-def _torch_stream_scope(device: str):
+def torch_stream_scope(device: str):
+    """Scope Warp launches onto torch's current stream (``ScopedDevice`` on CPU).
+
+    Every entry point that launches kernels against torch tensors has to open this
+    first, or the launches land on Warp's own stream and race the torch ops that
+    produced their inputs. Cached per ``(device, cudaStream_t)`` — see the note above.
+    """
     if device.startswith("cuda"):
         ts = torch.cuda.current_stream()
         key = (device, ts.cuda_stream)
@@ -186,10 +202,10 @@ class _WarpStepFn(torch.autograd.Function):
         state = TorchState(*state_tensors)
         n_envs = actions.shape[0]
 
-        with _torch_stream_scope(stepper.device):
+        with torch_stream_scope(stepper.device):
             if slot is None:
-                state_wp, in_grads = _wrap_input_state(state, scalar, with_grad=True)
-                actions_wp, act_grad = _wrap_actions(actions, scalar, with_grad=True)
+                state_wp, in_grads = wrap_input_state(state, scalar, with_grad=True)
+                actions_wp, act_grad = wrap_actions(actions, scalar, with_grad=True)
                 out_wp = stepper.alloc_state(n_envs, requires_grad=True)
                 buffers = stepper.make_buffers(n_envs, requires_grad=True)
             else:
@@ -224,7 +240,7 @@ class _WarpStepFn(torch.autograd.Function):
     @staticmethod
     def backward(ctx, *adj_out: torch.Tensor):
         stepper: Stepper = ctx.stepper
-        with _torch_stream_scope(stepper.device):
+        with torch_stream_scope(stepper.device):
             # Adjoint kernels accumulate (+=); zero all tape grads so repeated
             # backward calls on the same graph (retain_graph) stay correct.
             ctx.tape.zero()
@@ -265,7 +281,7 @@ def warp_step(
 
     scalar = _WP_SCALAR[actions.dtype]
     n_envs = actions.shape[0]
-    with _torch_stream_scope(stepper.device):
+    with torch_stream_scope(stepper.device):
         # When ``state`` is the previous step's cached output (the common hot-loop
         # case), its tensors already back a wrapped WorldState — reuse it instead
         # of re-running ``wp.from_torch`` on all nine fields.
@@ -273,7 +289,7 @@ def warp_step(
         if cached_in is not None:
             state_wp = cached_in
         else:
-            state_wp, _ = _wrap_input_state(state, scalar, with_grad=False)
+            state_wp, _ = wrap_input_state(state, scalar, with_grad=False)
         actions_wp = stepper.wrap_actions(actions, scalar)
         # Recycled ping-pong output (zero steady-state allocation); input and
         # output never alias. Returned tensors are valid until this batch size

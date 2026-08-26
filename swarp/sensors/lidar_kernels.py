@@ -1,12 +1,13 @@
 """Warp-kernel lidar backend: ray-circle scan with no dense pairwise intermediate.
 
-The torch backend in :mod:`swarp.sensors.lidar` materializes a full
-``[n_envs, n_agents, n_rays, n_targets, 2]`` tensor, so its memory scales as
-``O(E*A*R*T)``. This kernel computes the identical ranges (same analytic
-ray-circle test) but one thread owns an ``(env, agent)`` cell, loops over rays
-and targets, and keeps a thread-local running-min — so only the ``[E, A, R]``
-output is stored (``O(E*A*R)``, flat in the target count). This is the trick
-Isaac Sim uses to keep high ray counts affordable.
+The torch backend in :mod:`swarp.sensors.lidar` materializes a family of dense
+``[n_envs, n_agents, n_rays, n_targets]`` tensors (``proj``, ``perp2``, ``thc``,
+``t``, ``valid``), so its memory scales as ``O(E*A*R*T)``. This kernel computes
+the identical ranges (same analytic ray-circle test) but one thread owns an
+``(env, agent)`` cell, loops over rays and targets, and keeps a thread-local
+running-min — so only the ``[E, A, R]`` output is stored (``O(E*A*R)``, flat in
+the target count). This is the trick Isaac Sim uses to keep high ray counts
+affordable.
 
 The kernel is inference-only (launched ``record_tape=False``); the differentiable
 path stays the torch backend. Kept numerically equivalent to ``lidar_scan`` and

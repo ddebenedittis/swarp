@@ -123,3 +123,29 @@ def test_step_matches_underlying_env(device):
     assert out["next", "observation"].shape[0] == 8
     assert torch.isfinite(out["next", "reward"]).all()
     assert out["next", "done"].shape == (8, 1)
+    assert out["next", "terminated"].shape == (8, 1)
+    assert out["next", "truncated"].shape == (8, 1)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_timeout_is_truncated_not_terminated(device):
+    """The ``max_steps`` timeout must surface as ``truncated``, never as ``terminated``.
+
+    Reported as ``terminated``, a timeout makes every value estimator cut the bootstrap
+    at each episode boundary and biases the critic. A parked fleet never reaches its
+    goals, so ``terminated`` has to stay false all the way to the limit.
+    """
+    base = Environment(
+        NavigationScenario(n_agents=2), n_envs=4, device=device, dt=0.1, seed=0, max_steps=3
+    )
+    env = SwarpEnv(base)
+    td = env.reset()
+    action = torch.zeros(4, 2, env.act_dim, device=device)
+    for step in range(3):
+        out = env.step(td.set("action", action))
+        term = out["next", "terminated"]
+        trunc = out["next", "truncated"]
+        assert not bool(term.any())
+        assert bool(trunc.all()) is (step == 2)
+        assert torch.equal(out["next", "done"], term | trunc)
+        td = out["next"].exclude("reward", "done", "terminated", "truncated")

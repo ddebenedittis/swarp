@@ -1,19 +1,17 @@
 """torch.compile-compatible custom-op step: parity, gradients, and a compiled run."""
 
-import pytest
 import torch
 import warp as wp
 
-from swarp.core.config import WorldConfig
 from swarp.core.stepper import Stepper
 from swarp.dynamics.base import AgentConfig, ControlMode, DynamicsModel
 from swarp.interop.autograd import TorchState, warp_step
-from swarp.interop.compile import CudaGraphStep, compiled_warp_step
+from swarp.interop.compile import compiled_warp_step
 
 BIG = 100.0
 
 
-def _stepper(dtype=wp.float64, substeps=1, device="cpu", world=None):
+def _stepper(dtype=wp.float64, substeps=1, device="cpu"):
     cfgs = [
         AgentConfig(
             model=DynamicsModel.DIFF_DRIVE,
@@ -25,7 +23,7 @@ def _stepper(dtype=wp.float64, substeps=1, device="cpu", world=None):
         )
         for _ in range(2)
     ]
-    return Stepper(cfgs, dt=0.1, substeps=substeps, device=device, dtype=dtype, world=world)
+    return Stepper(cfgs, dt=0.1, substeps=substeps, device=device, dtype=dtype)
 
 
 def _state(n_envs=2, n_agents=2, requires_grad=False):
@@ -88,30 +86,3 @@ def test_torch_compile_runs_and_matches():
     compiled = torch.compile(rollout)(state, actions)
     assert torch.isfinite(compiled)
     torch.testing.assert_close(compiled, eager)
-
-
-@pytest.mark.gpu
-def test_cuda_graph_matches_eager():
-    """A CUDA-graph-captured step reproduces the eager no-grad step over a rollout."""
-    world = WorldConfig(collisions=True, collision_k=50.0)  # small fleet -> brute neighbors
-    stepper = _stepper(dtype=wp.float32, substeps=2, device="cuda:0", world=world)
-    n_envs = 16
-
-    def mk_state():
-        g = torch.Generator().manual_seed(1)
-        f = lambda *s: (0.3 * torch.randn(*s, generator=g)).to("cuda:0")  # noqa: E731
-        return TorchState(
-            f(n_envs, 2, 2), f(n_envs, 2), f(n_envs, 2, 2), f(n_envs, 2), f(n_envs, 2)
-        )
-
-    graph = CudaGraphStep(stepper, n_envs, act_dim=2)
-    s_eager = mk_state()
-    s_graph = mk_state()
-    gen = torch.Generator().manual_seed(9)
-    for _ in range(6):
-        a = (0.4 * torch.randn(n_envs, 2, 2, generator=gen)).to("cuda:0")
-        with torch.no_grad():
-            s_eager = warp_step(stepper, s_eager, a)
-        s_graph = graph(s_graph, a)
-    for x, y in zip(s_eager, s_graph, strict=True):
-        torch.testing.assert_close(x, y, rtol=1e-5, atol=1e-6)

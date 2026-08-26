@@ -5,6 +5,37 @@ All notable changes to `swarp`. Newest first. Nothing has been released yet — 
 
 ## Unreleased
 
+### Breaking changes
+
+- **`Environment.step` returns the Gymnasium 5-tuple** `(obs, reward, terminated,
+  truncated, info)` instead of `(obs, reward, done, info)`. `terminated` is the scenario's
+  own terminal condition; `truncated` is the `max_steps` time limit, previously OR-ed into
+  the single `done` flag. Auto-reset and the step counter key off `terminated | truncated`,
+  so episode boundaries are unchanged — only the reporting is. Migration is mechanical:
+  `obs, rew, done, info = env.step(a)` becomes
+  `obs, rew, term, trunc, info = env.step(a)`, with `done = term | trunc` where a single
+  flag is what you want.
+
+  `swarp.interop.torchrl.SwarpEnv` now emits `terminated`, `truncated`, and `done` (their
+  OR), so TorchRL's value estimators bootstrap through a timeout instead of cutting the
+  return at every truncation. `examples/pusht_torchrl.py` no longer has to reconstruct the
+  task terminal from `info` to work around the old behaviour.
+
+### Fixed
+
+- **`Lidar.scan` read the stale installed obstacle pose.** A movable obstacle is
+  integrated in place inside the stepper's own arrays, so `world.obstacle_pos` is its
+  *spawn* pose; the scan now takes the live pose from `World.obstacle_state_views()`, as
+  the renderer already did. Measured divergence before the fix: 1.41 world units after 20
+  Push-T steps.
+- **Segment and box obstacles were mis-modelled by the lidar, not ignored.** Passed
+  through the ray-circle test they reported a phantom hit on a disc of the obstacle's
+  `radius` centred at its origin — for a segment, its midpoint. `Lidar.scan` now filters
+  on `ObstacleShape`, so they are genuinely invisible to the sensor (and still act in the
+  collision step), which is what the docs always claimed.
+- `swarp/render/geometry.py` no longer syncs the device to the host every frame to decide
+  whether any obstacle is movable; it reads the memoized `Obstacles.any_movable`.
+
 ### Scenarios
 
 - **Push-T** (`PushTScenario`): agents push a T-shaped **movable compound rigid body** to a
@@ -41,6 +72,14 @@ All notable changes to `swarp`. Newest first. Nothing has been released yet — 
 - A **batched uniform-grid neighbor backend** (`neighbor_method="uniform_grid"`,
   radix-sort based) that stays linear in `n_envs` and beats brute force past ~512
   agents/env (~4× at 1k, ~10× at 4k on an RTX 3070).
+- **Static-origin uniform grid**: `NeighborGrid(..., bounds=(x_min, x_max, y_min, y_max))`
+  pins the grid frame once instead of re-deriving it from the batch on every build,
+  dropping the three-launch bounds pass (a global-atomic reduction over every position).
+  `Stepper.grid()` passes `World.bounds`, which all seven built-in scenarios set, so they
+  get it for free; `bounds=None` keeps the adaptive path. Measured build time -33% to -35%
+  across `(E, A)` in `{(256, 1024), (64, 4096), (1024, 512)}` on an RTX 3070 Laptop. Exact,
+  not approximate: the edge clamp is safe for any origin once `cell_size >= radius`, and
+  same-cell false candidates were always rejected by the distance filter.
 
 ### Visualization
 
@@ -76,6 +115,9 @@ All notable changes to `swarp`. Newest first. Nothing has been released yet — 
   batched `TensorDict` specs, passes TorchRL's `check_env_specs`.
 - **`torch.compile`-compatible step** (`swarp.interop.compile.compiled_warp_step`): a
   `torch.library.custom_op` with fake-tensor and autograd rules.
+- `CudaGraphStep` moved from `swarp.interop.compile` to `swarp.interop.persistent`, where
+  this changelog already documented it and where it belongs — `compile.py` is otherwise
+  entirely about the `torch.library.custom_op` path.
 
 ### Core
 
@@ -86,6 +128,22 @@ All notable changes to `swarp`. Newest first. Nothing has been released yet — 
 - **Arbitrary action arity**: the action tensor is `[n_envs, n_agents, act_dim]` with
   `act_dim` the max over agent models, decoupling the action space from the geometry.
 - **Neighbor-list overflow is surfaced**, not silently truncated.
+- **`Environment.close()`**: idempotent teardown that closes the render window and
+  releases the persistent runtime's captured CUDA graph (via a new `StepRuntime.release()`)
+  without destroying the env — stepping afterwards simply recaptures.
+- **`swarp.scenarios.register_scenario(name, cls)`**: register an out-of-tree scenario so
+  it reaches `swarp.make`, `make_scenario`, `fused_scenarios()` and the benchmark CLIs
+  without editing the installed package. Re-exported as `swarp.register_scenario`.
+- Four names promoted to the top level: `Obstacles` (needed by any custom-obstacle
+  scenario, and the class the already-exported `ObstacleKind`/`ObstacleShape` annotate),
+  `GradRing`, `drone_config`, `register_scenario`.
+- **14 cross-module private names promoted** to the public surface they already were, with
+  docstrings to match: the three contact primitives `collisions.pair_force` / `box_force` /
+  `closest_on_segment` (what a custom contact model wants), the torch<->Warp bridge
+  `autograd.torch_stream_scope` / `wrap_actions` / `wrap_input_state`, the render helpers
+  `overlays.to_px` / `to_px_batch` / `radius_px` / `get_font` and
+  `renderer.bounds_from_geometry` / `ensure_pygame`, and the benchmark helpers
+  `ablation.parity_ok` / `sync_device` and `compare_vmas.make_vmas`.
 - Cross-simulator throughput benchmark (`swarp.benchmark.compare_sims`: swarp vs VMAS vs
   JaxMARL vs CAMAR, one subprocess per simulator) and a VMAS head-to-head
   (`swarp.benchmark.compare_vmas`). See the [benchmarks](https://ddebenedittis.github.io/swarp/benchmarks.html) page.

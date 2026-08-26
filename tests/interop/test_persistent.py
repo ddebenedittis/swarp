@@ -1,7 +1,8 @@
-"""Persistent-buffer / CUDA-graph execution, slim 2D kernel, and GradRing."""
+"""Persistent-buffer / CUDA-graph execution, slim 2D kernel, GradRing, CudaGraphStep."""
 
 import pytest
 import torch
+import warp as wp
 from conftest import DEVICES
 
 from swarp import (
@@ -14,7 +15,11 @@ from swarp import (
     SamplingScenario,
     TransportScenario,
 )
-from swarp.dynamics.base import ControlMode, DynamicsModel
+from swarp.core.config import WorldConfig
+from swarp.core.stepper import Stepper
+from swarp.dynamics.base import AgentConfig, ControlMode, DynamicsModel
+from swarp.interop.autograd import TorchState, warp_step
+from swarp.interop.persistent import CudaGraphStep
 
 
 def _mk(
@@ -53,8 +58,8 @@ def _run(env, n_steps, device, n_agents, dtype=torch.float32):
             a = torch.empty(env.n_envs, n_agents, 2, device=device, dtype=dtype).uniform_(
                 -1, 1, generator=gen
             )
-            o, r, d, _ = env.step(a)
-            out.append((o.clone(), r.clone(), d.clone()))
+            o, r, term, trunc, _ = env.step(a)
+            out.append((o.clone(), r.clone(), (term | trunc).clone()))
     return out
 
 
@@ -196,12 +201,10 @@ def _run_info(env, n_steps, device, n_agents):
     out = []
     with torch.no_grad():
         for _ in range(n_steps):
-            a = torch.empty(env.n_envs, n_agents, 2, device=device).uniform_(
-                -1, 1, generator=gen
-            )
-            o, r, d, info = env.step(a)
+            a = torch.empty(env.n_envs, n_agents, 2, device=device).uniform_(-1, 1, generator=gen)
+            o, r, term, trunc, info = env.step(a)
             info_c = {k: (v.clone() if torch.is_tensor(v) else v) for k, v in info.items()}
-            out.append((o.clone(), r.clone(), d.clone(), info_c))
+            out.append((o.clone(), r.clone(), (term | trunc).clone(), info_c))
     return out
 
 
@@ -270,8 +273,9 @@ def test_prev_dist_reassignment_recapture(eager_trims):
     def mk(use_graph):
         scen = NavigationScenario(n_agents=4, neighbor_method="brute")
         scen.eager_trims = eager_trims  # an ablation knob, set directly (not a ctor kwarg)
-        return Environment(scen, n_envs=16, device=dev, dt=0.05, seed=0, max_steps=50,
-                           use_graph=use_graph)
+        return Environment(
+            scen, n_envs=16, device=dev, dt=0.05, seed=0, max_steps=50, use_graph=use_graph
+        )
 
     g, e = mk(True), mk(False)
     for env in (g, e):
@@ -296,11 +300,12 @@ def test_prev_dist_reassignment_recapture(eager_trims):
     with torch.no_grad():
         for _ in range(4):  # resume no-grad; recapture happens lazily on the first
             a = torch.empty(16, 4, 2, device=dev).uniform_(-1, 1, generator=gen)
-            og, rg, dg, _ = g.step(a)
-            oe, re, de, _ = e.step(a)
+            og, rg, tg, ug, _ = g.step(a)
+            oe, re, te, ue, _ = e.step(a)
             assert torch.equal(og, oe)
             assert torch.equal(rg, re)
-            assert torch.equal(dg, de)
+            assert torch.equal(tg, te)
+            assert torch.equal(ug, ue)
     if eager_trims:
         assert g.scenario.fused_token() == tok0
         assert g.world.runtime._graph is graph0
@@ -442,3 +447,46 @@ def test_gradring_capacity_guard():
     ring.acquire()
     with pytest.raises(RuntimeError, match="capacity"):
         ring.acquire()
+
+
+@pytest.mark.gpu
+def test_cuda_graph_step_matches_eager():
+    """A CUDA-graph-captured step reproduces the eager no-grad step over a rollout.
+
+    ``CudaGraphStep`` is the stripped-down capture reference next to ``StepRuntime``;
+    this is the coverage that keeps it honest.
+    """
+    big = 100.0  # limits wide enough that no clamp fires and hides a divergence
+    cfgs = [
+        AgentConfig(
+            model=DynamicsModel.DIFF_DRIVE,
+            ctrl_mode=ControlMode.ACCELERATION,
+            max_speed=big,
+            max_accel=big,
+            max_ang_vel=big,
+            max_ang_accel=big,
+        )
+        for _ in range(2)
+    ]
+    world = WorldConfig(collisions=True, collision_k=50.0)  # small fleet -> brute neighbors
+    stepper = Stepper(cfgs, dt=0.1, substeps=2, device="cuda:0", dtype=wp.float32, world=world)
+    n_envs = 16
+
+    def mk_state():
+        g = torch.Generator().manual_seed(1)
+        f = lambda *s: (0.3 * torch.randn(*s, generator=g)).to("cuda:0")  # noqa: E731
+        return TorchState(
+            f(n_envs, 2, 2), f(n_envs, 2), f(n_envs, 2, 2), f(n_envs, 2), f(n_envs, 2)
+        )
+
+    graph = CudaGraphStep(stepper, n_envs, act_dim=2)
+    s_eager = mk_state()
+    s_graph = mk_state()
+    gen = torch.Generator().manual_seed(9)
+    for _ in range(6):
+        a = (0.4 * torch.randn(n_envs, 2, 2, generator=gen)).to("cuda:0")
+        with torch.no_grad():
+            s_eager = warp_step(stepper, s_eager, a)
+        s_graph = graph(s_graph, a)
+    for x, y in zip(s_eager, s_graph, strict=True):
+        torch.testing.assert_close(x, y, rtol=1e-5, atol=1e-6)

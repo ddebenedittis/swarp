@@ -54,7 +54,7 @@ class Scenario(ABC):
     # How far this scenario's fused path may legitimately differ from its torch reference
     # path on the same seeded trajectory. It is the *scenario* that knows why its two
     # paths differ, so the number lives here and both readers take it from here: the
-    # per-scenario benchmark's parity gate (``swarp.benchmark.ablation._parity_ok``, via
+    # per-scenario benchmark's parity gate (``swarp.benchmark.ablation.parity_ok``, via
     # ``swarp.benchmark.scenarios.run_config``) and the shared test harness
     # (``tests/conftest.py``'s ``FusedSpec``). A second hardcoded table is what this
     # replaces — the CLI's flat 1e-5 reported push-t as a parity failure for a difference

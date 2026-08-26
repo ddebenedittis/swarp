@@ -31,8 +31,8 @@ def _traj(env, n_steps, device, n_agents):
     with torch.no_grad():
         for _ in range(n_steps):
             a = torch.empty(env.n_envs, n_agents, 2, device=device).uniform_(-1, 1, generator=gen)
-            obs, rew, done, _ = env.step(a)
-            out.append((obs.clone(), rew.clone(), done.clone()))
+            obs, rew, term, trunc, _ = env.step(a)
+            out.append((obs.clone(), rew.clone(), (term | trunc).clone()))
     return out
 
 

@@ -106,9 +106,9 @@ def extract_geometry_batch(
         # Same for orientation, but only where orientation is meaningful: a circle-only
         # scenario keeps obstacle_angle None (the documented "no angle" contract), while a
         # movable box needs the live value because it rotates as it is pushed.
-        movable = getattr(world, "obstacle_kind", None) is not None and bool(
-            (world.obstacle_kind != 0).any()
-        )
+        # Obstacles.any_movable is memoized for exactly this read; the raw
+        # (obstacle_kind != 0).any() it replaces cost a device->host sync every frame.
+        movable = world.obstacles is not None and world.obstacles.any_movable
         live_obs_angle = (
             _to_np(live_angle.index_select(0, sel))
             if (world.obstacle_angle is not None or movable)

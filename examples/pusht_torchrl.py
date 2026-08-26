@@ -288,11 +288,9 @@ def main() -> None:
     for it, batch in enumerate(collector):
         dist = batch.get(("next", "info", "tee_dist_to_goal"))
         ang = batch.get(("next", "info", "tee_angle_error"))
-        # `SwarpEnv` reports the max_steps time limit as `terminated`, which would make
-        # GAE cut the value bootstrap at every truncation. Recover the *task*
-        # termination (the on-goal condition) from info so only real terminals cut,
-        # and keep the wrapper's flag as `done` (terminated | truncated).
-        terminated = ((dist < scen.goal_tolerance) & (ang < scen.angle_tolerance)).unsqueeze(-1)
+        # The wrapper splits the two: `terminated` is the scenario's on-goal condition,
+        # `done` is that OR the max_steps timeout, so GAE bootstraps through a timeout.
+        terminated = batch.get(("next", "terminated"))
         batch.set(DONE_KEY, _expand(batch.get(("next", "done")), n_agents))
         batch.set(TERM_KEY, _expand(terminated, n_agents))
         with torch.no_grad():

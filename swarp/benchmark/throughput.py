@@ -2,9 +2,13 @@
 
 Run with:  python -m swarp.benchmark.throughput [--device cuda:0] [--steps 100]
 
-Steps the NavigationScenario hot path (dynamics + hash-grid neighbors + soft
+Steps the NavigationScenario hot path (dynamics + brute-force neighbors + soft
 collisions + obs/reward) under ``torch.no_grad()`` with random actions kept
-on-device.
+on-device. Brute force is not a choice made here: it is what
+:class:`~swarp.core.neighbors.NeighborGrid`'s ``"auto"`` picks below 512
+agents/env, and this benchmark sweeps 4/16/64 — so the grid backends have never
+been on this path. Point ``world_config=WorldConfig(neighbor_method=...)`` at
+them to measure those.
 
 ``use_graph`` is pinned rather than left at ``Environment``'s ``"auto"`` so this
 benchmark keeps measuring one fixed configuration and its numbers stay comparable

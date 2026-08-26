@@ -544,7 +544,7 @@ class PushTScenario(FusedScenario):
 
     def _box_contact(self, pos: torch.Tensor, vel: torch.Tensor) -> tuple[torch.Tensor, ...]:
         """Per (env, agent, box) oriented-box SDF contact, mirroring
-        :func:`swarp.core.collisions._box_force` (exterior clamp + interior nearest
+        :func:`swarp.core.collisions.box_force` (exterior clamp + interior nearest
         face). Returns the force on the T ``[E, A, B, 2]`` and its torque ``[E, A, B]``
         about the body centroid."""
         th = self.tee_theta  # [E]

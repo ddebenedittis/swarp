@@ -48,7 +48,7 @@ def test_hot_loop_api_guard(device):
     env.step(actions)  # warmup outside the guard (kernel compilation etc.)
     with torch.no_grad(), forbid_host_transfers():
         for _ in range(20):
-            obs, rew, done, info = env.step(actions)
+            obs, rew, term, trunc, info = env.step(actions)
     assert obs.device.type == torch.device(device).type
 
 

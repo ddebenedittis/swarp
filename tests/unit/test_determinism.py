@@ -16,7 +16,7 @@ def run_trajectory(device, seed, T=100):
     with torch.no_grad():
         for _ in range(T):
             actions = torch.randn(16, 8, 2, generator=gen).to(device)
-            obs, rew, done, _ = env.step(actions)
+            obs, rew, *_ = env.step(actions)
             obs_trace.append(obs)
             rew_trace.append(rew)
             pos_trace.append(env.world.state.pos.clone())

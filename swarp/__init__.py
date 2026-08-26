@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import inspect
 
-from swarp.core.config import ObstacleKind, ObstacleShape, WorldConfig
+from swarp.core.config import ObstacleKind, Obstacles, ObstacleShape, WorldConfig
 from swarp.core.environment import Environment
 from swarp.core.state import WorldState
 from swarp.core.stepper import Stepper
@@ -48,7 +48,8 @@ from swarp.dynamics.base import (
     action_bounds,
     per_env_float_template,
 )
-from swarp.interop.autograd import TorchState, rollout, warp_step
+from swarp.dynamics.drone import drone_config
+from swarp.interop.autograd import GradRing, TorchState, rollout, warp_step
 from swarp.scenarios import (
     SCENARIOS,
     Buf,
@@ -64,6 +65,7 @@ from swarp.scenarios import (
     TransportScenario,
     fused_scenarios,
     make_scenario,
+    register_scenario,
     scenario_class,
 )
 from swarp.sensors.lidar import Lidar, lidar_scan
@@ -113,12 +115,14 @@ __all__ = [
     "FormationScenario",
     "FusedPass",
     "FusedScenario",
+    "GradRing",
     "Integrator",
     "Lidar",
     "NUM_PARAMS",
     "NavigationScenario",
     "ObstacleKind",
     "ObstacleShape",
+    "Obstacles",
     "PARAM_FIELDS",
     "P_ARM",
     "P_GRAVITY",
@@ -147,11 +151,13 @@ __all__ = [
     "WorldConfig",
     "WorldState",
     "action_bounds",
+    "drone_config",
     "fused_scenarios",
     "lidar_scan",
     "make",
     "make_scenario",
     "per_env_float_template",
+    "register_scenario",
     "rollout",
     "scenario_class",
     "warp_step",

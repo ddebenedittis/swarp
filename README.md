@@ -75,7 +75,7 @@ env = swarp.make("navigation", n_envs=4096, n_agents=8, device="cuda:0", dt=0.05
 obs = env.reset()                                  # [n_envs, n_agents, obs_dim], on the GPU
 for _ in range(100):
     actions = torch.rand(4096, 8, env.act_dim, device="cuda:0") * 2 - 1
-    obs, reward, done, info = env.step(actions)    # all tensors stay on the GPU
+    obs, reward, term, trunc, info = env.step(actions)   # all tensors stay on the GPU
 ```
 
 The [quickstart](https://ddebenedittis.github.io/swarp/quickstart.html) walks through this line by line.

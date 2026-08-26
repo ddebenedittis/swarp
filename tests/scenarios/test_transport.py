@@ -30,9 +30,9 @@ def test_transport_api_and_finiteness(device):
     gen = torch.Generator(device=device).manual_seed(0)
     for _ in range(10):
         a = torch.rand(8, 3, env.world.act_dim, generator=gen, device=device) * 2 - 1
-        obs, rew, done, info = env.step(a)
+        obs, rew, term, trunc, info = env.step(a)
         assert torch.isfinite(obs).all() and torch.isfinite(rew).all()
-        assert rew.shape == (8, 3) and done.shape == (8,)
+        assert rew.shape == (8, 3) and term.shape == (8,) and trunc.shape == (8,)
         assert info["package_dist_to_goal"].shape == (8, 1)
 
 
@@ -45,7 +45,7 @@ def test_transport_determinism(device):
         out = []
         for _ in range(8):
             a = torch.rand(4, 3, env.world.act_dim, generator=gen, device=device) * 2 - 1
-            obs, rew, _, _ = env.step(a)
+            obs, rew, *_ = env.step(a)
             out += [obs, rew, env.scenario.pkg_pos.clone()]
         return out
 

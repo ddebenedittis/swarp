@@ -14,7 +14,11 @@ stream); the graph is *replayed* on the current stream, which is the same
 default stream PyTorch's eager ops use, so masked auto-resets (writes) and
 observations (reads) stay ordered with the replay without a device sync. Auto-
 reset stays *outside* the graph: it uses a ``torch.Generator`` whose philox
-offset is not capture-safe. (This mirrors :class:`swarp.interop.compile.CudaGraphStep`.)
+offset is not capture-safe.
+
+:class:`CudaGraphStep` at the bottom is the same idea stripped to its core — one
+capture over fixed buffers, no persistent state, no recapture logic — kept as the
+standalone reference the graph-vs-eager parity test compares against.
 """
 
 from __future__ import annotations
@@ -120,6 +124,18 @@ class StepRuntime:
         :class:`~swarp.core.hooks.WholeStepHook` for why it cannot live in here.
         """
         self._hook = hook
+        self._graph = None
+        self._graph_version = None
+
+    def release(self) -> None:
+        """Drop the captured CUDA graph, freeing its device-side resources.
+
+        Idempotent, and non-destructive: the persistent buffers, the stable torch views
+        and the registered hook all survive, so the next :meth:`step` simply recaptures
+        (exactly what happens after any recapture-token bump). This is what
+        :meth:`~swarp.core.environment.Environment.close` calls to hand the graph's memory
+        back without tearing the runtime down.
+        """
         self._graph = None
         self._graph_version = None
 
@@ -237,3 +253,49 @@ class StepRuntime:
         # or invoked eagerly); Environment reads this to skip a redundant post_step.
         self._ran_post = self._hook is not None
         return self.state_views
+
+
+class CudaGraphStep:
+    """CUDA-graph capture of the no-grad hot path to cut per-step launch latency.
+
+    Standalone building block kept for the tests. For end-to-end use prefer
+    :class:`StepRuntime` above (via ``Environment(..., use_graph=True)``), which owns
+    persistent state, replays on the default stream so eager torch resets/observations
+    stay ordered, and recaptures automatically on obstacle/param changes.
+
+    Captures a single ``launch_substeps`` on fixed input/output/scratch buffers
+    with ``wp.ScopedCapture``; each call copies the incoming state+actions into
+    the fixed inputs, replays the graph, and returns cloned outputs. The step
+    must be allocation-free during capture, so it requires a CUDA device and a
+    non-allocating neighbor path (the brute-force backend, i.e. the default for
+    up to a few hundred agents/env; the hash / uniform-grid builders allocate).
+    Determinism and no-host-copy behaviour are unchanged (same kernels).
+    """
+
+    def __init__(self, stepper: Stepper, n_envs: int, act_dim: int) -> None:
+        if not str(stepper.device).startswith("cuda"):
+            raise ValueError("CUDA-graph capture requires a CUDA device")
+        self.stepper = stepper
+        self.n_envs = n_envs
+        self._in = stepper.alloc_state(n_envs)
+        self._out = stepper.alloc_state(n_envs)
+        self._actions = wp.zeros(
+            (n_envs, stepper.n_agents, act_dim), dtype=stepper.dtype, device=stepper.device
+        )
+        self._buffers = stepper.make_buffers(n_envs, requires_grad=False)
+        # Warm up so kernels/grids are compiled and allocated before capture.
+        stepper.launch_substeps(self._in, self._actions, self._out, self._buffers)
+        wp.synchronize_device(stepper.device)
+        with wp.ScopedCapture(device=stepper.device) as capture:
+            stepper.launch_substeps(self._in, self._actions, self._out, self._buffers)
+        self._graph = capture.graph
+
+    def __call__(self, state: TorchState, actions: torch.Tensor) -> TorchState:
+        state = fill_state_defaults(state)
+        wp.copy(self._actions, wp.from_torch(actions.contiguous(), dtype=self._actions.dtype))
+        for dst, src in zip(self._in.arrays(), state, strict=True):
+            wp.copy(dst, wp.from_torch(src.contiguous(), dtype=dst.dtype))
+        wp.capture_launch(self._graph)
+        return TorchState(
+            *(wp.to_torch(a, requires_grad=False).clone() for a in self._out.arrays())
+        )

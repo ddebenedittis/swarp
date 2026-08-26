@@ -276,7 +276,26 @@ than two tables that drift.
 
 ## Registering it
 
-Add the class to `SCENARIOS` in `swarp/scenarios/__init__.py`. That is the single registry:
-`swarp.make(name, ...)`, the benchmark CLIs and the tests all read it, and
-`fused_scenarios()` derives fused capability from `cls.fused_available` — which
+`SCENARIOS` in `swarp/scenarios/__init__.py` is the single registry: `swarp.make(name, ...)`,
+`make_scenario`, `scenario_class`, the benchmark CLIs' `--scenario` and the tests all read it,
+and `fused_scenarios()` derives fused capability from `cls.fused_available` — which
 `FusedScenario` sets — so there is no second list to keep in step.
+
+Your scenario almost certainly lives outside this package, so add it with
+`register_scenario` at import time of the module that defines it. No fork, no edit to the
+installed package:
+
+```python
+import swarp
+from swarp.scenarios import register_scenario
+
+register_scenario("my_task", MyTaskScenario)
+
+env = swarp.make("my_task", n_envs=4096, n_agents=8, device="cuda:0")
+```
+
+A name collision raises rather than silently swapping — pass `overwrite=True` if replacing a
+built-in is what you meant.
+
+For a scenario contributed *to* the package, add it to the `SCENARIOS` dict literal directly
+instead; the registry is the same object either way.

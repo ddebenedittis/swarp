@@ -661,13 +661,13 @@ def test_reached_goal_renders_differently_from_a_distant_one():
 
 
 def test_pts_is_pixel_identical_to_the_scalar_transform():
-    from swarp.render.overlays import _p, _pts
+    from swarp.render.overlays import to_px, to_px_batch
 
     cam = Camera(bounds=(-1.0, 2.0, -1.0, 1.0), viewport=(5, 7, 333, 211), zoom=1.3)
     cam.pan(11.0, -23.0)
     rng = np.random.default_rng(0)
     pts = rng.uniform(-1.5, 1.5, size=(64, 2))
-    assert _pts(cam, pts) == [list(_p(cam, p)) for p in pts]
+    assert to_px_batch(cam, pts) == [list(to_px(cam, p)) for p in pts]
 
 
 def test_supersampled_frame_keeps_shape_and_antialiases():

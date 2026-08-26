@@ -154,12 +154,13 @@ obs = torch.cat([base_obs, ranges], dim=-1)
 ```
 
 Geometry is analytic ray-circle intersection against other agents and circular obstacles; a ray that hits nothing returns `max_range`. Rays are spaced uniformly over 2π and rotate with each agent's heading when `body_frame=True`.
-Box and segment obstacles are invisible to the lidar for now, though they still act in the collision step.
+Box and segment obstacles are **excluded** from the scan — `Lidar.scan` filters on `ObstacleShape` before casting, because ray-circle is the only test implemented — so they are invisible to the sensor while still acting in the collision step.
+`Lidar.scan` reads the obstacle pose from `world.obstacle_state_views()`, so a *movable* obstacle is scanned where it currently is, not where it spawned.
 
 Two interchangeable backends:
 
 `"torch"` (default)
-: the pure-torch broadcast implementation. Differentiable, but materializes an `[E, A, R, T, 2]` intermediate, so memory grows with the target count.
+: the pure-torch broadcast implementation. Differentiable, but materializes a dense `[E, A, R, T]` family, so memory grows with the target count.
 
 `"warp"`
 : the Warp kernel — numerically equivalent with no dense intermediate, which keeps high ray counts affordable. Inference-only: when gradients are required the scan transparently falls back to the torch path.

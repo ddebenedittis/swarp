@@ -19,11 +19,17 @@ class Environment:
     under ``torch.no_grad()`` it runs the tape-free hot path with no per-step
     host<->device transfers.
 
-    By default there is no auto-reset (like raw VMAS): inspect ``done`` and call
-    :meth:`reset` or :meth:`reset_at` when you want fresh episodes. Set
-    ``auto_reset=True`` to have :meth:`step` reset done envs in-place via a
-    host-sync-free masked path (no ``.any()``/``.nonzero()`` round-trip), so the
-    whole loop can stay on device.
+    :meth:`step` returns the Gymnasium 5-tuple
+    ``(obs, reward, terminated, truncated, info)``: ``terminated`` is the scenario's
+    own terminal condition, ``truncated`` the ``max_steps`` time limit. Keeping them
+    apart is what lets a value estimator bootstrap through a timeout instead of
+    treating it as a real terminal state.
+
+    By default there is no auto-reset (like raw VMAS): inspect
+    ``terminated | truncated`` and call :meth:`reset` or :meth:`reset_at` when you want
+    fresh episodes. Set ``auto_reset=True`` to have :meth:`step` reset those envs
+    in-place via a host-sync-free masked path (no ``.any()``/``.nonzero()``
+    round-trip), so the whole loop can stay on device.
 
     Args:
         use_graph: persistent-buffer execution backed by a whole-step CUDA graph.
@@ -33,11 +39,11 @@ class Environment:
             Pass ``False`` to force the plain functional step, ``True`` to demand
             persistent execution even where capture is unavailable (it then falls back
             to eager persistent execution with a warning).
-        clone_outputs: clone ``obs``/``reward``/``done`` before returning them. Off by
-            default, so :meth:`step` hands back **zero-copy views of buffers the next
-            step overwrites** — fine for a policy that consumes them immediately, wrong
-            for anything that retains them (a replay buffer, a trajectory list). Turn
-            this on, or clone at the call site.
+        clone_outputs: clone ``obs``/``reward``/``terminated``/``truncated`` before
+            returning them. Off by default, so :meth:`step` hands back **zero-copy views
+            of buffers the next step overwrites** — fine for a policy that consumes them
+            immediately, wrong for anything that retains them (a replay buffer, a
+            trajectory list). Turn this on, or clone at the call site.
         fused: use the scenario's fused Warp obs/reward kernels on the no-grad path.
             ``"auto"`` follows :attr:`~swarp.scenarios.base.Scenario.fused_available`;
             grad mode always falls back to the differentiable torch path.
@@ -86,6 +92,9 @@ class Environment:
         self.n_agents = self.world.n_agents
         self._seed(seed)
         self._step_count = torch.zeros(n_envs, device=device, dtype=torch.int32)
+        # Returned as ``truncated`` when there is no time limit. Allocated once: the hot
+        # path must not allocate a fresh all-false tensor on every step.
+        self._never_truncated = torch.zeros(n_envs, device=device, dtype=torch.bool)
         # Fused Warp obs/reward/done kernels for the no-grad hot path. "auto"
         # follows the scenario; grad mode always falls back to the torch path.
         self._fused = scenario.fused_available if fused == "auto" else bool(fused)
@@ -201,7 +210,7 @@ class Environment:
 
     def step(
         self, actions: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, Any]]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, Any]]:
         """Advance every env by one step.
 
         Args:
@@ -210,8 +219,15 @@ class Environment:
                 models; 2 for the current 2D vehicle models).
 
         Returns:
-            ``(obs [n_envs, n_agents, obs_dim], reward [n_envs, n_agents],
-            done [n_envs] bool, info dict)`` — all on the env device.
+            The Gymnasium 5-tuple ``(obs [n_envs, n_agents, obs_dim],
+            reward [n_envs, n_agents], terminated [n_envs] bool,
+            truncated [n_envs] bool, info dict)`` — all on the env device.
+
+            ``terminated`` is the scenario's own terminal condition
+            (:meth:`~swarp.scenarios.base.Scenario.done`); ``truncated`` is the
+            ``max_steps`` time limit, and is an all-false view when ``max_steps is
+            None``. Episode end — for auto-reset and for the step counter — is
+            ``terminated | truncated``.
         """
         act_dim = self.world.act_dim
         if actions.shape != (self.n_envs, self.n_agents, act_dim):
@@ -239,18 +255,22 @@ class Environment:
         # Reward/done/info describe the transition just taken (terminal state).
         reward = self.scenario.rewards()
         self._step_count += 1
-        done = self.scenario.done()
-        if self.max_steps is not None:
-            done = done | (self._step_count >= self.max_steps)
+        terminated = self.scenario.done()
+        truncated = (
+            self._step_count >= self.max_steps
+            if self.max_steps is not None
+            else self._never_truncated
+        )
         info = self.scenario.info()
 
         if self.auto_reset:
+            episode_end = terminated | truncated
             # Obs-only reset pass: reward/done/info were already returned for this
             # transition and their (fused) buffers must not be clobbered.
             with torch.no_grad():
-                self.scenario.reset_world(done, obs_only=True)
+                self.scenario.reset_world(episode_end, obs_only=True)
             self._step_count = torch.where(
-                done, torch.zeros_like(self._step_count), self._step_count
+                episode_end, torch.zeros_like(self._step_count), self._step_count
             )
 
         # Observations reflect the state after any auto-reset (next episode's
@@ -258,8 +278,8 @@ class Environment:
         obs = self.scenario.observations()
         if self.clone_outputs:
             obs, reward = obs.clone(), reward.clone()
-            done = done.clone()
-        return obs, reward, done, info
+            terminated, truncated = terminated.clone(), truncated.clone()
+        return obs, reward, terminated, truncated, info
 
     def radius_graph(self) -> torch.Tensor:
         """COO edge index [2, E] of the current within-radius neighbor graph.
@@ -314,3 +334,22 @@ class Environment:
         if self._viewer is not None:
             self._viewer.close()
             self._viewer = None
+
+    # ---------------------------------------------------------------- teardown
+
+    def close(self) -> None:
+        """Release what this env holds outside its own tensors, and stay usable.
+
+        Two things: the render window (as :meth:`close_viewer`) and the persistent
+        runtime's captured CUDA graph, whose device-side resources are otherwise pinned
+        for as long as the env is alive. Call it when a script keeps many environments
+        around, or when handing the GPU to something else.
+
+        Idempotent, and **not** a destructor: the persistent buffers, the state and the
+        scenario are untouched, so stepping after ``close()`` just recaptures the graph on
+        the next step — same as any recapture the token already triggers. Nothing needs
+        reconstructing.
+        """
+        self.close_viewer()
+        if self.world.runtime is not None:
+            self.world.runtime.release()

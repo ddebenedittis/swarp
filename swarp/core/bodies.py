@@ -39,9 +39,9 @@ import warp as wp
 from swarp.core.collisions import (
     SHAPE_BOX,
     SHAPE_SEGMENT,
-    _box_force,
-    _closest_on_segment,
-    _pair_force,
+    box_force,
+    closest_on_segment,
+    pair_force,
 )
 from swarp.core.config import ObstacleKind
 from swarp.core.state import VEC2
@@ -80,22 +80,22 @@ def _reaction(
     f_agent = type(p)(zero, zero)
     r = type(p)(zero, zero)
     if st == SHAPE_BOX:
-        f_agent = _box_force(
+        f_agent = box_force(
             p, v, center, angle, half, ra + margin, k, c, damp_denom, max_overlap, v_obs, om_obs
         )
         # Lever: from the body centre to the agent's closest point on the box. Using the
         # agent centre projected onto the surface normal would double-count the radius.
         r = p - center
     elif st == SHAPE_SEGMENT:
-        cp = _closest_on_segment(p, center, angle, half[0])
+        cp = closest_on_segment(p, center, angle, half[0])
         rr = cp - center
         vs = v_obs + type(p)(-om_obs * rr[1], om_obs * rr[0])
-        f_agent = _pair_force(
+        f_agent = pair_force(
             p - cp, v - vs, ra + obs_r + margin, k, c, damp_denom, max_overlap
         )
         r = rr
     else:  # SHAPE_CIRCLE: a frictionless normal passes through the centre -> no torque
-        f_agent = _pair_force(
+        f_agent = pair_force(
             p - center, v - v_obs, ra + obs_r + margin, k, c, damp_denom, max_overlap
         )
         r = type(p)(zero, zero)
@@ -155,22 +155,22 @@ def _body_body(
             # centre — otherwise a long wall would act like a small disc in its middle.
             c2 = q2
             if st2 == SHAPE_SEGMENT:
-                c2 = _closest_on_segment(q, q2, th2, half2[0])
-            f_other = _box_force(
+                c2 = closest_on_segment(q, q2, th2, half2[0])
+            f_other = box_force(
                 c2, tv2, q, th, half_self, r2 + margin, k, c, damp_denom, max_overlap, tv, th2
             )
             f = -f_other
             r = _closest_in_box(c2 - q, th, half_self)
     elif st2 == SHAPE_BOX:
         # This (round) body vs a box.
-        f = _box_force(
+        f = box_force(
             q, tv, q2, th2, half2, r_self + margin, k, c, damp_denom, max_overlap, tv2, zero
         )
     elif st2 == SHAPE_SEGMENT:
-        cp = _closest_on_segment(q, q2, th2, half2[0])
-        f = _pair_force(q - cp, tv - tv2, r_self + r2 + margin, k, c, damp_denom, max_overlap)
+        cp = closest_on_segment(q, q2, th2, half2[0])
+        f = pair_force(q - cp, tv - tv2, r_self + r2 + margin, k, c, damp_denom, max_overlap)
     else:
-        f = _pair_force(q - q2, tv - tv2, r_self + r2 + margin, k, c, damp_denom, max_overlap)
+        f = pair_force(q - q2, tv - tv2, r_self + r2 + margin, k, c, damp_denom, max_overlap)
     # A frictionless normal on a round body passes through its centre: no torque, so the
     # lever stays zero except in the box branch above.
     return f, r

@@ -97,11 +97,13 @@ def _brute_force(
 # cell coordinates modulo its dims and so aliases envs into shared cells), this
 # gives every env a disjoint block of ``bins*bins`` cells in one linear key
 # ``e*bins*bins + cy*bins + cx``, so it stays linear in ``n_envs`` with no
-# cross-env aliasing. Positions are placed against a shared origin (the batch's
-# min corner) with an adaptive cell size ``max(radius, extent/bins)``; agents
-# past ``bins`` cells clamp to the edge cell (still correct — the distance
-# filter rejects false candidates, and a cell size >= radius guarantees every
-# true within-radius neighbor lands in the queried 3x3 block).
+# cross-env aliasing. Positions are placed against a shared origin with a cell size
+# ``max(radius, extent/bins)``; agents past ``bins`` cells clamp to the edge cell
+# (still correct — the distance filter rejects false candidates, and a cell size
+# >= radius guarantees every true within-radius neighbor lands in the queried 3x3
+# block). The origin/extent come either from a per-build reduction over the batch
+# (``_bounds_*`` + ``_finalize_grid``) or, when the caller pins a static world
+# rectangle, once at allocation — see ``NeighborGrid._fill_static_grid``.
 
 
 @wp.kernel
@@ -289,6 +291,8 @@ class NeighborGrid:
       sorted by cell key with ``wp.utils.radix_sort_pairs``, and each agent
       queries its 3x3 cell neighborhood. Linear in ``n_envs`` and in agents;
       the intended choice for large per-env populations across many envs.
+      Pass ``bounds`` to pin the grid to a static world rectangle and drop the
+      per-build bounds reduction (see below).
     * ``"auto"`` (default) — ``uniform_grid`` when ``n_agents > 512``; brute
       otherwise.
     """
@@ -304,7 +308,14 @@ class NeighborGrid:
         grid_dim: int = 128,
         method: str = "auto",
         uniform_bins: int | None = None,
+        bounds: tuple[float, float, float, float] | None = None,
     ) -> None:
+        """``bounds`` is the world rectangle ``(x_min, x_max, y_min, y_max)`` — the same
+        ordering as :attr:`~swarp.core.config.WorldConfig.bounds`. Set it (with
+        ``method="uniform_grid"``) to pin the grid frame once instead of re-deriving it
+        from the batch on every build; see :meth:`_fill_static_grid`. ``None`` keeps the
+        adaptive per-build reduction.
+        """
         if radius <= 0.0:
             raise ValueError("radius must be positive")
         if method not in ("auto", "grid", "brute", "uniform_grid"):
@@ -343,6 +354,9 @@ class NeighborGrid:
         self._points: wp.array | None = None
         self._grid: wp.HashGrid | None = None
         self._u_alloc = False  # uniform-grid buffers allocated lazily
+        # A pinned world rectangle lets the uniform grid skip its per-build bounds pass.
+        self._bounds = bounds
+        self._static_grid = bounds is not None and self.method == "uniform_grid"
         self.grid_dim = grid_dim
         if method == "grid":
             self._points = wp.zeros(n_envs * n_agents, dtype=VEC3[dtype], device=device)
@@ -446,7 +460,38 @@ class NeighborGrid:
         self._u_vals = z(2 * n, wp.int32)
         self._u_cell_start = z(n_cells, wp.int32)
         self._u_cell_end = z(n_cells, wp.int32)
+        if self._static_grid:
+            self._fill_static_grid()
         self._u_alloc = True
+
+    def _fill_static_grid(self) -> None:
+        """Fill origin/cell size once from the pinned world rectangle.
+
+        This is the whole point of ``bounds``: with the grid frame fixed, every build
+        skips ``_bounds_init``/``_bounds_reduce``/``_finalize_grid`` — a global-atomic
+        reduction over all ``n_envs * n_agents`` positions that was costing 10-17% of the
+        build. All seven built-in scenarios pin a static world rectangle, so the batch
+        extent the dynamic path measures is bounded by it anyway.
+
+        **Why this stays exact.** The clamp that maps out-of-range positions into the edge
+        cell is safe for any origin as long as ``cell_size >= radius``, which the
+        ``max(radius, ...)`` below guarantees. A point clamped down to cell 0 has
+        ``x < origin``; a point genuinely in cell ``k >= 2`` has
+        ``x >= origin + 2 * cell_size``, so the two are more than ``radius`` apart and were
+        never true neighbours — the 3x3 block it fails to reach holds nothing it could
+        have matched. Symmetrically at the far edge. Everything else that lands in the
+        same cell without being in range is a mere *candidate*, and the exact distance
+        filter in ``_query_uniform`` rejects it.
+
+        The tradeoff, honestly: the cell size now follows the world rectangle rather than
+        the batch's own extent, so a batch that happens to be tightly clustered gets
+        coarser cells (more candidates per query) than the adaptive path would have
+        picked. In exchange every build is three launches shorter.
+        """
+        x_min, x_max, y_min, y_max = self._bounds
+        extent = max(x_max - x_min, y_max - y_min)
+        self._u_origin.assign([x_min, y_min])
+        self._u_cell_size.assign([max(self.radius, extent / self.uniform_bins)])
 
     def _query_uniform_into(self, pos, neighbor_idx, neighbor_count) -> None:
         self._ensure_uniform()
@@ -455,18 +500,20 @@ class NeighborGrid:
         bins = self.uniform_bins
         dim = (n_envs, n_agents)
         common = dict(device=self.device, record_tape=False)
-        # Origin (batch min corner) + adaptive cell size, all device-side (no sync).
-        wp.launch(
-            _bounds_init, dim=1, inputs=[self.dtype(1e30)], outputs=[self._u_bounds], **common
-        )
-        wp.launch(_bounds_reduce, dim=dim, inputs=[pos], outputs=[self._u_bounds], **common)
-        wp.launch(
-            _finalize_grid,
-            dim=1,
-            inputs=[self._u_bounds, self.dtype(self.radius), bins],
-            outputs=[self._u_origin, self._u_cell_size],
-            **common,
-        )
+        if not self._static_grid:
+            # Origin (batch min corner) + adaptive cell size, all device-side (no sync).
+            wp.launch(
+                _bounds_init, dim=1, inputs=[self.dtype(1e30)], outputs=[self._u_bounds], **common
+            )
+            wp.launch(_bounds_reduce, dim=dim, inputs=[pos], outputs=[self._u_bounds], **common)
+            wp.launch(
+                _finalize_grid,
+                dim=1,
+                inputs=[self._u_bounds, self.dtype(self.radius), bins],
+                outputs=[self._u_origin, self._u_cell_size],
+                **common,
+            )
+        # else: origin/cell size were pinned once in _fill_static_grid.
         wp.launch(
             _compute_keys,
             dim=dim,

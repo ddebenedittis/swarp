@@ -51,9 +51,9 @@ def test_pusht_api_and_finiteness(device):
     gen = torch.Generator(device=device).manual_seed(0)
     for _ in range(10):
         a = torch.rand(8, 4, env.world.act_dim, generator=gen, device=device) * 2 - 1
-        obs, rew, done, info = env.step(a)
+        obs, rew, term, trunc, info = env.step(a)
         assert torch.isfinite(obs).all() and torch.isfinite(rew).all()
-        assert rew.shape == (8, 4) and done.shape == (8,)
+        assert rew.shape == (8, 4) and term.shape == (8,) and trunc.shape == (8,)
         assert info["tee_dist_to_goal"].shape == (8,)
         assert info["tee_angle_error"].shape == (8,)
         # the wrapped heading error always lands in [0, pi]
@@ -70,7 +70,7 @@ def test_pusht_determinism(device):
         out = []
         for _ in range(8):
             a = torch.rand(4, 4, env.world.act_dim, generator=gen, device=device) * 2 - 1
-            obs, rew, _, _ = env.step(a)
+            obs, rew, *_ = env.step(a)
             out += [obs, rew, env.scenario.tee_pos.clone(), env.scenario.tee_theta.clone()]
         return out
 

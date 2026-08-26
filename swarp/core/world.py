@@ -81,8 +81,12 @@ class World:
         self.action: torch.Tensor | None = None  # [n_envs, n_agents, act_dim]
         self.goals: torch.Tensor | None = None  # [n_envs, n_agents, 2]
         # The installed obstacle set, retained whole (see set_obstacles). The
-        # obstacle_* attributes below mirror its fields for the renderer / sensors,
-        # which read None as "all circles" / "no orientation".
+        # obstacle_* attributes below mirror the *installed spec* -- shape/extent/kind
+        # metadata that never changes, plus the spawn pose -- and read None as "all
+        # circles" / "no orientation". They are NOT the live pose: a movable obstacle is
+        # integrated in place inside the stepper's arrays, so obstacle_pos/_angle go
+        # stale the moment it is pushed. Both the renderer and the lidar take the pose
+        # from obstacle_state_views() for exactly that reason.
         self.obstacles: Obstacles | None = None
         self.obstacle_pos: torch.Tensor | None = None  # [n_envs, n_obstacles, 2]
         self.obstacle_radius: torch.Tensor | None = None  # [n_obstacles]
@@ -240,9 +244,11 @@ class World:
         body grouping. Re-installing a retained spec is also free — it is already resolved,
         and an unchanged obstacle count takes the in-place path (no graph recapture).
 
-        The ``obstacle_*`` attributes mirror the spec's fields for the renderer and the
-        lidar; they keep ``None`` for absent fields, which those layers read as "every
-        obstacle is a circle" / "no orientation".
+        The ``obstacle_*`` attributes mirror the spec's fields as shape/extent/kind
+        metadata (plus the spawn pose); they keep ``None`` for absent fields, which the
+        renderer and the lidar read as "every obstacle is a circle" / "no orientation".
+        For the *live* pose of a movable obstacle those layers use
+        :meth:`obstacle_state_views` instead.
         """
         obs = obstacles.resolve(self.device, self.dtype)
         self.obstacles = obs

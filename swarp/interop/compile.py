@@ -7,27 +7,30 @@ functional custom op ``swarp::step`` with a fake (meta) implementation and an
 autograd rule, so a compiled policy/env loop treats it as a single opaque,
 differentiable operator instead of breaking the graph.
 
-The op is *functional*: the forward allocates fresh outputs (no buffer
-recycling, no input mutation) and the backward re-records a Warp tape from the
-saved inputs and replays it (recompute-in-backward), so no Warp state has to
-survive between the forward and backward calls — exactly what Dynamo/AOTAutograd
-expect. Use :func:`compiled_warp_step`, which mirrors :func:`warp_step`'s
-signature but routes through the registered op.
+The op is *functional*: the forward allocates fresh **outputs** and mutates no
+input, and the backward re-records a Warp tape from the saved inputs and replays
+it (recompute-in-backward), so no Warp state has to survive between the forward
+and backward calls — exactly what Dynamo/AOTAutograd expect. The substep
+*scratch* is recycled from the stepper's cache: it is consumed inside the launch
+and never escapes, so it is invisible to the op's contract.
+
+Use :func:`compiled_warp_step`, which mirrors :func:`warp_step`'s signature but
+routes through the registered op.
 """
 
 from __future__ import annotations
 
 import torch
 
-from swarp.core.state import WorldState, field_wp_dtype
+from swarp.core.state import field_wp_dtype
 from swarp.core.stepper import Stepper
 from swarp.interop.autograd import (
     TorchState,
-    _torch_stream_scope,
-    _wrap_actions,
-    _wrap_input_state,
     fill_state_defaults,
+    torch_stream_scope,
     warp_step,
+    wrap_actions,
+    wrap_input_state,
 )
 
 # Steppers are plain Python objects and cannot cross the custom-op boundary, so
@@ -71,13 +74,14 @@ def _step_op(
     scalar = {torch.float32: wp.float32, torch.float64: wp.float64}[actions.dtype]
     state = TorchState(pos, theta, vel, speed, ang_vel, z, vz, attitude, body_rates)
     n_envs = actions.shape[0]
-    with _torch_stream_scope(stepper.device):
-        state_wp, _ = _wrap_input_state(state, scalar, with_grad=False)
-        actions_wp, _ = _wrap_actions(actions, scalar, with_grad=False)
+    with torch_stream_scope(stepper.device):
+        state_wp, _ = wrap_input_state(state, scalar, with_grad=False)
+        actions_wp, _ = wrap_actions(actions, scalar, with_grad=False)
         out_wp = stepper.alloc_state(n_envs, requires_grad=False)
-        stepper.launch_substeps(
-            state_wp, actions_wp, out_wp, stepper.make_buffers(n_envs, requires_grad=False)
-        )
+        # The scratch is consumed inside the launch and never handed back, so recycling
+        # it does not break the op's functional contract — the *outputs* are still
+        # freshly allocated, which is what AOTAutograd needs.
+        stepper.launch_substeps(state_wp, actions_wp, out_wp, stepper.cached_buffers(n_envs))
         return [wp.to_torch(a, requires_grad=False).clone() for a in out_wp.arrays()]
 
 
@@ -107,9 +111,9 @@ def _step_backward(ctx, *grad_outputs):
     scalar = {torch.float32: wp.float32, torch.float64: wp.float64}[actions.dtype]
     state = TorchState(*state_tensors)
     n_envs = actions.shape[0]
-    with _torch_stream_scope(stepper.device):
-        state_wp, in_grads = _wrap_input_state(state, scalar, with_grad=True)
-        actions_wp, act_grad = _wrap_actions(actions, scalar, with_grad=True)
+    with torch_stream_scope(stepper.device):
+        state_wp, in_grads = wrap_input_state(state, scalar, with_grad=True)
+        actions_wp, act_grad = wrap_actions(actions, scalar, with_grad=True)
         out_wp = stepper.alloc_state(n_envs, requires_grad=True)
         buffers = stepper.make_buffers(n_envs, requires_grad=True)
         tape = wp.Tape()
@@ -135,62 +139,9 @@ def compiled_warp_step(stepper: Stepper, state: TorchState, actions: torch.Tenso
     return TorchState(*outs)
 
 
-class CudaGraphStep:
-    """CUDA-graph capture of the no-grad hot path to cut per-step launch latency.
-
-    Standalone building block kept for the tests. For end-to-end use prefer
-    :class:`swarp.interop.persistent.StepRuntime` (via ``Environment(...,
-    use_graph=True)``), which owns persistent state, replays on the default
-    stream so eager torch resets/observations stay ordered, and recaptures
-    automatically on obstacle/param changes.
-
-    Captures a single ``launch_substeps`` on fixed input/output/scratch buffers
-    with ``wp.ScopedCapture``; each call copies the incoming state+actions into
-    the fixed inputs, replays the graph, and returns cloned outputs. The step
-    must be allocation-free during capture, so it requires a CUDA device and a
-    non-allocating neighbor path (the brute-force backend, i.e. the default for
-    up to a few hundred agents/env; the hash / uniform-grid builders allocate).
-    Determinism and no-host-copy behaviour are unchanged (same kernels).
-    """
-
-    def __init__(self, stepper: Stepper, n_envs: int, act_dim: int) -> None:
-        import warp as wp
-
-        if not str(stepper.device).startswith("cuda"):
-            raise ValueError("CUDA-graph capture requires a CUDA device")
-        self.stepper = stepper
-        self.n_envs = n_envs
-        self._in = stepper.alloc_state(n_envs)
-        self._out = stepper.alloc_state(n_envs)
-        self._actions = wp.zeros(
-            (n_envs, stepper.n_agents, act_dim), dtype=stepper.dtype, device=stepper.device
-        )
-        self._buffers = stepper.make_buffers(n_envs, requires_grad=False)
-        # Warm up so kernels/grids are compiled and allocated before capture.
-        stepper.launch_substeps(self._in, self._actions, self._out, self._buffers)
-        wp.synchronize_device(stepper.device)
-        with wp.ScopedCapture(device=stepper.device) as capture:
-            stepper.launch_substeps(self._in, self._actions, self._out, self._buffers)
-        self._graph = capture.graph
-
-    def __call__(self, state: TorchState, actions: torch.Tensor) -> TorchState:
-        import warp as wp
-
-        state = fill_state_defaults(state)
-        wp.copy(self._actions, wp.from_torch(actions.contiguous(), dtype=self._actions.dtype))
-        for dst, src in zip(self._in.arrays(), state, strict=True):
-            wp.copy(dst, wp.from_torch(src.contiguous(), dtype=dst.dtype))
-        wp.capture_launch(self._graph)
-        return TorchState(
-            *(wp.to_torch(a, requires_grad=False).clone() for a in self._out.arrays())
-        )
-
-
 # Re-export the eager reference so callers can compare paths.
 __all__ = [
-    "CudaGraphStep",
     "compiled_warp_step",
     "register_stepper",
     "warp_step",
-    "WorldState",
 ]

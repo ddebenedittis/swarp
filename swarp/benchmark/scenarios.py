@@ -39,7 +39,7 @@ import time
 import torch
 
 from swarp import DynamicsModel, Environment, Lidar
-from swarp.benchmark.ablation import _parity_ok, _sync
+from swarp.benchmark.ablation import parity_ok, sync_device
 from swarp.scenarios import (
     SCENARIOS,
     make_scenario,
@@ -111,10 +111,10 @@ def _trajectory(env: Environment, n_agents: int, device: str, n_steps: int = 5) 
         for _ in range(n_steps):
             a = torch.empty(env.n_envs, n_agents, env.world.act_dim, device=device)
             a.uniform_(-1.0, 1.0, generator=gen)
-            obs, rew, done, _ = env.step(a)
+            obs, rew, term, trunc, _ = env.step(a)
             obs_l.append(obs.detach().clone())
             rew_l.append(rew.detach().clone())
-            done_l.append(done.detach().clone())
+            done_l.append((term | trunc).detach().clone())
     return {"obs": obs_l, "reward": rew_l, "done": done_l}
 
 
@@ -128,14 +128,14 @@ def time_env(env, n_agents, device, steps=60, warmup=20, lidar=None) -> float:
             env.step(a)
             if lidar is not None:
                 lidar.scan(env.world)
-        _sync(device)
+        sync_device(device)
         t0 = time.perf_counter()
         for _ in range(steps):
             a.uniform_(-1.0, 1.0, generator=gen)
             env.step(a)
             if lidar is not None:
                 lidar.scan(env.world)
-        _sync(device)
+        sync_device(device)
     return 1e3 * (time.perf_counter() - t0) / steps
 
 
@@ -166,7 +166,7 @@ def run_config(
         # tolerance the *scenario* declares (Scenario.parity_rtol / parity_atol) — the same
         # numbers tests/conftest.py's FusedSpec reads.
         cls = SCENARIOS[name]
-        ok, why = _parity_ok(
+        ok, why = parity_ok(
             _trajectory(base, n_agents, device),
             _trajectory(opt, n_agents, device),
             cls.parity_rtol,
@@ -201,7 +201,7 @@ def _warmup_all(selected: list[str], device: str) -> None:
                     time_env(env, 8, device, steps=3, warmup=3)
                 except Exception:  # noqa: BLE001, S110 — warmup is best-effort
                     pass
-    _sync(device)
+    sync_device(device)
 
 
 # ----------------------------------------------------------------------- CLI

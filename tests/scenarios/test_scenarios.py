@@ -12,7 +12,14 @@ from conftest import DEVICES
 import swarp
 from swarp import DynamicsModel, Environment, Integrator, WorldConfig
 from swarp.scenarios import SCENARIOS as REGISTRY
-from swarp.scenarios import Scenario, fused_scenarios, make_scenario
+from swarp.scenarios import (
+    Scenario,
+    fused_scenarios,
+    make_scenario,
+    register_scenario,
+    resolve_scenarios,
+    scenario_class,
+)
 from swarp.scenarios.discovery import DiscoveryScenario
 from swarp.scenarios.flocking import FlockingScenario
 from swarp.scenarios.formation import FormationScenario
@@ -60,6 +67,40 @@ class _PlainScenario(Scenario):
 
     def observation(self, agent_idx):
         raise NotImplementedError
+
+
+class _OutOfTreeScenario(REGISTRY["navigation"]):
+    """Concrete stand-in for a scenario defined outside the package."""
+
+
+def test_register_scenario_reaches_the_whole_registry(monkeypatch):
+    """An out-of-tree scenario must be reachable by name without editing the package."""
+    monkeypatch.setitem(REGISTRY, "mine", _OutOfTreeScenario)  # snapshot/restore
+    del REGISTRY["mine"]
+
+    register_scenario("mine", _OutOfTreeScenario)
+    assert scenario_class("mine") is _OutOfTreeScenario
+    assert isinstance(make_scenario("mine", n_agents=2), _OutOfTreeScenario)
+    assert "mine" in resolve_scenarios(["all"])
+    assert isinstance(swarp.make("mine", n_envs=2, n_agents=2, device="cpu"), Environment)
+
+
+def test_register_scenario_rejects_collisions_and_non_scenarios(monkeypatch):
+    monkeypatch.setitem(REGISTRY, "mine", _OutOfTreeScenario)
+    with pytest.raises(ValueError, match="already registered"):
+        register_scenario("mine", _OutOfTreeScenario)
+    register_scenario("mine", _OutOfTreeScenario, overwrite=True)  # explicit opt-in is fine
+    # Shadowing a built-in needs the same opt-in.
+    with pytest.raises(ValueError, match="already registered"):
+        register_scenario("navigation", _OutOfTreeScenario)
+
+    with pytest.raises(ValueError, match="non-empty"):
+        register_scenario("", _OutOfTreeScenario)
+    with pytest.raises(TypeError, match="Scenario subclass"):
+        register_scenario("nope", object)
+    with pytest.raises(TypeError, match="Scenario subclass"):
+        register_scenario("nope", _OutOfTreeScenario(n_agents=2))  # instance, not class
+    assert "nope" not in REGISTRY
 
 
 def test_fused_scenarios_is_derived_not_hardcoded(monkeypatch):
@@ -179,10 +220,11 @@ def test_scenario_api_and_finiteness(device, name):
     assert obs.shape[:2] == (8, env.n_agents) and torch.isfinite(obs).all()
     gen = torch.Generator(device=device).manual_seed(0)
     for _ in range(10):
-        obs, rew, done, info = env.step(_random_actions(env, gen))
+        obs, rew, term, trunc, info = env.step(_random_actions(env, gen))
         assert obs.shape[:2] == (8, env.n_agents) and torch.isfinite(obs).all()
         assert rew.shape == (8, env.n_agents) and torch.isfinite(rew).all()
-        assert done.shape == (8,) and done.dtype == torch.bool
+        for flag in (term, trunc):
+            assert flag.shape == (8,) and flag.dtype == torch.bool
 
 
 @pytest.mark.parametrize("device", DEVICES)
@@ -196,7 +238,7 @@ def test_scenario_determinism(device, name):
         gen = torch.Generator(device=device).manual_seed(5)
         traj = [obs]
         for _ in range(8):
-            obs, rew, _, _ = env.step(_random_actions(env, gen))
+            obs, rew, *_ = env.step(_random_actions(env, gen))
             traj.append(obs)
             traj.append(rew)
         return traj
@@ -216,7 +258,7 @@ def test_sampling_rewards_nonneg_and_consume(device):
     frac0 = scenario.consumed.float().mean().item()
     total = 0.0
     for _ in range(15):
-        _, rew, _, _ = env.step(_random_actions(env, gen))
+        _, rew, *_ = env.step(_random_actions(env, gen))
         assert (rew >= -1e-6).all()  # sampling reward is field value >= 0
         total += rew.sum().item()
     frac1 = scenario.consumed.float().mean().item()

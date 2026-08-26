@@ -13,7 +13,7 @@ env = swarp.make("navigation", n_envs=4096, n_agents=8, device="cuda:0", dt=0.05
 obs = env.reset()                                   # [n_envs, n_agents, obs_dim], on the GPU
 for _ in range(100):
     actions = torch.rand(4096, 8, env.act_dim, device="cuda:0") * 2 - 1
-    obs, reward, done, info = env.step(actions)     # every tensor stays on the GPU
+    obs, reward, term, trunc, info = env.step(actions)  # every tensor stays on the GPU
 ```
 
 `make` routes its keyword arguments by name: those the `Environment` constructor accepts (`device`, `dt`, `substeps`, `dtype`, `max_steps`, `seed`, `auto_reset`, `use_graph`, `clone_outputs`, `fused`) go to it, and everything else (`n_agents`, `world_size`, `model`, …) goes to the scenario constructor.
@@ -60,7 +60,7 @@ The constructor arguments worth knowing:
 ## What `step` returns
 
 ```python
-obs, reward, done, info = env.step(actions)
+obs, reward, terminated, truncated, info = env.step(actions)
 ```
 
 | value | shape | notes |
@@ -68,7 +68,8 @@ obs, reward, done, info = env.step(actions)
 | `actions` (in) | `[n_envs, n_agents, act_dim]` | `env.act_dim` is the max action arity over the agent models: 2 for the 2D vehicles, 4 for the quadrotor |
 | `obs` | `[n_envs, n_agents, obs_dim]` | `env.obs_dim` comes from the scenario |
 | `reward` | `[n_envs, n_agents]` | per-agent term plus the scenario's shared global term |
-| `done` | `[n_envs]`, bool | one flag per env, shared by its agents |
+| `terminated` | `[n_envs]`, bool | the scenario's terminal condition; one flag per env, shared by its agents |
+| `truncated` | `[n_envs]`, bool | the `max_steps` time limit; all-false when `max_steps is None` |
 | `info` | `dict[str, Tensor]` | whatever the scenario emits; navigation reports `dist_to_goal` |
 
 Actions are clamped to each agent's configured limits inside the kernel, so a policy that emits values in `[-1, 1]` is always safe.
