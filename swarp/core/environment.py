@@ -182,6 +182,8 @@ class Environment:
         # RNG-only, never reach for episode state.
         self.world.generator = torch.Generator(device=self.device)
         self.world.generator.manual_seed(seed)
+        self.world.kernel_seed = int(seed)
+        self.world._kernel_step = 0
 
     @property
     def graph_mode(self) -> bool:

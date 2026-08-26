@@ -105,14 +105,18 @@ That makes the reset path's own cost the thing to watch. At 4096x8 on an RTX 307
 
 | | ms/step |
 |---|---|
-| `auto_reset=False` | 0.13 |
-| `auto_reset=True` | 3.9 |
+| `auto_reset=False` | 0.14 |
+| `auto_reset=True` | 1.20 |
 
-Navigation's spawn sampler used to dominate that second row: a fixed 16-iteration `torch.cdist` rejection loop, run twice per reset (spawns, then goals), for 40.8 ms/step — 315x the plain step. It is now stratified jittered-cell sampling (`NavigationScenario._sample_separated`), which gets the pairwise separation by construction in a single draw: 10.6x faster, and the separation is now guaranteed rather than merely likely.
+Navigation's spawn sampler used to dominate that second row, twice over. First it was a fixed 16-iteration `torch.cdist` rejection loop, run twice per reset (spawns, then goals), for 40.8 ms/step — 315x the plain step; stratified jittered-cell sampling replaced it, getting the pairwise separation by construction in a single draw.
+
+That left a torch draw still running every step, and at 16,384x16 it was **86%** of the step: two batched `argsort`s (the only way to get a uniform random k-subset out of batched torch ops), four `sample_uniform`s and the `torch.where` blends — around 25 ops, on a path that is bound by op count rather than by arithmetic. The whole masked reset is now a single Warp launch (`nav_reset_kernel`), one thread per env, drawing its distinct cells by a partial Fisher–Yates over a scratch permutation. Same guarantee, same distribution — a *uniform* k-subset, which is the part worth protecting: a cheaper structured draw (cells by a random base and stride) passes every separation and bounds check while collapsing the reachable spawn layouts from C(25,16) ≈ 2.0M to 250, which surfaces much later as a generalization failure rather than as a test failure. `tests/unit/test_reset_kernel.py` pins it.
+
+The reset went from 3.9 to 1.20 ms/step at 4096x8; at 16,384x16 the RL configuration (graph on, `auto_reset=True`) went from 4.2M to 13.8M env-steps/s.
 
 Two things follow for anyone writing a scenario:
 
-- Whatever `reset_world` does, it does on every step under `auto_reset`. Budget it as hot-path work, not as setup.
+- Whatever `reset_world` does, it does on every step under `auto_reset`. Budget it as hot-path work, not as setup — and prefer one masked kernel over a chain of masked torch ops, because what costs you there is the number of launches, not the arithmetic.
 - If you only need resets at episode boundaries you control, leave `auto_reset=False` and call `env.reset_at` yourself with a mask — you then pay the reset cost only on the steps that need it.
 
 ## Running the benchmarks

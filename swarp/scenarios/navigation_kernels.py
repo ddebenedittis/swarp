@@ -266,6 +266,120 @@ def _obs_signature(dtype) -> list:
     ]
 
 
+@wp.func
+def _as(x: wp.float32, ref: wp.float32) -> wp.float32:
+    return x
+
+
+@wp.func
+def _as(x: wp.float32, ref: wp.float64) -> wp.float64:
+    return wp.float64(x)
+
+
+@wp.kernel
+def nav_reset_kernel(
+    reset_mask: wp.array(dtype=wp.uint8),
+    use_mask: wp.int32,
+    seed: wp.int32,
+    lim: Any,
+    cell: Any,
+    jitter: Any,
+    grid: wp.int32,
+    n_cells: wp.int32,
+    stratified: wp.int32,
+    n_agents: wp.int32,
+    perm: wp.array2d(dtype=wp.int32),
+    pos: Any,
+    theta: Any,
+    vel: Any,
+    speed: Any,
+    ang_vel: Any,
+    goals: Any,
+):
+    """One masked episode reset per env: spawns, goals, headings, zeroed velocities.
+
+    Thread per **env**, not per agent: the distinct-cell draw is a partial Fisher-Yates
+    over ``perm[e]``, which is inherently sequential. That is the whole reason this is a
+    kernel rather than the torch chain it replaces — ``argsort`` is the only way to get a
+    uniform random k-subset out of batched torch ops, and under ``auto_reset`` it costs a
+    sort over ``[n_envs, n_cells]`` twice on *every* step.
+
+    ``stratified == 0`` is the packing-limit fallback: no grid both fits the points and
+    leaves jitter room, so draw uniformly and give up the separation guarantee rather than
+    pin every point to a cell centre. Mirrors the torch reference's fallback in
+    :meth:`~swarp.scenarios.navigation.NavigationScenario._sample_separated`.
+
+    ``_as`` widens the float32 ``wp.randf`` draw to the world's scalar type; everything
+    downstream is generic arithmetic, so a float64 world gets float64 spawns.
+    """
+    e = wp.tid()
+    if use_mask == 1 and reset_mask[e] == wp.uint8(0):
+        return
+
+    rng = wp.rand_init(seed, e)
+    # Typed constants: Warp reads a bare float literal as float32, so every literal that
+    # meets the world's scalar type has to be widened through ``_as`` first.
+    zero = _as(0.0, lim)
+    one = _as(1.0, lim)
+    two = _as(2.0, lim)
+    mid = _as(0.5, lim)
+    pi = _as(3.14159265358979, lim)
+
+    for a in range(n_agents):
+        vel[e, a] = wp.vector(zero, zero)
+        speed[e, a] = zero
+        ang_vel[e, a] = zero
+        theta[e, a] = (_as(wp.randf(rng), lim) * two - one) * pi
+
+    if stratified == 0:
+        for a in range(n_agents):
+            x = (_as(wp.randf(rng), lim) * two - one) * lim
+            y = (_as(wp.randf(rng), lim) * two - one) * lim
+            pos[e, a] = wp.vector(x, y)
+        for a in range(n_agents):
+            x = (_as(wp.randf(rng), lim) * two - one) * lim
+            y = (_as(wp.randf(rng), lim) * two - one) * lim
+            goals[e, a] = wp.vector(x, y)
+        return
+
+    half = cell * mid - lim
+
+    # Spawns, then goals: two independent uniform k-subsets of the cell grid.
+    for i in range(n_cells):
+        perm[e, i] = i
+    for i in range(n_agents):
+        j = i + wp.int32(wp.randf(rng) * wp.float32(n_cells - i))
+        if j > n_cells - 1:
+            j = n_cells - 1
+        swap = perm[e, i]
+        perm[e, i] = perm[e, j]
+        perm[e, j] = swap
+    for a in range(n_agents):
+        c = perm[e, a]
+        x = _as(wp.float32(c % grid), lim) * cell + half
+        y = _as(wp.float32(c / grid), lim) * cell + half
+        x += (_as(wp.randf(rng), lim) - mid) * jitter
+        y += (_as(wp.randf(rng), lim) - mid) * jitter
+        pos[e, a] = wp.vector(x, y)
+
+    for i in range(n_cells):
+        perm[e, i] = i
+    for i in range(n_agents):
+        j = i + wp.int32(wp.randf(rng) * wp.float32(n_cells - i))
+        if j > n_cells - 1:
+            j = n_cells - 1
+        swap = perm[e, i]
+        perm[e, i] = perm[e, j]
+        perm[e, j] = swap
+    for a in range(n_agents):
+        c = perm[e, a]
+        x = _as(wp.float32(c % grid), lim) * cell + half
+        y = _as(wp.float32(c / grid), lim) * cell + half
+        x += (_as(wp.randf(rng), lim) - mid) * jitter
+        y += (_as(wp.randf(rng), lim) - mid) * jitter
+        goals[e, a] = wp.vector(x, y)
+
+
 def _reward_signature(dtype) -> list:
     a2s = wp.array2d(dtype=dtype)
     return [
@@ -281,6 +395,31 @@ def _reward_signature(dtype) -> list:
     ]
 
 
+def _reset_signature(dtype) -> list:
+    a2v = wp.array2d(dtype=VEC2[dtype])
+    a2s = wp.array2d(dtype=dtype)
+    return [
+        wp.array(dtype=wp.uint8),  # reset_mask
+        wp.int32,  # use_mask
+        wp.int32,  # seed
+        dtype,  # lim
+        dtype,  # cell
+        dtype,  # jitter
+        wp.int32,  # grid
+        wp.int32,  # n_cells
+        wp.int32,  # stratified
+        wp.int32,  # n_agents
+        wp.array2d(dtype=wp.int32),  # perm scratch
+        a2v,  # pos
+        a2s,  # theta
+        a2v,  # vel
+        a2s,  # speed
+        a2s,  # ang_vel
+        a2v,  # goals
+    ]
+
+
 for _T in (wp.float32, wp.float64):
     register(nav_obs_kernel, _T, _obs_signature(_T))
     register(nav_reward_kernel, _T, _reward_signature(_T))
+    register(nav_reset_kernel, _T, _reset_signature(_T))

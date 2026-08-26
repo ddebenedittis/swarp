@@ -105,6 +105,13 @@ class World:
         self.obstacle_half_extents: torch.Tensor | None = None  # [n_obstacles, 2]
         self.obstacle_kind: torch.Tensor | None = None  # [n_obstacles] ObstacleKind tags
         self.generator: torch.Generator | None = None  # installed by Environment
+        # Seed stream for kernel-side RNG, advanced host-side. A Warp kernel needs an
+        # integer seed, and pulling one out of ``generator`` would mean a device->host
+        # copy on every reset — which is exactly what a masked reset exists to avoid. So
+        # this counter mirrors the generator's role without touching the device: same
+        # ``seed`` in, same sequence of kernel seeds out. Reset alongside the generator.
+        self.kernel_seed = 0
+        self._kernel_step = 0
         self.agent_radius = torch.tensor(
             [c.radius for c in agent_configs], device=device, dtype=dtype
         )
@@ -248,6 +255,15 @@ class World:
             self.state = self.zero_state()
 
     # ------------------------------------------------------------- randomness
+
+    def next_kernel_seed(self) -> int:
+        """A fresh deterministic seed for a kernel-side RNG. Host-side, no sync.
+
+        Mixes the base seed with a monotonic counter so that two draws in one step get
+        independent streams, and a rerun from the same ``seed`` reproduces both.
+        """
+        self._kernel_step += 1
+        return (self.kernel_seed * 0x9E3779B1 + self._kernel_step) & 0x7FFFFFFF
 
     def sample_uniform(self, shape: tuple[int, ...], low: float, high: float) -> torch.Tensor:
         u = torch.rand(shape, generator=self.generator, device=self.device, dtype=self.dtype)

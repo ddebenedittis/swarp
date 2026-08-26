@@ -5,6 +5,45 @@ All notable changes to `swarp`. Newest first. Nothing has been released yet — 
 
 ## Unreleased
 
+### Performance
+
+- **Kernel overloads are resolved once, not per launch.** Every generic kernel was already
+  instantiated per dtype at import, but the registration loops discarded what
+  `wp.overload` returns and launched the *generic* kernel, so `wp.launch` re-inferred the
+  argument types and rebuilt a signature string on every call. `swarp._overloads` keeps the
+  concrete kernel and dispatches it for the cost of a dict lookup. Isolated: 492 -> 173 us
+  for the 2D integrator at 4096x16. End to end (`swarp.benchmark.throughput`,
+  `use_graph=False`): ~1.7-1.8x, e.g. 16000x16 from 5.1M to 8.9M env-steps/s. Outputs are
+  bit-identical — only which kernel object reaches `wp.launch` changes.
+
+- **Navigation's masked reset is one Warp launch instead of ~25 torch ops.** Under
+  `auto_reset` the reset runs on every step for the whole batch (there is no host-side "is
+  anything done?" gate, by design), and it was **86%** of the step time at 16,384x16 —
+  two batched `argsort`s, four `sample_uniform`s and the `torch.where` blends, on a path
+  bound by op count rather than arithmetic. `nav_reset_kernel` writes spawns, goals,
+  headings and zeroed velocities in one masked launch, one thread per env, drawing its
+  distinct cells with a partial Fisher-Yates over a scratch permutation. The RL
+  configuration (graph on, `auto_reset=True`) went from 4.2M to 13.8M env-steps/s at
+  16,384x16; the two changes together are ~3.3x there.
+
+  The draw is still a *uniform* random k-subset of cells, matching the torch reference's
+  distribution. That is deliberate and tested: a cheaper structured draw (cells by a
+  random base and coprime stride) satisfies every separation and bounds check while
+  collapsing the reachable spawn layouts from C(25,16) = 2,042,975 to 250 — a loss that
+  shows up as a generalization failure long after it would show up in a test.
+
+  `NavigationScenario._sample_separated` is retained as the torch reference and keeps its
+  own tests; it and the kernel share no code, like the fused obs/reward kernels and their
+  oracles.
+
+### Changed
+
+- **Seeded trajectories differ from previous versions.** The navigation reset no longer
+  draws from `world.generator`, so every downstream torch draw sits at a different point
+  in that stream. Reproducibility is unchanged going forward — same `seed` in, same
+  trajectory out — and `World.next_kernel_seed` gives the kernel RNG its own deterministic
+  host-side stream, reset alongside the generator, with no device->host round-trip.
+
 ### Breaking changes
 
 - **`SamplingScenario(collision_penalty=...)` is gone.** The parameter was stored and never

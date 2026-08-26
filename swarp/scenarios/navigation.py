@@ -21,10 +21,16 @@ import warp as wp
 
 from swarp._overloads import concrete
 from swarp.core.config import Obstacles, WorldConfig
+from swarp.core.state import VEC2
 from swarp.core.world import World
 from swarp.dynamics.base import AgentConfig, ControlMode, DynamicsModel
+from swarp.interop.autograd import torch_stream_scope
 from swarp.scenarios.fused import Buf, FusedPass, FusedScenario
-from swarp.scenarios.navigation_kernels import nav_obs_kernel, nav_reward_kernel
+from swarp.scenarios.navigation_kernels import (
+    nav_obs_kernel,
+    nav_reset_kernel,
+    nav_reward_kernel,
+)
 
 
 class NavigationScenario(FusedScenario):
@@ -122,6 +128,13 @@ class NavigationScenario(FusedScenario):
         # with alloc="if_none". Reassigned by the torch path when eager_trims is off,
         # which is what watch=True catches.
         self._prev_dist: torch.Tensor | None = None
+        # Lazily sized by _launch_reset: the Fisher-Yates scratch and the uint8 reset
+        # mask, plus their Warp views (built once — the tensors are never reallocated
+        # for a given batch, so the handles stay pointer-stable).
+        self._reset_perm: torch.Tensor | None = None
+        self._reset_perm_wp = None
+        self._reset_mask: torch.Tensor | None = None
+        self._reset_mask_wp = None
         # Goals are engine-independent per-agent targets, written in place on every
         # reset; allocated here (not in reset_world) so the fused spec can adopt them.
         self.world.goals = torch.zeros(n_envs, self.n_agents, 2, device=device, dtype=dtype)
@@ -170,10 +183,14 @@ class NavigationScenario(FusedScenario):
 
         That replaces a fixed 16-iteration ``torch.cdist`` rejection loop, which cost a
         batched distance matrix per iteration and could still return overlapping points.
-        Under ``auto_reset`` this runs on every step, for the whole batch (the reset is
-        masked device-side, so there is no host-side "is anything done?" gate to skip it) —
-        making it cheap is the only lever, and it was worth ~300x on the step time at
-        4096x8. See ``docs/performance.md``.
+
+        This is the **reference** implementation, not the one the step loop runs: making
+        the draw cheap was not in fact the only lever, and ``reset_world`` now launches
+        :data:`~swarp.scenarios.navigation_kernels.nav_reset_kernel` instead — one masked
+        Warp launch where this is ~25 torch ops, which is what a path bound by op count
+        cares about. Both are kept, sharing no code, so the kernel can be tested against
+        this one's invariants the way the fused obs/reward kernels are. See
+        ``docs/performance.md``.
 
         Host-sync-free (``torch.rand`` / ``argsort`` / arithmetic on ``world.generator``),
         so it stays safe inside a masked reset on the step loop.
@@ -207,28 +224,97 @@ class NavigationScenario(FusedScenario):
         centers = torch.stack([col, row], dim=-1) * s + (0.5 * s - lim)
         return centers + (w.sample_uniform(shape, 0.0, 1.0) - 0.5) * jitter
 
+    def _reset_grid(self) -> tuple[float, float, float, int, int, bool]:
+        """Cell geometry for the stratified spawn draw: ``(lim, cell, jitter, g, ncell,
+        stratified)``.
+
+        The same derivation :meth:`_sample_separated` documents, hoisted so the kernel can
+        take it as scalars. ``stratified=False`` is the packing-limit fallback.
+        """
+        lim = self.world_size - 2.0 * self.agent_radius
+        min_dist = self.min_spawn_separation
+        if self.n_agents == 1 or min_dist <= 0.0:
+            return lim, 0.0, 0.0, 1, 1, False
+        side = 2.0 * lim
+        g = math.ceil(math.sqrt(self.n_agents * self._SPAWN_CELL_OVERSAMPLE))
+        g = min(g, int(side // (2.0 * min_dist)))
+        g = max(g, math.ceil(math.sqrt(self.n_agents)))
+        if side / g <= min_dist:
+            return lim, 0.0, 0.0, 1, 1, False
+        cell = side / g
+        return lim, cell, cell - min_dist, g, g * g, True
+
+    def _launch_reset(self, env_mask: torch.Tensor | None) -> None:
+        """Launch the masked device-side reset (see :meth:`reset_world`)."""
+        w = self.world
+        lim, cell, jitter, g, n_cells, stratified = self._reset_grid()
+
+        if self._reset_perm is None or self._reset_perm.shape != (w.n_envs, n_cells):
+            self._reset_perm = torch.zeros(
+                (w.n_envs, n_cells), dtype=torch.int32, device=w.device
+            )
+            self._reset_perm_wp = wp.from_torch(self._reset_perm)
+        if self._reset_mask is None or self._reset_mask.shape != (w.n_envs,):
+            self._reset_mask = torch.zeros(w.n_envs, dtype=torch.uint8, device=w.device)
+            self._reset_mask_wp = wp.from_torch(self._reset_mask)
+        if env_mask is not None:
+            self._reset_mask.copy_(env_mask)  # bool -> uint8
+
+        st = w.state_wp()
+        goals = wp.from_torch(w.goals.contiguous(), dtype=VEC2[w.wp_dtype])
+        scalar = w.wp_dtype
+        with torch_stream_scope(w.device):
+            wp.launch(
+                concrete(nav_reset_kernel, scalar),
+                dim=w.n_envs,
+                inputs=[
+                    self._reset_mask_wp,
+                    wp.int32(0 if env_mask is None else 1),
+                    wp.int32(w.next_kernel_seed()),
+                    scalar(lim),
+                    scalar(cell),
+                    scalar(jitter),
+                    wp.int32(g),
+                    wp.int32(n_cells),
+                    wp.int32(1 if stratified else 0),
+                    wp.int32(self.n_agents),
+                    self._reset_perm_wp,
+                    st.pos,
+                    st.theta,
+                    st.vel,
+                    st.speed,
+                    st.ang_vel,
+                    goals,
+                ],
+                device=w.device,
+                record_tape=False,
+            )
+        w.mark_pos_dirty()
+
+
     def reset_world(
         self, env_mask: torch.Tensor | None = None, *, obs_only: bool = False
     ) -> None:
         """Reset all envs (``env_mask=None``) or the ``True`` entries of a
-        boolean ``[n_envs]`` mask. Host-sync-free: the full batch is always
-        sampled and blended with ``torch.where`` so no variable-length gather or
-        ``.any()`` is needed."""
-        w = self.world
-        n = w.n_envs  # always sample full width; blend selected envs with where
-        spawn = self._sample_separated(n, self.n_agents, self.min_spawn_separation)
-        goals = self._sample_separated(n, self.n_agents, self.min_spawn_separation)
-        theta = w.sample_uniform((n, self.n_agents), -torch.pi, torch.pi)
+        boolean ``[n_envs]`` mask.
 
-        w.write_state(env_mask, pos=spawn, theta=theta, vel=0.0, speed=0.0, ang_vel=0.0)
-        if env_mask is None:
-            w.goals.copy_(goals)
-        else:
-            w.goals.copy_(torch.where(env_mask.view(-1, 1, 1), goals, w.goals))
+        Host-sync-free, and device-side: one masked Warp launch writes spawns, goals,
+        headings and zeroed velocities. Under ``auto_reset`` this runs on **every** step
+        (the mask is applied in the kernel, so there is no host-side "is anything done?"
+        gate that could skip it), which is why it is one launch rather than the ~25 torch
+        ops it replaces — two batched ``argsort``s, four ``sample_uniform``s and the
+        ``torch.where`` blends. That was 86% of the RL step time at 16384x16.
+
+        :meth:`_sample_separated` stays the torch reference for the same draw, and the
+        kernel is validated against its invariants rather than its values: the two
+        deliberately do not share code, and their RNG streams are independent.
+        """
+        w = self.world
+        self._launch_reset(env_mask)
 
         if self.n_obstacles > 0:
             lim = self.world_size - self.obstacle_radius
-            obs_pos = w.sample_uniform((n, self.n_obstacles, 2), -lim, lim)
+            obs_pos = w.sample_uniform((w.n_envs, self.n_obstacles, 2), -lim, lim)
             if env_mask is None:
                 w.obstacle_pos.copy_(obs_pos)
             else:
