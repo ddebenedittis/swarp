@@ -18,7 +18,7 @@ world_config = WorldConfig(
 world = World(agent_configs, world_config, n_envs=n_envs, device=device, dt=dt, substeps=1, dtype=dtype)
 ```
 
-### Overriding a scenario's engine settings
+## Overriding a scenario's engine settings
 
 The built-in scenarios compute their own `WorldConfig` — `bounds` from `world_size`, `neighbor_radius` from the contact reach — and most of its fields are not scenario constructor arguments.
 Pass `world_config=` to `swarp.make` or `Environment` to override them without subclassing:

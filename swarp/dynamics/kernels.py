@@ -861,6 +861,16 @@ def integrate_kernel(
         )
 
 
+# The ``_per_env`` twins below duplicate their base kernel verbatim apart from the
+# ``params`` rank and indexing (``params[a, X]`` vs ``params[e, a, X]``). That is
+# deliberate, and was measured: collapsing each pair into one kernel taking a 3-D
+# ``params`` plus a 0/1 env stride (the shared rows as a zero-copy ``[1, n_agents, P]``
+# view, indexed ``params[e * p_stride, a, X]``) is correct and bit-identical, but costs
+# ~4% of NavigationScenario throughput at 16k envs x 64 agents — an interleaved A/B on
+# an RTX 3070 put the collapsed variant's median below the baseline's worst run. One
+# integer multiply per thread is not free on the hottest kernel in the library, and 194
+# lines of mechanical duplication are cheaper than that. Keep the twins in sync by hand;
+# ``tests/unit/test_per_env_params.py`` exercises both paths against each other.
 @wp.kernel
 def integrate_kernel_per_env(
     # state in
