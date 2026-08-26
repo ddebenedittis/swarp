@@ -9,12 +9,27 @@ capture is unavailable, runs the same launches eagerly. Either way it returns th
 same stable torch views, so the scenario's obs/reward layer reads persistent
 memory with no per-step wrapping.
 
-Capture runs on a side stream (CUDA forbids capturing the legacy default
-stream); the graph is *replayed* on the current stream, which is the same
-default stream PyTorch's eager ops use, so masked auto-resets (writes) and
-observations (reads) stay ordered with the replay without a device sync. Auto-
-reset stays *outside* the graph: it uses a ``torch.Generator`` whose philox
-offset is not capture-safe.
+Streams. Warp launches go to Warp's **own** created stream, not the legacy default
+stream — that is what makes capture legal at all. That stream carries the *blocking* flag,
+so the driver serializes it against stream 0 in both directions, which is why torch code
+on the default stream stays ordered against these launches with no event of ours involved.
+Under a **user-created** ``torch.cuda.Stream`` that guarantee does not apply, so every
+eager entry point here opens :func:`~swarp.interop.autograd.torch_stream_scope`: the
+replay, the eager fallback, the pre-capture warm-up, and the two state-loading paths
+(whose ``.contiguous()`` temporaries are torch-allocator memory freed at return — a
+use-after-free under a user stream). On the default stream that scope deliberately
+degrades to a plain ``ScopedDevice``, because paying for two events per step to re-derive
+what the blocking flag already guarantees cost 10% of the graph replay.
+
+The one thing that cannot be scoped at all is the capture itself: ``wp.ScopedCapture``
+captures the *current* stream and capturing torch's legacy stream is a hard CUDA error, so
+``_ensure_graph``'s capture block stays on Warp's own stream. Replaying a graph on the
+legacy stream is fine; only capturing it is not.
+
+With that, masked auto-resets (writes) and observations (reads) stay ordered with the
+replay without a device sync, under a user-created stream as much as under the default one.
+Auto-reset stays *outside* the graph: it uses a ``torch.Generator`` whose philox offset is
+not capture-safe.
 
 :class:`CudaGraphStep` at the bottom is the same idea stripped to its core — one
 capture over fixed buffers, no persistent state, no recapture logic — kept as the
@@ -31,7 +46,7 @@ import warp as wp
 from swarp.core.hooks import WholeStepHook
 from swarp.core.stepper import Stepper
 from swarp.dynamics.base import Integrator
-from swarp.interop.autograd import TorchState, fill_state_defaults
+from swarp.interop.autograd import TorchState, fill_state_defaults, torch_stream_scope
 
 
 class StepRuntime:
@@ -111,14 +126,21 @@ class StepRuntime:
     # ------------------------------------------------------------------ state
 
     def load_state(self, state: TorchState) -> None:
-        """Copy an external torch state into the persistent buffers in place."""
+        """Copy an external torch state into the persistent buffers in place.
+
+        Scoped onto torch's stream: a ``.contiguous()`` here can be a fresh
+        torch-allocator tensor that is freed the moment this returns, so a copy issued on
+        Warp's own stream would be reading memory torch has already handed out again.
+        """
         state = fill_state_defaults(state)
-        for dst, src in zip(self.state.arrays(), state, strict=True):
-            wp.copy(dst, wp.from_torch(src.detach().contiguous(), dtype=dst.dtype))
+        with torch_stream_scope(self.device):
+            for dst, src in zip(self.state.arrays(), state, strict=True):
+                wp.copy(dst, wp.from_torch(src.detach().contiguous(), dtype=dst.dtype))
 
     def reset_state(self) -> None:
         """Zero the persistent state in place (keeps the views/graph valid)."""
-        self.state.zero_()
+        with torch_stream_scope(self.device):
+            self.state.zero_()
 
     @property
     def graph_active(self) -> bool:
@@ -213,20 +235,26 @@ class StepRuntime:
         # Snapshotting after the physics warm-up — as this used to — could not undo that:
         # a scenario with a movable body entered its first replay one extra body-step
         # ahead of the eager path.
+        #
+        # The warm-up is scoped onto torch's stream (it reads buffers torch has just
+        # written, and the carry restore below is a torch write racing the hook's launches
+        # otherwise); the ``wp.synchronize_device`` after it is what bridges to the capture
+        # stream, which must stay Warp's own — see the module docstring.
         carries = self._hook.carries() if self._hook is not None else []
         saved = [c.clone() for c in carries]
-        stepper.launch_substeps(
-            self.state,
-            self._actions,
-            self._state_out,
-            self._buffers,
-            reuse_neighbors=True,
-            skip_drone=True,
-        )
-        if self._hook is not None:
-            self._hook.run()
-        for c, s in zip(carries, saved, strict=True):
-            c.copy_(s)
+        with torch_stream_scope(self.device):
+            stepper.launch_substeps(
+                self.state,
+                self._actions,
+                self._state_out,
+                self._buffers,
+                reuse_neighbors=True,
+                skip_drone=True,
+            )
+            if self._hook is not None:
+                self._hook.run()
+            for c, s in zip(carries, saved, strict=True):
+                c.copy_(s)
         wp.synchronize_device(stepper.device)
         # Re-sync built_version after warm-up (which bumped state_version without
         # touching the grid's contents) so the capture takes the reuse branch iff
@@ -255,11 +283,17 @@ class StepRuntime:
         overwritten by the next call — clone if a copy must outlive the step.
         """
         self.actions_view.copy_(actions)
+        # ``_ensure_graph`` deliberately stays *outside* the scope: it captures, and
+        # capture has to happen on Warp's own stream (module docstring). The replay and the
+        # eager fallback go on torch's stream, so they are ordered against the action copy
+        # just above and the obs read just after.
         if self._can_graph:
             self._ensure_graph()
-            wp.capture_launch(self._graph)
+            with torch_stream_scope(self.device):
+                wp.capture_launch(self._graph)
         else:
-            self._run_eager()
+            with torch_stream_scope(self.device):
+                self._run_eager()
         # Both paths run the hook when one is registered (captured into the graph
         # or invoked eagerly); Environment reads this to skip a redundant post_step.
         self._ran_post = self._hook is not None
@@ -307,10 +341,14 @@ class CudaGraphStep:
 
     def __call__(self, state: TorchState, actions: torch.Tensor) -> TorchState:
         state = fill_state_defaults(state)
-        wp.copy(self._actions, wp.from_torch(actions.contiguous(), dtype=self._actions.dtype))
-        for dst, src in zip(self._in.arrays(), state, strict=True):
-            wp.copy(dst, wp.from_torch(src.contiguous(), dtype=dst.dtype))
-        wp.capture_launch(self._graph)
+        # Same rule as ``StepRuntime.step``: the in-copies read torch-allocator
+        # temporaries and the replay must be ordered against them, so both go on torch's
+        # current stream. (The capture in ``__init__`` stays on Warp's own.)
+        with torch_stream_scope(str(self.stepper.device)):
+            wp.copy(self._actions, wp.from_torch(actions.contiguous(), dtype=self._actions.dtype))
+            for dst, src in zip(self._in.arrays(), state, strict=True):
+                wp.copy(dst, wp.from_torch(src.contiguous(), dtype=dst.dtype))
+            wp.capture_launch(self._graph)
         return TorchState(
             *(wp.to_torch(a, requires_grad=False).clone() for a in self._out.arrays())
         )

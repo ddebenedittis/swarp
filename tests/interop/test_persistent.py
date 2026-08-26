@@ -81,6 +81,37 @@ def test_graph_matches_eager(auto_reset, n_obstacles):
         assert torch.equal(dg, de)
 
 
+@pytest.mark.gpu(reason="a non-default CUDA stream needs a GPU")
+@pytest.mark.parametrize("use_graph", [True, False])
+def test_matches_under_a_user_created_stream(use_graph):
+    """A rollout inside the caller's own ``torch.cuda.Stream`` must match the default one.
+
+    Warp launches go to Warp's own created stream, whose blocking flag is what made
+    default-stream torch code *happen* to stay ordered against them. Under a user stream
+    that accident stops holding, so every eager launch site is scoped onto torch's current
+    stream instead. Both arms are covered: ``use_graph=True`` exercises the replay, the
+    pre-capture warm-up and the captured ``World.neighbors``; ``use_graph=False`` the eager
+    persistent path and the eager ``World.neighbors``/fused launches.
+
+    Honest caveat: this passes on the *unscoped* code too, because Warp's stream is created
+    with the blocking flag and this box's timings do not expose the race. It is a guard, not
+    a reproducer — its job is to fail if the ordering ever stops being explicit, and to
+    catch the far more likely regression of a scope opened somewhere it breaks a capture.
+    """
+    dev = "cuda:0"
+    ref = _run(_mk(dev, use_graph, auto_reset=True, n_obstacles=3), 12, dev, 4)
+    env = _mk(dev, use_graph, auto_reset=True, n_obstacles=3)
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        got = _run(env, 12, dev, 4)
+    torch.cuda.current_stream().wait_stream(stream)
+    assert env.graph_mode is use_graph
+    for (og, rg, dg), (oe, re, de) in zip(got, ref, strict=True):
+        assert torch.equal(og, oe)
+        assert torch.equal(rg, re)
+        assert torch.equal(dg, de)
+
+
 @pytest.mark.gpu(reason="CUDA graph capture needs a GPU")
 @pytest.mark.parametrize(
     "scen_factory",

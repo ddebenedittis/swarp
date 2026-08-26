@@ -118,11 +118,25 @@ def torch_stream_scope(device: str):
     """Scope Warp launches onto torch's current stream (``ScopedDevice`` on CPU).
 
     Every entry point that launches kernels against torch tensors has to open this
-    first, or the launches land on Warp's own stream and race the torch ops that
-    produced their inputs. Cached per ``(device, cudaStream_t)`` — see the note above.
+    first, or the launches land on Warp's own stream, unordered against the torch ops
+    that produced their inputs. Cached per ``(device, cudaStream_t)`` — see the note above.
+
+    **Except on the legacy default stream**, where it is a plain ``ScopedDevice``. Warp's
+    own stream is created with the *blocking* flag, so the driver already serializes it
+    against stream 0 in both directions: a Warp launch issued after queued torch work waits
+    for that work, with no event of ours involved. (Measured, not assumed — queue ~550 ms of
+    torch matmuls on stream 0, then ``wp.synchronize_stream(device.stream)`` on a trivial
+    Warp launch: it returns after ~540 ms, i.e. it waited.) Opening a ScopedStream there
+    costs two event records and two waits per call for nothing, and this is the hot path:
+    at 4000x16 it measured 0.166 -> 0.185 ms/step, a 10% regression on the graph replay.
+
+    A caller running inside its own ``torch.cuda.Stream`` gets the real scope, which is the
+    case the blocking flag does *not* cover.
     """
     if device.startswith("cuda"):
         ts = torch.cuda.current_stream()
+        if ts.cuda_stream == 0:  # the legacy default stream; see above
+            return wp.ScopedDevice(device)
         key = (device, ts.cuda_stream)
         wp_stream = _STREAM_CACHE.get(key)
         if wp_stream is None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from typing import NamedTuple
 
 import torch
@@ -11,7 +12,7 @@ from swarp.core.config import Obstacles, WorldConfig
 from swarp.core.state import VEC2
 from swarp.core.stepper import Stepper
 from swarp.dynamics.base import AgentConfig, action_dim
-from swarp.interop.autograd import TorchState, warp_step
+from swarp.interop.autograd import TorchState, torch_stream_scope, warp_step
 
 TORCH_TO_WP = {torch.float32: wp.float32, torch.float64: wp.float64}
 
@@ -331,18 +332,26 @@ class World:
         if not self.stepper.collisions:
             raise RuntimeError("neighbor lists require WorldConfig.collisions=True")
         grid = self.stepper.grid(self.n_envs)
-        if self._persistent and not self._detached:
-            # The persistent state's pos is already a Warp array — build directly
-            # on it (no re-wrap). Runs on the default stream, ordered with the
-            # graph replay that reads the grid's lists on the next step.
-            grid.build(self.runtime.state.pos)
-        else:
-            pos_wp = wp.from_torch(
-                self.state.pos.detach().contiguous(),
-                dtype=VEC2[self.wp_dtype],
-                requires_grad=False,
-            )
-            grid.build(pos_wp)
+        # Scoped onto torch's current stream, so the build is ordered against the torch
+        # writes to ``state.pos`` that precede it and the graph replay that reads the lists
+        # on the next step. The exception is a *captured* invocation: navigation's fused
+        # ``_launch_obs`` calls this from inside ``wp.ScopedCapture``, where opening a
+        # ScopedStream onto torch's legacy stream would break the capture — there the build
+        # records onto the capture stream, which is exactly what it must do.
+        dev = wp.get_device(self.device)
+        capturing = dev.is_cuda and dev.is_capturing
+        with nullcontext() if capturing else torch_stream_scope(self.device):
+            if self._persistent and not self._detached:
+                # The persistent state's pos is already a Warp array — build directly on
+                # it (no re-wrap).
+                grid.build(self.runtime.state.pos)
+            else:
+                pos_wp = wp.from_torch(
+                    self.state.pos.detach().contiguous(),
+                    dtype=VEC2[self.wp_dtype],
+                    requires_grad=False,
+                )
+                grid.build(pos_wp)
         grid.built_version = self.stepper.state_version
         return grid.torch_views()
 

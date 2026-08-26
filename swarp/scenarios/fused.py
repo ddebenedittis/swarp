@@ -39,6 +39,7 @@ import warp as wp
 
 from swarp.core.hooks import WholeStepHook
 from swarp.core.state import VEC2
+from swarp.interop.autograd import torch_stream_scope
 from swarp.scenarios.base import Scenario
 
 #: How a :class:`Buf` is seen from torch and from Warp, in one field.
@@ -380,10 +381,16 @@ class FusedScenario(Scenario):
         The fused arm runs the *same* sequence the whole-step graph captures, which is
         what keeps non-graph fused mode and CPU eager-persistent mode bit-identical to
         graph mode.
+
+        Scoped onto torch's current stream — these launches read state torch has just
+        written and their outputs are read by torch straight after. The scope goes *here*
+        rather than inside :meth:`launch_fused`, because the captured path
+        (:meth:`_launch_fused_step`) has to record on the capture stream and must stay raw.
         """
         if self.fused_active:
             self.prepare_fused()
-            self.launch_fused(STEP)
+            with torch_stream_scope(self.world.device):
+                self.launch_fused(STEP)
         else:
             self.post_step_torch()
 
@@ -401,7 +408,8 @@ class FusedScenario(Scenario):
                     mask.fill_(1)
                 else:
                     mask.copy_(env_mask)  # bool -> uint8
-            self.launch_fused(FusedPass("reset", env_mask=env_mask, full=not obs_only))
+            with torch_stream_scope(self.world.device):
+                self.launch_fused(FusedPass("reset", env_mask=env_mask, full=not obs_only))
         else:
             self.reset_torch(env_mask)
 

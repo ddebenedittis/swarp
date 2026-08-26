@@ -227,6 +227,16 @@ class Stepper:
         captured whole-step graph. An install with movable bodies derives the body group in
         torch and reads ``any_movable`` back to the host, so it must stay outside a
         capture. Pinned by ``tests/unit/test_obstacles.py``.
+
+        **Streams.** The in-place ``wp.copy`` install runs on Warp's own stream, not
+        torch's — this is the one launch site in the engine that is not
+        :func:`~swarp.interop.autograd.torch_stream_scope`'d, and it cannot be: transport
+        calls it mid-capture, where opening a scope onto torch's legacy stream would break
+        the capture. It is safe under the default torch stream because Warp's stream is
+        created with the blocking flag (it synchronizes with the legacy stream), and safe
+        inside a capture because the copies then record on the capture stream. A caller
+        installing obstacles from inside its own ``torch.cuda.Stream`` is the uncovered
+        case: synchronize that stream, or install on the default one.
         """
         obs = obstacles.resolve(self.device, self.torch_dtype)
         n_envs, n_obs = obs.n_envs, obs.n_obstacles
