@@ -10,7 +10,7 @@ Isaac Sim uses to keep high ray counts affordable.
 
 The kernel is inference-only (launched ``record_tape=False``); the differentiable
 path stays the torch backend. Kept numerically equivalent to ``lidar_scan`` and
-asserted so in ``tests/test_lidar.py``.
+asserted so in ``tests/unit/test_lidar.py``.
 """
 
 from __future__ import annotations

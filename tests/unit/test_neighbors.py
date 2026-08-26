@@ -234,3 +234,43 @@ def test_edge_index(device):
     got = set(map(tuple, edges.T.cpu().numpy().tolist()))
     assert got == expected
     assert edges.device.type == ("cuda" if device.startswith("cuda") else "cpu")
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_lazy_hash_grid_honours_grid_dim(device, monkeypatch):
+    """``build_grid`` on a non-``"grid"`` backend must not fall back to a hardcoded 128.
+
+    The lazy allocation in ``_ensure_grid`` is the only way ``WorldConfig.grid_dim``
+    can be silently discarded, because it is reached from ``build_grid`` regardless of
+    the configured method.
+    """
+    dims = []
+    real = wp.HashGrid
+
+    def spy(dim_x, dim_y, dim_z, **kw):  # wp.HashGrid keeps no dim attributes
+        dims.append((dim_x, dim_y, dim_z))
+        return real(dim_x, dim_y, dim_z, **kw)
+
+    monkeypatch.setattr(wp, "HashGrid", spy)
+    rng = np.random.default_rng(0)
+    pos_np = make_positions(rng, 2, 6)
+    grid = NeighborGrid(2, 6, radius=0.5, device=device, method="brute", grid_dim=64)
+    assert grid._grid is None and not dims  # nothing allocated for the brute backend
+    pos = wp.array(pos_np.astype(np.float32), dtype=wp.vec2f, device=device)
+    grid.build_grid(pos)
+    assert dims == [(64, 64, 64)]
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_lazy_hash_grid_agrees_with_brute_force_at_a_small_grid_dim(device):
+    """...and the smaller grid still produces the same neighbor sets."""
+    rng = np.random.default_rng(1)
+    pos_np = make_positions(rng, 3, 12)
+    pos = wp.array(pos_np.astype(np.float32), dtype=wp.vec2f, device=device)
+    ref = NeighborGrid(3, 12, radius=0.6, device=device, method="brute")
+    ref.build_brute_force(pos)
+    small = NeighborGrid(3, 12, radius=0.6, device=device, method="brute", grid_dim=32)
+    small.build_grid(pos)
+    a = neighbor_sets(ref.neighbor_idx.numpy(), ref.neighbor_count.numpy())
+    b = neighbor_sets(small.neighbor_idx.numpy(), small.neighbor_count.numpy())
+    assert a == b

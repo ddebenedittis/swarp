@@ -145,7 +145,6 @@ class FusedPass:
 
 #: The one pass on the hot path. A module constant so a step allocates nothing at all.
 STEP = FusedPass("step")
-FusedPass.STEP = STEP  # type: ignore[attr-defined]
 
 
 class FusedScenario(Scenario):

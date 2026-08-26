@@ -5,8 +5,9 @@ default keyboard toggle and a default-on flag. The renderer walks :data:`OVERLAY
 and calls each one whose name is in the enabled set, so registry order == draw order.
 
 Overlays are read-only w.r.t. the simulator; they only consume a :class:`RenderGeometry`.
-The ``lidar`` overlay is a no-op until ``geometry.extras["lidar"]`` is populated by a future
-lidar sensor — so this layer can ship before the sensor does.
+The ``lidar`` overlay is a no-op until ``geometry.extras["lidar"]`` is populated, which
+:mod:`swarp.render.demo` does from :mod:`swarp.sensors.lidar`; a scenario without a lidar
+simply draws no rays.
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ from dataclasses import dataclass
 import numpy as np
 import pygame
 
+from swarp.core.config import ObstacleKind, ObstacleShape
 from swarp.dynamics.base import P_LF, P_LR, P_MAX_STEER, P_THRUST_MAX
 from swarp.render.camera import Camera
 from swarp.render.geometry import RenderGeometry
@@ -86,8 +88,12 @@ def _draw_bounds(surface, g, camera, style):
     )
 
 
-SHAPE_CIRCLE, SHAPE_BOX, SHAPE_SEGMENT = 0, 1, 2  # mirrors core.config.ObstacleShape
-KIND_MOVABLE = 1  # mirrors core.config.ObstacleKind.MOVABLE
+# Derived, not mirrored: RenderGeometry carries the tags as plain int arrays, and
+# ObstacleShape's docstring promises the kernel-side copies "cannot drift".
+SHAPE_CIRCLE = int(ObstacleShape.CIRCLE)
+SHAPE_BOX = int(ObstacleShape.BOX)
+SHAPE_SEGMENT = int(ObstacleShape.SEGMENT)
+KIND_MOVABLE = int(ObstacleKind.MOVABLE)
 
 
 def _rotated_rect(center, angle: float, half_x: float, half_y: float) -> np.ndarray:

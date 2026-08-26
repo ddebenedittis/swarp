@@ -26,6 +26,22 @@ def make_env(n_envs=4, n_agents=3, n_obstacles=2, world_size=1.0, device="cpu"):
 # --------------------------------------------------------------- geometry
 
 
+def test_overlay_tags_are_the_core_enum_values():
+    """The renderer's obstacle tags are derived from the enums, not a second literal list.
+
+    Re-listing ``0, 1, 2`` here would only pin the copy in place; comparing against the
+    enum is what makes a renumbered :class:`ObstacleShape` fail instead of silently
+    drawing boxes as circles.
+    """
+    from swarp.core.config import ObstacleKind, ObstacleShape
+    from swarp.render import overlays
+
+    assert overlays.SHAPE_CIRCLE == ObstacleShape.CIRCLE
+    assert overlays.SHAPE_BOX == ObstacleShape.BOX
+    assert overlays.SHAPE_SEGMENT == ObstacleShape.SEGMENT
+    assert overlays.KIND_MOVABLE == ObstacleKind.MOVABLE
+
+
 def test_extract_geometry_shapes_and_is_cpu_numpy():
     env, scenario = make_env(n_agents=3, n_obstacles=2, world_size=1.0)
     g = extract_geometry(env.world, env_idx=1, scenario=scenario)

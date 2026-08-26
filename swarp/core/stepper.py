@@ -65,6 +65,9 @@ class Stepper:
         dtype=wp.float32,
         world: WorldConfig | None = None,
     ) -> None:
+        # Note the asymmetry with WorldConfig()'s own collisions=True default: a bare
+        # Stepper is the dynamics-only integrator the dynamics tests drive, so it stays
+        # collision-free unless a config asks otherwise. World always passes one through.
         world = world if world is not None else WorldConfig(collisions=False)
         if substeps < 1:
             raise ValueError("substeps must be >= 1")

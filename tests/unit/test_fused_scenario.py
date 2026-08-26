@@ -34,7 +34,6 @@ def test_fused_pass_properties_are_named_after_the_kernel_arguments():
 
 def test_step_pass_is_a_shared_constant():
     """The hot path must not allocate even a descriptor object per step."""
-    assert STEP is FusedPass.STEP
     assert STEP.kind == "step" and STEP.env_mask is None
 
 

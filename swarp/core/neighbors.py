@@ -325,6 +325,7 @@ class NeighborGrid:
         self._points: wp.array | None = None
         self._grid: wp.HashGrid | None = None
         self._u_alloc = False  # uniform-grid buffers allocated lazily
+        self.grid_dim = grid_dim
         if method == "grid":
             self._points = wp.zeros(n_envs * n_agents, dtype=VEC3[dtype], device=device)
             self._grid = wp.HashGrid(grid_dim, grid_dim, grid_dim, device=device, dtype=dtype)
@@ -366,11 +367,18 @@ class NeighborGrid:
             self._query_brute_into(pos, neighbor_idx, neighbor_count)
 
     def _ensure_grid(self) -> None:
+        """Lazily allocate the hash grid, at the same ``grid_dim`` ``__init__`` would use.
+
+        Reachable without ``method="grid"`` via :meth:`build_grid`, so hardcoding a
+        dimension here would silently discard ``WorldConfig.grid_dim``.
+        """
         if self._grid is None:
             self._points = wp.zeros(
                 self.n_envs * self.n_agents, dtype=VEC3[self.dtype], device=self.device
             )
-            self._grid = wp.HashGrid(128, 128, 128, device=self.device, dtype=self.dtype)
+            self._grid = wp.HashGrid(
+                self.grid_dim, self.grid_dim, self.grid_dim, device=self.device, dtype=self.dtype
+            )
 
     def _query_grid_into(self, pos, neighbor_idx, neighbor_count) -> None:
         self._ensure_grid()
@@ -515,7 +523,7 @@ class NeighborGrid:
         idx = idx.long()
         device = idx.device
         ar = torch.arange(self.max_neighbors, device=device)
-        mask = ar.view(1, 1, -1) < cnt.long().unsqueeze(-1)  # [E?, valid slots]
+        mask = ar.view(1, 1, -1) < cnt.long().unsqueeze(-1)  # [n_envs, n_agents, max_neighbors]
         env_offset = torch.arange(self.n_envs, device=device).view(-1, 1, 1) * self.n_agents
         senders = (idx + env_offset)[mask]
         receivers = (torch.arange(self.n_agents, device=device).view(1, -1, 1) + env_offset).expand(
