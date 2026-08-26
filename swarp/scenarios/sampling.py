@@ -35,7 +35,6 @@ class SamplingScenario(FusedScenario):
         grid_res: int = 12,
         field_std: float = 0.15,
         max_speed: float = 1.0,
-        collision_penalty: float = -0.1,
     ) -> None:
         self.n_agents = n_agents
         self.agent_radius = agent_radius
@@ -44,7 +43,6 @@ class SamplingScenario(FusedScenario):
         self.grid_res = grid_res
         self.field_std = field_std
         self.max_speed = max_speed
-        self.collision_penalty = collision_penalty
 
     def make_world(self, n_envs, device, dt, substeps, dtype, world_config=None) -> World:
         cfgs = [
@@ -63,7 +61,7 @@ class SamplingScenario(FusedScenario):
             collision_margin=margin,
             bounds=(-self.world_size, self.world_size, -self.world_size, self.world_size),
             bounds_mode="soft",
-            max_neighbors=min(8, max(2, self.n_agents)),
+            max_neighbors=min(32, max(4, self.n_agents)),
         ).override_with(world_config)
         self.world = World(
             cfgs, cfg, n_envs=n_envs, device=device, dt=dt, substeps=substeps, dtype=dtype
@@ -81,6 +79,13 @@ class SamplingScenario(FusedScenario):
         # Cell-centre coordinates in world units, per axis: (i+0.5)/res * 2W - W.
         i = torch.arange(self.grid_res, device=device, dtype=dtype)
         self._cell_coord = (i + 0.5) / self.grid_res * 2.0 * self.world_size - self.world_size
+        # The 3x3 neighbourhood stencil, built here rather than per refresh: a
+        # ``torch.tensor([...])`` literal is a host allocation plus a H2D copy, and on the
+        # torch path ``_refresh`` runs every step.
+        self._offs = torch.tensor([-1, 0, 1], device=device)
+        # ``info()``'s consumed fraction, reduced into in place — one allocation at build
+        # time instead of two per step, and in the *world's* dtype rather than float32.
+        self._consumed_frac = torch.zeros(n_envs, device=device, dtype=dtype)
         return self.world
 
     @property
@@ -169,13 +174,13 @@ class SamplingScenario(FusedScenario):
         cells the fresh spawn sits on as consumed. Only ``full_pass`` differs: a mid-step
         auto-reset must not clobber the reward/field already returned for the transition.
         """
-        self._launch_obs_reward(full_pass=pass_.full_pass)
-        self._launch_scatter()
+        st = self.world.state_wp()  # one wrap for both launches
+        self._launch_obs_reward(st, full_pass=pass_.full_pass)
+        self._launch_scatter(st)
 
-    def _launch_obs_reward(self, full_pass: int) -> None:
+    def _launch_obs_reward(self, st, full_pass: int) -> None:
         w = self.world
         scalar = w.wp_dtype
-        st = w.state_wp()
         wp.launch(
             sampling_obs_reward_kernel,
             dim=(w.n_envs, self.n_agents),
@@ -195,13 +200,13 @@ class SamplingScenario(FusedScenario):
             record_tape=False,
         )
 
-    def _launch_scatter(self) -> None:
+    def _launch_scatter(self, st) -> None:
         w = self.world
         scalar = w.wp_dtype
         wp.launch(
             sampling_scatter_kernel,
             dim=(w.n_envs, self.n_agents),
-            inputs=[w.state_wp().pos, scalar(self.world_size), wp.int32(self.grid_res)],
+            inputs=[st.pos, scalar(self.world_size), wp.int32(self.grid_res)],
             outputs=[self._wp["consumed"]],
             device=w.device,
             record_tape=False,
@@ -220,9 +225,8 @@ class SamplingScenario(FusedScenario):
         # Local 3x3 field samples around each agent's cell (observation cue).
         cx = (cell % self.grid_res).clamp(1, self.grid_res - 2)
         cy = (cell // self.grid_res).clamp(1, self.grid_res - 2)
-        offs = torch.tensor([-1, 0, 1], device=w.device)
-        gx = (cx.unsqueeze(-1) + offs).clamp(0, self.grid_res - 1)  # [n_envs, n_agents, 3]
-        gy = (cy.unsqueeze(-1) + offs).clamp(0, self.grid_res - 1)
+        gx = (cx.unsqueeze(-1) + self._offs).clamp(0, self.grid_res - 1)  # [E, A, 3]
+        gy = (cy.unsqueeze(-1) + self._offs).clamp(0, self.grid_res - 1)
         # cell-centre coordinates for the 3x3 block: [n_envs, n_agents, 9, 2]
         xs = self._cell_coord[gx]  # [n_envs, n_agents, 3]
         ys = self._cell_coord[gy]
@@ -253,6 +257,17 @@ class SamplingScenario(FusedScenario):
         return self.fb["reward"] if self.fused_active else super().rewards()
 
     def info(self) -> dict[str, Any]:
-        if self.fused_active:
-            return {"field": self.fb["field"], "consumed_frac": self.consumed.float().mean(-1)}
-        return {"field": self._cache["field"], "consumed_frac": self.consumed.float().mean(-1)}
+        field = self.fb["field"] if self.fused_active else self._cache["field"]
+        return {"field": field, "consumed_frac": self._consumed_frac_now()}
+
+    def _consumed_frac_now(self) -> torch.Tensor:
+        """Fraction of cells consumed, reduced into the preallocated buffer.
+
+        ``consumed.float().mean(-1)`` allocated twice per step and returned float32 in a
+        float64 world. The returned tensor is a view the next call overwrites — the same
+        zero-copy contract the other five scenarios' ``info`` values already have (see
+        ``clone_outputs`` in :class:`~swarp.core.environment.Environment`).
+        """
+        buf = self._consumed_frac
+        torch.sum(self.consumed, dim=-1, out=buf)
+        return buf.mul_(1.0 / self.consumed.shape[-1])

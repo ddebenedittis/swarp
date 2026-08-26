@@ -202,10 +202,10 @@ mapping reads as a rename. Where each scenario puts them differs, and all of it 
 expressible without touching a kernel signature:
 
 ```python
-# navigation / formation — flags on the obs kernel; no reward on a reset
+# navigation / formation — flags on the obs kernel; no reward on an obs-only auto-reset
 def launch_fused(self, pass_):
     self._launch_obs(advance_prev=pass_.advance_prev, full_pass=pass_.full_pass)
-    if pass_.is_step:
+    if pass_.full_pass:
         self._launch_reward()
 
 # transport / pusht — flags on the reward kernel; no body advance on a reset
@@ -220,13 +220,19 @@ def launch_fused(self, pass_):
 def launch_fused(self, pass_):
     self._launch(full_pass=pass_.full_pass)
 
-# discovery — neither flag: "a reset must not clobber the reward" by omitting the launch
+# discovery — neither flag reaches a kernel; full_pass only gates the reward launch
 def launch_fused(self, pass_):
     self._launch_cover()
     self._launch_obs()
-    if pass_.is_step:
+    if pass_.full_pass:
         self._launch_reward()
 ```
+
+Note which flag gates that reward launch: `full_pass`, not `is_step`. Only the *obs-only*
+auto-reset must preserve reward/done (they were already returned for the transition just
+taken). A standalone `reset()`/`reset_at()` is a full pass and has to recompute them, or
+the fused path reports the previous episode where the torch oracle reports the new one —
+which is exactly what `assert_reset_parity` in `tests/conftest.py` pins.
 
 ### Capture safety — the one rule that bites
 

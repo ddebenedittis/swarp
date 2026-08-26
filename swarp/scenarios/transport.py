@@ -248,16 +248,16 @@ class TransportScenario(FusedScenario):
         The ``_install_obstacles`` in the middle is an ordinary line here, running inside
         ``wp.ScopedCapture`` on a step — see its docstring for why that is legal.
         """
+        st = self.world.state_wp()  # one wrap for every launch in this pass
         if pass_.is_step:
-            self._launch_body()
+            self._launch_body(st)
             self._install_obstacles()  # updated package pose for the next step
-        self._launch_obs()
+        self._launch_obs(st)
         self._launch_reward(advance_prev=pass_.advance_prev, full_pass=pass_.full_pass)
 
-    def _launch_body(self) -> None:
+    def _launch_body(self, st) -> None:
         w = self.world
         scalar = w.wp_dtype
-        st = w.state_wp()
         pk = self._wp
         bound = self.world_size - self.package_radius
         wp.launch(
@@ -284,9 +284,8 @@ class TransportScenario(FusedScenario):
             record_tape=False,
         )
 
-    def _launch_obs(self) -> None:
+    def _launch_obs(self, st) -> None:
         w = self.world
-        st = w.state_wp()
         wp.launch(
             transport_obs_kernel,
             dim=(w.n_envs, self.n_agents),

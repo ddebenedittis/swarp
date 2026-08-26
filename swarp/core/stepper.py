@@ -349,6 +349,14 @@ class Stepper:
         re-randomize. Buffer shapes are unchanged, so no hot-path buffers are
         cleared.
 
+        The radius-vs-neighbor-reach check needs ``floats[..., P_RADIUS].max()`` on the
+        host, so it runs only on a **first install or a reallocation**. The in-place
+        refresh below — the per-reset re-randomization path, the one that runs inside a
+        graph-mode loop — is trusted against the bound validated then: a stall per reset
+        is exactly what that path exists to avoid. Widening the radius range past what the
+        first install validated therefore needs a reinstall (a differently shaped or typed
+        array, or a fresh Stepper) for it to be re-checked.
+
         Args:
             floats: ``[n_envs, n_agents, NUM_PARAMS]`` array (torch.Tensor or
                 np.ndarray); columns follow ``AgentConfig.to_row()`` order. See
@@ -362,7 +370,20 @@ class Stepper:
                 f"per-env params must have shape [n_envs, n_agents={self.n_agents}, "
                 f"NUM_PARAMS={NUM_PARAMS}]; got {shape}"
             )
-        if self.collisions:
+        torch_dt = self.torch_dtype
+        existing = self.params.floats_per_env
+        # In-place refresh (no numpy round-trip, no realloc, no version bump, and — see
+        # the docstring — no host read) when an on-device torch buffer of the matching
+        # shape/dtype is already installed: the per-reset re-randomization path in
+        # graph mode.
+        in_place = (
+            is_torch
+            and existing is not None
+            and tuple(existing.shape) == shape
+            and floats.dtype == torch_dt
+            and str(floats.device) == str(self.device)
+        )
+        if self.collisions and not in_place:
             if is_torch:
                 max_r = float(floats[..., P_RADIUS].max())
             else:
@@ -374,18 +395,7 @@ class Stepper:
                     f"(= 2 * max per-env radius + margin), but neighbor_radius="
                     f"{self.neighbor_radius}; set WorldConfig.neighbor_radius accordingly."
                 )
-        torch_dt = self.torch_dtype
-        existing = self.params.floats_per_env
-        # In-place refresh (no numpy round-trip, no realloc, no version bump) when
-        # an on-device torch buffer of the matching shape/dtype is already
-        # installed — the per-reset re-randomization path in graph mode.
-        if (
-            is_torch
-            and existing is not None
-            and tuple(existing.shape) == shape
-            and floats.dtype == torch_dt
-            and str(floats.device) == str(self.device)
-        ):
+        if in_place:
             wp.copy(existing, wp.from_torch(floats.contiguous(), dtype=self.dtype))
             return
         # (Re)allocate. Build on-device from torch when possible to avoid a host

@@ -1,5 +1,6 @@
 """torch.compile-compatible custom-op step: parity, gradients, and a compiled run."""
 
+import pytest
 import torch
 import warp as wp
 
@@ -86,3 +87,28 @@ def test_torch_compile_runs_and_matches():
     compiled = torch.compile(rollout)(state, actions)
     assert torch.isfinite(compiled)
     torch.testing.assert_close(compiled, eager)
+
+
+def test_registry_does_not_keep_the_stepper_alive():
+    """Registering for the custom op must not pin the stepper (and its device buffers).
+
+    The handle registry used to be a strong dict, so every stepper ever compiled — and,
+    through it, the whole world — lived until the process exited.
+    """
+    import gc
+    import weakref
+
+    from swarp.interop import compile as compile_mod
+
+    stepper = _stepper()
+    handle = compile_mod.register_stepper(stepper)
+    assert compile_mod.register_stepper(stepper) == handle  # stable, and O(1) to re-look-up
+    ref = weakref.ref(stepper)
+
+    del stepper
+    gc.collect()
+    assert ref() is None, "the registry is still holding the stepper"
+    assert handle not in compile_mod._STEPPERS
+    # ...and a call against the stale handle says so instead of raising KeyError.
+    with pytest.raises(RuntimeError, match="garbage-collected"):
+        compile_mod._stepper(handle)

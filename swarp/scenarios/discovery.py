@@ -74,7 +74,7 @@ class DiscoveryScenario(FusedScenario):
             collision_margin=margin,
             bounds=(-self.world_size, self.world_size, -self.world_size, self.world_size),
             bounds_mode="soft",
-            max_neighbors=min(8, max(2, self.n_agents)),
+            max_neighbors=min(32, max(4, self.n_agents)),
         ).override_with(world_config)
         self.world = World(
             cfgs, cfg, n_envs=n_envs, device=device, dt=dt, substeps=substeps, dtype=dtype
@@ -89,6 +89,9 @@ class DiscoveryScenario(FusedScenario):
             n_envs, self.n_targets, dtype=torch.bool, device=device
         )
         self._cache: dict[str, torch.Tensor] | None = None
+        # ``info()``'s covered fraction, reduced into in place — one allocation at build
+        # time instead of two per step, and in the *world's* dtype rather than float32.
+        self._covered_frac = torch.zeros(n_envs, device=device, dtype=dtype)
         return self.world
 
     @property
@@ -149,7 +152,6 @@ class DiscoveryScenario(FusedScenario):
             "rel_targets": (self.targets.unsqueeze(1) - pos.unsqueeze(2)).reshape(
                 w.n_envs, w.n_agents, self.n_targets * 2
             ),
-            "covered_frac": self.covered.float().mean(-1),
         }
 
     # --------------------------------------------------------- fused fast path
@@ -177,19 +179,20 @@ class DiscoveryScenario(FusedScenario):
         recomputes both. Coverage always runs, updating the ``covered`` latch exactly as
         the torch ``_refresh`` does — which is what makes the reset-pass reward correct.
         """
-        self._launch_cover()
-        self._launch_obs()
+        st = self.world.state_wp()  # one wrap for both launches
+        self._launch_cover(st)
+        self._launch_obs(st)
         if pass_.full_pass:
             self._launch_reward()
 
-    def _launch_cover(self) -> None:
+    def _launch_cover(self, st) -> None:
         w = self.world
         scalar = w.wp_dtype
         wp.launch(
             discovery_cover_kernel,
             dim=(w.n_envs, self.n_targets),
             inputs=[
-                w.state_wp().pos,
+                st.pos,
                 self._wp["targets"],
                 wp.int32(self.n_agents),
                 scalar(self.covering_range**2),
@@ -200,10 +203,9 @@ class DiscoveryScenario(FusedScenario):
             record_tape=False,
         )
 
-    def _launch_obs(self) -> None:
+    def _launch_obs(self, st) -> None:
         w = self.world
         scalar = w.wp_dtype
-        st = w.state_wp()
         wp.launch(
             discovery_obs_kernel,
             dim=(w.n_envs, self.n_agents),
@@ -270,6 +272,12 @@ class DiscoveryScenario(FusedScenario):
         return self.covered.all(dim=-1)
 
     def info(self) -> dict[str, Any]:
-        if self.fused_active:
-            return {"covered_frac": self.covered.float().mean(-1)}
-        return {"covered_frac": self._cache["covered_frac"]}
+        """The covered fraction, read off the live ``covered`` latch on both paths.
+
+        Reduced into a preallocated buffer, so the returned tensor is a view the next call
+        overwrites — the same zero-copy contract as the other scenarios' ``info`` values
+        (see ``clone_outputs`` in :class:`~swarp.core.environment.Environment`).
+        """
+        buf = self._covered_frac
+        torch.sum(self.covered, dim=-1, out=buf)
+        return {"covered_frac": buf.mul_(1.0 / self.n_targets)}

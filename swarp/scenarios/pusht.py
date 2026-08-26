@@ -499,10 +499,11 @@ class PushTScenario(FusedScenario):
         the engine's copy is what got seeded *from* it) and passes ``advance_prev=0`` so the
         reward kernel rebases the shaping baselines for the reset envs.
         """
+        state = self.world.state_wp()  # one wrap for every launch in this pass
         if pass_.is_step:
             self._launch_body_sync()
-        self._launch_obs()
-        self._launch_reward(advance_prev=pass_.advance_prev, full_pass=pass_.full_pass)
+        self._launch_obs(state)
+        self._launch_reward(state, advance_prev=pass_.advance_prev, full_pass=pass_.full_pass)
 
     def _launch_body_sync(self) -> None:
         """Lift the engine's root-body state into the cached ``tee_*`` Warp arrays."""
@@ -522,9 +523,8 @@ class PushTScenario(FusedScenario):
             record_tape=False,
         )
 
-    def _launch_obs(self) -> None:
+    def _launch_obs(self, st) -> None:
         w = self.world
-        st = w.state_wp()
         wp.launch(
             pusht_obs_kernel,
             dim=(w.n_envs, self.n_agents),
@@ -541,14 +541,14 @@ class PushTScenario(FusedScenario):
             record_tape=False,
         )
 
-    def _launch_reward(self, advance_prev: int, full_pass: int) -> None:
+    def _launch_reward(self, st, advance_prev: int, full_pass: int) -> None:
         w = self.world
         scalar = w.wp_dtype
         wp.launch(
             pusht_reward_kernel,
             dim=w.n_envs,
             inputs=[
-                w.state_wp().pos,
+                st.pos,
                 self._wp["tee_pos"],
                 self._wp["tee_theta"],
                 self._wp["goal_pos"],

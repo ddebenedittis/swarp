@@ -107,6 +107,10 @@ class Lidar:
       ``T``), which keeps high ray counts affordable. **Inference-only**: when
       gradients are required the scan transparently falls back to the torch path,
       so ``backend="warp"`` means "warp for inference, torch for grad."
+
+      One behavioural difference: it returns a **view of a reused buffer** that the next
+      same-shaped scan overwrites, where the torch path allocates fresh output. Fine to
+      concatenate into an observation (that copies); ``clone()`` it to keep it.
     """
 
     def __init__(

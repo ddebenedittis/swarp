@@ -16,9 +16,23 @@ and never escapes, so it is invisible to the op's contract.
 
 Use :func:`compiled_warp_step`, which mirrors :func:`warp_step`'s signature but
 routes through the registered op.
+
+Two consequences of that contract worth knowing:
+
+* **The per-step clone of every output is required, not defensive.** A custom op may not
+  return a tensor that aliases storage it does not own, and ``wp.to_torch`` returns a view
+  of the Warp array. Dropping the clone is a use-after-free once the stepper recycles that
+  array, and AOTAutograd's aliasing checks reject it outright.
+* **``torch.compile(mode="reduce-overhead")`` is not supported.** It wants to CUDA-graph
+  the compiled region, and the forward allocates Warp arrays every call — capture-illegal.
+  For graph execution use :class:`swarp.interop.persistent.StepRuntime` instead, which
+  captures the whole step (physics plus the fused obs/reward launches) against persistent
+  buffers; that is the fast path this module is *not* trying to be.
 """
 
 from __future__ import annotations
+
+import weakref
 
 import torch
 
@@ -33,22 +47,46 @@ from swarp.interop.autograd import (
     wrap_input_state,
 )
 
-# Steppers are plain Python objects and cannot cross the custom-op boundary, so
-# they are referenced by a small integer handle registered here.
-_STEPPERS: dict[int, Stepper] = {}
+# Steppers are plain Python objects and cannot cross the custom-op boundary, so they are
+# referenced by a small integer handle registered here. The registry holds them **weakly**:
+# a strong dict made every stepper ever compiled immortal, pinning its device buffers (and
+# in an env's case the whole world) for the life of the process. ``_HANDLES`` is the
+# reverse map, so re-registering is an O(1) lookup rather than a scan of the registry on
+# every ``compiled_warp_step`` call; a finalizer drops its entry when the stepper dies,
+# which also runs before the id can be reused by a new object.
+_STEPPERS: weakref.WeakValueDictionary[int, Stepper] = weakref.WeakValueDictionary()
+_HANDLES: dict[int, int] = {}  # id(stepper) -> handle
 _NEXT_ID = 0
 
 
 def register_stepper(stepper: Stepper) -> int:
-    """Return a stable int handle for ``stepper`` usable with the custom op."""
+    """Return a stable int handle for ``stepper`` usable with the custom op.
+
+    The handle does not keep ``stepper`` alive: the caller (normally the ``Environment``
+    or ``World`` that owns it) must outlive the compiled step.
+    """
     global _NEXT_ID
-    for k, v in _STEPPERS.items():
-        if v is stepper:
-            return k
+    handle = _HANDLES.get(id(stepper))
+    if handle is not None:
+        return handle
     handle = _NEXT_ID
     _NEXT_ID += 1
     _STEPPERS[handle] = stepper
+    _HANDLES[id(stepper)] = handle
+    weakref.finalize(stepper, _HANDLES.pop, id(stepper), None)
     return handle
+
+
+def _stepper(handle: int) -> Stepper:
+    """The registered stepper, or a legible error if it has been collected."""
+    try:
+        return _STEPPERS[handle]
+    except KeyError:
+        raise RuntimeError(
+            f"swarp::step was called with handle {handle}, whose Stepper has been "
+            "garbage-collected. Keep the Environment/World (or the Stepper itself) alive "
+            "for as long as the compiled step is used."
+        ) from None
 
 
 @torch.library.custom_op("swarp::step", mutates_args=())
@@ -67,7 +105,7 @@ def _step_op(
 ) -> list[torch.Tensor]:
     import warp as wp
 
-    stepper = _STEPPERS[stepper_id]
+    stepper = _stepper(stepper_id)
     scalar = {torch.float32: wp.float32, torch.float64: wp.float64}[actions.dtype]
     state = TorchState(pos, theta, vel, speed, ang_vel, z, vz, attitude, body_rates)
     n_envs = actions.shape[0]
@@ -86,9 +124,14 @@ def _step_op(
 def _step_op_fake(
     stepper_id, actions, pos, theta, vel, speed, ang_vel, z, vz, attitude, body_rates
 ):
-    # Outputs have the same shapes/dtypes/device as the corresponding inputs.
+    # Outputs have the same shapes/dtypes/device as the corresponding inputs — but not
+    # necessarily the same *strides*: the real op returns clones of Warp arrays, which are
+    # always contiguous, while an input may be a non-contiguous view. ``empty_like``
+    # inherits the input's layout and would let the traced graph plan against strides the
+    # eager op never produces.
     return [
-        torch.empty_like(t) for t in (pos, theta, vel, speed, ang_vel, z, vz, attitude, body_rates)
+        torch.empty(t.shape, dtype=t.dtype, device=t.device)
+        for t in (pos, theta, vel, speed, ang_vel, z, vz, attitude, body_rates)
     ]
 
 
@@ -103,7 +146,7 @@ def _step_backward(ctx, *grad_outputs):
 
     # A list-valued op output arrives as a single list of per-output grads.
     grads = grad_outputs[0] if len(grad_outputs) == 1 else grad_outputs
-    stepper = _STEPPERS[ctx.stepper_id]
+    stepper = _stepper(ctx.stepper_id)
     actions, *state_tensors = ctx.saved_tensors
     scalar = {torch.float32: wp.float32, torch.float64: wp.float64}[actions.dtype]
     state = TorchState(*state_tensors)
