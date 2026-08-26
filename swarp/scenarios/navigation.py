@@ -19,6 +19,7 @@ from typing import Any
 import torch
 import warp as wp
 
+from swarp._overloads import concrete
 from swarp.core.config import Obstacles, WorldConfig
 from swarp.core.world import World
 from swarp.dynamics.base import AgentConfig, ControlMode, DynamicsModel
@@ -284,7 +285,7 @@ class NavigationScenario(FusedScenario):
         # World.agent_radius); per-env randomization affects forces, not this count.
         params = w.stepper.params.floats
         wp.launch(
-            nav_obs_kernel,
+            concrete(nav_obs_kernel, self.world.wp_dtype),
             dim=(n_envs, self.n_agents),
             inputs=[
                 st.pos,
@@ -320,7 +321,7 @@ class NavigationScenario(FusedScenario):
         w = self.world
         scalar = w.wp_dtype
         wp.launch(
-            nav_reward_kernel,
+            concrete(nav_reward_kernel, self.world.wp_dtype),
             dim=w.n_envs,
             inputs=[
                 self._wp["touch"],

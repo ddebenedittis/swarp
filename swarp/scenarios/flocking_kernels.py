@@ -21,6 +21,7 @@ from typing import Any
 
 import warp as wp
 
+from swarp._overloads import register
 from swarp.core.state import VEC2
 
 
@@ -142,4 +143,4 @@ def _signature(dtype) -> list:
 
 
 for _T in (wp.float32, wp.float64):
-    wp.overload(flocking_obs_reward_kernel, _signature(_T))
+    register(flocking_obs_reward_kernel, _T, _signature(_T))

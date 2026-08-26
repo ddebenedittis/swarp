@@ -25,6 +25,7 @@ from typing import Any
 import torch
 import warp as wp
 
+from swarp._overloads import concrete, register
 from swarp.core.state import TORCH_DTYPE_TO_WP, VEC2
 from swarp.interop.autograd import torch_stream_scope
 
@@ -104,7 +105,7 @@ def _signature(dtype) -> list:
 
 
 for _T in (wp.float32, wp.float64):
-    wp.overload(lidar_scan_kernel, _signature(_T))
+    register(lidar_scan_kernel, _T, _signature(_T))
 
 
 # Single-slot wrap caches, one per kernel input, exactly as ``Stepper.wrap_actions``
@@ -194,7 +195,7 @@ def lidar_scan_warp(
         range_out = _buffer((n_envs, n_agents, n_rays), wp_dtype, device)
 
         wp.launch(
-            lidar_scan_kernel,
+            concrete(lidar_scan_kernel, wp_dtype),
             dim=(n_envs, n_agents, n_rays),
             inputs=[
                 pos_wp,

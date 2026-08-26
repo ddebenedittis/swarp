@@ -27,6 +27,7 @@ from typing import Any
 
 import warp as wp
 
+from swarp._overloads import register
 from swarp.core.state import VEC2
 from swarp.dynamics.base import P_RADIUS
 
@@ -281,5 +282,5 @@ def _reward_signature(dtype) -> list:
 
 
 for _T in (wp.float32, wp.float64):
-    wp.overload(nav_obs_kernel, _obs_signature(_T))
-    wp.overload(nav_reward_kernel, _reward_signature(_T))
+    register(nav_obs_kernel, _T, _obs_signature(_T))
+    register(nav_reward_kernel, _T, _reward_signature(_T))

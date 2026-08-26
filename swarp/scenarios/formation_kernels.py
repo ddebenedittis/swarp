@@ -23,6 +23,7 @@ from typing import Any
 
 import warp as wp
 
+from swarp._overloads import register
 from swarp.core.state import VEC2
 
 
@@ -174,5 +175,5 @@ def _reward_signature(dtype) -> list:
 
 
 for _T in (wp.float32, wp.float64):
-    wp.overload(formation_obs_kernel, _obs_signature(_T))
-    wp.overload(formation_reward_kernel, _reward_signature(_T))
+    register(formation_obs_kernel, _T, _obs_signature(_T))
+    register(formation_reward_kernel, _T, _reward_signature(_T))

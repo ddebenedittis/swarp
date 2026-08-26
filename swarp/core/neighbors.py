@@ -24,6 +24,7 @@ from typing import Any
 import torch
 import warp as wp
 
+from swarp._overloads import concrete, register
 from swarp.core.state import VEC2
 
 VEC3 = {wp.float32: wp.vec3f, wp.float64: wp.vec3d}
@@ -215,9 +216,10 @@ def _query_uniform(
 
 
 for _T in (wp.float32, wp.float64):
-    wp.overload(_fill_points, [wp.array2d(dtype=VEC2[_T]), _T, wp.array(dtype=VEC3[_T])])
-    wp.overload(
+    register(_fill_points, _T, [wp.array2d(dtype=VEC2[_T]), _T, wp.array(dtype=VEC3[_T])])
+    register(
         _query_grid,
+        _T,
         [
             wp.uint64,
             wp.array(dtype=VEC3[_T]),
@@ -227,8 +229,9 @@ for _T in (wp.float32, wp.float64):
             wp.array2d(dtype=wp.int32),
         ],
     )
-    wp.overload(
+    register(
         _brute_force,
+        _T,
         [
             wp.array2d(dtype=VEC2[_T]),
             _T,
@@ -237,14 +240,16 @@ for _T in (wp.float32, wp.float64):
             wp.array2d(dtype=wp.int32),
         ],
     )
-    wp.overload(_bounds_init, [_T, wp.array(dtype=_T)])
-    wp.overload(_bounds_reduce, [wp.array2d(dtype=VEC2[_T]), wp.array(dtype=_T)])
-    wp.overload(
+    register(_bounds_init, _T, [_T, wp.array(dtype=_T)])
+    register(_bounds_reduce, _T, [wp.array2d(dtype=VEC2[_T]), wp.array(dtype=_T)])
+    register(
         _finalize_grid,
+        _T,
         [wp.array(dtype=_T), _T, wp.int32, wp.array(dtype=_T), wp.array(dtype=_T)],
     )
-    wp.overload(
+    register(
         _compute_keys,
+        _T,
         [
             wp.array2d(dtype=VEC2[_T]),
             wp.array(dtype=_T),
@@ -255,8 +260,9 @@ for _T in (wp.float32, wp.float64):
             wp.array(dtype=wp.int32),
         ],
     )
-    wp.overload(
+    register(
         _query_uniform,
+        _T,
         [
             wp.array2d(dtype=VEC2[_T]),
             wp.array(dtype=_T),
@@ -416,7 +422,7 @@ class NeighborGrid:
         self._ensure_grid()
         dim = (self.n_envs, self.n_agents)
         wp.launch(
-            _fill_points,
+            concrete(_fill_points, self.dtype),
             dim=dim,
             inputs=[pos, self.dtype(self.z_spacing)],
             outputs=[self._points],
@@ -425,7 +431,7 @@ class NeighborGrid:
         )
         self._grid.build(self._points, self.radius)
         wp.launch(
-            _query_grid,
+            concrete(_query_grid, self.dtype),
             dim=dim,
             inputs=[wp.uint64(self._grid.id), self._points, self.dtype(self.radius)],
             outputs=[neighbor_idx, neighbor_count, self.neighbor_true_count],
@@ -435,7 +441,7 @@ class NeighborGrid:
 
     def _query_brute_into(self, pos, neighbor_idx, neighbor_count) -> None:
         wp.launch(
-            _brute_force,
+            concrete(_brute_force, self.dtype),
             dim=(self.n_envs, self.n_agents),
             inputs=[pos, self.dtype(self.radius)],
             outputs=[neighbor_idx, neighbor_count, self.neighbor_true_count],
@@ -503,11 +509,21 @@ class NeighborGrid:
         if not self._static_grid:
             # Origin (batch min corner) + adaptive cell size, all device-side (no sync).
             wp.launch(
-                _bounds_init, dim=1, inputs=[self.dtype(1e30)], outputs=[self._u_bounds], **common
+                concrete(_bounds_init, self.dtype),
+                dim=1,
+                inputs=[self.dtype(1e30)],
+                outputs=[self._u_bounds],
+                **common,
             )
-            wp.launch(_bounds_reduce, dim=dim, inputs=[pos], outputs=[self._u_bounds], **common)
             wp.launch(
-                _finalize_grid,
+                concrete(_bounds_reduce, self.dtype),
+                dim=dim,
+                inputs=[pos],
+                outputs=[self._u_bounds],
+                **common,
+            )
+            wp.launch(
+                concrete(_finalize_grid, self.dtype),
                 dim=1,
                 inputs=[self._u_bounds, self.dtype(self.radius), bins],
                 outputs=[self._u_origin, self._u_cell_size],
@@ -515,7 +531,7 @@ class NeighborGrid:
             )
         # else: origin/cell size were pinned once in _fill_static_grid.
         wp.launch(
-            _compute_keys,
+            concrete(_compute_keys, self.dtype),
             dim=dim,
             inputs=[pos, self._u_origin, self._u_cell_size, bins, n_agents],
             outputs=[self._u_keys, self._u_vals],
@@ -533,7 +549,7 @@ class NeighborGrid:
             **common,
         )
         wp.launch(
-            _query_uniform,
+            concrete(_query_uniform, self.dtype),
             dim=dim,
             inputs=[
                 pos,

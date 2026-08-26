@@ -15,6 +15,7 @@ from typing import Any
 import torch
 import warp as wp
 
+from swarp._overloads import concrete
 from swarp.core.config import WorldConfig
 from swarp.core.world import World
 from swarp.dynamics.base import AgentConfig, ControlMode, DynamicsModel
@@ -179,7 +180,7 @@ class SamplingScenario(FusedScenario):
         w = self.world
         scalar = w.wp_dtype
         wp.launch(
-            sampling_obs_reward_kernel,
+            concrete(sampling_obs_reward_kernel, self.world.wp_dtype),
             dim=(w.n_envs, self.n_agents),
             inputs=[
                 st.pos,
@@ -201,7 +202,7 @@ class SamplingScenario(FusedScenario):
         w = self.world
         scalar = w.wp_dtype
         wp.launch(
-            sampling_scatter_kernel,
+            concrete(sampling_scatter_kernel, self.world.wp_dtype),
             dim=(w.n_envs, self.n_agents),
             inputs=[st.pos, scalar(self.world_size), wp.int32(self.grid_res)],
             outputs=[self._wp["consumed"]],

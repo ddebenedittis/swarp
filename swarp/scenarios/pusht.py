@@ -39,6 +39,7 @@ from typing import Any
 import torch
 import warp as wp
 
+from swarp._overloads import concrete
 from swarp.core.bodies import body_state_gather_kernel
 from swarp.core.config import ObstacleKind, Obstacles, ObstacleShape, WorldConfig
 from swarp.core.world import World
@@ -517,7 +518,7 @@ class PushTScenario(FusedScenario):
         w = self.world
         st = w.stepper
         wp.launch(
-            body_state_gather_kernel,
+            concrete(body_state_gather_kernel, self.world.wp_dtype),
             dim=w.n_envs,
             inputs=[st.body_pos, st.body_angle, st.body_vel, st.body_ang_vel, wp.int32(0)],
             outputs=[
@@ -533,7 +534,7 @@ class PushTScenario(FusedScenario):
     def _launch_obs(self, st) -> None:
         w = self.world
         wp.launch(
-            pusht_obs_kernel,
+            concrete(pusht_obs_kernel, self.world.wp_dtype),
             dim=(w.n_envs, self.n_agents),
             inputs=[
                 st.pos,
@@ -552,7 +553,7 @@ class PushTScenario(FusedScenario):
         w = self.world
         scalar = w.wp_dtype
         wp.launch(
-            pusht_reward_kernel,
+            concrete(pusht_reward_kernel, self.world.wp_dtype),
             dim=w.n_envs,
             inputs=[
                 st.pos,

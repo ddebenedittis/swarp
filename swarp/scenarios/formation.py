@@ -25,6 +25,7 @@ from typing import Any
 import torch
 import warp as wp
 
+from swarp._overloads import concrete
 from swarp.core.config import WorldConfig
 from swarp.core.world import World
 from swarp.dynamics.base import AgentConfig, ControlMode, DynamicsModel
@@ -158,7 +159,7 @@ class FormationScenario(FusedScenario):
         scalar = w.wp_dtype
         st = w.state_wp()
         wp.launch(
-            formation_obs_kernel,
+            concrete(formation_obs_kernel, self.world.wp_dtype),
             dim=(w.n_envs, self.n_agents),
             inputs=[
                 st.pos,
@@ -188,7 +189,7 @@ class FormationScenario(FusedScenario):
         w = self.world
         scalar = w.wp_dtype
         wp.launch(
-            formation_reward_kernel,
+            concrete(formation_reward_kernel, self.world.wp_dtype),
             dim=w.n_envs,
             inputs=[
                 self._wp["shaping"],

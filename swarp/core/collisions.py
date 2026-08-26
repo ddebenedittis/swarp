@@ -29,6 +29,7 @@ from typing import Any
 
 import warp as wp
 
+from swarp._overloads import concrete, register
 from swarp.core.config import ObstacleShape
 from swarp.core.state import VEC2
 from swarp.dynamics.base import P_MASS, P_RADIUS, AgentParams
@@ -460,8 +461,8 @@ def _signature(dtype, per_env: bool = False) -> list:
 
 
 for _T in (wp.float32, wp.float64):
-    wp.overload(collision_forces_kernel, _signature(_T))
-    wp.overload(collision_forces_kernel_per_env, _signature(_T, per_env=True))
+    register(collision_forces_kernel, _T, _signature(_T))
+    register(collision_forces_kernel_per_env, _T, _signature(_T, per_env=True))
 
 
 def launch_collision_forces(
@@ -499,7 +500,7 @@ def launch_collision_forces(
     else:
         kernel, floats = collision_forces_kernel_per_env, params.floats_per_env
     wp.launch(
-        kernel,
+        concrete(kernel, dtype),
         dim=(n_envs, n_agents),
         inputs=[
             pos,

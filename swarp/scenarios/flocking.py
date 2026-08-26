@@ -13,6 +13,7 @@ from typing import Any
 import torch
 import warp as wp
 
+from swarp._overloads import concrete
 from swarp.core.config import WorldConfig
 from swarp.core.world import World
 from swarp.dynamics.base import AgentConfig, ControlMode, DynamicsModel
@@ -133,7 +134,7 @@ class FlockingScenario(FusedScenario):
         scalar = w.wp_dtype
         st = w.state_wp()
         wp.launch(
-            flocking_obs_reward_kernel,
+            concrete(flocking_obs_reward_kernel, self.world.wp_dtype),
             dim=(n_envs, self.n_agents),
             inputs=[
                 st.pos,

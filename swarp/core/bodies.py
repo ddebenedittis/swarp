@@ -36,6 +36,7 @@ from typing import Any
 
 import warp as wp
 
+from swarp._overloads import concrete, register
 from swarp.core.collisions import (
     SHAPE_BOX,
     SHAPE_SEGMENT,
@@ -405,8 +406,8 @@ def _signature(dtype) -> list:
 
 
 for _T in (wp.float32, wp.float64):
-    wp.overload(obstacle_dynamics_kernel, _signature(_T))
-    wp.overload(body_state_gather_kernel, _gather_signature(_T))
+    register(obstacle_dynamics_kernel, _T, _signature(_T))
+    register(body_state_gather_kernel, _T, _gather_signature(_T))
 
 
 def launch_obstacle_dynamics(
@@ -435,7 +436,7 @@ def launch_obstacle_dynamics(
     """
     n_envs = pos.shape[0]
     wp.launch(
-        obstacle_dynamics_kernel,
+        concrete(obstacle_dynamics_kernel, dtype),
         dim=(n_envs, stepper.n_obstacles),
         inputs=[
             pos,

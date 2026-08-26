@@ -33,6 +33,7 @@ from typing import Any
 import torch
 import warp as wp
 
+from swarp._overloads import concrete
 from swarp.core.config import Obstacles, WorldConfig
 from swarp.core.world import World
 from swarp.dynamics.base import AgentConfig, ControlMode, DynamicsModel
@@ -261,7 +262,7 @@ class TransportScenario(FusedScenario):
         pk = self._wp
         bound = self.world_size - self.package_radius
         wp.launch(
-            transport_body_kernel,
+            concrete(transport_body_kernel, self.world.wp_dtype),
             dim=(w.n_envs, self.n_packages),
             inputs=[
                 st.pos,
@@ -287,7 +288,7 @@ class TransportScenario(FusedScenario):
     def _launch_obs(self, st) -> None:
         w = self.world
         wp.launch(
-            transport_obs_kernel,
+            concrete(transport_obs_kernel, self.world.wp_dtype),
             dim=(w.n_envs, self.n_agents),
             inputs=[
                 st.pos,
@@ -305,7 +306,7 @@ class TransportScenario(FusedScenario):
         w = self.world
         scalar = w.wp_dtype
         wp.launch(
-            transport_reward_kernel,
+            concrete(transport_reward_kernel, self.world.wp_dtype),
             dim=w.n_envs,
             inputs=[
                 self._wp["pkg_pos"],

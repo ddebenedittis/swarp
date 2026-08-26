@@ -19,6 +19,7 @@ from typing import Any
 
 import warp as wp
 
+from swarp._overloads import concrete, register
 from swarp.core.state import QUAT, VEC2, VEC3, WorldState
 from swarp.dynamics.base import (
     P_ARM,
@@ -1182,10 +1183,10 @@ def _signature(dtype, per_env: bool = False) -> list:
 
 
 for _T in (wp.float32, wp.float64):
-    wp.overload(integrate_kernel, _signature(_T))
-    wp.overload(integrate_kernel_per_env, _signature(_T, per_env=True))
-    wp.overload(integrate2d_kernel, _signature2d(_T))
-    wp.overload(integrate2d_kernel_per_env, _signature2d(_T, per_env=True))
+    register(integrate_kernel, _T, _signature(_T))
+    register(integrate_kernel_per_env, _T, _signature(_T, per_env=True))
+    register(integrate2d_kernel, _T, _signature2d(_T))
+    register(integrate2d_kernel_per_env, _T, _signature2d(_T, per_env=True))
 
 
 #: Integrator enum value -> kernel tag (must match the INT_* constants above).
@@ -1231,7 +1232,7 @@ def launch_integrate(
     if slim:
         kernel2d = integrate2d_kernel_per_env if per_env else integrate2d_kernel
         wp.launch(
-            kernel2d,
+            concrete(kernel2d, dtype),
             dim=(n_envs, n_agents),
             inputs=[
                 state_in.pos,
@@ -1270,7 +1271,7 @@ def launch_integrate(
         return
     kernel = integrate_kernel_per_env if per_env else integrate_kernel
     wp.launch(
-        kernel,
+        concrete(kernel, dtype),
         dim=(n_envs, n_agents),
         inputs=[
             *state_in.arrays(),
