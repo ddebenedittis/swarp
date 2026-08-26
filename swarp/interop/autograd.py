@@ -13,6 +13,7 @@ overwriting an array recorded on a tape silently corrupts its adjoint. Under
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import NamedTuple
 
@@ -113,6 +114,22 @@ def wrap_actions(actions: torch.Tensor, scalar, with_grad: bool):
 # wrapped ``wp.Stream`` keyed by (device, cudaStream_t pointer).
 _STREAM_CACHE: dict[tuple[str, int], object] = {}
 
+# Reading torch's current stream is on the per-step path, so it has to be cheap.
+# ``torch.cuda.current_stream()`` builds a Python ``Stream`` object and measured **17 us**
+# per call on an RTX 3070 Laptop — more than the ``ScopedStream`` it is called to avoid,
+# and ~10% of a graph-mode step. The private raw accessor hands back the bare
+# ``cudaStream_t`` as an int in **0.4 us**; it is the same one torch.compile's inductor
+# runtime uses. The ``getattr`` keeps us working if it is ever renamed.
+_RAW_STREAM = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+
+
+def _current_raw_stream(device: str) -> int:
+    """torch's current ``cudaStream_t`` for ``device``, as an int. ``0`` = legacy default."""
+    index = int(device.partition(":")[2]) if ":" in device else 0
+    if _RAW_STREAM is not None:
+        return _RAW_STREAM(index)
+    return torch.cuda.current_stream(index).cuda_stream
+
 
 def torch_stream_scope(device: str):
     """Scope Warp launches onto torch's current stream (``ScopedDevice`` on CPU).
@@ -121,26 +138,32 @@ def torch_stream_scope(device: str):
     first, or the launches land on Warp's own stream, unordered against the torch ops
     that produced their inputs. Cached per ``(device, cudaStream_t)`` — see the note above.
 
-    **Except on the legacy default stream**, where it is a plain ``ScopedDevice``. Warp's
-    own stream is created with the *blocking* flag, so the driver already serializes it
-    against stream 0 in both directions: a Warp launch issued after queued torch work waits
-    for that work, with no event of ours involved. (Measured, not assumed — queue ~550 ms of
-    torch matmuls on stream 0, then ``wp.synchronize_stream(device.stream)`` on a trivial
-    Warp launch: it returns after ~540 ms, i.e. it waited.) Opening a ScopedStream there
-    costs two event records and two waits per call for nothing, and this is the hot path:
-    at 4000x16 it measured 0.166 -> 0.185 ms/step, a 10% regression on the graph replay.
+    **Except on the legacy default stream**, where it is a no-op. Warp's own stream is
+    created with the *blocking* flag, so the driver already serializes it against stream 0
+    in both directions: a Warp launch issued after queued torch work waits for that work,
+    with no event of ours involved. (Measured, not assumed — queue ~550 ms of torch matmuls
+    on stream 0, then ``wp.synchronize_stream(device.stream)`` on a trivial Warp launch: it
+    returns after ~540 ms, i.e. it waited.) Skipping the scope there is therefore exactly
+    the behaviour that shipped before it existed, and it has to be skipped *cheaply*: this
+    is the per-step path, and a ``ScopedStream`` (22 us) or even a ``ScopedDevice`` (7 us)
+    is a measurable share of a 130-370 us graph-mode step.
+
+    Not scoping the device is safe because nothing in the step path relies on the ambient
+    one — every ``wp.launch`` in ``stepper``/``collisions``/``neighbors``/``bodies`` and in
+    the fused scenario kernels names its ``device=`` explicitly. A launch added without one
+    would silently follow Warp's default device here.
 
     A caller running inside its own ``torch.cuda.Stream`` gets the real scope, which is the
     case the blocking flag does *not* cover.
     """
     if device.startswith("cuda"):
-        ts = torch.cuda.current_stream()
-        if ts.cuda_stream == 0:  # the legacy default stream; see above
-            return wp.ScopedDevice(device)
-        key = (device, ts.cuda_stream)
+        raw = _current_raw_stream(device)
+        if raw == 0:  # the legacy default stream; see above
+            return nullcontext()
+        key = (device, raw)
         wp_stream = _STREAM_CACHE.get(key)
         if wp_stream is None:
-            wp_stream = wp.stream_from_torch(ts)
+            wp_stream = wp.stream_from_torch(torch.cuda.current_stream())
             _STREAM_CACHE[key] = wp_stream
         return wp.ScopedStream(wp_stream)
     return wp.ScopedDevice(device)

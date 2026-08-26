@@ -18,8 +18,9 @@ eager entry point here opens :func:`~swarp.interop.autograd.torch_stream_scope`:
 replay, the eager fallback, the pre-capture warm-up, and the two state-loading paths
 (whose ``.contiguous()`` temporaries are torch-allocator memory freed at return — a
 use-after-free under a user stream). On the default stream that scope deliberately
-degrades to a plain ``ScopedDevice``, because paying for two events per step to re-derive
-what the blocking flag already guarantees cost 10% of the graph replay.
+degrades to a **no-op** behind a 0.4 us stream check: re-deriving with events what the
+blocking flag already guarantees cost 10-36% of a graph-mode step, most of it in
+``torch.cuda.current_stream()`` itself.
 
 The one thing that cannot be scoped at all is the capture itself: ``wp.ScopedCapture``
 captures the *current* stream and capturing torch's legacy stream is a hard CUDA error, so

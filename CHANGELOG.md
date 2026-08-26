@@ -15,10 +15,6 @@ All notable changes to `swarp`. Newest first. Nothing has been released yet — 
   itself, and swarp's auto-reset returns the *next* episode's first observation alongside a
   `True` done — so every boundary transition a collector stored paired a reward with an
   observation from a different episode. Build the env with `auto_reset=False` (the default).
-- **`discovery`/`sampling` `info()` values are now views**, reduced into a preallocated
-  buffer that the next call overwrites, in the world's dtype rather than float32. That is
-  what the other five scenarios already returned and what `Environment`'s `clone_outputs`
-  flag exists for; code retaining them across steps must clone (or set that flag).
 - **The Warp lidar backend returns a view of a reused buffer**, where the torch backend
   still allocates fresh output. Concatenating into an observation copies; `clone()` to keep
   it.
@@ -81,6 +77,8 @@ All notable changes to `swarp`. Newest first. Nothing has been released yet — 
   collision step), which is what the docs always claimed.
 - `swarp/render/geometry.py` no longer syncs the device to the host every frame to decide
   whether any obstacle is movable; it reads the memoized `Obstacles.any_movable`.
+- **`discovery`/`sampling` `info()` reported float32 in a float64 world** — the fraction was
+  built with `.float()` rather than the world dtype.
 
 ### Scenarios
 
@@ -118,9 +116,10 @@ All notable changes to `swarp`. Newest first. Nothing has been released yet — 
   scope degrades to a `ScopedDevice`, because opening a real one cost 10% of the graph replay
   (0.166 → 0.185 ms/step at 4000×16).
 - Per-step allocations removed from the fused scenarios: one `state_wp()` wrap per pass
-  instead of one per launch (discovery, sampling, transport, pusht), preallocated
-  reduction buffers for discovery/sampling `info()`, sampling's 3×3 stencil and pusht's
-  teammate index built once in `make_world`.
+  instead of one per launch (discovery, sampling, transport, pusht), and sampling's 3×3
+  stencil and pusht's teammate index built once in `make_world` instead of per call. Worth
+  ~4-6% of the eager (capture-off) fused step, which is host-launch-bound; invisible under
+  CUDA-graph capture, where those launches are inside the graph.
 - `set_agent_params_per_env` no longer reads the max radius back to the host on the in-place
   refresh path, so per-reset domain randomization inside a graph-mode loop does not stall.
 - `swarp.interop.compile`'s stepper registry is weak, so a compiled stepper (and through it

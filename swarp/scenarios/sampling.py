@@ -83,9 +83,6 @@ class SamplingScenario(FusedScenario):
         # ``torch.tensor([...])`` literal is a host allocation plus a H2D copy, and on the
         # torch path ``_refresh`` runs every step.
         self._offs = torch.tensor([-1, 0, 1], device=device)
-        # ``info()``'s consumed fraction, reduced into in place — one allocation at build
-        # time instead of two per step, and in the *world's* dtype rather than float32.
-        self._consumed_frac = torch.zeros(n_envs, device=device, dtype=dtype)
         return self.world
 
     @property
@@ -261,13 +258,11 @@ class SamplingScenario(FusedScenario):
         return {"field": field, "consumed_frac": self._consumed_frac_now()}
 
     def _consumed_frac_now(self) -> torch.Tensor:
-        """Fraction of cells consumed, reduced into the preallocated buffer.
+        """Fraction of cells consumed.
 
-        ``consumed.float().mean(-1)`` allocated twice per step and returned float32 in a
-        float64 world. The returned tensor is a view the next call overwrites — the same
-        zero-copy contract the other five scenarios' ``info`` values already have (see
-        ``clone_outputs`` in :class:`~swarp.core.environment.Environment`).
+        ``.to(dtype)`` rather than ``.float()``: the old form reported float32 in a float64
+        world. Reducing into a preallocated buffer instead looks like the obvious win and is
+        not one — see :meth:`~swarp.scenarios.discovery.DiscoveryScenario.info` for the
+        measurement (``sum(out=)`` + ``mul_`` is ~30% slower than the allocating mean).
         """
-        buf = self._consumed_frac
-        torch.sum(self.consumed, dim=-1, out=buf)
-        return buf.mul_(1.0 / self.consumed.shape[-1])
+        return self.consumed.to(self.world.dtype).mean(-1)

@@ -89,9 +89,6 @@ class DiscoveryScenario(FusedScenario):
             n_envs, self.n_targets, dtype=torch.bool, device=device
         )
         self._cache: dict[str, torch.Tensor] | None = None
-        # ``info()``'s covered fraction, reduced into in place — one allocation at build
-        # time instead of two per step, and in the *world's* dtype rather than float32.
-        self._covered_frac = torch.zeros(n_envs, device=device, dtype=dtype)
         return self.world
 
     @property
@@ -274,10 +271,12 @@ class DiscoveryScenario(FusedScenario):
     def info(self) -> dict[str, Any]:
         """The covered fraction, read off the live ``covered`` latch on both paths.
 
-        Reduced into a preallocated buffer, so the returned tensor is a view the next call
-        overwrites — the same zero-copy contract as the other scenarios' ``info`` values
-        (see ``clone_outputs`` in :class:`~swarp.core.environment.Environment`).
+        ``.to(dtype).mean(-1)`` rather than the ``.float().mean(-1)`` this used to be: in a
+        float64 world the old form silently reported float32. It is *not* reduced into a
+        preallocated buffer, though that looks like the obvious win — measured on an RTX
+        3070 Laptop, ``torch.sum(bool, out=float)`` + ``mul_`` costs 73 us against 57 us for
+        the allocating mean, and cost discovery's graph-mode step ~7%. The bool->float cast
+        is one kernel either way, and torch's caching allocator makes the allocation it
+        avoids nearly free.
         """
-        buf = self._covered_frac
-        torch.sum(self.covered, dim=-1, out=buf)
-        return {"covered_frac": buf.mul_(1.0 / self.n_targets)}
+        return {"covered_frac": self.covered.to(self.world.dtype).mean(-1)}
