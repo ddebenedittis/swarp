@@ -88,8 +88,8 @@ obs = env.reset_at(mask)      # only where the [n_envs] bool mask is True
 `reset_at` writes with a masked `torch.where` blend, so it never needs `.any()` or `.nonzero()` — no device→host round-trip, and the whole RL loop can stay on-device.
 `auto_reset=True` makes `step` do exactly that with the `done` mask it just computed.
 
-The reset primitive scenarios build on is `World.write_state(mask, pos=..., vel=..., ...)`, which does the blend in place and invalidates the cached neighbour list when positions move.
-Writing `state.pos` directly and forgetting `World.mark_pos_dirty()` is a silent stale-neighbour-list bug — that is the reason to route resets through `write_state`.
+The reset primitive scenarios build on is `World.write_state(mask, pos=..., vel=..., ...)`, which does the blend in place and invalidates the cached neighbor list when positions move.
+Writing `state.pos` directly and forgetting `World.mark_pos_dirty()` is a silent stale-neighbor-list bug — that is the reason to route resets through `write_state`.
 
 ## Reading the state
 
@@ -106,7 +106,7 @@ Writing `state.pos` directly and forgetting `World.mark_pos_dirty()` is a silent
 
 One unified state serves every model, which is what keeps observations uniform across a heterogeneous fleet.
 
-## Neighbours and the radius graph
+## Neighbors and the radius graph
 
 ```python
 idx, count = env.world.neighbors()      # [E, A, K] int32, [E, A] int32 — zero-copy views
@@ -121,7 +121,7 @@ Both views are overwritten by the next call: gather from them within the step.
 ## Determinism and seeding
 
 `Environment(..., seed=0)` seeds the world RNG, and `reset(seed=...)` reseeds it.
-Given the same seed, device, dtype and action sequence, rollouts are bit-reproducible: collision forces are gather-based (each agent sums over its own neighbour list) so there are no atomics and no nondeterministic reduction order.
+Given the same seed, device, dtype and action sequence, rollouts are bit-reproducible: collision forces are gather-based (each agent sums over its own neighbor list) so there are no atomics and no nondeterministic reduction order.
 
 Determinism does **not** carry across devices or precisions — float32-on-CUDA and float64-on-CPU are different arithmetic — and it does not make swarp trajectory-compatible with VMAS. The dynamics, collision constants and observation model differ by design.
 

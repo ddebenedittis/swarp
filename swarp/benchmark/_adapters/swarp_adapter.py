@@ -11,7 +11,7 @@ so the benchmark can compare swarp *configurations*:
 The world/action setup mirrors ``compare_vmas._make_swarp`` (same ``world_size``,
 seeded on-device action buffer) so numbers are directly comparable, except that
 the cross-sim benchmark uses ``neighbor_obs=3`` (vs the scenario default of 2) so
-the observation encodes the same number of nearest neighbours as CAMAR's obs at
+the observation encodes the same number of nearest neighbors as CAMAR's obs at
 higher agent counts — an apples-to-apples observation size across the sims.
 """
 

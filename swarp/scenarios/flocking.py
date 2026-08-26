@@ -1,9 +1,9 @@
-"""Flocking: a Reynolds-style boids reward over within-radius neighbours.
+"""Flocking: a Reynolds-style boids reward over within-radius neighbors.
 
-Each agent is rewarded for cohesion (staying near the local neighbour centroid)
+Each agent is rewarded for cohesion (staying near the local neighbor centroid)
 and alignment (matching the local mean velocity), and penalized for crowding
-(separation) when neighbours come closer than ``separation_dist``. All terms are
-differentiable torch ops over the neighbour features the World already exposes.
+(separation) when neighbors come closer than ``separation_dist``. All terms are
+differentiable torch ops over the neighbor features the World already exposes.
 """
 
 from __future__ import annotations
@@ -171,8 +171,8 @@ class FlockingScenario(FusedScenario):
         rel_vel = (nvel - vel.unsqueeze(2)) * vf
         cnt_f = cnt.to(w.dtype).clamp(min=1.0).unsqueeze(-1)
 
-        centroid_off = rel_pos.sum(dim=2) / cnt_f  # mean neighbour offset
-        vel_off = rel_vel.sum(dim=2) / cnt_f  # mean neighbour velocity difference
+        centroid_off = rel_pos.sum(dim=2) / cnt_f  # mean neighbor offset
+        vel_off = rel_vel.sum(dim=2) / cnt_f  # mean neighbor velocity difference
         ndist = rel_pos.norm(dim=-1)  # [n_envs, n_agents, k]
         crowd = ((self.separation_dist - ndist).clamp(min=0.0) * valid.to(w.dtype)).sum(dim=-1)
 

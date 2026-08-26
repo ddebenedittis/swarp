@@ -10,7 +10,7 @@ Two structural points:
 
 * **Gather-based, thread per (env, obstacle).** Each body thread loops over all agents
   and sums its own force and torque, exactly like the agent side loops over its own
-  neighbours. No atomics, so the reduction order is fixed and the result deterministic.
+  neighbors. No atomics, so the reduction order is fixed and the result deterministic.
 * **Launched inside the substep loop** (:meth:`swarp.core.stepper.Stepper.launch_substeps`),
   right after the force pass and before the agents integrate, so both sides of every
   contact see the same state and the pose an agent collides against is at most one
@@ -24,7 +24,7 @@ capsule). **Box-box obstacle contacts are not modelled**: that needs a polygon c
 manifold (SAT), not an SDF evaluated against a disc, so two boxes pass through one
 another. Agent-vs-box is exact for every shape; this gap is only obstacle-vs-obstacle.
 
-Not taped: like the neighbour lists, body state is advanced with ``record_tape=False``.
+Not taped: like the neighbor lists, body state is advanced with ``record_tape=False``.
 The discrete question of which contacts exist is not differentiated, and a scenario that
 needs gradients through a movable body keeps its own torch-side reference (see
 :class:`swarp.scenarios.pusht.PushTScenario`).

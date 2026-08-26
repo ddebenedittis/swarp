@@ -4,7 +4,7 @@ Port of the VMAS ``sampling`` scenario (no new physics). Each env carries a
 batched sum-of-Gaussians density on a ``grid_res x grid_res`` grid over the
 world square. An agent earns the field value at its current cell the first time
 any agent enters that cell; the cell is then marked consumed. Observation is the
-agent's own pose plus the field sampled at the 3x3 cell neighbourhood around it
+agent's own pose plus the field sampled at the 3x3 cell neighborhood around it
 (a local gradient cue), all differentiable w.r.t. positions.
 """
 

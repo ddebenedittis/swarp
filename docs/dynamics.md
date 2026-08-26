@@ -71,7 +71,7 @@ from swarp.dynamics.drone import drone_config
 cfg = drone_config(mass=1.0, thrust_max=10.0, arm_length=0.15, inertia_zz=0.02)
 ```
 
-`radius` is the horizontal footprint the shared 2D neighbour and contact machinery uses.
+`radius` is the horizontal footprint the shared 2D neighbor and contact machinery uses.
 
 :::{note}
 The attitude loop is much stiffer than the 2D models'.

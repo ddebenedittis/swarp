@@ -1,6 +1,6 @@
 # World, contacts and sensing
 
-`WorldConfig` (`swarp/core/config.py`) holds everything about the world that is not an agent: the contact law, the boundary, the neighbour search, and the integrator.
+`WorldConfig` (`swarp/core/config.py`) holds everything about the world that is not an agent: the contact law, the boundary, the neighbor search, and the integrator.
 A scenario builds one in its `make_world`.
 
 ```python
@@ -60,7 +60,7 @@ It is also a smooth rational function of the state, which differentiates better 
 
 Contacts are **frictionless** everywhere in the engine: normal spring plus normal damping, no tangential term.
 
-Forces are **gather-based** — each thread sums the forces on its own agent from its own neighbour list, obstacles and walls. Symmetric pairs are computed twice, which buys a deterministic, race-free result with no atomics.
+Forces are **gather-based** — each thread sums the forces on its own agent from its own neighbor list, obstacles and walls. Symmetric pairs are computed twice, which buys a deterministic, race-free result with no atomics.
 
 ## Bounds
 
@@ -116,16 +116,16 @@ Two limits worth knowing:
 - **Box-box obstacle-obstacle contacts are not modelled.** Obstacles collide with each other for every pair in which at least one body is round; two boxes pass through one another, since that needs a polygon contact manifold rather than an SDF evaluated against a disc. Agent-vs-box is exact for every shape.
 - **Body integration is not taped** (`record_tape=False`), so no gradient flows through a body's motion. A scenario that needs one keeps its own torch-side copy — see [Differentiability](differentiability.md).
 
-## Neighbour search
+## Neighbor search
 
-Neighbour lists are padded to `max_neighbors` and built without a host sync. `neighbor_radius` defaults to the interaction reach `2·max_agent_radius + collision_margin`, and may not be set below it while collisions are on.
+Neighbor lists are padded to `max_neighbors` and built without a host sync. `neighbor_radius` defaults to the interaction reach `2·max_agent_radius + collision_margin`, and may not be set below it while collisions are on.
 
 `neighbor_method` picks the backend:
 
 | method | strategy | when |
 |---|---|---|
 | `"brute"` | per-env O(n_agents²) kernel | the usual multi-agent regime; linear in `n_envs` with a tiny constant |
-| `"uniform_grid"` | batched radix-sort grid, each env owning a disjoint block of cells, 3×3 neighbourhood query | large per-env populations across many envs |
+| `"uniform_grid"` | batched radix-sort grid, each env owning a disjoint block of cells, 3×3 neighborhood query | large per-env populations across many envs |
 | `"grid"` | one `wp.HashGrid` over all envs via a z-lift | very large per-env populations and few envs only |
 | `"auto"` (default) | `uniform_grid` above 512 agents per env, `brute` otherwise | |
 
@@ -138,7 +138,7 @@ A value that far above the heuristic warns.
 
 The backends are tested to agree exactly. `World.neighbor_overflow()` flags any agent whose true in-radius count exceeded `max_neighbors`, so truncation is never silent, and `World.edge_index()` turns the same lists into a COO radius graph.
 
-Neighbour construction is **not taped**: the neighbour *set* is a discrete structure, so gradients flow through contact geometry rather than through membership.
+Neighbor construction is **not taped**: the neighbor *set* is a discrete structure, so gradients flow through contact geometry rather than through membership.
 `neighbor_reuse` (on by default) lets the no-grad path reuse the list the previous step's post-step build already produced, turning two builds per step into one; the reused list is bit-identical to a fresh build on the same positions.
 
 ## Lidar

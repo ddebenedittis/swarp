@@ -89,13 +89,13 @@ With `auto_reset=True` the returned `obs` already reflects the reset — for a f
 
 ## Graph observations
 
-For GNN policies, the current within-radius neighbour graph is available as a COO edge index:
+For GNN policies, the current within-radius neighbor graph is available as a COO edge index:
 
 ```python
 edge_index = env.radius_graph()   # [2, E] int, on the env device
 ```
 
-It reuses the neighbour lists `step` already built, so there is no rebuild — just the single sync needed to materialize `E`.
+It reuses the neighbor lists `step` already built, so there is no rebuild — just the single sync needed to materialize `E`.
 
 ## Where to go next
 

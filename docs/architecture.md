@@ -60,7 +60,7 @@ Key modules:
 ## Design invariants
 
 **The step is functional** (`state_in → state_out`).
-Every array written during a taped step — intermediate states, force buffers, neighbour lists — must be allocated **fresh per step**: overwriting an array recorded on a `wp.Tape` silently corrupts its adjoint.
+Every array written during a taped step — intermediate states, force buffers, neighbor lists — must be allocated **fresh per step**: overwriting an array recorded on a `wp.Tape` silently corrupts its adjoint.
 `Stepper` is the single place that knows this; the no-grad hot path recycles one cached `StepBuffers` per batch size.
 
 **Precision is explicit.**
@@ -68,10 +68,10 @@ Kernels are generic over dtype and instantiated for float32 and float64 via `wp.
 float64-on-CPU is what makes strict `torch.autograd.gradcheck` possible.
 
 **Collision forces are gather-based.**
-Each agent sums over its own neighbour list. No atomics: deterministic and race-free.
+Each agent sums over its own neighbor list. No atomics: deterministic and race-free.
 
-**Neighbour construction is not taped.**
-The neighbour *set* is discrete, so gradients flow through contact geometry, not through membership.
+**Neighbor construction is not taped.**
+The neighbor *set* is discrete, so gradients flow through contact geometry, not through membership.
 
 **`wp.HashGrid` wraps cell coordinates modulo its dims**, which aliases cells across the z-lifted env batching — brute force wins up to a few hundred agents per env, and `uniform_grid` takes over above that.
 

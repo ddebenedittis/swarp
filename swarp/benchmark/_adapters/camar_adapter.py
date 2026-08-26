@@ -5,7 +5,7 @@ collision-avoidance sim. Two configurations:
 
 * ``obstacles=False`` (default) — an **open arena** (``string_grid`` of all-free
   cells, no border), matching swarp ``NavigationScenario``'s obstacle-free space.
-  Observations reduce to goal + neighbour features (no obstacle raycasting).
+  Observations reduce to goal + neighbor features (no obstacle raycasting).
   CAMAR integrates ``frameskip + 1`` world steps per ``env.step``, so
   ``frameskip=0`` runs exactly one world step, matching swarp ``substeps=1`` —
   an apples-to-apples navigation task (``frameskip=1`` would double CAMAR's

@@ -478,7 +478,7 @@ class NeighborGrid:
         ``max(radius, ...)`` below guarantees. A point clamped down to cell 0 has
         ``x < origin``; a point genuinely in cell ``k >= 2`` has
         ``x >= origin + 2 * cell_size``, so the two are more than ``radius`` apart and were
-        never true neighbours — the 3x3 block it fails to reach holds nothing it could
+        never true neighbors — the 3x3 block it fails to reach holds nothing it could
         have matched. Symmetrically at the far edge. Everything else that lands in the
         same cell without being in range is a mere *candidate*, and the exact distance
         filter in ``_query_uniform`` rejects it.

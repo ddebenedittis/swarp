@@ -41,7 +41,7 @@ Details that matter in practice:
 - Capture runs on a side stream (CUDA forbids capturing the legacy default stream); the graph is *replayed* on the current stream, so masked auto-resets and observation reads stay ordered with the replay without a device sync.
 - Auto-reset stays **outside** the graph: it uses a `torch.Generator` whose philox offset is not capture-safe.
 - Passing `use_graph=True` demands persistent execution even where capture is unavailable — it then falls back to eager persistent execution with a one-time warning. `use_graph=False` forces the plain functional step.
-- Capture is unavailable on CPU, and with the `wp.HashGrid` `"grid"` neighbour backend, which allocates during a build.
+- Capture is unavailable on CPU, and with the `wp.HashGrid` `"grid"` neighbor backend, which allocates during a build.
 
 `env.graph_mode` reports whether a graph is actually in play.
 
@@ -88,7 +88,7 @@ Downstream code written against `VmasEnv` needs the flat path here.
 
 ## Choosing a batch shape
 
-Almost every batch size lands on the same ~0.65–0.8 ms/step host floor, so raising `n_agents` is close to free until the neighbour and force kernels saturate the GPU.
+Almost every batch size lands on the same ~0.65–0.8 ms/step host floor, so raising `n_agents` is close to free until the neighbor and force kernels saturate the GPU.
 If you have a throughput target, raise `n_agents` before `n_envs`.
 
 Two knobs with real cost:
