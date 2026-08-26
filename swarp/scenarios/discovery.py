@@ -50,7 +50,7 @@ class DiscoveryScenario(FusedScenario):
         self.collision_penalty = collision_penalty
         self.max_speed = max_speed
 
-    def make_world(self, n_envs, device, dt, substeps, dtype) -> World:
+    def make_world(self, n_envs, device, dt, substeps, dtype, world_config=None) -> World:
         cfgs = [
             AgentConfig(
                 model=DynamicsModel.HOLONOMIC,
@@ -68,7 +68,7 @@ class DiscoveryScenario(FusedScenario):
             bounds=(-self.world_size, self.world_size, -self.world_size, self.world_size),
             bounds_mode="soft",
             max_neighbors=min(8, max(2, self.n_agents)),
-        )
+        ).override_with(world_config)
         self.world = World(
             cfgs, cfg, n_envs=n_envs, device=device, dt=dt, substeps=substeps, dtype=dtype
         )

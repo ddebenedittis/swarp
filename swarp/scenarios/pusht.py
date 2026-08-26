@@ -81,6 +81,11 @@ class PushTScenario(FusedScenario):
         self.tee_mass = tee_mass
         self.world_size = world_size
         self.max_speed = max_speed
+        # contact_k/contact_c ARE the engine's WorldConfig.collision_k/collision_c —
+        # the same spring-damper law, named for the agent<->T contact that dominates
+        # here. contact_margin is NOT the engine's collision_margin (which is derived
+        # from agent_radius in make_world): it is this scenario's own agent<->T
+        # activation gap, used by the torch reference path below.
         self.contact_k = contact_k
         self.contact_c = contact_c
         self.contact_margin = contact_margin
@@ -147,7 +152,7 @@ class PushTScenario(FusedScenario):
         self.goal_spawn_radius: float | None = None
         self.goal_spawn_angle: float | None = None
 
-    def make_world(self, n_envs, device, dt, substeps, dtype) -> World:
+    def make_world(self, n_envs, device, dt, substeps, dtype, world_config=None) -> World:
         cfgs = [
             AgentConfig(
                 model=DynamicsModel.HOLONOMIC,
@@ -183,7 +188,7 @@ class PushTScenario(FusedScenario):
             obstacle_linear_damping=self.linear_damping,
             obstacle_angular_damping=self.angular_damping,
             contact_max_overlap=self.max_overlap,
-        )
+        ).override_with(world_config)
         self.dt = dt
         self.world = World(
             cfgs, cfg, n_envs=n_envs, device=device, dt=dt, substeps=substeps, dtype=dtype

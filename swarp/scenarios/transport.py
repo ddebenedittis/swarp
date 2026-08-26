@@ -64,6 +64,11 @@ class TransportScenario(FusedScenario):
         self.package_inertia = 0.5 * package_mass * package_radius**2
         self.world_size = world_size
         self.max_speed = max_speed
+        # contact_k/contact_c ARE the engine's WorldConfig.collision_k/collision_c —
+        # the same spring-damper law, named for the agent<->package contact that dominates
+        # here. contact_margin is NOT the engine's collision_margin (which is derived
+        # from agent_radius in make_world): it is this scenario's own agent<->package
+        # activation gap, used by the torch reference path below.
         self.contact_k = contact_k
         self.contact_c = contact_c
         self.contact_margin = contact_margin
@@ -73,7 +78,7 @@ class TransportScenario(FusedScenario):
         self.goal_reward = goal_reward
         self.goal_tolerance = goal_tolerance if goal_tolerance is not None else package_radius
 
-    def make_world(self, n_envs, device, dt, substeps, dtype) -> World:
+    def make_world(self, n_envs, device, dt, substeps, dtype, world_config=None) -> World:
         cfgs = [
             AgentConfig(
                 model=DynamicsModel.HOLONOMIC,
@@ -96,7 +101,7 @@ class TransportScenario(FusedScenario):
             bounds_mode="soft",
             neighbor_radius=reach,
             max_neighbors=min(32, max(4, self.n_agents)),
-        )
+        ).override_with(world_config)
         self.dt = dt
         self.world = World(
             cfgs, cfg, n_envs=n_envs, device=device, dt=dt, substeps=substeps, dtype=dtype

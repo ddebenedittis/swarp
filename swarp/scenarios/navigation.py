@@ -86,11 +86,11 @@ class NavigationScenario(FusedScenario):
             for _ in range(self.n_agents)
         ]
 
-    def make_world(self, n_envs, device, dt, substeps, dtype) -> World:
+    def make_world(self, n_envs, device, dt, substeps, dtype, world_config=None) -> World:
         configs = self._agent_configs()
         margin = 0.5 * self.agent_radius
         reach = 2.0 * self.agent_radius + margin
-        world_config = WorldConfig(
+        cfg = WorldConfig(
             collisions=True,
             collision_k=100.0,
             collision_c=1.0,
@@ -100,10 +100,10 @@ class NavigationScenario(FusedScenario):
             neighbor_radius=max(self.neighbor_radius or 0.0, reach),
             max_neighbors=min(32, max(4, self.n_agents)),
             neighbor_method=self.neighbor_method,
-        )
+        ).override_with(world_config)
         self.world = World(
             configs,
-            world_config,
+            cfg,
             n_envs=n_envs,
             device=device,
             dt=dt,
@@ -122,7 +122,7 @@ class NavigationScenario(FusedScenario):
         # Persistent eager-trim scratch (allocated lazily on first refresh).
         self._eager_k_all: int = -1
         self._eager_k: int = -1
-        self._k_obs = min(self.neighbor_obs, world_config.max_neighbors)
+        self._k_obs = min(self.neighbor_obs, cfg.max_neighbors)
         if self.n_obstacles > 0:
             # Install the (zeroed) obstacle set once, here: ``World`` then retains the
             # resolved spec, so every reset just writes new poses into its own tensor and

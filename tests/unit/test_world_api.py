@@ -162,3 +162,43 @@ def test_obstacle_state_views_alias_the_engine_arrays_without_stable_identity(de
     body = w.obstacle_state_views(body=True)
     assert body[0].data_ptr() == wp.to_torch(w.stepper.body_pos).data_ptr()
     assert body[0].data_ptr() != a[0].data_ptr()
+
+
+# -------------------------------------------------------------- override_with
+
+
+def test_override_with_none_is_the_identity():
+    """The no-override path must not even rebuild the config a scenario computed."""
+    base = WorldConfig(collision_k=42.0, bounds=(-2.0, 2.0, -2.0, 2.0))
+    assert base.override_with(None) is base
+
+
+def test_override_with_takes_only_non_default_fields():
+    """A scenario's computed geometry survives an override that does not mention it."""
+    base = WorldConfig(
+        collision_k=8000.0,
+        collision_margin=0.0125,
+        bounds=(-1.0, 1.0, -1.0, 1.0),
+        neighbor_radius=0.3,
+        max_neighbors=8,
+    )
+    merged = base.override_with(WorldConfig(collision_k=50.0, bounds_mode="clamp"))
+    assert merged.collision_k == 50.0 and merged.bounds_mode == "clamp"
+    assert merged.collision_margin == 0.0125  # untouched by the override
+    assert merged.bounds == (-1.0, 1.0, -1.0, 1.0)
+    assert merged.neighbor_radius == 0.3 and merged.max_neighbors == 8
+    assert base.collision_k == 8000.0  # and the original is not mutated
+
+
+def test_override_with_cannot_restore_a_default():
+    """The documented limit of the merge rule, pinned so it stays a known one."""
+    base = WorldConfig(collision_k=8000.0)
+    # WorldConfig()'s own default is 100.0, which reads as "did not ask".
+    assert base.override_with(WorldConfig(collision_k=100.0)).collision_k == 8000.0
+
+
+def test_override_with_revalidates():
+    base = WorldConfig(bounds=(-1.0, 1.0, -1.0, 1.0))
+    with pytest.raises(ValueError, match="bounds_mode"):
+        base.override_with(WorldConfig(bounds_mode="bouncy"))
+

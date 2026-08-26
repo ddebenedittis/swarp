@@ -18,6 +18,28 @@ world_config = WorldConfig(
 world = World(agent_configs, world_config, n_envs=n_envs, device=device, dt=dt, substeps=1, dtype=dtype)
 ```
 
+### Overriding a scenario's engine settings
+
+The built-in scenarios compute their own `WorldConfig` — `bounds` from `world_size`, `neighbor_radius` from the contact reach — and most of its fields are not scenario constructor arguments.
+Pass `world_config=` to `swarp.make` or `Environment` to override them without subclassing:
+
+```python
+import swarp
+from swarp import WorldConfig, Integrator
+
+env = swarp.make(
+    "navigation",
+    n_envs=4096,
+    n_agents=8,
+    world_config=WorldConfig(integrator=Integrator.RK4, bounds_mode="clamp", collision_k=50.0),
+)
+```
+
+Only the fields you set **away from the `WorldConfig()` defaults** are applied, so the scenario keeps everything it computed (`WorldConfig.override_with` is the merge).
+The one case this cannot express is forcing a field *back* to its default against a scenario that changed it — build the scenario's `World` yourself for that.
+
+`Scenario.make_world` takes the same argument, and all seven built-ins honour it (a test pins that).
+
 ## Soft contacts
 
 Interactions are spring-damper penalties, not impulses: forces are computed from overlap and closing velocity and fed to the integrator.
@@ -108,6 +130,11 @@ Neighbour lists are padded to `max_neighbors` and built without a host sync. `ne
 | `"auto"` (default) | `uniform_grid` above 512 agents per env, `brute` otherwise | |
 
 `wp.HashGrid` wraps cell *coordinates* modulo its dims, so the z-lifted envs alias into shared cells and query cost grows with `n_envs` — which is why `"grid"` is rarely the right answer here and is measured ~300× slower than brute force at 16k envs × 64 agents.
+`grid_dim` (default 128) is that backend's bucket dimension per axis.
+
+`uniform_bins` sets the cells per axis of the `"uniform_grid"` backend; `None` (the default) picks `~sqrt(n_agents)`, which keeps occupancy near one agent per cell.
+Raising it is usually a mistake: every query zeroes `n_envs · bins²` `int32` cell offsets before the sort, so an over-fine grid spends more clearing empty cells than searching occupied ones — 128 bins with 8 agents is 16384 cells per env for 8 points.
+A value that far above the heuristic warns.
 
 The backends are tested to agree exactly. `World.neighbor_overflow()` flags any agent whose true in-radius count exceeded `max_neighbors`, so truncation is never silent, and `World.edge_index()` turns the same lists into a COO radius graph.
 

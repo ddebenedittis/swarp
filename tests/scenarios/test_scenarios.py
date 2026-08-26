@@ -10,7 +10,7 @@ import torch
 from conftest import DEVICES
 
 import swarp
-from swarp import DynamicsModel, Environment
+from swarp import DynamicsModel, Environment, Integrator, WorldConfig
 from swarp.scenarios import SCENARIOS as REGISTRY
 from swarp.scenarios import Scenario, fused_scenarios, make_scenario
 from swarp.scenarios.discovery import DiscoveryScenario
@@ -97,6 +97,70 @@ def test_make_builds_a_working_environment(device):
 def test_make_drops_model_for_holonomic_only_scenarios():
     env = swarp.make("flocking", n_envs=2, n_agents=2, device="cpu", model=DynamicsModel.DIFF_DRIVE)
     assert env.n_agents == 2  # constructed despite the unsupported kwarg
+
+
+# Engine settings no scenario exposes as a constructor argument. All six are set away
+# from the WorldConfig() defaults, which is what makes them visible to the merge rule.
+UNREACHABLE_OVERRIDE = WorldConfig(
+    integrator=Integrator.RK4,
+    bounds_mode="clamp",
+    neighbor_reuse=False,
+    grid_dim=64,
+    obstacle_angular_damping=3.5,
+    contact_max_overlap=0.25,
+)
+
+
+@pytest.mark.parametrize("name", sorted(REGISTRY))
+def test_every_scenario_honours_the_world_config_override(name):
+    """All seven must end make_world with ``.override_with(world_config)``.
+
+    Nothing in the type system enforces that, and a scenario that quietly dropped the
+    argument would leave its users back where they started: subclass or nothing.
+    """
+    scen = make_scenario(name, **SCENARIO_KWARGS.get(name, {}))
+    world = scen.make_world(
+        n_envs=2,
+        device="cpu",
+        dt=0.1,
+        substeps=1,
+        dtype=torch.float32,
+        world_config=UNREACHABLE_OVERRIDE,
+    )
+    cfg = world.stepper.world
+    assert cfg.integrator is Integrator.RK4
+    assert cfg.bounds_mode == "clamp"
+    assert cfg.neighbor_reuse is False
+    assert cfg.grid_dim == 64
+    assert cfg.obstacle_angular_damping == 3.5
+    assert cfg.contact_max_overlap == 0.25
+    # ...and what the scenario computed for itself is still there.
+    assert cfg.bounds is not None and cfg.collision_margin != WorldConfig().collision_margin
+
+
+@pytest.mark.parametrize("name", sorted(REGISTRY))
+def test_omitting_world_config_leaves_the_scenario_config_untouched(name):
+    """The non-breaking half: no argument must mean byte-for-byte the old config."""
+    kwargs = dict(n_envs=2, device="cpu", dt=0.1, substeps=1, dtype=torch.float32)
+    plain = make_scenario(name, **SCENARIO_KWARGS.get(name, {})).make_world(**kwargs)
+    explicit_none = make_scenario(name, **SCENARIO_KWARGS.get(name, {})).make_world(
+        **kwargs, world_config=None
+    )
+    assert plain.stepper.world == explicit_none.stepper.world
+
+
+def test_make_forwards_world_config():
+    """``swarp.make`` routes it by name, so the front door reaches the engine too."""
+    env = swarp.make(
+        "navigation",
+        n_envs=8,
+        n_agents=3,
+        device="cpu",
+        world_config=WorldConfig(collision_k=50.0),
+    )
+    cfg = env.world.stepper.world
+    assert cfg.collision_k == 50.0
+    assert cfg.bounds is not None  # navigation's own bounds survived
 
 
 def _random_actions(env, gen):

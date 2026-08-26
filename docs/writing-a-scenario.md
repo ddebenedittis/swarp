@@ -21,7 +21,7 @@ Four abstract members:
 
 | member | what it does |
 |---|---|
-| `make_world(n_envs, device, dt, substeps, dtype) -> World` | build the `World`, **and allocate all persistent state** |
+| `make_world(n_envs, device, dt, substeps, dtype, world_config=None) -> World` | build the `World`, **and allocate all persistent state** |
 | `reset_world(env_mask=None, *, obs_only=False)` | (re)randomize state, goals, obstacles |
 | `observations() -> [n_envs, n_agents, obs_dim]` | batched observations |
 | `obs_dim -> int` | per-agent observation width |
@@ -37,6 +37,27 @@ That matters more than it looks: `reset_world` runs on the per-step auto-reset p
 lazy allocation there is an undeclared ordering precondition — the fused path breaks if it
 runs before the first reset. `FusedScenario` turns that into a hard error rather than a
 subtle one.
+
+### `make_world` must honour `world_config`
+
+Compute your `WorldConfig` from your own scenario parameters as usual, then end with one
+call:
+
+```python
+cfg = WorldConfig(
+    collisions=True,
+    collision_margin=margin,
+    bounds=(-self.world_size, self.world_size, -self.world_size, self.world_size),
+    neighbor_radius=reach,
+).override_with(world_config)
+```
+
+That is the whole contract. It is what lets a caller reach engine settings your
+constructor does not expose (`integrator`, `bounds_mode`, `neighbor_reuse`, `grid_dim`,
+`uniform_bins`, the obstacle damping) via `swarp.make(..., world_config=...)` without
+subclassing, while your computed `bounds` and `neighbor_radius` survive — only the fields
+set away from the `WorldConfig()` defaults are taken. `tests/scenarios/test_scenarios.py`
+pins that all seven built-ins do this.
 
 ### `reset_world` must be host-sync-free
 

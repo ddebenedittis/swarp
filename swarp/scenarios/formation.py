@@ -43,7 +43,7 @@ class FormationScenario(FusedScenario):
         self.collision_penalty = collision_penalty
         self.goal_tolerance = goal_tolerance if goal_tolerance is not None else 2.0 * agent_radius
 
-    def make_world(self, n_envs, device, dt, substeps, dtype) -> World:
+    def make_world(self, n_envs, device, dt, substeps, dtype, world_config=None) -> World:
         cfgs = [
             AgentConfig(
                 model=DynamicsModel.HOLONOMIC,
@@ -63,7 +63,7 @@ class FormationScenario(FusedScenario):
             bounds_mode="soft",
             neighbor_radius=reach,
             max_neighbors=min(32, max(4, self.n_agents)),
-        )
+        ).override_with(world_config)
         self.world = World(
             cfgs, cfg, n_envs=n_envs, device=device, dt=dt, substeps=substeps, dtype=dtype
         )

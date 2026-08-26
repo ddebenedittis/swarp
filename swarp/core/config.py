@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, replace
 from enum import IntEnum
 
 import torch
@@ -230,6 +230,33 @@ class WorldConfig:
     # engaged on the no-grad path (the taped path rebuilds so adjoints stay
     # correct). See :meth:`swarp.core.stepper.Stepper.launch_substeps`.
     neighbor_reuse: bool = True
+
+    def override_with(self, other: WorldConfig | None) -> WorldConfig:
+        """This config with ``other``'s **non-default** fields applied on top.
+
+        Scenarios compute most of a ``WorldConfig`` from their own parameters — bounds
+        from ``world_size``, ``neighbor_radius`` from the contact reach — so a caller's
+        override cannot simply replace it wholesale without destroying those. Only the
+        fields ``other`` sets away from the ``WorldConfig()`` defaults are taken, which
+        is what makes ``world_config=WorldConfig(collision_k=50.0)`` mean "everything the
+        scenario decided, but with that stiffness".
+
+        The one thing this cannot express is forcing a field *back* to its
+        ``WorldConfig()`` default against a scenario that changed it — that is
+        indistinguishable from not asking. Build the scenario's ``World`` yourself when
+        you need that.
+
+        Returns ``self`` unchanged when there is nothing to apply.
+        """
+        if other is None:
+            return self
+        default = WorldConfig()
+        changed = {
+            f.name: getattr(other, f.name)
+            for f in fields(self)
+            if getattr(other, f.name) != getattr(default, f.name)
+        }
+        return replace(self, **changed) if changed else self
 
     def __post_init__(self) -> None:
         if self.bounds_mode not in ("soft", "clamp"):

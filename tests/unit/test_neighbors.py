@@ -274,3 +274,24 @@ def test_lazy_hash_grid_agrees_with_brute_force_at_a_small_grid_dim(device):
     a = neighbor_sets(ref.neighbor_idx.numpy(), ref.neighbor_count.numpy())
     b = neighbor_sets(small.neighbor_idx.numpy(), small.neighbor_count.numpy())
     assert a == b
+
+
+def test_over_fine_uniform_grid_warns():
+    """``bins**2`` far above ``n_agents`` means each query memsets more cells than it searches."""
+    with pytest.warns(RuntimeWarning, match="cells per env"):
+        NeighborGrid(2, 8, radius=0.5, device="cpu", method="uniform_grid", uniform_bins=128)
+
+
+def test_default_uniform_bins_is_quiet():
+    """The ~sqrt(n_agents) heuristic is the shape the warning is calibrated against."""
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        NeighborGrid(2, 8, radius=0.5, device="cpu", method="uniform_grid")
+
+
+def test_uniform_bins_must_be_positive():
+    with pytest.raises(ValueError, match="uniform_bins"):
+        NeighborGrid(2, 8, radius=0.5, device="cpu", method="uniform_grid", uniform_bins=0)
+

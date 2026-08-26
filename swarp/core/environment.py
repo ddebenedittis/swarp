@@ -6,6 +6,7 @@ from typing import Any
 
 import torch
 
+from swarp.core.config import WorldConfig
 from swarp.dynamics.base import action_bounds
 from swarp.scenarios.base import Scenario
 
@@ -40,6 +41,14 @@ class Environment:
         fused: use the scenario's fused Warp obs/reward kernels on the no-grad path.
             ``"auto"`` follows :attr:`~swarp.scenarios.base.Scenario.fused_available`;
             grad mode always falls back to the differentiable torch path.
+        world_config: engine-level overrides applied on top of whatever the scenario
+            computes, so settings no scenario exposes as a constructor argument
+            (``integrator``, ``bounds_mode``, ``neighbor_reuse``, ``neighbor_method``,
+            ``grid_dim``, ``uniform_bins``, the obstacle damping, ``contact_max_overlap``)
+            are reachable without subclassing. Only the fields set away from the
+            ``WorldConfig()`` defaults are taken — the scenario keeps its computed
+            ``bounds`` and ``neighbor_radius``. See
+            :meth:`~swarp.core.config.WorldConfig.override_with`.
     """
 
     def __init__(
@@ -56,6 +65,7 @@ class Environment:
         use_graph: bool | str = "auto",
         clone_outputs: bool = False,
         fused: bool | str = "auto",
+        world_config: WorldConfig | None = None,
     ) -> None:
         self.scenario = scenario
         self.n_envs = n_envs
@@ -66,7 +76,12 @@ class Environment:
         self.clone_outputs = clone_outputs
         self._viewer: Any = None
         self.world = scenario.make_world(
-            n_envs=n_envs, device=device, dt=dt, substeps=substeps, dtype=dtype
+            n_envs=n_envs,
+            device=device,
+            dt=dt,
+            substeps=substeps,
+            dtype=dtype,
+            world_config=world_config,
         )
         self.n_agents = self.world.n_agents
         self._seed(seed)

@@ -18,6 +18,7 @@ substep, so adjoint kernels must not re-query it).
 from __future__ import annotations
 
 import math
+import warnings
 from typing import Any
 
 import torch
@@ -321,7 +322,24 @@ class NeighborGrid:
         self.method = method
         # Cells per axis for the uniform grid: ~sqrt(n_agents) keeps occupancy
         # near one agent per cell (memory is n_envs * bins^2 int32 offsets).
+        if uniform_bins is not None and uniform_bins < 1:
+            raise ValueError("uniform_bins must be >= 1")
         self.uniform_bins = uniform_bins or max(4, min(128, int(math.ceil(math.sqrt(n_agents)))))
+        # Every query zeroes n_envs * bins^2 int32 cell_start/cell_end entries before the
+        # sort, so an over-fine grid spends more clearing empty cells than searching
+        # occupied ones — at 8 agents and bins=128 that is 16384 cells per env for 8
+        # points. Warn rather than raise: a deliberately sparse grid is legal, just
+        # rarely intended.
+        if self.method == "uniform_grid" and self.uniform_bins**2 > 16 * max(1, n_agents):
+            warnings.warn(
+                f"uniform_bins={self.uniform_bins} gives {self.uniform_bins**2} cells per env "
+                f"for {n_agents} agents; each query memsets all of them, which will dominate "
+                f"the search. The default heuristic (~sqrt(n_agents), here "
+                f"{max(4, min(128, int(math.ceil(math.sqrt(n_agents)))))}) keeps occupancy "
+                "near one agent per cell.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         self._points: wp.array | None = None
         self._grid: wp.HashGrid | None = None
         self._u_alloc = False  # uniform-grid buffers allocated lazily

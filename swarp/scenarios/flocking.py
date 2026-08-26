@@ -45,7 +45,7 @@ class FlockingScenario(FusedScenario):
         self.separation = separation
         self.separation_dist = separation_dist
 
-    def make_world(self, n_envs, device, dt, substeps, dtype) -> World:
+    def make_world(self, n_envs, device, dt, substeps, dtype, world_config=None) -> World:
         cfgs = [
             AgentConfig(
                 model=DynamicsModel.HOLONOMIC,
@@ -65,7 +65,7 @@ class FlockingScenario(FusedScenario):
             bounds_mode="soft",
             neighbor_radius=max(self.neighbor_radius, reach),
             max_neighbors=min(32, max(4, self.n_agents)),
-        )
+        ).override_with(world_config)
         self.world = World(
             cfgs, cfg, n_envs=n_envs, device=device, dt=dt, substeps=substeps, dtype=dtype
         )
