@@ -55,25 +55,57 @@ class Integrator(Enum):
     RK4 = "rk4"
 
 
-# Column indices into the float parameter matrix [n_agents, NUM_PARAMS].
-P_RADIUS = 0
-P_MASS = 1
-P_MAX_SPEED = 2
-P_MAX_ACCEL = 3
-P_MAX_ANG_VEL = 4
-P_MAX_ANG_ACCEL = 5
-P_LF = 6
-P_LR = 7
-P_MAX_STEER = 8
-# 6-DOF drone parameters (ignored by the 2D vehicle models).
-P_THRUST_MAX = 9  # per-rotor max thrust (N)
-P_ARM = 10  # rotor arm length from CoG (m)
-P_IXX = 11  # body-frame diagonal inertia
-P_IYY = 12
-P_IZZ = 13
-P_KAPPA = 14  # yaw reaction torque per unit rotor thrust
-P_GRAVITY = 15  # gravitational acceleration (m/s^2)
-NUM_PARAMS = 16
+#: Layout of the float parameter matrix ``[n_agents, NUM_PARAMS]``, in column order:
+#: each entry is the :class:`AgentConfig` field packed into that column.
+#:
+#: This tuple is the **single source of truth** for the layout. The ``P_*`` column
+#: indices below, :data:`NUM_PARAMS` and :meth:`AgentConfig.to_row` are all derived
+#: from it, so inserting or moving a parameter cannot leave the kernels reading
+#: ``mass`` out of the column ``max_speed`` was packed into — the failure mode of
+#: three hand-maintained positional lists, which is silent (right shape, wrong
+#: physics). Same principle as :class:`~swarp.core.config.ObstacleShape` and the
+#: ``TAG_*`` constants in :mod:`swarp.dynamics.kernels`: derive, never duplicate.
+PARAM_FIELDS: tuple[str, ...] = (
+    "radius",
+    "mass",
+    "max_speed",
+    "max_accel",
+    "max_ang_vel",
+    "max_ang_accel",
+    "l_f",
+    "l_r",
+    "max_steer",
+    # 6-DOF drone parameters (ignored by the 2D vehicle models).
+    "thrust_max",
+    "arm_length",
+    "inertia_xx",
+    "inertia_yy",
+    "inertia_zz",
+    "torque_coeff",
+    "gravity",
+)
+NUM_PARAMS = len(PARAM_FIELDS)
+_COL = {name: i for i, name in enumerate(PARAM_FIELDS)}
+
+# Column indices into the float parameter matrix, spelled out (rather than injected
+# into globals()) so the kernels' `from ... import P_MASS` stays statically resolvable.
+# A mistyped field name is an import-time KeyError, not a wrong column.
+P_RADIUS = _COL["radius"]
+P_MASS = _COL["mass"]
+P_MAX_SPEED = _COL["max_speed"]
+P_MAX_ACCEL = _COL["max_accel"]
+P_MAX_ANG_VEL = _COL["max_ang_vel"]
+P_MAX_ANG_ACCEL = _COL["max_ang_accel"]
+P_LF = _COL["l_f"]
+P_LR = _COL["l_r"]
+P_MAX_STEER = _COL["max_steer"]
+P_THRUST_MAX = _COL["thrust_max"]  # per-rotor max thrust (N)
+P_ARM = _COL["arm_length"]  # rotor arm length from CoG (m)
+P_IXX = _COL["inertia_xx"]  # body-frame diagonal inertia
+P_IYY = _COL["inertia_yy"]
+P_IZZ = _COL["inertia_zz"]
+P_KAPPA = _COL["torque_coeff"]  # yaw reaction torque per unit rotor thrust
+P_GRAVITY = _COL["gravity"]  # gravitational acceleration (m/s^2)
 
 
 @dataclass
@@ -112,24 +144,8 @@ class AgentConfig:
                     raise ValueError(f"AgentConfig.{name} must be positive for a drone.")
 
     def to_row(self) -> list[float]:
-        return [
-            self.radius,
-            self.mass,
-            self.max_speed,
-            self.max_accel,
-            self.max_ang_vel,
-            self.max_ang_accel,
-            self.l_f,
-            self.l_r,
-            self.max_steer,
-            self.thrust_max,
-            self.arm_length,
-            self.inertia_xx,
-            self.inertia_yy,
-            self.inertia_zz,
-            self.torque_coeff,
-            self.gravity,
-        ]
+        """This config as one ``[NUM_PARAMS]`` kernel row, in :data:`PARAM_FIELDS` order."""
+        return [float(getattr(self, name)) for name in PARAM_FIELDS]
 
 
 #: Which ``AgentConfig`` limit each model's integrate branch clamps each action slot
