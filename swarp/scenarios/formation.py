@@ -141,9 +141,14 @@ class FormationScenario(FusedScenario):
         )
 
     def launch_fused(self, pass_: FusedPass) -> None:
-        """Obs, then reward — the reward only on a step (see NavigationScenario)."""
+        """Obs, then reward — the reward on every pass but an obs-only auto-reset.
+
+        Same rule as :meth:`~swarp.scenarios.navigation.NavigationScenario.launch_fused`:
+        ``full_pass=0`` (a mid-step auto-reset) keeps the reward/done already returned for
+        that transition, and a standalone reset recomputes them to match the torch oracle.
+        """
         self._launch_obs(advance_prev=pass_.advance_prev, full_pass=pass_.full_pass)
-        if pass_.is_step:
+        if pass_.full_pass:
             self._launch_reward()
 
     def _launch_obs(self, advance_prev: int, full_pass: int) -> None:

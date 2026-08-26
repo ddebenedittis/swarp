@@ -122,12 +122,14 @@ def _body_body(
     q: Any,
     tv: Any,
     th: Any,
+    om_self: Any,
     st: wp.int32,
     r_self: Any,
     half_self: Any,
     q2: Any,
     tv2: Any,
     th2: Any,
+    om_other: Any,
     st2: wp.int32,
     r2: Any,
     half2: Any,
@@ -144,6 +146,12 @@ def _body_body(
     obstacle contacts are not modelled** — that needs a polygon manifold (SAT), not an
     SDF against a disc — so two boxes pass through each other. Agents still collide
     correctly with every shape; this is only about obstacles hitting each other.
+
+    ``om_self``/``om_other`` are the two bodies' angular velocities. They only enter the
+    damper, through the velocity of the material point in contact (``v + om x r``) — the
+    same closing-velocity correction :func:`swarp.core.collisions._static_forces` applies
+    on the agent side. Getting them wrong damps a spinning body against an absolute
+    velocity that has nothing to do with the contact.
     """
     zero = type(k)(0.0)
     f = type(q)(zero, zero)
@@ -154,21 +162,28 @@ def _body_body(
             # capsule that round body sits at the closest point of its spine, not at its
             # centre — otherwise a long wall would act like a small disc in its middle.
             c2 = q2
+            v2 = tv2
             if st2 == SHAPE_SEGMENT:
                 c2 = closest_on_segment(q, q2, th2, half2[0])
+                rr = c2 - q2
+                v2 = tv2 + type(q)(-om_other * rr[1], om_other * rr[0])
             f_other = box_force(
-                c2, tv2, q, th, half_self, r2 + margin, k, c, damp_denom, max_overlap, tv, th2
+                c2, v2, q, th, half_self, r2 + margin, k, c, damp_denom, max_overlap, tv, om_self
             )
             f = -f_other
             r = _closest_in_box(c2 - q, th, half_self)
     elif st2 == SHAPE_BOX:
         # This (round) body vs a box.
         f = box_force(
-            q, tv, q2, th2, half2, r_self + margin, k, c, damp_denom, max_overlap, tv2, zero
+            q, tv, q2, th2, half2, r_self + margin, k, c, damp_denom, max_overlap, tv2, om_other
         )
     elif st2 == SHAPE_SEGMENT:
         cp = closest_on_segment(q, q2, th2, half2[0])
-        f = pair_force(q - cp, tv - tv2, r_self + r2 + margin, k, c, damp_denom, max_overlap)
+        # Surface point velocity of a spinning capsule: v + om x (cp - centre), exactly as
+        # :func:`swarp.core.collisions._static_forces` does it for the agent side.
+        rr = cp - q2
+        vs2 = tv2 + type(q)(-om_other * rr[1], om_other * rr[0])
+        f = pair_force(q - cp, tv - vs2, r_self + r2 + margin, k, c, damp_denom, max_overlap)
     else:
         f = pair_force(q - q2, tv - tv2, r_self + r2 + margin, k, c, damp_denom, max_overlap)
     # A frictionless normal on a round body passes through its centre: no torque, so the
@@ -269,9 +284,9 @@ def obstacle_dynamics_kernel(
         for o2 in range(n_obstacles):
             if obs_body[o2] != o:
                 f2, r2v = _body_body(
-                    cs, vs, th, st, obs_r, half,
-                    obs_pos[e, o2], obs_vel[e, o2], obs_angle[e, o2], obs_type[o2],
-                    obs_radius[o2], obs_half[o2],
+                    cs, vs, th, om, st, obs_r, half,
+                    obs_pos[e, o2], obs_vel[e, o2], obs_angle[e, o2], obs_ang_vel[e, o2],
+                    obs_type[o2], obs_radius[o2], obs_half[o2],
                     k, c, margin, denom_self, max_overlap,
                 )
                 lx = owx + r2v[0]

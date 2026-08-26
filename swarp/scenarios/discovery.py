@@ -167,17 +167,19 @@ class DiscoveryScenario(FusedScenario):
         )
 
     def launch_fused(self, pass_: FusedPass) -> None:
-        """Coverage, observations, and — on a step only — the reward.
+        """Coverage, observations, and — outside an obs-only auto-reset — the reward.
 
         Discovery's kernels take *neither* ``advance_prev`` nor ``full_pass``: there is no
-        shaping baseline to rebase, and "a reset must not clobber the reward already
-        returned for this transition" is expressed by simply not launching the reward
-        kernel. Coverage still runs on a reset, updating the ``covered`` latch exactly as
-        the torch ``_refresh`` does.
+        shaping baseline to rebase, so the pass flags only decide whether the reward kernel
+        runs at all. An obs-only auto-reset skips it, keeping the reward/done already
+        returned for the transition just taken; a standalone reset launches it, because the
+        reward kernel is the only writer of the fused ``done`` and the torch oracle
+        recomputes both. Coverage always runs, updating the ``covered`` latch exactly as
+        the torch ``_refresh`` does — which is what makes the reset-pass reward correct.
         """
         self._launch_cover()
         self._launch_obs()
-        if pass_.is_step:
+        if pass_.full_pass:
             self._launch_reward()
 
     def _launch_cover(self) -> None:

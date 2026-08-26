@@ -258,15 +258,17 @@ class NavigationScenario(FusedScenario):
         )
 
     def launch_fused(self, pass_: FusedPass) -> None:
-        """Observations, then the reward — the latter only on a step.
+        """Observations, then the reward — on every pass except an obs-only auto-reset.
 
-        A reset must leave ``reward``/``done`` alone: an auto-reset's were already returned
-        for the transition just taken. A standalone reset still passes ``full_pass=1``,
-        which fills the ``info`` outputs; those all come off the obs kernel. Either way the
-        shaping baseline rebases only the envs the reset mask selects.
+        A mid-step auto-reset must leave ``reward``/``done`` alone: they were already
+        returned for the transition just taken, and ``full_pass=0`` is what skips the
+        launch. A *standalone* ``reset``/``reset_at`` instead has to recompute them, since
+        the reward kernel is the only writer of the fused ``done`` — otherwise the first
+        ``done()`` after a reset would still report the pre-reset episode, unlike the torch
+        oracle. Either way the shaping baseline rebases only the envs the mask selects.
         """
         self._launch_obs(advance_prev=pass_.advance_prev, full_pass=pass_.full_pass)
-        if pass_.is_step:
+        if pass_.full_pass:
             self._launch_reward()
 
     def _launch_obs(self, advance_prev: int, full_pass: int) -> None:

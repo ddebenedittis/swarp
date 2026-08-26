@@ -7,6 +7,7 @@ from conftest import (
     FusedSpec,
     assert_fused_determinism,
     assert_grad_falls_back_to_torch,
+    assert_reset_parity,
     fused_env,
     fused_rollout,
 )
@@ -77,3 +78,9 @@ def test_grad_step_falls_back_to_torch(device):
     """A grad-enabled step must take the differentiable torch path (fused off)."""
     env = _env(device, fused=True, n_agents=4, world_size=1.0)
     assert_grad_falls_back_to_torch(env, device, 4, SPEC)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_reset_parity(device):
+    """A standalone ``reset()``/``reset_at()`` must leave the same outputs as torch."""
+    assert_reset_parity(lambda fused: _env(device, fused), device, 6, SPEC)

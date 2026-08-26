@@ -226,3 +226,52 @@ def test_render_geometry_reports_kind_and_live_pose(device):
     # The pushed body's *live* pose, not the tensor that was installed at reset.
     assert g.obstacle_pos[0][0] > 0.05
     assert g.obstacle_pos[1][0] == pytest.approx(1.2)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_wall_angle_parameterization_does_not_change_body_dynamics(device):
+    """A segment is symmetric under ``angle + pi``: both descriptions are the same wall.
+
+    A body-body contact reads the *other* shape's angular velocity, not its angle. Feeding
+    the angle in its place made the same physical wall push a body differently depending on
+    which of the two equivalent angles the scenario happened to install.
+    """
+    dev, dt = device, torch.float32
+
+    def run(wall_angle):
+        w = _world(device, n_envs=1)
+        w.set_obstacles(
+            Obstacles(
+                torch.tensor([[[0.0, 0.0], [0.6, 0.0]]], device=dev, dtype=dt),
+                torch.tensor([0.0, 0.04], device=dev, dtype=dt),
+                shape=torch.tensor(
+                    [int(ObstacleShape.BOX), int(ObstacleShape.SEGMENT)],
+                    device=dev,
+                    dtype=torch.int32,
+                ),
+                angle=torch.tensor([[0.0, wall_angle]], device=dev, dtype=dt),
+                half_extents=torch.tensor([[0.1, 0.1], [0.8, 0.0]], device=dev, dtype=dt),
+                kind=torch.tensor(
+                    [int(ObstacleKind.MOVABLE), int(ObstacleKind.IMMOVABLE)],
+                    device=dev,
+                    dtype=torch.int32,
+                ),
+                mass=torch.tensor([1.0, 1.0], device=dev, dtype=dt),
+                inertia=torch.tensor([0.02, 1.0], device=dev, dtype=dt),
+            )
+        )
+        # Off-centre, so the box spins as it hits the wall: the spurious surface velocity
+        # only projects onto the contact normal once the contact point is off the face
+        # centre, which needs the box to be rotated.
+        return [t.clone() for t in _push(w, steps=120, start=(-0.35, 0.05))]
+
+    plus, minus = run(1.5707963), run(-1.5707963)
+    assert abs(plus[1][0, 0].item()) > 1e-4, "the box never rotated: the test is vacuous"
+    # Obstacle 0 only: obstacle 1 is the wall, whose own angle field is the thing we varied.
+    # ``atol`` rather than exact equality: flipping the segment's direction reorders the
+    # float32 arithmetic in ``closest_on_segment`` by a few ulps. The bug moved the body by
+    # ~1e-2 (x) and ~3e-2 rad, three orders of magnitude above that noise.
+    for a, b in zip(plus, minus, strict=True):
+        assert torch.allclose(a[:, 0], b[:, 0], atol=1e-5), (
+            "the wall's angle parameterization changed the body's trajectory"
+        )

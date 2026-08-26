@@ -133,6 +133,12 @@ class Lidar:
         self.include_agents = include_agents
         self.include_obstacles = include_obstacles
         self.backend = backend
+        # Memoized circle filter, see :meth:`_obstacle_targets`. Keyed on the identity of
+        # the installed shape/radius tensors, so it survives every scan against one
+        # obstacle set and is rebuilt when a different set is installed.
+        self._filter_key: tuple[int, int, int] | None = None
+        self._filter_keep: torch.Tensor | None = None
+        self._filter_radius: torch.Tensor | None = None
 
     def scan(self, world) -> torch.Tensor:
         """Ranges ``[n_envs, n_agents, n_rays]`` against the world's *live* geometry.
@@ -170,13 +176,19 @@ class Lidar:
             obstacle_radius=obs_rad,
         )
 
-    @staticmethod
-    def _obstacle_targets(world) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    def _obstacle_targets(self, world) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """Live ``(pos [E, C, 2], radius [C])`` for the circle obstacles only.
 
         ``world.obstacle_pos is None`` means no obstacle set is installed — the stepper
         still holds a dummy ``(1, 1)`` array, which is why the guard is on the world's
         mirror of the spec rather than on the view.
+
+        The filter itself is **memoized**, because deciding it costs two device→host
+        syncs (``is_circle.all()`` and ``nonzero``) and the answer only changes when a new
+        obstacle set is installed. Which shapes exist is static per install — obstacle
+        *poses* move, their shape tags do not — so the cache is keyed on the identity of
+        the shape/radius tensors and the obstacle count. Without it a lidar scan stalls the
+        pipeline twice per step, which is the whole point of keeping the loop on device.
         """
         if world.obstacle_pos is None or world.obstacle_radius is None:
             return None, None
@@ -184,13 +196,19 @@ class Lidar:
         shape = world.obstacle_shape
         if shape is None:
             return live_pos, world.obstacle_radius  # documented "all circles"
-        is_circle = shape == int(ObstacleShape.CIRCLE)
-        if bool(is_circle.all()):
-            return live_pos, world.obstacle_radius
-        keep = is_circle.nonzero(as_tuple=False).squeeze(-1)
-        return (
-            live_pos.index_select(1, keep),
-            world.obstacle_radius.index_select(0, keep),
-        )
+        radius = world.obstacle_radius
+        key = (shape.data_ptr(), radius.data_ptr(), int(shape.shape[0]))
+        if key != self._filter_key:
+            is_circle = shape == int(ObstacleShape.CIRCLE)
+            if bool(is_circle.all()):  # sync #1, once per install
+                keep, kept_radius = None, radius
+            else:
+                keep = is_circle.nonzero(as_tuple=False).squeeze(-1)  # sync #2
+                kept_radius = radius.index_select(0, keep)
+            self._filter_key, self._filter_keep, self._filter_radius = key, keep, kept_radius
+        if self._filter_keep is None:
+            return live_pos, self._filter_radius
+        # The one remaining per-scan op: an allocation, not a sync.
+        return live_pos.index_select(1, self._filter_keep), self._filter_radius
 
     __call__ = scan

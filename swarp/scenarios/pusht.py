@@ -194,6 +194,12 @@ class PushTScenario(FusedScenario):
             cfgs, cfg, n_envs=n_envs, device=device, dt=dt, substeps=substeps, dtype=dtype
         )
         tt = {"device": device, "dtype": dtype}
+        # Agent masses, for the oracle's contact denominator. The implicit damping solve
+        # belongs to whoever the impulse is applied to, and on the engine side that is the
+        # *agent*: :func:`swarp.core.bodies._reaction` reuses the agent-side force verbatim
+        # and negates it, so its ``damp_denom`` is built from the agent's mass. ``[1, A, 1]``
+        # so it broadcasts over the ``[E, A, B]`` contact grid.
+        self._agent_mass = torch.tensor([c.mass for c in cfgs], **tt).view(1, -1, 1)
         # Env-independent obstacle attributes (both boxes, every env).
         self._obs_shape = torch.full((self.n_boxes,), int(ObstacleShape.BOX), device=device,
                                      dtype=torch.int32)
@@ -610,8 +616,9 @@ class PushTScenario(FusedScenario):
 
         overlap = (self.agent_radius + self.contact_margin) - s
         active = (overlap > 0).to(pos.dtype)
-        # Smooth depth saturation, mirroring pusht_body_kernel: bounds the impulse a
-        # frozen-pose sweep can inject without a gradient-killing hard clamp.
+        # Smooth depth saturation, mirroring :func:`swarp.core.collisions._normal_coeff`:
+        # bounds the impulse a frozen-pose sweep can inject without a gradient-killing
+        # hard clamp.
         mo = self.max_overlap
         overlap = mo * torch.tanh(overlap.clamp(min=0.0) / mo)
         # closest surface point (box frame) -> lever arm about the tee centroid
@@ -626,10 +633,16 @@ class PushTScenario(FusedScenario):
         rvx = self.tee_vel[:, None, None, 0] - om * ry - vel[..., 0].unsqueeze(-1)
         rvy = self.tee_vel[:, None, None, 1] + om * rx - vel[..., 1].unsqueeze(-1)
         vn = rvx * mx + rvy * my
-        # Linearly-implicit damping + repulsive clamp; see pusht_body_kernel.
+        # Linearly-implicit damping + repulsive clamp; see
+        # :func:`swarp.core.collisions._normal_coeff` for the derivation. The mass in the
+        # denominator is the **agent's**, not the T's: the engine solves the implicit step
+        # for the body the impulse acts on, and reuses that one number as the reaction on
+        # the T (:func:`swarp.core.bodies._reaction`). ``sub_dt`` *does* stay this loop's
+        # own — the implicit term belongs to the scheme applying the impulse, and here that
+        # scheme is the oracle's ``body_substeps`` loop rather than the engine's substep.
         sub_dt = self.dt / self.body_substeps
         coeff = (self.contact_k * overlap - self.contact_c * vn) / (
-            1.0 + self.contact_c * sub_dt / self.tee_mass
+            1.0 + self.contact_c * sub_dt / self._agent_mass
         )
         coeff = coeff.clamp(min=0.0) * active
         fx, fy = coeff * mx, coeff * my
@@ -640,9 +653,10 @@ class PushTScenario(FusedScenario):
         pos, vel = w.state.pos, w.state.vel  # [n_envs, n_agents, 2]
 
         if integrate:
-            # Substepped exactly like pusht_body_kernel: the contact force is recomputed
-            # from the frozen agent state each sub-step, which is what keeps a stiff
-            # contact_k stable. Gradients flow through every sub-step.
+            # Substepped exactly like :func:`swarp.core.bodies.obstacle_dynamics_kernel`
+            # (whose per-shape reaction is :func:`swarp.core.bodies._reaction`): the contact
+            # force is recomputed from the frozen agent state each sub-step, which is what
+            # keeps a stiff contact_k stable. Gradients flow through every sub-step.
             sub_dt = self.dt / self.body_substeps
             b = self.world_size - self.tee_radius
             for _ in range(self.body_substeps):

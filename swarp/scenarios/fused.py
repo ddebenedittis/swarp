@@ -108,11 +108,11 @@ class FusedPass:
     The three kernel flags the seven scenarios actually need are all derivable from
     ``(kind, full)``, but *where* each puts them differs: navigation and formation carry
     them on the obs kernel, transport and pusht on the reward kernel, flocking and
-    sampling only take ``full_pass``, and discovery takes neither and instead expresses
-    "a reset must not clobber the reward" by *omitting* the reward launch. So this
-    describes the pass and :meth:`FusedScenario.launch_fused` maps it onto the
-    scenario's own sequence. The properties are named after the kernel arguments they
-    feed, so that mapping reads as a rename rather than a translation.
+    sampling only take ``full_pass``, and discovery takes neither — it reads ``full_pass``
+    in ``launch_fused`` itself to decide whether the reward kernel runs. So this describes
+    the pass and :meth:`FusedScenario.launch_fused` maps it onto the scenario's own
+    sequence. The properties are named after the kernel arguments they feed, so that
+    mapping reads as a rename rather than a translation.
 
     Attributes:
         kind: ``"step"`` (post-physics) or ``"reset"``.
