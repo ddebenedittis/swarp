@@ -7,6 +7,29 @@ All notable changes to `swarp`. Newest first. Nothing has been released yet — 
 
 ### Breaking changes
 
+- **`SamplingScenario(collision_penalty=...)` is gone.** The parameter was stored and never
+  read — the reward never had a collision term. Agents still collide physically
+  (`WorldConfig(collisions=True)`); nothing about the dynamics or the reward changes, only
+  the constructor signature.
+- **`SwarpEnv` rejects `Environment(auto_reset=True)`.** TorchRL resets from the done flags
+  itself, and swarp's auto-reset returns the *next* episode's first observation alongside a
+  `True` done — so every boundary transition a collector stored paired a reward with an
+  observation from a different episode. Build the env with `auto_reset=False` (the default).
+- **`discovery`/`sampling` `info()` values are now views**, reduced into a preallocated
+  buffer that the next call overwrites, in the world's dtype rather than float32. That is
+  what the other five scenarios already returned and what `Environment`'s `clone_outputs`
+  flag exists for; code retaining them across steps must clone (or set that flag).
+- **The Warp lidar backend returns a view of a reused buffer**, where the torch backend
+  still allocates fresh output. Concatenating into an observation copies; `clone()` to keep
+  it.
+- **`swarp.benchmark.scenarios.SCENARIO_FACTORIES` is gone.** It was an alias for
+  `swarp.scenarios.SCENARIOS`, which is the registry's home.
+- **`swarp.make` now raises `TypeError` for a keyword neither `Environment` nor the chosen
+  scenario accepts**, listing the scenario's keywords and suggesting the `Environment` one
+  it looks like a typo of. Previously a misspelled `Environment` keyword was routed silently
+  to the scenario and reported (much later) against the wrong constructor.
+- **`Environment` raises for a `cuda` device on a CPU-only install** instead of failing
+  deep inside Warp device resolution.
 - **`Environment.step` returns the Gymnasium 5-tuple** `(obs, reward, terminated,
   truncated, info)` instead of `(obs, reward, done, info)`. `terminated` is the scenario's
   own terminal condition; `truncated` is the `max_steps` time limit, previously OR-ed into
@@ -23,6 +46,29 @@ All notable changes to `swarp`. Newest first. Nothing has been released yet — 
 
 ### Fixed
 
+- **A body-body contact read the other obstacle's *angle* where it wanted its angular
+  velocity** (`swarp/core/bodies.py`). The damper's closing velocity was therefore computed
+  against a spurious surface motion, and the same physical wall pushed a movable body
+  differently depending on which of the two equivalent segment angles (`+pi/2` vs `-pi/2`) a
+  scenario happened to install — 1e-2 world units and 3e-2 rad apart after 120 steps. Both
+  bodies' spins are now parameters, and the segment branches fold the other body's spin into
+  the closest-point surface velocity the way `collisions._static_forces` already did on the
+  agent side.
+- **navigation, formation and discovery skipped their fused reward launch on every reset**,
+  not just the obs-only auto-reset it was meant for. Their reward kernel is the only writer
+  of the fused `done`, so the first `done()`/`rewards()`/`info()` after a standalone
+  `reset()` or `reset_at()` still described the *previous* episode, while the torch
+  reference recomputed them. Now gated on `full_pass`. No rollout-only parity test could
+  see this: those cross auto-resets only, which is the one case the old gate got right.
+- **Push-T's torch oracle divided the contact coefficient by `tee_mass`.** The implicit
+  damping solve belongs to the body the impulse is applied to — the agent — and the engine
+  reuses that one number as the reaction on the T (`bodies._reaction`). The oracle now
+  carries the agent masses, so the parity oracle and the whole grad path agree with the
+  engine for any T that is not unit mass. Bit-identical at the defaults, where both are 1.0.
+- **`Lidar.scan` re-decided its circle filter with two device→host syncs on every scan**
+  (`is_circle.all()` and `nonzero()`). Shape tags are static per obstacle install — poses
+  move, shapes do not — so the filter is memoized and the per-scan work is at most one
+  `index_select`.
 - **`Lidar.scan` read the stale installed obstacle pose.** A movable obstacle is
   integrated in place inside the stepper's own arrays, so `world.obstacle_pos` is its
   *spawn* pose; the scan now takes the live pose from `World.obstacle_state_views()`, as
@@ -60,6 +106,26 @@ All notable changes to `swarp`. Newest first. Nothing has been released yet — 
 
 ### Performance
 
+- **Ray-parallel lidar kernel**: the Warp backend takes the ray as a third launch dimension
+  instead of looping it, and caches its input wraps (as `Stepper.wrap_actions` does) and its
+  output buffer. 683 → 455 us/scan at 24×4×256 and 1307 → 791 at 1024×16×128 on an RTX 3070
+  Laptop.
+- **Eager launch sites are scoped onto torch's current stream** (the graph replay, the eager
+  persistent step, the pre-capture warm-up, the state-loading paths, `World.neighbors`, the
+  fused obs/reward launches, the lidar scan), so a caller running inside its own
+  `torch.cuda.Stream` is ordered correctly rather than relying on Warp's stream carrying the
+  blocking flag. On the default stream — where the driver does guarantee that ordering — the
+  scope degrades to a `ScopedDevice`, because opening a real one cost 10% of the graph replay
+  (0.166 → 0.185 ms/step at 4000×16).
+- Per-step allocations removed from the fused scenarios: one `state_wp()` wrap per pass
+  instead of one per launch (discovery, sampling, transport, pusht), preallocated
+  reduction buffers for discovery/sampling `info()`, sampling's 3×3 stencil and pusht's
+  teammate index built once in `make_world`.
+- `set_agent_params_per_env` no longer reads the max radius back to the host on the in-place
+  refresh path, so per-reset domain randomization inside a graph-mode loop does not stall.
+- `swarp.interop.compile`'s stepper registry is weak, so a compiled stepper (and through it
+  a whole world) is no longer immortal for the life of the process, and the handle lookup is
+  O(1) rather than a scan.
 - **Whole-step CUDA-graph capture**: physics plus fused obs/reward captured into one graph,
   so a step is a single graph replay with no per-launch host floor.
 - **Fused Warp obs/reward/done kernels** for every scenario, with the torch
@@ -150,6 +216,18 @@ All notable changes to `swarp`. Newest first. Nothing has been released yet — 
 
 ### Repo
 
+- A second CI job installs the `torchrl` extra and runs `tests/interop/test_torchrl.py`,
+  which `importorskip`ed on every runner until now — the wrapper was effectively untested
+  in CI.
+- **Benchmark attribution corrected.** The 24.1 M env-steps/s headline is the fused kernels
+  with capture *off* (`use_graph=False`, which `throughput.py` pins so the table stays
+  comparable across commits), not "fused kernels plus capture" as the README, `docs/index`
+  and `docs/performance` claimed; the graph-on figure (35.6 M at 16,384 × 16) is now quoted
+  separately. The CAMAR comparison discloses that its 1.2×1.2 arena is not swarp's 2×2–4×4
+  rather than claiming they match, and its `frameskip` is documented as the 0 the adapter
+  actually passes.
+- `pyproject.toml` grew `[project.urls]` and trove classifiers, and dropped the `slow`
+  pytest marker nothing used.
 - MIT `LICENSE`, GitHub Actions CI (ruff + the CPU test suite on Python 3.12), a tracked
   `uv.lock`, and `docs/` split out of the README.
 
