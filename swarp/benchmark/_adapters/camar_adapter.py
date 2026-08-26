@@ -21,7 +21,11 @@ from __future__ import annotations
 from swarp.benchmark._adapters import Runner, assert_jax_gpu, make_jax_runner
 
 _SUPPORTED = {"navigation"}
-# All-free 12x12 arena (no border) -> zero obstacles, ~1.2x1.2 world (≈ swarp's).
+# All-free 12x12 arena (no border) -> zero obstacles, a ~1.2x1.2 world. Note that this is
+# *not* the same arena size as swarp's: the swarp adapter uses
+# ``world_size = max(1, sqrt(n_agents)/4)`` with bounds at +-world_size, i.e. 2x2 from 3 to
+# 16 agents and 4x4 at 64. CAMAR's map generator is what fixes its extent, so matching it
+# exactly is not available here; the density difference is disclosed in docs/benchmarks.md.
 _OPEN_GRID = "\n".join(["." * 12 for _ in range(12)])
 
 

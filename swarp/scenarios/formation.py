@@ -6,13 +6,15 @@ position-shaping toward the assigned slot (``(prev_dist - dist) * factor``, the
 same shaping NavigationScenario uses) plus a soft collision penalty, so the team
 converges onto — and holds — the shape.
 
-**Scaling.** Both the torch path and the fused kernels do the inter-agent part of the
-observation as **O(n_agents^2)** all-pairs work rather than walking the neighbor list.
-That is deliberate: the fused path exists to match the torch parity oracle bit-for-bit,
-and the neighbor list is truncated at ``max_neighbors``, so reading it would make the two
-paths disagree by construction whenever the list overflowed. The quadratic term is the
-price of that guarantee — fine at the tens-of-agents this scenario is written for, and
-worth knowing about before pushing ``n_agents`` into the hundreds.
+**Scaling.** The observation itself is only 6 wide (own pos, own vel, goal-relative
+vector) and costs O(1) per agent — nothing inter-agent goes into it. What is
+**O(n_agents^2)** is the *touching count* the obs pass computes alongside it, on both
+paths: an all-pairs scan rather than a walk of the neighbor list, feeding the collision
+term of the reward. That is deliberate: the fused path exists to match the torch parity
+oracle bit-for-bit, and the neighbor list is truncated at ``max_neighbors``, so reading it
+would make the two paths disagree by construction whenever the list overflowed. The
+quadratic term is the price of that guarantee — fine at the tens-of-agents this scenario is
+written for, and worth knowing about before pushing ``n_agents`` into the hundreds.
 """
 
 from __future__ import annotations

@@ -200,6 +200,13 @@ class PushTScenario(FusedScenario):
         # and negates it, so its ``damp_denom`` is built from the agent's mass. ``[1, A, 1]``
         # so it broadcasts over the ``[E, A, B]`` contact grid.
         self._agent_mass = torch.tensor([c.mass for c in cfgs], **tt).view(1, -1, 1)
+        # Teammate index for the torch observation: row ``a`` is every agent but ``a``, in
+        # ascending order. Fixed by ``n_agents``, so it is built here rather than rebuilt
+        # (four ops and two allocations) on every ``observations()`` call.
+        na = self.n_agents
+        idx = torch.arange(na, device=device)
+        others = idx.unsqueeze(0).expand(na, -1)[idx.unsqueeze(1) != idx.unsqueeze(0)]
+        self._others = others.view(na, na - 1)  # [A, A-1]
         # Env-independent obstacle attributes (both boxes, every env).
         self._obs_shape = torch.full((self.n_boxes,), int(ObstacleShape.BOX), device=device,
                                      dtype=torch.int32)
@@ -735,10 +742,7 @@ class PushTScenario(FusedScenario):
         th = self.tee_theta.unsqueeze(1).expand(-1, na)
         angles = torch.stack([th.cos(), th.sin(), raw.cos(), raw.sin()], dim=-1)
         # Teammates' positions relative to each agent, ascending index, self skipped.
-        idx = torch.arange(na, device=s.pos.device)
-        others = idx.unsqueeze(0).expand(na, -1)[idx.unsqueeze(1) != idx.unsqueeze(0)]
-        others = others.view(na, na - 1)  # [A, A-1]
-        rel = (s.pos[:, others] - s.pos.unsqueeze(2)).flatten(2)  # [E, A, 2(A-1)]
+        rel = (s.pos[:, self._others] - s.pos.unsqueeze(2)).flatten(2)  # [E, A, 2(A-1)]
         return torch.cat(
             [s.pos, s.vel, self._cache["tee_rel"], tee_to_goal, angles, rel], dim=-1
         )
@@ -763,8 +767,6 @@ class PushTScenario(FusedScenario):
         Same two boxes the body is built from, placed at ``(goal_pos, goal_theta)``:
         the outline shows exactly where the T has to end up.
         """
-        if self.goal_pos is None:
-            return {}
         th = float(self.goal_theta[env_idx])
         gx, gy = (float(v) for v in self.goal_pos[env_idx])
         ca, sa = math.cos(th), math.sin(th)

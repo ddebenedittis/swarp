@@ -45,3 +45,33 @@ jobs:
         env:
           SDL_VIDEODRIVER: dummy
         run: uv run --no-sync pytest -m "not gpu"
+
+  # The `torchrl` extra is not installed in the main job: it drags in torchrl +
+  # tensordict, which resolve against the torch build and would slow (or break) the
+  # suite that has nothing to do with them. So the wrapper's tests get their own job —
+  # without it `tests/interop/test_torchrl.py` `importorskip`s on every runner and the
+  # wrapper is effectively untested in CI.
+  torchrl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      UV_TORCH_BACKEND: cpu
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Create the environment
+        run: uv venv --python 3.12
+
+      - name: Install swarp + dev + torchrl
+        run: uv pip install -e '.[torchrl]' --group dev
+
+      - name: Test the TorchRL wrapper
+        run: uv run --no-sync pytest tests/interop/test_torchrl.py -m "not gpu"

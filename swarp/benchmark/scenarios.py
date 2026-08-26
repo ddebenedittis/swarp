@@ -47,9 +47,6 @@ from swarp.scenarios import (
     supports_model,
 )
 
-# Backwards-compatible alias for the registry, whose home is swarp.scenarios.
-SCENARIO_FACTORIES = SCENARIOS
-
 MODELS: dict[str, DynamicsModel] = {
     "holonomic": DynamicsModel.HOLONOMIC,
     "diff-drive": DynamicsModel.DIFF_DRIVE,

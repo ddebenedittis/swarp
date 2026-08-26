@@ -91,6 +91,16 @@ Obstacles collide with each other only when at least one of the pair is round; t
 **Discrete or communication action spaces.**
 Actions are continuous real vectors.
 
+**A dynamics model as a plug-in.**
+Adding one is an in-tree edit, not an extension point: the `DynamicsModel` enum
+(`swarp/dynamics/base.py`), a row of parameter columns in `PARAM_FIELDS` and
+`build_agent_params` beside it, a `TAG_*` constant, and a branch in each `if tag == …`
+chain in `swarp/dynamics/kernels.py` (`integrate`, the clamp, the action-arity table).
+That closed dispatch is deliberate and it is what buys the headline feature: one kernel
+steps a *mixed* fleet, because every agent's model is a branch inside the same thread
+rather than a separate launch per model. An open registry of Python-defined models cannot
+compile into that. Four models are in tree; a fifth is a patch, not a subclass.
+
 ## Roadmap
 
 Next: putting movable bodies on the adjoint tape, and **joints** (VMAS `balance` parity).

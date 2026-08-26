@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import torch
 from tensordict import TensorDict
-from torchrl.data import Bounded, Composite, Unbounded
+from torchrl.data import Bounded, Categorical, Composite, Unbounded
 from torchrl.envs import EnvBase
 
 from swarp.core.environment import Environment
@@ -65,6 +65,13 @@ class SwarpEnv(EnvBase):
 
     Termination
     -----------
+    TorchRL owns resetting: its collectors read ``done`` and call ``_reset`` themselves.
+    So ``Environment(auto_reset=True)`` is **rejected** at construction — with it on, the
+    observation returned alongside a ``True`` ``done`` is already the *next* episode's
+    first observation, and every transition at an episode boundary would train on an
+    observation from a different episode than its reward. Build the env with
+    ``auto_reset=False`` (the default) and let TorchRL do it.
+
     ``terminated`` is the scenario's own terminal condition; ``truncated`` is the
     ``max_steps`` time limit; ``done`` is their OR, which is what TorchRL's resetters
     key off. Because the time limit no longer masquerades as a terminal state, GAE and
@@ -100,6 +107,14 @@ class SwarpEnv(EnvBase):
         action_low: float | torch.Tensor | None = None,
         action_high: float | torch.Tensor | None = None,
     ) -> None:
+        if env.auto_reset:
+            raise ValueError(
+                "SwarpEnv requires Environment(auto_reset=False): TorchRL resets envs "
+                "itself from the done flags, and swarp's auto-reset returns the *next* "
+                "episode's first observation alongside a True done, so the terminal "
+                "transition a collector stores would pair a reward with an observation "
+                "from a different episode."
+            )
         # Default to the box the kernels actually clamp against. Either bound left None
         # takes its side from ``env.action_bounds``, so overriding one does not silently
         # revert the other to a guess.
@@ -183,11 +198,15 @@ class SwarpEnv(EnvBase):
             shape=(ne,),
             device=self.device,
         )
-        # A single shared done/terminated/truncated per env.
+        # A single shared done/terminated/truncated per env. ``Categorical(n=2)`` rather
+        # than ``Unbounded``: these are two-valued, and it is the spec TorchRL's own env
+        # constructors use, so ``check_env_specs`` and the transforms that read the domain
+        # (rather than only the dtype) see what they expect.
         self.done_spec = Composite(
-            done=Unbounded(shape=(ne, 1), dtype=torch.bool, device=self.device),
-            terminated=Unbounded(shape=(ne, 1), dtype=torch.bool, device=self.device),
-            truncated=Unbounded(shape=(ne, 1), dtype=torch.bool, device=self.device),
+            **{
+                key: Categorical(n=2, shape=(ne, 1), dtype=torch.bool, device=self.device)
+                for key in ("done", "terminated", "truncated")
+            },
             shape=(ne,),
             device=self.device,
         )
@@ -223,10 +242,15 @@ class SwarpEnv(EnvBase):
         action = tensordict.get("action")
         obs, reward, terminated, truncated, info = self._env.step(action)
         # Fused / graph-mode outputs are zero-copy views into persistent buffers
-        # overwritten next step; collectors hold refs across steps, so clone.
-        obs, reward = obs.clone(), reward.clone()
-        terminated = terminated.clone().reshape(-1, 1)
-        truncated = truncated.clone().reshape(-1, 1)
+        # overwritten next step; collectors hold refs across steps, so they must be
+        # copied — unless the Environment was built with ``clone_outputs=True``, which
+        # already did exactly that (info values included) and would make this a second,
+        # pointless copy of every tensor on every step.
+        if not self._env.clone_outputs:
+            obs, reward = obs.clone(), reward.clone()
+            terminated, truncated = terminated.clone(), truncated.clone()
+        terminated = terminated.reshape(-1, 1)
+        truncated = truncated.reshape(-1, 1)
         out = TensorDict(
             {
                 "observation": obs,
@@ -239,13 +263,16 @@ class SwarpEnv(EnvBase):
             device=self.device,
         )
         if self._info_keys:
-            out.set("info", self._info_td(info))
+            out.set("info", self._info_td(info, copy=not self._env.clone_outputs))
         return out
 
-    def _info_td(self, info: dict[str, torch.Tensor]) -> TensorDict:
-        """Pack the scenario info dict into a nested TensorDict (tensors kept on-device)."""
+    def _info_td(self, info: dict[str, torch.Tensor], *, copy: bool = True) -> TensorDict:
+        """Pack the scenario info dict into a nested TensorDict (tensors kept on-device).
+
+        ``copy=False`` only where the Environment already handed back clones.
+        """
         return TensorDict(
-            {key: info[key].clone() for key in self._info_keys},
+            {key: info[key].clone() if copy else info[key] for key in self._info_keys},
             batch_size=self.batch_size,
             device=self.device,
         )

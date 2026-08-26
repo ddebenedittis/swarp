@@ -53,7 +53,8 @@ Navigation, flocking, formation, discovery, sampling, transport and Push-T — e
 :link: benchmarks
 :link-type: doc
 
-Full navigation hot path at 16,000 envs × 16 agents on one RTX 3070 Laptop GPU.
+Full navigation hot path at 16,000 envs × 16 agents on one RTX 3070 Laptop GPU — fused
+kernels, capture off. Whole-step CUDA-graph capture reaches 35.6 M at 16,384 × 16.
 :::
 
 ::::

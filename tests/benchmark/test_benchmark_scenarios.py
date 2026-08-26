@@ -4,7 +4,6 @@ import pytest
 
 from swarp.benchmark.scenarios import (
     MODELS,
-    SCENARIO_FACTORIES,
     build_scenario,
     resolve_scenarios,
     run_config,
@@ -17,7 +16,7 @@ FUSED_SCENARIOS = fused_scenarios()
 
 
 def test_registry_has_all_scenarios():
-    assert set(SCENARIO_FACTORIES) == {
+    assert set(SCENARIOS) == {
         "navigation",
         "flocking",
         "formation",
@@ -28,11 +27,6 @@ def test_registry_has_all_scenarios():
     }
 
 
-def test_benchmark_reuses_the_shared_registry():
-    """The benchmark is a consumer of swarp.scenarios, not a second registry."""
-    assert SCENARIO_FACTORIES is SCENARIOS
-
-
 def test_fused_scenarios_is_derived_and_covers_every_scenario():
     """Today every registered scenario is fused; the list must come from the classes."""
     assert list(SCENARIOS) == FUSED_SCENARIOS
@@ -40,7 +34,7 @@ def test_fused_scenarios_is_derived_and_covers_every_scenario():
 
 def test_resolve_scenarios_single_and_all():
     assert resolve_scenarios(["navigation"]) == ["navigation"]
-    assert resolve_scenarios(["all"]) == list(SCENARIO_FACTORIES)
+    assert resolve_scenarios(["all"]) == list(SCENARIOS)
     # de-dup while preserving order
     assert resolve_scenarios(["flocking", "flocking", "navigation"]) == [
         "flocking",
@@ -53,14 +47,14 @@ def test_resolve_scenarios_unknown_lists_valid():
         resolve_scenarios(["bogus"])
     msg = str(exc.value)
     assert "bogus" in msg
-    for name in SCENARIO_FACTORIES:
+    for name in SCENARIOS:
         assert name in msg
 
 
 def test_only_navigation_supports_model():
-    assert supports_model(SCENARIO_FACTORIES["navigation"])
+    assert supports_model(SCENARIOS["navigation"])
     for name in ("flocking", "formation", "discovery", "sampling", "transport", "pusht"):
-        assert not supports_model(SCENARIO_FACTORIES[name])
+        assert not supports_model(SCENARIOS[name])
 
 
 def test_build_scenario_applies_model_only_where_supported():

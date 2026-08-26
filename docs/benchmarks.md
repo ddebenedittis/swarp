@@ -222,7 +222,13 @@ open-field navigation with **raycasting-free, relative-position observations**:
 | `swarp` | optimized (fused Warp kernels + CUDA graph); neighbor-list obs, no obstacles |
 | `vmas-nolidar` | VMAS navigation, `collisions=False` → no 12-ray lidar, relative-position obs |
 | `jaxmarl` | `MPE_simple_spread_v3` continuous — relative-position obs (already raycast-free) |
-| `camar` | **open arena** (`string_grid`, no obstacles, `frameskip=1`) instead of the default ~800-obstacle `random_grid` |
+| `camar` | **open arena** (`string_grid`, no obstacles, `frameskip=0` — one world step per step, like `substeps=1`) instead of the default ~800-obstacle `random_grid` |
+
+The arenas are *not* the same size: CAMAR's 12×12 all-free `string_grid` is a ~1.2×1.2
+world fixed by its map generator, while the swarp adapter uses `world_size = max(1,
+sqrt(n_agents)/4)` with bounds at ±`world_size` — 2×2 up to 16 agents, 4×4 at 64. Agent
+density therefore differs, which matters for the neighbor/contact half of the step; there
+is no CAMAR knob that would match it exactly.
 
 The JAX sims fold obs+reward into the scan carry so XLA cannot dead-code-eliminate
 them, and JIT/XLA compile is excluded via warmup at the timed length. Both

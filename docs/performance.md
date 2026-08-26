@@ -4,6 +4,7 @@ The defaults are already the fast configuration: `Environment(fused="auto", use_
 This page explains what those two switches do, what they cost, and how the step plugs into `torch.compile` and TorchRL.
 
 Headline: the full navigation hot path sustains **24.1 M env-steps/s** at 16,000 envs × 16 agents on one RTX 3070 Laptop GPU, peaking at 491 M agent-steps/s at 16,000 × 64.
+That figure is the fused kernels *without* capture — `use_graph=False`, the configuration `swarp.benchmark.throughput` pins — so it is the floor the graph builds on rather than the number the defaults produce; capture on top reaches 35.6 M env-steps/s at 16,384 × 16 ([table below](#whole-step-cuda-graph)).
 Full tables and the head-to-heads against VMAS, JaxMARL and CAMAR are in [Benchmarks](benchmarks.md).
 
 ## The no-grad hot path

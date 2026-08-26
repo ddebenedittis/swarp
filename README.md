@@ -40,7 +40,7 @@ The whole step — dynamics, soft collisions, walls — also runs under Warp's a
 - **Soft contacts and rigid bodies** — spring-damper interactions against agents, circle/box/segment obstacles and walls, plus movable compound rigid bodies pushed by the reaction of those same contacts. [→](https://ddebenedittis.github.io/swarp/world.html)
 - **Neighbor search without a sync** — padded within-radius lists, an explicit overflow flag, a COO radius graph for GNN policies, and three interchangeable backends tested to agree exactly. [→](https://ddebenedittis.github.io/swarp/world.html#neighbor-search)
 - **Seven scenarios** — navigation, flocking, formation, discovery, sampling, transport and Push-T, each with fused Warp obs/reward kernels alongside the torch reference they are parity-tested against. [→](https://ddebenedittis.github.io/swarp/scenarios.html)
-- **Fast by default** — fused kernels plus whole-step CUDA-graph capture: **24.1 M env-steps/s** at 16,000 envs × 16 agents on one RTX 3070 Laptop GPU. [→](https://ddebenedittis.github.io/swarp/performance.html)
+- **Fast by default** — **24.1 M env-steps/s** at 16,000 envs × 16 agents on one RTX 3070 Laptop GPU from the fused Warp obs/reward kernels alone, with whole-step CUDA-graph capture (on by default) taking 16,384 × 16 to 35.6 M. [→](https://ddebenedittis.github.io/swarp/performance.html)
 - **Interactive viewer** — an optional pygame renderer with headless frames, mp4/webm export, notebook embedding, a batch mosaic and live overlay toggles. [→](https://ddebenedittis.github.io/swarp/visualization.html)
 
 ## Install
@@ -99,6 +99,7 @@ The [quickstart](https://ddebenedittis.github.io/swarp/quickstart.html) walks th
 ## Benchmarks
 
 The full NavigationScenario hot path — dynamics, neighbor lists, soft collisions, obs and reward — sustains **24.1 M env-steps/s** at 16,000 envs × 16 agents on a single RTX 3070 Laptop GPU (385 M agent-steps/s), peaking at 491 M agent-steps/s at 16,000 × 64.
+Those are fused kernels with capture *off* (`use_graph=False`, which `throughput.py` pins so the table stays comparable across commits); capture on top is worth another ~1.3–2× — 35.6 M env-steps/s at 16,384 × 16.
 
 ```bash
 python -m swarp.benchmark.throughput      # the full (n_envs, n_agents) grid

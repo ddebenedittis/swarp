@@ -149,3 +149,55 @@ def test_timeout_is_truncated_not_terminated(device):
         assert bool(trunc.all()) is (step == 2)
         assert torch.equal(out["next", "done"], term | trunc)
         td = out["next"].exclude("reward", "done", "terminated", "truncated")
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_auto_reset_is_rejected(device):
+    """TorchRL owns resetting; swarp's auto-reset would hand it post-reset observations.
+
+    With ``auto_reset=True`` the obs returned alongside a True done already belongs to the
+    next episode, so every boundary transition a collector stores would pair a reward with
+    an observation from a different episode — silently, and only visibly as a training
+    pathology. Guarded at construction instead.
+    """
+    env = Environment(
+        NavigationScenario(n_agents=3), n_envs=8, device=device, dt=0.1, seed=0, auto_reset=True
+    )
+    with pytest.raises(ValueError, match="auto_reset=False"):
+        SwarpEnv(env)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_clone_outputs_env_is_not_cloned_twice(device):
+    """``clone_outputs=True`` already copies everything ``_step`` would; specs still hold.
+
+    The wrapper cloned unconditionally, so an env configured for safe outputs paid for two
+    copies of obs/reward/done/info on every step.
+    """
+    env = Environment(
+        FormationScenario(n_agents=4),
+        n_envs=8,
+        device=device,
+        dt=0.1,
+        seed=0,
+        clone_outputs=True,
+    )
+    tenv = SwarpEnv(env)
+    check_env_specs(tenv)
+    td = tenv.rollout(max_steps=4)
+    assert torch.isfinite(td["next", "reward"]).all()
+    # Distinct storage per time step is the property the clones exist for; the rollout
+    # stack would silently repeat one buffer otherwise.
+    rew = td["next", "reward"]
+    assert not torch.equal(rew[:, 0], rew[:, -1]) or rew.abs().sum() == 0
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_done_specs_are_two_valued(device):
+    from torchrl.data import Categorical
+
+    tenv = _make(device, NavigationScenario(n_agents=3))
+    for key in ("done", "terminated", "truncated"):
+        spec = tenv.done_spec[key]
+        assert isinstance(spec, Categorical), key
+        assert spec.n == 2 and spec.dtype == torch.bool and spec.shape == (8, 1)

@@ -187,6 +187,14 @@ class WorldConfig:
         collision_k: spring stiffness of the soft penalty.
         collision_c: damping coefficient (normal direction).
         collision_margin: forces activate within this gap around touching radii.
+        obstacle_linear_damping: viscous drag on ``MOVABLE`` obstacles, standing in for
+            table friction — a pushed body settles at ``sum(f) / (mass * damping)``
+            instead of accelerating without limit. ``0`` is a frictionless coasting puck.
+        obstacle_angular_damping: the same, for a movable body's spin.
+        contact_max_overlap: depth at which the contact spring saturates, smoothly
+            (``0`` disables). Bounds the impulse a deep overlap can inject; must stay
+            *above* the depth a velocity-mode agent settles at, or agents walk through
+            movable bodies.
         bounds: world rectangle ``(x_min, x_max, y_min, y_max)``, or ``None``.
         bounds_mode: ``"soft"`` (spring-damper walls) or ``"clamp"``
             (positions hard-clamped inside; differentiable subgradient).
@@ -199,6 +207,11 @@ class WorldConfig:
         grid_dim: hash-grid bucket dimension per axis.
         uniform_bins: cells per axis for the ``"uniform_grid"`` backend
             (``None`` -> a ~sqrt(n_agents) heuristic).
+        integrator: substep integration scheme, :class:`~swarp.dynamics.base.Integrator`.
+        neighbor_reuse: reuse the list the previous step's post-step build produced for
+            substep 0 instead of rebuilding it — one build per step rather than two at
+            ``substeps=1``, and exact (the reused list is bit-identical to a fresh build
+            on the same positions). No-grad path only; a taped step always rebuilds.
     """
 
     collisions: bool = True

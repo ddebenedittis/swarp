@@ -99,6 +99,11 @@ class Environment:
         # Warp device names downstream), so a ``torch.device`` has to be accepted here.
         self.device = str(device)
         device = self.device
+        if device.startswith("cuda") and not torch.cuda.is_available():
+            raise RuntimeError(
+                f"device {device!r} requested but CUDA is not available; pass device='cpu' "
+                "(everything runs on CPU) or install a CUDA-enabled torch"
+            )
         self.dtype = dtype
         self.max_steps = max_steps
         self.auto_reset = auto_reset

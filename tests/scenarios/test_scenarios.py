@@ -58,15 +58,23 @@ def test_make_scenario_unknown_name_lists_valid():
 
 
 class _PlainScenario(Scenario):
-    """A concrete scenario with no fused kernels (inherits fused_available -> False)."""
+    """A concrete scenario with no fused kernels (inherits fused_available -> False).
 
-    def make_world(self, n_envs, device, dt, substeps, dtype):
+    The signatures mirror the ABC exactly — ``world_config`` on ``make_world``,
+    ``obs_only`` on ``reset_world``, ``observations`` (the abstract member) rather than
+    ``observation`` (the concrete slicing helper). ``test_plain_scenario_matches_the_abc``
+    instantiates it, which is what keeps them from drifting again.
+    """
+
+    obs_dim = 4
+
+    def make_world(self, n_envs, device, dt, substeps, dtype, world_config=None):
         raise NotImplementedError
 
-    def reset_world(self, env_mask=None):
+    def reset_world(self, env_mask=None, *, obs_only=False):
         raise NotImplementedError
 
-    def observation(self, agent_idx):
+    def observations(self):
         raise NotImplementedError
 
 
@@ -384,3 +392,35 @@ def test_flocking_separation_penalty(device):
     scenario._refresh()
     assert scenario._cache["crowd"][0, 0].item() > 0.0
     assert scenario.agent_reward(0)[0].item() < 0.0
+
+
+def test_plain_scenario_matches_the_abc():
+    """``_PlainScenario`` must stay instantiable and signature-compatible with ``Scenario``.
+
+    It drifted once — a stale ``make_world`` without ``world_config`` and an
+    ``observation`` where the ABC declares ``observations`` — and nothing noticed, because
+    the only test using it read ``fused_available`` off the class and never constructed it.
+    """
+    scen = _PlainScenario()
+    assert scen.fused_available is False
+    assert scen.graph_hook() is None
+    for name in ("make_world", "reset_world", "observations"):
+        theirs = inspect.signature(getattr(_PlainScenario, name))
+        base = inspect.signature(getattr(Scenario, name))
+        assert theirs.parameters.keys() == base.parameters.keys(), name
+
+
+@pytest.mark.parametrize(
+    ("bad", "hint"),
+    [("max_step", "max_steps"), ("devise", "device")],
+)
+def test_make_suggests_the_environment_keyword_you_meant(bad, hint):
+    """A misspelled Environment keyword is routed to the scenario, so ``make`` has to
+    catch it itself — with the name it looks like, not a bare unexpected-keyword error."""
+    with pytest.raises(TypeError, match=f"Did you mean Environment's '{hint}'"):
+        swarp.make("navigation", n_envs=2, device="cpu", **{bad: 4})
+
+
+def test_make_lists_the_scenario_keywords_for_an_unknown_one():
+    with pytest.raises(TypeError, match="Scenario keywords: .*n_agents"):
+        swarp.make("navigation", n_envs=2, device="cpu", bogus=1)

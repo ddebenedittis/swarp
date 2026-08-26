@@ -358,3 +358,17 @@ def test_close_is_idempotent_and_env_stays_usable(device):
     obs, rew, term, trunc, _ = env.step(actions)
     assert torch.isfinite(obs).all() and torch.isfinite(rew).all()
     assert term.shape == (4,) and trunc.shape == (4,)
+
+
+def test_cuda_device_without_cuda_fails_with_a_useful_message(monkeypatch):
+    """Asking for CUDA on a CPU-only install must say so at construction.
+
+    Without the check the failure surfaced much later and much deeper — inside Warp
+    device resolution or a torch allocation — with nothing pointing at the ``device=``
+    argument that caused it.
+    """
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    with pytest.raises(RuntimeError, match="CUDA is not available"):
+        Environment(NavigationScenario(n_agents=2), n_envs=2, device="cuda:0")
+    # ...and the CPU advice in that message is real.
+    Environment(NavigationScenario(n_agents=2), n_envs=2, device="cpu")

@@ -15,6 +15,7 @@ scenario registry.
 
 from __future__ import annotations
 
+import difflib
 import inspect
 
 from swarp.core.config import ObstacleKind, Obstacles, ObstacleShape, WorldConfig
@@ -97,11 +98,44 @@ def make(name: str, n_envs: int, **kwargs) -> Environment:
 
     ``model=`` is dropped, with a warning, for holonomic-only scenarios (see
     :func:`swarp.scenarios.make_scenario`).
+
+    Because the routing is by name, a typo in an ``Environment`` keyword silently becomes
+    a scenario keyword. So an unknown keyword is checked against the chosen scenario
+    *before* anything is constructed, and the ``TypeError`` lists that scenario's
+    keywords — plus the ``Environment`` one it looks like a misspelling of.
     """
     env_kwargs = {k: v for k, v in kwargs.items() if k in _ENV_KWARGS}
     scen_kwargs = {k: v for k, v in kwargs.items() if k not in _ENV_KWARGS}
+    _check_scenario_kwargs(name, scen_kwargs)
     scenario = make_scenario(name, **scen_kwargs)
     return Environment(scenario, n_envs=n_envs, **env_kwargs)
+
+
+def _check_scenario_kwargs(name: str, scen_kwargs: dict) -> None:
+    """Raise a legible ``TypeError`` for keywords the scenario cannot take.
+
+    Without this the failure is either a bare ``__init__() got an unexpected keyword
+    argument`` from deep inside construction, or — for a misspelled ``Environment``
+    keyword — nothing at all until the same message arrives from the scenario, naming the
+    wrong constructor.
+    """
+    params = inspect.signature(scenario_class(name).__init__).parameters
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return  # takes **kwargs: it decides for itself what is valid
+    valid = sorted(set(params) - {"self"})
+    for key in scen_kwargs:
+        # ``model`` is legitimately accepted-or-dropped-with-a-warning by
+        # :func:`swarp.scenarios.make_scenario`; that decision stays there.
+        if key in valid or key == "model":
+            continue
+        msg = (
+            f"{key!r} is not a keyword of scenario {name!r} or of Environment. "
+            f"Scenario keywords: {', '.join(valid)}."
+        )
+        close = difflib.get_close_matches(key, _ENV_KWARGS, n=1)
+        if close:
+            msg += f" Did you mean Environment's {close[0]!r}?"
+        raise TypeError(msg)
 
 
 __all__ = [

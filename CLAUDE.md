@@ -25,7 +25,7 @@ uv pip install --group docs                # docs toolchain (no torch/warp neede
 uv run --no-sync sphinx-build -b html -W docs docs/_build/html   # build the docs site
 ```
 
-Markers declared in `pyproject.toml`: `gpu` (needs CUDA), `slow`, `viz` (needs the `viz`
+Markers declared in `pyproject.toml`: `gpu` (needs CUDA) and `viz` (needs the `viz`
 extra). Benchmark numbers and the multi-venv cross-simulator setup live in
 `docs/benchmarks.md` — keep them out of the README.
 
