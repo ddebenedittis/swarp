@@ -294,4 +294,3 @@ def test_default_uniform_bins_is_quiet():
 def test_uniform_bins_must_be_positive():
     with pytest.raises(ValueError, match="uniform_bins"):
         NeighborGrid(2, 8, radius=0.5, device="cpu", method="uniform_grid", uniform_bins=0)
-
