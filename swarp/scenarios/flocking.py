@@ -14,6 +14,7 @@ import torch
 import warp as wp
 
 from swarp._overloads import concrete
+from swarp.core.cached_launch import CachedLaunch, ptr_key
 from swarp.core.config import WorldConfig
 from swarp.core.world import World
 from swarp.dynamics.base import AgentConfig, ControlMode, DynamicsModel
@@ -81,6 +82,10 @@ class FlockingScenario(FusedScenario):
         self._cache: dict[str, torch.Tensor] | None = None
         # Fused-kernel obs width (capped at max_neighbors).
         self._k_obs = min(self.neighbor_obs, cfg.max_neighbors)
+        # Cached, repack-once launches for the eager reset path — see
+        # swarp/core/cached_launch.py.
+        self._reset_launch = CachedLaunch()
+        self._obs_launch = CachedLaunch()
         return self.world
 
     @property
@@ -97,14 +102,15 @@ class FlockingScenario(FusedScenario):
         mask, use_mask = self.reset_mask_wp(env_mask)
         st = w.state_wp()
         scalar = w.wp_dtype
+        seed = wp.int32(w.next_kernel_seed())
         with torch_stream_scope(w.device):
-            wp.launch(
+            launch = self._reset_launch.get(
                 concrete(flocking_reset_kernel, scalar),
                 dim=w.n_envs,
                 inputs=[
                     mask,
                     use_mask,
-                    wp.int32(w.next_kernel_seed()),
+                    seed,
                     scalar(lim),
                     scalar(vel_lim),
                     wp.int32(self.n_agents),
@@ -112,8 +118,19 @@ class FlockingScenario(FusedScenario):
                     st.vel,
                 ],
                 device=w.device,
-                record_tape=False,
+                key=(
+                    w.n_envs,
+                    ptr_key(mask),
+                    lim,
+                    vel_lim,
+                    self.n_agents,
+                    ptr_key(st.pos),
+                    ptr_key(st.vel),
+                ),
             )
+            launch.set_param_by_name("use_mask", use_mask)
+            launch.set_param_by_name("seed", seed)
+            launch.launch()
         w.mark_pos_dirty()
         self.finish_reset(env_mask, obs_only=obs_only)
 
@@ -156,7 +173,8 @@ class FlockingScenario(FusedScenario):
         grid = w.stepper.grid(n_envs)
         scalar = w.wp_dtype
         st = w.state_wp()
-        wp.launch(
+        obs, reward, crowd = self._wp["obs"], self._wp["reward"], self._wp["crowd"]
+        launch = self._obs_launch.get(
             concrete(flocking_obs_reward_kernel, self.world.wp_dtype),
             dim=(n_envs, self.n_agents),
             inputs=[
@@ -171,10 +189,27 @@ class FlockingScenario(FusedScenario):
                 scalar(self.separation_dist),
                 wp.int32(full_pass),
             ],
-            outputs=[self._wp["obs"], self._wp["reward"], self._wp["crowd"]],
+            outputs=[obs, reward, crowd],
             device=w.device,
-            record_tape=False,
+            key=(
+                n_envs,
+                self.n_agents,
+                ptr_key(st.pos),
+                ptr_key(st.vel),
+                ptr_key(grid.neighbor_idx),
+                ptr_key(grid.neighbor_count),
+                self._k_obs,
+                self.cohesion,
+                self.alignment,
+                self.separation,
+                self.separation_dist,
+                ptr_key(obs),
+                ptr_key(reward),
+                ptr_key(crowd),
+            ),
         )
+        launch.set_param_by_name("full_pass", wp.int32(full_pass))
+        launch.launch()
 
     def _refresh(self) -> None:
         w = self.world

@@ -20,6 +20,7 @@ import torch
 import warp as wp
 
 from swarp._overloads import concrete
+from swarp.core.cached_launch import CachedLaunch, ptr_key
 from swarp.core.config import Obstacles, WorldConfig
 from swarp.core.state import VEC2
 from swarp.core.world import World
@@ -133,6 +134,12 @@ class NavigationScenario(FusedScenario):
         # pointer-stable). The reset mask itself comes from FusedScenario.
         self._reset_perm: torch.Tensor | None = None
         self._reset_perm_wp = None
+        # Cached, repack-once launches for the eager reset path (see CLAUDE.md, "Speed
+        # Is a First-Class Citizen" / swarp/core/cached_launch.py). Never touched inside
+        # a captured step: the whole-step graph already amortizes wp.launch's packing
+        # cost to once, at capture time.
+        self._reset_launch = CachedLaunch()
+        self._obs_launch = CachedLaunch()
         # Goals are engine-independent per-agent targets, written in place on every
         # reset; allocated here (not in reset_world) so the fused spec can adopt them.
         self.world.goals = torch.zeros(n_envs, self.n_agents, 2, device=device, dtype=dtype)
@@ -267,14 +274,21 @@ class NavigationScenario(FusedScenario):
         else:
             goals = wp.from_torch(w.goals.contiguous(), dtype=VEC2[w.wp_dtype])
         scalar = w.wp_dtype
+        seed = wp.int32(w.next_kernel_seed())
         with torch_stream_scope(w.device):
-            wp.launch(
+            # ``mask``, ``use_mask`` and ``seed`` genuinely vary call to call (a mask
+            # pointer swap never happens, but its *value* and use_mask do, and the seed
+            # always does); everything else — the grid geometry (n_agents/world_size
+            # derived, so config-invariant), the state/goal/perm handles — is
+            # step-invariant in the persistent hot path, so only those three are
+            # explicitly re-set below rather than folded into the cache key.
+            launch = self._reset_launch.get(
                 concrete(nav_reset_kernel, scalar),
                 dim=w.n_envs,
                 inputs=[
                     mask,
                     use_mask,
-                    wp.int32(w.next_kernel_seed()),
+                    seed,
                     scalar(lim),
                     scalar(cell),
                     scalar(jitter),
@@ -291,8 +305,28 @@ class NavigationScenario(FusedScenario):
                     goals,
                 ],
                 device=w.device,
-                record_tape=False,
+                key=(
+                    w.n_envs,
+                    ptr_key(mask),
+                    lim,
+                    cell,
+                    jitter,
+                    g,
+                    n_cells,
+                    stratified,
+                    self.n_agents,
+                    ptr_key(self._reset_perm_wp),
+                    ptr_key(st.pos),
+                    ptr_key(st.theta),
+                    ptr_key(st.vel),
+                    ptr_key(st.speed),
+                    ptr_key(st.ang_vel),
+                    ptr_key(goals),
+                ),
             )
+            launch.set_param_by_name("use_mask", use_mask)
+            launch.set_param_by_name("seed", seed)
+            launch.launch()
         w.mark_pos_dirty()
 
 
@@ -374,7 +408,23 @@ class NavigationScenario(FusedScenario):
         # Touching uses the static per-agent radius (matches the torch reference's
         # World.agent_radius); per-env randomization affects forces, not this count.
         params = w.stepper.params.floats
-        wp.launch(
+        resetmask = self._wp["resetmask"]
+        obs, touch, dist, shaping = (
+            self._wp["obs"],
+            self._wp["touch"],
+            self._wp["dist"],
+            self._wp["shaping"],
+        )
+        ongoal, overflow = self._wp["ongoal"], self._wp["overflow"]
+        # ``advance_prev``/``full_pass`` are the only genuinely per-call arguments (STEP
+        # vs. RESET, full vs. obs-only); everything else is either static config or a
+        # pointer-stable persistent-mode handle, so it lives in the cache key instead.
+        # Shared by the captured STEP pass and the eager RESET pass: the STEP pass's
+        # launch only ever runs once (at capture time, inside wp.ScopedCapture), so
+        # caching it costs nothing and the *reused* handle across capture epochs is
+        # exactly what the recapture token (bumped by sync_fused_handles on a pointer
+        # move) already guards against going stale.
+        launch = self._obs_launch.get(
             concrete(nav_obs_kernel, self.world.wp_dtype),
             dim=(n_envs, self.n_agents),
             inputs=[
@@ -387,25 +437,43 @@ class NavigationScenario(FusedScenario):
                 grid.neighbor_count,
                 grid.neighbor_true_count,
                 params,
-                self._wp["resetmask"],
+                resetmask,
                 wp.int32(self._k_obs),
                 scalar(self.pos_shaping_factor),
                 scalar(self.goal_tolerance),
                 wp.int32(advance_prev),
                 wp.int32(full_pass),
             ],
-            outputs=[
-                self._wp["obs"],
-                self._wp["touch"],
-                self._wp["dist"],
-                self._wp["shaping"],
-                self._wp["ongoal"],
-                self._wp["overflow"],
-                prev,
-            ],
+            outputs=[obs, touch, dist, shaping, ongoal, overflow, prev],
             device=w.device,
-            record_tape=False,
+            key=(
+                n_envs,
+                self.n_agents,
+                ptr_key(st.pos),
+                ptr_key(st.vel),
+                ptr_key(st.theta),
+                ptr_key(st.ang_vel),
+                ptr_key(goals),
+                ptr_key(grid.neighbor_idx),
+                ptr_key(grid.neighbor_count),
+                ptr_key(grid.neighbor_true_count),
+                ptr_key(params),
+                ptr_key(resetmask),
+                self._k_obs,
+                self.pos_shaping_factor,
+                self.goal_tolerance,
+                ptr_key(obs),
+                ptr_key(touch),
+                ptr_key(dist),
+                ptr_key(shaping),
+                ptr_key(ongoal),
+                ptr_key(overflow),
+                ptr_key(prev),
+            ),
         )
+        launch.set_param_by_name("advance_prev", wp.int32(advance_prev))
+        launch.set_param_by_name("full_pass", wp.int32(full_pass))
+        launch.launch()
 
     def _launch_reward(self) -> None:
         w = self.world

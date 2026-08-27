@@ -22,6 +22,7 @@ import torch
 import warp as wp
 
 from swarp._overloads import concrete
+from swarp.core.cached_launch import CachedLaunch, ptr_key
 from swarp.core.config import WorldConfig
 from swarp.core.state import VEC2
 from swarp.core.world import World
@@ -93,6 +94,11 @@ class DiscoveryScenario(FusedScenario):
             n_envs, self.n_targets, dtype=torch.bool, device=device
         )
         self._cache: dict[str, torch.Tensor] | None = None
+        # Cached, repack-once launches for the eager reset path — see
+        # swarp/core/cached_launch.py.
+        self._reset_launch = CachedLaunch()
+        self._cover_launch = CachedLaunch()
+        self._obs_launch = CachedLaunch()
         return self.world
 
     @property
@@ -118,14 +124,15 @@ class DiscoveryScenario(FusedScenario):
         else:
             aux = wp.from_torch(self.targets.contiguous(), dtype=VEC2[scalar])
             flags = wp.from_torch(self.covered.view(torch.uint8))
+        seed = wp.int32(w.next_kernel_seed())
         with torch_stream_scope(w.device):
-            wp.launch(
+            launch = self._reset_launch.get(
                 concrete(discovery_reset_kernel, scalar),
                 dim=w.n_envs,
                 inputs=[
                     mask,
                     use_mask,
-                    wp.int32(w.next_kernel_seed()),
+                    seed,
                     scalar(lim),
                     scalar(lim),
                     wp.int32(self.n_agents),
@@ -137,8 +144,22 @@ class DiscoveryScenario(FusedScenario):
                     flags,
                 ],
                 device=w.device,
-                record_tape=False,
+                key=(
+                    w.n_envs,
+                    ptr_key(mask),
+                    lim,
+                    self.n_agents,
+                    self.n_targets,
+                    self.covered.shape[1],
+                    ptr_key(st.pos),
+                    ptr_key(st.vel),
+                    ptr_key(aux),
+                    ptr_key(flags),
+                ),
             )
+            launch.set_param_by_name("use_mask", use_mask)
+            launch.set_param_by_name("seed", seed)
+            launch.launch()
         w.mark_pos_dirty()
         self.finish_reset(env_mask, obs_only=obs_only)
 
@@ -212,40 +233,68 @@ class DiscoveryScenario(FusedScenario):
     def _launch_cover(self, st) -> None:
         w = self.world
         scalar = w.wp_dtype
-        wp.launch(
+        targets, covered, newly = self._wp["targets"], self._wp["covered"], self._wp["newly"]
+        # No per-call-varying argument at all: every entry is either static config or a
+        # pointer-stable persistent-mode handle, so a hit needs no set_param_* calls.
+        launch = self._cover_launch.get(
             concrete(discovery_cover_kernel, self.world.wp_dtype),
             dim=(w.n_envs, self.n_targets),
             inputs=[
                 st.pos,
-                self._wp["targets"],
+                targets,
                 wp.int32(self.n_agents),
                 scalar(self.covering_range**2),
                 wp.int32(self.agents_per_target),
             ],
-            outputs=[self._wp["covered"], self._wp["newly"]],
+            outputs=[covered, newly],
             device=w.device,
-            record_tape=False,
+            key=(
+                w.n_envs,
+                self.n_targets,
+                ptr_key(st.pos),
+                ptr_key(targets),
+                self.n_agents,
+                self.covering_range,
+                self.agents_per_target,
+                ptr_key(covered),
+                ptr_key(newly),
+            ),
         )
+        launch.launch()
 
     def _launch_obs(self, st) -> None:
         w = self.world
         scalar = w.wp_dtype
-        wp.launch(
+        targets, covered = self._wp["targets"], self._wp["covered"]
+        obs, touch = self._wp["obs"], self._wp["touch"]
+        launch = self._obs_launch.get(
             concrete(discovery_obs_kernel, self.world.wp_dtype),
             dim=(w.n_envs, self.n_agents),
             inputs=[
                 st.pos,
                 st.vel,
-                self._wp["targets"],
-                self._wp["covered"],
+                targets,
+                covered,
                 wp.int32(self.n_agents),
                 wp.int32(self.n_targets),
                 scalar((2.0 * self.agent_radius) ** 2),
             ],
-            outputs=[self._wp["obs"], self._wp["touch"]],
+            outputs=[obs, touch],
             device=w.device,
-            record_tape=False,
+            key=(
+                w.n_envs,
+                self.n_agents,
+                self.n_targets,
+                ptr_key(st.pos),
+                ptr_key(st.vel),
+                ptr_key(targets),
+                ptr_key(covered),
+                self.agent_radius,
+                ptr_key(obs),
+                ptr_key(touch),
+            ),
         )
+        launch.launch()
 
     def _launch_reward(self) -> None:
         w = self.world

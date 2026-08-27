@@ -25,6 +25,7 @@ import torch
 import warp as wp
 
 from swarp._overloads import concrete, register
+from swarp.core.cached_launch import CachedLaunch, ptr_key
 from swarp.core.state import VEC2
 
 VEC3 = {wp.float32: wp.vec3f, wp.float64: wp.vec3d}
@@ -385,6 +386,11 @@ class NeighborGrid:
         # ``launch_substeps`` reuses them for substep 0 when it still matches.
         self.build_count: int = 0
         self.built_version: int = -1
+        # Cached, repack-once launch for the brute-force backend's eager (reset-path)
+        # rebuilds — see swarp/core/cached_launch.py. The captured step-time build pays
+        # this exactly once anyway (at capture); it is the eager auto_reset rebuild,
+        # every step, that this amortizes.
+        self._brute_launch = CachedLaunch()
 
     def build(self, pos: wp.array) -> None:
         """Refresh the padded lists from positions [n_envs, n_agents] (vec2)."""
@@ -440,14 +446,26 @@ class NeighborGrid:
         )
 
     def _query_brute_into(self, pos, neighbor_idx, neighbor_count) -> None:
-        wp.launch(
+        # No genuinely per-call argument here at all (radius is fixed at construction) —
+        # every argument is either config-invariant or a pointer-stable persistent-mode
+        # handle, so a cache hit needs no set_param_* calls, just .launch().
+        launch = self._brute_launch.get(
             concrete(_brute_force, self.dtype),
             dim=(self.n_envs, self.n_agents),
             inputs=[pos, self.dtype(self.radius)],
             outputs=[neighbor_idx, neighbor_count, self.neighbor_true_count],
             device=self.device,
-            record_tape=False,
+            key=(
+                self.n_envs,
+                self.n_agents,
+                ptr_key(pos),
+                self.radius,
+                ptr_key(neighbor_idx),
+                ptr_key(neighbor_count),
+                ptr_key(self.neighbor_true_count),
+            ),
         )
+        launch.launch()
 
     def _ensure_uniform(self) -> None:
         if self._u_alloc:

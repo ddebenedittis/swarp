@@ -26,6 +26,7 @@ import torch
 import warp as wp
 
 from swarp._overloads import concrete
+from swarp.core.cached_launch import CachedLaunch, ptr_key
 from swarp.core.config import WorldConfig
 from swarp.core.state import VEC2
 from swarp.core.world import World
@@ -100,6 +101,10 @@ class FormationScenario(FusedScenario):
         self._cache: dict[str, torch.Tensor] | None = None
         # Allocated here, not in reset_world, so the fused spec can adopt the slots.
         self.world.goals = torch.zeros(n_envs, self.n_agents, 2, device=device, dtype=dtype)
+        # Cached, repack-once launches for the eager reset path — see
+        # swarp/core/cached_launch.py.
+        self._reset_launch = CachedLaunch()
+        self._obs_launch = CachedLaunch()
         return self.world
 
     @property
@@ -130,14 +135,15 @@ class FormationScenario(FusedScenario):
             goals = self._wp["goals"]
         else:
             goals = wp.from_torch(w.goals.contiguous(), dtype=VEC2[scalar])
+        seed = wp.int32(w.next_kernel_seed())
         with torch_stream_scope(w.device):
-            wp.launch(
+            launch = self._reset_launch.get(
                 concrete(formation_reset_kernel, scalar),
                 dim=w.n_envs,
                 inputs=[
                     mask,
                     use_mask,
-                    wp.int32(w.next_kernel_seed()),
+                    seed,
                     scalar(lim),
                     scalar(clim),
                     wp.int32(self.n_agents),
@@ -147,8 +153,21 @@ class FormationScenario(FusedScenario):
                     goals,
                 ],
                 device=w.device,
-                record_tape=False,
+                key=(
+                    w.n_envs,
+                    ptr_key(mask),
+                    lim,
+                    clim,
+                    self.n_agents,
+                    ptr_key(self._slot_offsets_wp),
+                    ptr_key(st.pos),
+                    ptr_key(st.vel),
+                    ptr_key(goals),
+                ),
             )
+            launch.set_param_by_name("use_mask", use_mask)
+            launch.set_param_by_name("seed", seed)
+            launch.launch()
         w.mark_pos_dirty()
         self.finish_reset(env_mask, obs_only=obs_only)
 
@@ -194,14 +213,23 @@ class FormationScenario(FusedScenario):
         w = self.world
         scalar = w.wp_dtype
         st = w.state_wp()
-        wp.launch(
+        goals, resetmask = self._wp["goals"], self._wp["resetmask"]
+        obs, shaping, touch, dist, inform, prev = (
+            self._wp["obs"],
+            self._wp["shaping"],
+            self._wp["touch"],
+            self._wp["dist"],
+            self._wp["inform"],
+            self._wp["prev"],
+        )
+        launch = self._obs_launch.get(
             concrete(formation_obs_kernel, self.world.wp_dtype),
             dim=(w.n_envs, self.n_agents),
             inputs=[
                 st.pos,
                 st.vel,
-                self._wp["goals"],
-                self._wp["resetmask"],
+                goals,
+                resetmask,
                 scalar((2.0 * self.agent_radius) ** 2),
                 scalar(self.goal_tolerance),
                 scalar(self.pos_shaping_factor),
@@ -209,17 +237,29 @@ class FormationScenario(FusedScenario):
                 wp.int32(advance_prev),
                 wp.int32(full_pass),
             ],
-            outputs=[
-                self._wp["obs"],
-                self._wp["shaping"],
-                self._wp["touch"],
-                self._wp["dist"],
-                self._wp["inform"],
-                self._wp["prev"],
-            ],
+            outputs=[obs, shaping, touch, dist, inform, prev],
             device=w.device,
-            record_tape=False,
+            key=(
+                w.n_envs,
+                self.n_agents,
+                ptr_key(st.pos),
+                ptr_key(st.vel),
+                ptr_key(goals),
+                ptr_key(resetmask),
+                self.agent_radius,
+                self.goal_tolerance,
+                self.pos_shaping_factor,
+                ptr_key(obs),
+                ptr_key(shaping),
+                ptr_key(touch),
+                ptr_key(dist),
+                ptr_key(inform),
+                ptr_key(prev),
+            ),
         )
+        launch.set_param_by_name("advance_prev", wp.int32(advance_prev))
+        launch.set_param_by_name("full_pass", wp.int32(full_pass))
+        launch.launch()
 
     def _launch_reward(self) -> None:
         w = self.world

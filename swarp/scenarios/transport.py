@@ -34,6 +34,7 @@ import torch
 import warp as wp
 
 from swarp._overloads import concrete
+from swarp.core.cached_launch import CachedLaunch, ptr_key
 from swarp.core.config import Obstacles, WorldConfig
 from swarp.core.state import VEC2
 from swarp.core.world import World
@@ -135,6 +136,11 @@ class TransportScenario(FusedScenario):
         self._obstacles = Obstacles(self.pkg_pos.detach(), self._pkg_radius).resolve(device, dtype)
         self._prev_dist: torch.Tensor | None = None
         self._cache: dict[str, torch.Tensor] | None = None
+        # Cached, repack-once launches for the eager reset path — see
+        # swarp/core/cached_launch.py.
+        self._reset_launch = CachedLaunch()
+        self._obs_launch = CachedLaunch()
+        self._reward_launch = CachedLaunch()
         return self.world
 
     @property
@@ -179,14 +185,15 @@ class TransportScenario(FusedScenario):
             pkg_theta = wp.from_torch(self.pkg_theta.contiguous())
             pkg_ang_vel = wp.from_torch(self.pkg_ang_vel.contiguous())
             goal = wp.from_torch(self.goal.contiguous(), dtype=vec2)
+        seed = wp.int32(w.next_kernel_seed())
         with torch_stream_scope(w.device):
-            wp.launch(
+            launch = self._reset_launch.get(
                 concrete(transport_reset_kernel, scalar),
                 dim=w.n_envs,
                 inputs=[
                     mask,
                     use_mask,
-                    wp.int32(w.next_kernel_seed()),
+                    seed,
                     scalar(lim),
                     scalar(plim),
                     wp.int32(self.n_agents),
@@ -200,8 +207,25 @@ class TransportScenario(FusedScenario):
                     goal,
                 ],
                 device=w.device,
-                record_tape=False,
+                key=(
+                    w.n_envs,
+                    ptr_key(mask),
+                    lim,
+                    plim,
+                    self.n_agents,
+                    self.n_packages,
+                    ptr_key(st.pos),
+                    ptr_key(st.vel),
+                    ptr_key(pkg_pos),
+                    ptr_key(pkg_vel),
+                    ptr_key(pkg_theta),
+                    ptr_key(pkg_ang_vel),
+                    ptr_key(goal),
+                ),
             )
+            launch.set_param_by_name("use_mask", use_mask)
+            launch.set_param_by_name("seed", seed)
+            launch.launch()
         w.mark_pos_dirty()
 
         self._install_obstacles()
@@ -318,31 +342,45 @@ class TransportScenario(FusedScenario):
 
     def _launch_obs(self, st) -> None:
         w = self.world
-        wp.launch(
+        pkg_pos, goal = self._wp["pkg_pos"], self._wp["goal"]
+        obs = self._wp["obs"]
+        # No per-call-varying argument at all: pointer-stable persistent-mode handles.
+        launch = self._obs_launch.get(
             concrete(transport_obs_kernel, self.world.wp_dtype),
             dim=(w.n_envs, self.n_agents),
-            inputs=[
-                st.pos,
-                st.vel,
-                self._wp["pkg_pos"],
-                self._wp["goal"],
-                wp.int32(self.n_packages),
-            ],
-            outputs=[self._wp["obs"]],
+            inputs=[st.pos, st.vel, pkg_pos, goal, wp.int32(self.n_packages)],
+            outputs=[obs],
             device=w.device,
-            record_tape=False,
+            key=(
+                w.n_envs,
+                self.n_agents,
+                ptr_key(st.pos),
+                ptr_key(st.vel),
+                ptr_key(pkg_pos),
+                ptr_key(goal),
+                self.n_packages,
+                ptr_key(obs),
+            ),
         )
+        launch.launch()
 
     def _launch_reward(self, advance_prev: int, full_pass: int) -> None:
         w = self.world
         scalar = w.wp_dtype
-        wp.launch(
+        pkg_pos, goal, resetmask = self._wp["pkg_pos"], self._wp["goal"], self._wp["resetmask"]
+        prev, reward, done, dist = (
+            self._wp["prev"],
+            self._wp["reward"],
+            self._wp["done"],
+            self._wp["dist"],
+        )
+        launch = self._reward_launch.get(
             concrete(transport_reward_kernel, self.world.wp_dtype),
             dim=w.n_envs,
             inputs=[
-                self._wp["pkg_pos"],
-                self._wp["goal"],
-                self._wp["resetmask"],
+                pkg_pos,
+                goal,
+                resetmask,
                 wp.int32(self.n_agents),
                 wp.int32(self.n_packages),
                 scalar(self.pos_shaping_factor),
@@ -351,10 +389,27 @@ class TransportScenario(FusedScenario):
                 wp.int32(advance_prev),
                 wp.int32(full_pass),
             ],
-            outputs=[self._wp["prev"], self._wp["reward"], self._wp["done"], self._wp["dist"]],
+            outputs=[prev, reward, done, dist],
             device=w.device,
-            record_tape=False,
+            key=(
+                w.n_envs,
+                ptr_key(pkg_pos),
+                ptr_key(goal),
+                ptr_key(resetmask),
+                self.n_agents,
+                self.n_packages,
+                self.pos_shaping_factor,
+                self.goal_tolerance,
+                self.goal_reward,
+                ptr_key(prev),
+                ptr_key(reward),
+                ptr_key(done),
+                ptr_key(dist),
+            ),
         )
+        launch.set_param_by_name("advance_prev", wp.int32(advance_prev))
+        launch.set_param_by_name("full_pass", wp.int32(full_pass))
+        launch.launch()
 
     def _refresh(self, reset_mask: torch.Tensor | None = None, integrate: bool = True) -> None:
         w = self.world

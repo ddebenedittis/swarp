@@ -41,6 +41,7 @@ import warp as wp
 
 from swarp._overloads import concrete
 from swarp.core.bodies import body_state_gather_kernel
+from swarp.core.cached_launch import CachedLaunch, ptr_key
 from swarp.core.config import ObstacleKind, Obstacles, ObstacleShape, WorldConfig
 from swarp.core.state import VEC2
 from swarp.core.world import World
@@ -266,6 +267,12 @@ class PushTScenario(FusedScenario):
         self._prev_ang: torch.Tensor | None = None
         self._prev_adist: torch.Tensor | None = None  # [n_envs, n_agents]
         self._cache: dict[str, torch.Tensor] | None = None
+        # Cached, repack-once launches for the eager reset path — see
+        # swarp/core/cached_launch.py. ``_launch_body_sync`` is excluded: it only ever
+        # runs on the STEP pass, i.e. inside capture, where it is paid exactly once.
+        self._reset_launch = CachedLaunch()
+        self._obs_launch = CachedLaunch()
+        self._reward_launch = CachedLaunch()
         return self.world
 
     # Push-T's two paths do not compute the same thing, by design: the fused path lets the
@@ -328,21 +335,26 @@ class PushTScenario(FusedScenario):
             tee_ang_vel = wp.from_torch(self.tee_ang_vel.contiguous())
             goal_pos = wp.from_torch(self.goal_pos.contiguous(), dtype=vec2)
             goal_theta = wp.from_torch(self.goal_theta.contiguous())
+        seed = wp.int32(w.next_kernel_seed())
+        goal_radius = 0.0 if self.goal_spawn_radius is None else self.goal_spawn_radius
+        goal_angle = 0.0 if self.goal_spawn_angle is None else self.goal_spawn_angle
+        use_goal_radius = 0 if self.goal_spawn_radius is None else 1
+        use_goal_angle = 0 if self.goal_spawn_angle is None else 1
         with torch_stream_scope(w.device):
-            wp.launch(
+            launch = self._reset_launch.get(
                 concrete(pusht_reset_kernel, scalar),
                 dim=w.n_envs,
                 inputs=[
                     mask,
                     use_mask,
-                    wp.int32(w.next_kernel_seed()),
+                    seed,
                     scalar(lim),
                     scalar(tlim),
                     scalar(clear),
-                    scalar(0.0 if self.goal_spawn_radius is None else self.goal_spawn_radius),
-                    scalar(0.0 if self.goal_spawn_angle is None else self.goal_spawn_angle),
-                    wp.int32(0 if self.goal_spawn_radius is None else 1),
-                    wp.int32(0 if self.goal_spawn_angle is None else 1),
+                    scalar(goal_radius),
+                    scalar(goal_angle),
+                    wp.int32(use_goal_radius),
+                    wp.int32(use_goal_angle),
                     wp.int32(self.n_agents),
                     st.pos,
                     st.vel,
@@ -354,8 +366,30 @@ class PushTScenario(FusedScenario):
                     goal_theta,
                 ],
                 device=w.device,
-                record_tape=False,
+                key=(
+                    w.n_envs,
+                    ptr_key(mask),
+                    lim,
+                    tlim,
+                    clear,
+                    goal_radius,
+                    goal_angle,
+                    use_goal_radius,
+                    use_goal_angle,
+                    self.n_agents,
+                    ptr_key(st.pos),
+                    ptr_key(st.vel),
+                    ptr_key(tee_pos),
+                    ptr_key(tee_vel),
+                    ptr_key(tee_theta),
+                    ptr_key(tee_ang_vel),
+                    ptr_key(goal_pos),
+                    ptr_key(goal_theta),
+                ),
             )
+            launch.set_param_by_name("use_mask", use_mask)
+            launch.set_param_by_name("seed", seed)
+            launch.launch()
         w.mark_pos_dirty()
 
         self._install_obstacles()
@@ -548,35 +582,57 @@ class PushTScenario(FusedScenario):
 
     def _launch_obs(self, st) -> None:
         w = self.world
-        wp.launch(
+        tee_pos, tee_theta = self._wp["tee_pos"], self._wp["tee_theta"]
+        goal_pos, goal_theta = self._wp["goal_pos"], self._wp["goal_theta"]
+        obs = self._wp["obs"]
+        # No per-call-varying argument: pointer-stable persistent-mode/watched handles.
+        launch = self._obs_launch.get(
             concrete(pusht_obs_kernel, self.world.wp_dtype),
             dim=(w.n_envs, self.n_agents),
-            inputs=[
-                st.pos,
-                st.vel,
-                self._wp["tee_pos"],
-                self._wp["tee_theta"],
-                self._wp["goal_pos"],
-                self._wp["goal_theta"],
-            ],
-            outputs=[self._wp["obs"]],
+            inputs=[st.pos, st.vel, tee_pos, tee_theta, goal_pos, goal_theta],
+            outputs=[obs],
             device=w.device,
-            record_tape=False,
+            key=(
+                w.n_envs,
+                self.n_agents,
+                ptr_key(st.pos),
+                ptr_key(st.vel),
+                ptr_key(tee_pos),
+                ptr_key(tee_theta),
+                ptr_key(goal_pos),
+                ptr_key(goal_theta),
+                ptr_key(obs),
+            ),
         )
+        launch.launch()
 
     def _launch_reward(self, st, advance_prev: int, full_pass: int) -> None:
         w = self.world
         scalar = w.wp_dtype
-        wp.launch(
+        tee_pos, tee_theta = self._wp["tee_pos"], self._wp["tee_theta"]
+        goal_pos, goal_theta = self._wp["goal_pos"], self._wp["goal_theta"]
+        resetmask = self._wp["resetmask"]
+        prev_dist, prev_ang, prev_adist = (
+            self._wp["prev_dist"],
+            self._wp["prev_ang"],
+            self._wp["prev_adist"],
+        )
+        reward, done, dist, ang = (
+            self._wp["reward"],
+            self._wp["done"],
+            self._wp["dist"],
+            self._wp["ang"],
+        )
+        launch = self._reward_launch.get(
             concrete(pusht_reward_kernel, self.world.wp_dtype),
             dim=w.n_envs,
             inputs=[
                 st.pos,
-                self._wp["tee_pos"],
-                self._wp["tee_theta"],
-                self._wp["goal_pos"],
-                self._wp["goal_theta"],
-                self._wp["resetmask"],
+                tee_pos,
+                tee_theta,
+                goal_pos,
+                goal_theta,
+                resetmask,
                 wp.int32(self.n_agents),
                 scalar(self.pos_shaping_factor),
                 scalar(self.rot_shaping_factor),
@@ -589,18 +645,37 @@ class PushTScenario(FusedScenario):
                 wp.int32(advance_prev),
                 wp.int32(full_pass),
             ],
-            outputs=[
-                self._wp["prev_dist"],
-                self._wp["prev_ang"],
-                self._wp["prev_adist"],
-                self._wp["reward"],
-                self._wp["done"],
-                self._wp["dist"],
-                self._wp["ang"],
-            ],
+            outputs=[prev_dist, prev_ang, prev_adist, reward, done, dist, ang],
             device=w.device,
-            record_tape=False,
+            key=(
+                w.n_envs,
+                ptr_key(st.pos),
+                ptr_key(tee_pos),
+                ptr_key(tee_theta),
+                ptr_key(goal_pos),
+                ptr_key(goal_theta),
+                ptr_key(resetmask),
+                self.n_agents,
+                self.pos_shaping_factor,
+                self.rot_shaping_factor,
+                self.agent_dist_shaping,
+                self.push_point_offset,
+                self.joint_shaping,
+                self.goal_tolerance,
+                self.angle_tolerance,
+                self.goal_reward,
+                ptr_key(prev_dist),
+                ptr_key(prev_ang),
+                ptr_key(prev_adist),
+                ptr_key(reward),
+                ptr_key(done),
+                ptr_key(dist),
+                ptr_key(ang),
+            ),
         )
+        launch.set_param_by_name("advance_prev", wp.int32(advance_prev))
+        launch.set_param_by_name("full_pass", wp.int32(full_pass))
+        launch.launch()
 
     def _box_contact(self, pos: torch.Tensor, vel: torch.Tensor) -> tuple[torch.Tensor, ...]:
         """Per (env, agent, box) oriented-box SDF contact, mirroring

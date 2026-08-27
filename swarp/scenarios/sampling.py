@@ -16,6 +16,7 @@ import torch
 import warp as wp
 
 from swarp._overloads import concrete
+from swarp.core.cached_launch import CachedLaunch, ptr_key
 from swarp.core.config import WorldConfig
 from swarp.core.state import VEC2
 from swarp.core.world import World
@@ -87,6 +88,11 @@ class SamplingScenario(FusedScenario):
         # ``torch.tensor([...])`` literal is a host allocation plus a H2D copy, and on the
         # torch path ``_refresh`` runs every step.
         self._offs = torch.tensor([-1, 0, 1], device=device)
+        # Cached, repack-once launches for the eager reset path — see
+        # swarp/core/cached_launch.py.
+        self._reset_launch = CachedLaunch()
+        self._obs_reward_launch = CachedLaunch()
+        self._scatter_launch = CachedLaunch()
         return self.world
 
     @property
@@ -132,14 +138,15 @@ class SamplingScenario(FusedScenario):
         else:
             aux = wp.from_torch(self.centers.contiguous(), dtype=VEC2[scalar])
             flags = wp.from_torch(self.consumed.view(torch.uint8))
+        seed = wp.int32(w.next_kernel_seed())
         with torch_stream_scope(w.device):
-            wp.launch(
+            launch = self._reset_launch.get(
                 concrete(sampling_reset_kernel, scalar),
                 dim=w.n_envs,
                 inputs=[
                     mask,
                     use_mask,
-                    wp.int32(w.next_kernel_seed()),
+                    seed,
                     scalar(lim),
                     scalar(lim),
                     wp.int32(self.n_agents),
@@ -151,8 +158,22 @@ class SamplingScenario(FusedScenario):
                     flags,
                 ],
                 device=w.device,
-                record_tape=False,
+                key=(
+                    w.n_envs,
+                    ptr_key(mask),
+                    lim,
+                    self.n_agents,
+                    self.n_gaussians,
+                    self.consumed.shape[1],
+                    ptr_key(st.pos),
+                    ptr_key(st.vel),
+                    ptr_key(aux),
+                    ptr_key(flags),
+                ),
             )
+            launch.set_param_by_name("use_mask", use_mask)
+            launch.set_param_by_name("seed", seed)
+            launch.launch()
         w.mark_pos_dirty()
         self.finish_reset(env_mask, obs_only=obs_only)
 
@@ -205,36 +226,64 @@ class SamplingScenario(FusedScenario):
     def _launch_obs_reward(self, st, full_pass: int) -> None:
         w = self.world
         scalar = w.wp_dtype
-        wp.launch(
+        centers, consumed = self._wp["centers"], self._wp["consumed"]
+        obs, reward, field = self._wp["obs"], self._wp["reward"], self._wp["field"]
+        launch = self._obs_reward_launch.get(
             concrete(sampling_obs_reward_kernel, self.world.wp_dtype),
             dim=(w.n_envs, self.n_agents),
             inputs=[
                 st.pos,
                 st.vel,
-                self._wp["centers"],
-                self._wp["consumed"],
+                centers,
+                consumed,
                 scalar(self.world_size),
                 wp.int32(self.grid_res),
                 wp.int32(self.n_gaussians),
                 scalar(2.0 * self.field_std**2),
                 wp.int32(full_pass),
             ],
-            outputs=[self._wp["obs"], self._wp["reward"], self._wp["field"]],
+            outputs=[obs, reward, field],
             device=w.device,
-            record_tape=False,
+            key=(
+                w.n_envs,
+                self.n_agents,
+                ptr_key(st.pos),
+                ptr_key(st.vel),
+                ptr_key(centers),
+                ptr_key(consumed),
+                self.world_size,
+                self.grid_res,
+                self.n_gaussians,
+                self.field_std,
+                ptr_key(obs),
+                ptr_key(reward),
+                ptr_key(field),
+            ),
         )
+        launch.set_param_by_name("full_pass", wp.int32(full_pass))
+        launch.launch()
 
     def _launch_scatter(self, st) -> None:
         w = self.world
         scalar = w.wp_dtype
-        wp.launch(
+        consumed = self._wp["consumed"]
+        # No per-call-varying argument: idempotent write of the agent's own cell.
+        launch = self._scatter_launch.get(
             concrete(sampling_scatter_kernel, self.world.wp_dtype),
             dim=(w.n_envs, self.n_agents),
             inputs=[st.pos, scalar(self.world_size), wp.int32(self.grid_res)],
-            outputs=[self._wp["consumed"]],
+            outputs=[consumed],
             device=w.device,
-            record_tape=False,
+            key=(
+                w.n_envs,
+                self.n_agents,
+                ptr_key(st.pos),
+                self.world_size,
+                self.grid_res,
+                ptr_key(consumed),
+            ),
         )
+        launch.launch()
 
     def _refresh(self) -> None:
         w = self.world
