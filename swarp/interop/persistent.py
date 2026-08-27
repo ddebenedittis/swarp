@@ -34,8 +34,22 @@ legacy stream is fine; only capturing it is not.
 
 With that, masked auto-resets (writes) and observations (reads) stay ordered with the
 replay without a device sync, under a user-created stream as much as under the default one.
-Auto-reset stays *outside* the graph: it uses a ``torch.Generator`` whose philox offset is
-not capture-safe.
+
+Auto-reset used to stay *outside* the graph unconditionally, on the theory that it uses a
+``torch.Generator`` whose philox offset is not capture-safe. That was half the story: the
+philox offset is exactly as capture-unsafe as it sounds, but the *other* blocker was that
+``World.next_kernel_seed`` handed a reset kernel a scalar seed, and a scalar argument gets
+baked into a captured launch by value — a graph seeded that way would replay the same draw
+forever. ``World.seed_state`` (``swarp/core/rng.py``) fixes that half: a device-resident
+seed pair, advanced by its own one-thread kernel immediately before the reset kernel reads
+it, baked into the graph by *pointer* rather than by value, so its contents can keep
+changing between replays. The real, narrower rule is: a scenario whose whole reset is Warp
+launches against pointer-stable buffers with a device-side seed (``supports_graph_reset()``)
+can fold its reset into the graph; one that still needs a ``torch.Generator`` draw or an
+allocation (navigation with obstacles samples obstacle poses that way) cannot, and keeps
+running its reset on the eager tail outside the graph exactly as before. See
+``Environment.__init__``'s ``_reset_in_graph`` and
+``FusedScenario.supports_graph_reset``/``reset_in_graph``.
 
 :class:`CudaGraphStep` at the bottom is the same idea stripped to its core — one
 capture over fixed buffers, no persistent state, no recapture logic — kept as the
@@ -147,11 +161,12 @@ class StepRuntime:
     def set_post_physics(self, hook: WholeStepHook | None) -> None:
         """Register (or clear) the whole-step hook. Invalidates any existing graph.
 
-        The runtime uses three of the hook's four members: :attr:`~swarp.core.hooks.
+        The runtime uses four of the hook's five members: :attr:`~swarp.core.hooks.
         WholeStepHook.run` is captured / invoked eagerly after the physics step,
-        :attr:`~swarp.core.hooks.WholeStepHook.token` gates recapture, and
-        :attr:`~swarp.core.hooks.WholeStepHook.carries` is snapshotted around warm-up.
-        ``prepare`` is the caller's to run, eagerly, before the step — see
+        :attr:`~swarp.core.hooks.WholeStepHook.token` gates recapture,
+        :attr:`~swarp.core.hooks.WholeStepHook.carries` is snapshotted around warm-up, and
+        :attr:`~swarp.core.hooks.WholeStepHook.after_warmup` runs once the restore is
+        done. ``prepare`` is the caller's to run, eagerly, before the step — see
         :class:`~swarp.core.hooks.WholeStepHook` for why it cannot live in here.
         """
         self._hook = hook
@@ -229,8 +244,14 @@ class StepRuntime:
         if self._hook is not None:
             self._hook.run()
 
-    def _graph_key(self) -> tuple[int, int]:
-        """Recapture key: physics mutation version + the hook's handle token."""
+    def _graph_key(self) -> tuple[int, object]:
+        """Recapture key: physics mutation version + the hook's handle token.
+
+        The hook's ``token`` is typed ``Callable[[], object]`` (see
+        :class:`~swarp.core.hooks.WholeStepHook`), so this tuple's second element can be
+        anything comparable — an ``int`` for the common case, or a composite tuple when
+        the hook was assembled from more than one thing that can force a recapture.
+        """
         post_ver = 0 if self._hook is None else self._hook.token()
         return (self.stepper.mutation_version, post_ver)
 
@@ -272,6 +293,11 @@ class StepRuntime:
         # a scenario with a movable body entered its first replay one extra body-step
         # ahead of the eager path.
         #
+        # A snapshot cannot fix everything, though: the hook's ``after_warmup`` runs right
+        # after the restore for state that is a *function* of the carries rather than a
+        # copy of them — see ``WholeStepHook.after_warmup``'s docstring for why the
+        # neighbor grid needs exactly this.
+        #
         # The warm-up is scoped onto torch's stream (it reads buffers torch has just
         # written, and the carry restore below is a torch write racing the hook's launches
         # otherwise); the ``wp.synchronize_device`` after it is what bridges to the capture
@@ -291,6 +317,8 @@ class StepRuntime:
                 self._hook.run()
             for c, s in zip(carries, saved, strict=True):
                 c.copy_(s)
+            if self._hook is not None:
+                self._hook.after_warmup()
         wp.synchronize_device(stepper.device)
         # Re-sync built_version after warm-up (which bumped state_version without
         # touching the grid's contents) so the capture takes the reuse branch iff

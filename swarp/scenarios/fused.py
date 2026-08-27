@@ -163,7 +163,11 @@ class FusedScenario(Scenario):
       is the parity oracle and stays entirely the scenario's own.
 
     and optionally :meth:`engine_carries` when the fused launches also advance state
-    that lives in the engine rather than in the spec.
+    that lives in the engine rather than in the spec, and optionally
+    :meth:`supports_graph_reset` / :meth:`reset_in_graph` together when the scenario's
+    whole reset is itself capture-safe and can be folded into the whole-step graph (see
+    their docstrings; ``False`` is the correct default for a scenario that samples with
+    a ``torch.Generator`` or allocates during reset).
     """
 
     fused_available = True
@@ -201,6 +205,34 @@ class FusedScenario(Scenario):
     @abstractmethod
     def reset_torch(self, env_mask: torch.Tensor | None) -> None:
         """Refresh the torch reference cache after a reset (non-fused path)."""
+
+    def supports_graph_reset(self) -> bool:
+        """Whether this scenario's ``reset_world`` can be folded into the captured
+        whole-step graph — i.e. it is pure Warp launches against pointer-stable buffers
+        with a device-side RNG, with no torch sampling and no allocation.
+
+        ``False`` by default: this is an opt-in, not a framework guarantee, because
+        satisfying it is scenario-specific work (a masked reset kernel keyed off a
+        device-resident seed, per ``swarp/core/rng.py``) that the other six built-ins
+        have not done. A scenario that overrides this to ``True`` must also override
+        :meth:`reset_in_graph`.
+        """
+        return False
+
+    def reset_in_graph(self) -> None:
+        """The capture-safe reset tail: the masked reset kernel(s) plus an obs-only
+        refresh, run from inside the whole-step graph right after the episode-end
+        kernel has stamped the reset mask.
+
+        Same capture-safety contract as :meth:`launch_fused`'s ``kind="step"`` case: only
+        ``wp.launch`` / neighbor-grid builds against pointer-stable handles, no
+        allocation, no host reads. Only reachable when :meth:`supports_graph_reset`
+        returns ``True``, so the default body is unreachable rather than a silent no-op.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__}.supports_graph_reset() returned True but "
+            "reset_in_graph() was not overridden"
+        )
 
     def engine_carries(self) -> list[torch.Tensor]:
         """Extra warm-up carries that live in the engine rather than in the spec.

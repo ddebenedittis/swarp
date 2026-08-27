@@ -28,6 +28,7 @@ from typing import Any
 import warp as wp
 
 from swarp._overloads import register
+from swarp.core.rng import seed_from_state
 from swarp.core.state import VEC2
 from swarp.dynamics.base import P_RADIUS
 from swarp.scenarios.reset_kernels import _as
@@ -278,7 +279,7 @@ def _obs_signature(dtype) -> list:
 def nav_reset_kernel(
     reset_mask: wp.array(dtype=wp.uint8),
     use_mask: wp.int32,
-    seed: wp.int32,
+    seed_state: wp.array(dtype=wp.int32),
     lim: Any,
     cell: Any,
     jitter: Any,
@@ -317,12 +318,20 @@ def nav_reset_kernel(
 
     ``_as`` widens the float32 ``wp.randf`` draw to the world's scalar type; everything
     downstream is generic arithmetic, so a float64 world gets float64 spawns.
+
+    ``seed_state`` is the device-side ``[base, counter]`` pair from ``World.seed_state``
+    (see ``swarp/core/rng.py``), not a plain scalar: a scalar argument gets baked into a
+    captured launch by value and would replay the same seed forever, where this array is
+    baked by pointer and its *contents* can still change between graph replays. The caller
+    (``NavigationScenario._launch_reset``) launches ``advance_seed_kernel`` on this same
+    array immediately before this kernel, every call — advance, then use — which is what
+    reproduces ``World.next_kernel_seed``'s "increment first, return after" stream exactly.
     """
     e = wp.tid()
     if use_mask == 1 and reset_mask[e] == wp.uint8(0):
         return
 
-    rng = wp.rand_init(seed, e)
+    rng = wp.rand_init(seed_from_state(seed_state), e)
     # Typed constants: Warp reads a bare float literal as float32, so every literal that
     # meets the world's scalar type has to be widened through ``_as`` first.
     zero = _as(0.0, lim)
@@ -407,7 +416,7 @@ def _reset_signature(dtype) -> list:
     return [
         wp.array(dtype=wp.uint8),  # reset_mask
         wp.int32,  # use_mask
-        wp.int32,  # seed
+        wp.array(dtype=wp.int32),  # seed_state
         dtype,  # lim
         dtype,  # cell
         dtype,  # jitter

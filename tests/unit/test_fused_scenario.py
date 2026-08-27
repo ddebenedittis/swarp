@@ -50,6 +50,17 @@ def test_every_registered_scenario_implements_the_same_member_set(cls):
     # ...and none of them override what the framework owns.
     for name in ("post_step", "graph_hook", "ensure_fused", "prepare_fused", "finish_reset"):
         assert name not in vars(cls), f"{cls.__name__} overrides the framework's {name}"
+    # ``supports_graph_reset``/``reset_in_graph`` are declared *extension points*
+    # (default ``False`` / ``NotImplementedError``), not framework machinery: a
+    # scenario opts its own reset into the captured whole-step graph by overriding
+    # both together, so this only pins that they can't be split — overriding
+    # ``reset_in_graph`` alone would leave it permanently unreachable dead code
+    # (``supports_graph_reset`` still says ``False``), and overriding
+    # ``supports_graph_reset`` alone would flip the flag onto the base class's
+    # ``NotImplementedError`` body.
+    assert ("supports_graph_reset" in vars(cls)) == ("reset_in_graph" in vars(cls)), (
+        f"{cls.__name__} overrides only one of supports_graph_reset/reset_in_graph"
+    )
 
 
 @pytest.mark.parametrize("cls", FUSED, ids=IDS)

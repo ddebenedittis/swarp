@@ -263,6 +263,181 @@ def test_whole_step_matches_fused_eager(auto_reset, n_obstacles):
                 assert torch.equal(ig[k], ie[k]), k
 
 
+# ---------------------------------------------- in-graph auto-reset tail (navigation)
+
+
+@pytest.mark.gpu(reason="CUDA graph capture needs a GPU")
+def test_reset_in_graph_eligibility():
+    """``_reset_in_graph`` is exactly ``auto_reset and whole_step and
+    scenario.supports_graph_reset()`` -- obstacles disqualify navigation, and
+    ``auto_reset=False`` disqualifies everything regardless of the scenario."""
+    dev = "cuda:0"
+    assert _mk(dev, True, auto_reset=True, n_obstacles=0)._reset_in_graph
+    assert not _mk(dev, True, auto_reset=True, n_obstacles=3)._reset_in_graph
+    assert not _mk(dev, True, auto_reset=False, n_obstacles=0)._reset_in_graph
+    assert not _mk(dev, False, auto_reset=True, n_obstacles=0)._reset_in_graph  # no runtime
+
+
+@pytest.mark.gpu(reason="CUDA graph capture needs a GPU")
+def test_reset_in_graph_matches_eager_staggered(max_steps=9, n_steps=40):
+    """The "real" regime: envs reach ``done``/``max_steps`` at staggered times, not all
+    at once, which exercises the masked reset/neighbor-rebuild/obs-only paths on a
+    genuinely partial mask most steps -- unlike a synchronized rollout where every env
+    happens to reset together.
+
+    Graph (``use_graph=True``, tail folded into the capture) vs. the plain functional
+    step (``use_graph=False``, the old host-side tail) must stay bit-identical over the
+    whole rollout: obs, reward, terminated, truncated and the five state arrays.
+    """
+    dev = "cuda:0"
+
+    def mk(use_graph):
+        scen = NavigationScenario(n_agents=4, world_size=1.0, neighbor_method="brute")
+        env = Environment(
+            scen,
+            n_envs=32,
+            device=dev,
+            dt=0.05,
+            seed=0,
+            auto_reset=True,
+            max_steps=max_steps,
+            use_graph=use_graph,
+        )
+        env.reset(seed=0)
+        # Stagger step_count so envs cross max_steps at different times instead of in
+        # lockstep -- otherwise every env would reset on the same step and the masked
+        # paths would never see a genuinely partial mask. A dedicated, freshly-seeded
+        # generator (not the ambient default one) so ``g`` and ``e`` get the identical
+        # stagger regardless of construction order / other CUDA RNG consumers.
+        stagger_gen = torch.Generator(device=dev).manual_seed(5)
+        env._step_count.copy_(
+            torch.randint(
+                0, max_steps, (env.n_envs,), device=dev, generator=stagger_gen, dtype=torch.int32
+            )
+        )
+        return env
+
+    g, e = mk(True), mk(False)
+    assert g._reset_in_graph and not e._reset_in_graph
+    gen = torch.Generator(device=dev).manual_seed(11)
+    with torch.no_grad():
+        for _ in range(n_steps):
+            a = torch.empty(g.n_envs, 4, 2, device=dev).uniform_(-1, 1, generator=gen)
+            og, rg, termg, truncg, _ = g.step(a)
+            oe, re, terme, trunce, _ = e.step(a)
+            assert torch.equal(og, oe)
+            assert torch.equal(rg, re)
+            assert torch.equal(termg, terme)
+            assert torch.equal(truncg, trunce)
+            # Only the five 2D fields the holonomic model actually reads/writes: the
+            # trailing drone-only fields (z/vz/attitude/obs_ang_vel) are allocation-only
+            # scratch for this fleet, never written by either the physics or the reset
+            # kernel, so their contents are uninitialized-memory noise unrelated to this
+            # test's subject.
+            for fg, fe in zip(g.world.state[:5], e.world.state[:5], strict=True):
+                assert torch.equal(fg, fe)
+    assert g.graph_mode
+
+
+@pytest.mark.gpu(reason="CUDA graph capture needs a GPU")
+def test_reset_in_graph_no_time_limit():
+    """``max_steps=None`` with ``auto_reset=True``: terminated-only resets, and
+    ``truncated`` stays all-False throughout -- the episode-end kernel's
+    ``max_steps <= 0`` branch."""
+    dev = "cuda:0"
+
+    def mk(use_graph):
+        scen = NavigationScenario(n_agents=3, world_size=1.0, neighbor_method="brute")
+        env = Environment(
+            scen,
+            n_envs=16,
+            device=dev,
+            dt=0.05,
+            seed=0,
+            auto_reset=True,
+            max_steps=None,
+            use_graph=use_graph,
+        )
+        env.reset(seed=0)
+        return env
+
+    g, e = mk(True), mk(False)
+    assert g._reset_in_graph
+    gen = torch.Generator(device=dev).manual_seed(3)
+    with torch.no_grad():
+        for _ in range(15):
+            a = torch.empty(g.n_envs, 3, 2, device=dev).uniform_(-1, 1, generator=gen)
+            og, rg, termg, truncg, _ = g.step(a)
+            oe, re, terme, trunce, _ = e.step(a)
+            assert not truncg.any() and not trunce.any()
+            assert torch.equal(og, oe)
+            assert torch.equal(rg, re)
+            assert torch.equal(termg, terme)
+            assert torch.equal(truncg, trunce)
+
+
+@pytest.mark.gpu(reason="CUDA graph capture needs a GPU")
+def test_max_steps_reassignment_forces_recapture():
+    """The episode-end launch bakes ``max_steps`` in by value, so reassigning
+    ``env.max_steps`` must bump the recapture token (composed into
+    ``WholeStepHook.token`` as ``(scenario.fused_token(), self.max_steps)``) and
+    produce a genuinely different graph, not a stale one still enforcing the old limit."""
+    dev = "cuda:0"
+    env = _mk(dev, True, auto_reset=True, n_obstacles=0)
+    assert env._reset_in_graph
+    env.reset(seed=0)
+    a = torch.zeros(env.n_envs, 4, 2, device=dev)
+    with torch.no_grad():
+        for _ in range(3):
+            env.step(a)
+    rt = env.world.runtime
+    graph0 = rt._graph
+    assert graph0 is not None
+    env.max_steps = env.max_steps + 100
+    with torch.no_grad():
+        env.step(a)  # recapture happens lazily on the first step after the change
+    assert rt._graph is not graph0
+    # And the new limit is what actually governs truncation now: reset to pin
+    # step_count at exactly 0 (a host-side full reset, not the graph tail), then step
+    # up to (but not reaching) the new limit, then one more to cross it.
+    env.reset(seed=0)
+    with torch.no_grad():
+        for _ in range(env.max_steps - 1):
+            _, _, _, truncated, _ = env.step(a)
+            assert not truncated.any()
+        _, _, _, truncated, _ = env.step(a)
+        assert truncated.all()
+
+
+@pytest.mark.gpu(reason="CUDA graph capture needs a GPU")
+def test_grad_step_does_not_use_the_in_graph_tail():
+    """A taped step must keep running the eager host tail: the whole-step hook
+    (and with it the composed reset tail) only ever runs on the no-grad path."""
+    dev = "cuda:0"
+    env = _mk(dev, True, auto_reset=True, n_obstacles=0, n_envs=8)
+    assert env._reset_in_graph
+    env.reset(seed=0)
+    ag = torch.zeros(env.n_envs, 4, 2, device=dev, requires_grad=True)
+    with torch.enable_grad():
+        _, r, *_ = env.step(ag)
+        assert not env.world.ran_post_physics  # grad step took the torch path
+        r.sum().backward()
+
+
+@pytest.mark.gpu(reason="CUDA graph capture needs a GPU")
+def test_no_time_limit_no_auto_reset_still_matches():
+    """Sanity: ``auto_reset=False`` must be completely unaffected by any of this --
+    ``_reset_in_graph`` is False and the trajectory matches the pre-existing
+    graph-vs-eager parity ``test_graph_matches_eager`` already covers."""
+    dev = "cuda:0"
+    g = _mk(dev, True, auto_reset=False, n_obstacles=0)
+    assert not g._reset_in_graph
+    e = _mk(dev, False, auto_reset=False, n_obstacles=0)
+    gr, er = _run(g, 10, dev, 4), _run(e, 10, dev, 4)
+    for (og, rg, dg), (oe, re, de) in zip(gr, er, strict=True):
+        assert torch.equal(og, oe) and torch.equal(rg, re) and torch.equal(dg, de)
+
+
 @pytest.mark.gpu(reason="CUDA graph capture needs a GPU")
 def test_no_double_post_step():
     # The whole-step graph fills the obs/reward buffers, so Environment must skip

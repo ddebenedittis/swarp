@@ -112,6 +112,29 @@ class World:
         # ``seed`` in, same sequence of kernel seeds out. Reset alongside the generator.
         self.kernel_seed = 0
         self._kernel_step = 0
+        # Device-side mirror of the pair above (base seed, counter), for a scenario that
+        # needs the seed value *inside* a launch that might end up captured — currently
+        # just NavigationScenario's reset, see swarp/core/rng.py for why a device array
+        # rather than a scalar. Allocated exactly once, here: its pointer is baked into
+        # any captured graph that reads it, so it must never move for the life of the
+        # World. Kept in sync with kernel_seed/_kernel_step by set_kernel_seed below.
+        #
+        # Torch-backed (not a bare ``wp.array``): a captured graph's warm-up runs the
+        # whole hook once, including the reset kernel's ``advance_seed_kernel`` -- which
+        # means warm-up genuinely advances this counter and it has to be snapshotted and
+        # restored like every other carry (``StepRuntime._ensure_graph``'s ``carries``
+        # list), and that mechanism deals in torch tensors (``.clone()`` / ``.copy_()``),
+        # not ``wp.array``. ``self.seed_state`` stays the ``wp.array`` handle every
+        # kernel launch binds; ``self._seed_state_t`` is the torch tensor a carry list
+        # holds. Both view the same storage, so a write through either is visible to the
+        # other with no copy.
+        #
+        # ``int32``, not ``uint32``: torch has no unsigned 32-bit dtype, so the pair is
+        # stored as its int32 bit pattern and the kernel side (``swarp/core/rng.py``)
+        # reinterprets each element back to ``uint32`` before doing the actual mixing
+        # arithmetic -- see that module for why the two are numerically identical.
+        self._seed_state_t = torch.zeros(2, dtype=torch.int32, device=self.device)
+        self.seed_state = wp.from_torch(self._seed_state_t)
         self.agent_radius = torch.tensor(
             [c.radius for c in agent_configs], device=device, dtype=dtype
         )
@@ -264,6 +287,33 @@ class World:
         """
         self._kernel_step += 1
         return (self.kernel_seed * 0x9E3779B1 + self._kernel_step) & 0x7FFFFFFF
+
+    def set_kernel_seed(self, seed: int) -> None:
+        """Reseed the kernel-RNG stream: the host counter (:meth:`next_kernel_seed`,
+        still what the six non-navigation scenarios use) and the device mirror
+        (:attr:`seed_state`, what navigation's capture-safe reset uses) together.
+
+        Called on every ``Environment.reset(seed=...)`` / ``Environment.seed(...)``, and
+        equivalent to the zero-init done in ``__init__``. The device write is a host->device
+        copy, but it only ever happens on an explicit reseed — never inside a captured
+        step — so it does not touch the "no host<->device copy on the hot path" invariant.
+        """
+        self.kernel_seed = seed
+        self._kernel_step = 0
+        # Write through the torch tensor, not ``self.seed_state.assign(...)``: the two
+        # view the same storage, but ``assign`` is a Warp-side host->device copy that
+        # bypasses torch's allocator bookkeeping, and this keeps the write on the side
+        # the carry-snapshot mechanism (``.clone()``/``.copy_()``) already understands.
+        # ``base`` has to land in int32's range: ``seed & 0xFFFFFFFF`` is the unsigned
+        # 32-bit value the kernel side wants, and casting an int64 holding it down to
+        # int32 truncates to the low 32 bits -- i.e. reinterprets those same bits as
+        # two's complement, which is exactly what ``wp.uint32(int32)`` undoes on the
+        # kernel side (see swarp/core/rng.py).
+        base = torch.tensor(
+            seed & 0xFFFFFFFF, dtype=torch.int64, device=self._seed_state_t.device
+        ).to(torch.int32)
+        self._seed_state_t[0] = base
+        self._seed_state_t[1] = 0
 
     def sample_uniform(self, shape: tuple[int, ...], low: float, high: float) -> torch.Tensor:
         u = torch.rand(shape, generator=self.generator, device=self.device, dtype=self.dtype)

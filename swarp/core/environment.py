@@ -5,8 +5,12 @@ from __future__ import annotations
 from typing import Any
 
 import torch
+import warp as wp
 
+from swarp.core.cached_launch import CachedLaunch, ptr_key
 from swarp.core.config import WorldConfig
+from swarp.core.episode_kernels import episode_end_kernel
+from swarp.core.hooks import WholeStepHook
 from swarp.dynamics.base import action_bounds
 from swarp.scenarios.base import Scenario
 
@@ -43,6 +47,18 @@ class Environment:
       host-side "is anything done?" gate, the scenario's ``reset_world`` executes on every
       step over the whole batch, whether or not any env is done — see
       "The cost of ``auto_reset``" in ``docs/performance.md``.
+
+    For an eligible scenario (currently ``NavigationScenario`` with ``n_obstacles == 0``
+    — see :meth:`~swarp.scenarios.fused.FusedScenario.supports_graph_reset`) that "every
+    step" reset is not eager host work: the episode-end bookkeeping (``step_count``,
+    ``truncated``, the reset mask) and the reset itself are folded into the same
+    whole-step CUDA graph as the physics and fused obs/reward, so a step under
+    ``auto_reset=True`` is one graph replay with **no** host-side tail at all — the
+    increment/compare/mask-fill/``reset_world`` call this docstring describes above
+    still happen, just as ``wp.launch``\\ es inside the capture instead of Python calling
+    them each step. A scenario that samples with a ``torch.Generator`` during reset (or
+    allocates) is not eligible and keeps paying the old eager tail every step, same as
+    before this was added.
 
     Args:
         use_graph: persistent-buffer execution backed by a whole-step CUDA graph.
@@ -152,10 +168,149 @@ class Environment:
             self.world.enable_persistent(use_graph=True, graph_requested=graph_requested)
         runtime = self.world.runtime
         self._whole_step = self._hook is not None and runtime is not None
+        # Whether the auto-reset tail (episode-end bookkeeping + the scenario's own
+        # reset) is folded into the same hook as the physics/obs/reward pass, so that
+        # under ``auto_reset=True`` a step is one graph replay with no eager host work
+        # left over. Gated on ``self._whole_step`` — the condition for the hook running
+        # at all, captured or eager-persistent-fallback alike — rather than on CUDA or
+        # on capture having actually succeeded: the composed hook's ``run`` is correct
+        # either way (see ``swarp/interop/persistent.py``'s module docstring), and
+        # gating on capture would leave the eager-persistent-fallback case, which is
+        # exactly as capture-safe, paying the old host tail for no reason.
+        self._reset_in_graph = self._whole_step and auto_reset and scenario.supports_graph_reset()
         if self._whole_step:
+            if self._reset_in_graph:
+                self._hook = self._compose_graph_reset_hook(scenario, self._hook)
             runtime.set_post_physics(self._hook)
         else:
             self._hook = None
+            self._reset_in_graph = False
+
+    def _compose_graph_reset_hook(
+        self, scenario: Scenario, base_hook: WholeStepHook
+    ) -> WholeStepHook:
+        """Fold the auto-reset tail into ``base_hook`` (the scenario's own step hook).
+
+        Builds the composed :class:`~swarp.core.hooks.WholeStepHook` whose ``run`` is
+        ``base_hook.run`` (physics-adjacent obs/reward) followed by the episode-end
+        kernel and ``scenario.reset_in_graph()``. The launch sequence the capture then
+        holds is: physics substeps -> fused step obs/reward -> episode-end kernel ->
+        masked reset kernel -> masked neighbor rebuild -> masked obs-only pass.
+
+        The episode-end kernel's own cached Warp handles (``done``/``step_count``/
+        ``truncated``/``reset_mask``) are built lazily, in the composed ``prepare``, not
+        here: building them needs ``scenario.ensure_fused()`` to have already allocated
+        the fused buffers at the real batch size, and ``ensure_fused`` is itself lazy —
+        calling it from ``__init__`` would allocate before anything the caller has done
+        justifies it (a plain ``Environment(...)`` construction with no ``reset()``/
+        ``step()`` yet).
+        """
+        w = self.world
+        episode_launch = CachedLaunch()
+        handles: dict[str, wp.array] = {}
+
+        def _ensure_episode_handles() -> None:
+            if handles:
+                return
+            scenario.ensure_fused()
+            mask_name = scenario._fused_mask
+            if mask_name is None:
+                raise RuntimeError(
+                    f"{type(scenario).__name__}.supports_graph_reset() returned True "
+                    "but its fused_spec declares no reset_mask buffer -- the episode-"
+                    "end kernel needs one to stamp which envs just ended"
+                )
+            # All four are pointer-stable for the runtime's lifetime: ``done`` and
+            # ``resetmask`` are framework-owned fused buffers that ``sync_fused_handles``
+            # never rebuilds (only ``watch=True`` adopted buffers move), and
+            # ``_step_count``/``_truncated_buf`` are allocated once in
+            # ``Environment.__init__`` and never reassigned.
+            handles["done"] = scenario._wp["done"]
+            handles["step_count"] = wp.from_torch(self._step_count)
+            handles["truncated"] = wp.from_torch(
+                self._truncated_buf.view(torch.uint8), dtype=wp.uint8
+            )
+            handles["reset_mask"] = scenario._wp[mask_name]
+
+        def _prepare() -> None:
+            base_hook.prepare()
+            _ensure_episode_handles()
+
+        def _run() -> None:
+            base_hook.run()
+            launch = episode_launch.get(
+                episode_end_kernel,
+                dim=self.n_envs,
+                inputs=[
+                    handles["done"],
+                    wp.int32(self.max_steps if self.max_steps is not None else 0),
+                    handles["step_count"],
+                    handles["truncated"],
+                    handles["reset_mask"],
+                ],
+                device=self.device,
+                # ``max_steps`` is genuinely re-set every call (a caller may reassign
+                # ``env.max_steps``): baking it into the key would repack the whole
+                # launch on every step that happens to leave it unchanged, so instead
+                # it lives in ``token`` below, which forces a full *recapture* -- the
+                # right response, since a captured graph has already baked the old
+                # limit into this launch's params by value and repacking the cached
+                # ``Launch`` object does nothing to a graph node that was recorded
+                # before the repack happened.
+                key=(
+                    self.n_envs,
+                    ptr_key(handles["done"]),
+                    ptr_key(handles["step_count"]),
+                    ptr_key(handles["truncated"]),
+                    ptr_key(handles["reset_mask"]),
+                ),
+            )
+            launch.set_param_by_name(
+                "max_steps", wp.int32(self.max_steps if self.max_steps is not None else 0)
+            )
+            launch.launch()
+            scenario.reset_in_graph()
+
+        def _token() -> object:
+            return (base_hook.token(), self.max_steps)
+
+        def _carries() -> list[torch.Tensor]:
+            out = list(base_hook.carries())
+            # Everything the tail advances *in place* that ``base_hook.carries()`` does
+            # not already cover. The physics warm-up is out-of-place, but the *reset*
+            # kernel writes the persistent state and the goals directly; the episode-end
+            # kernel writes the step count and ``truncated``; and the reset mask is the
+            # subtle one — ``prepare`` zeroes it before the step, warm-up's episode-end
+            # kernel stamps it, and the capture step's replay would then run its own
+            # *step* obs pass against a dirty mask, rebasing shaping baselines for envs
+            # that never reset. The seed counter is carried so warm-up does not consume
+            # a draw the eager path would not have.
+            out.extend(w.runtime.state_views)  # pos/theta/vel/speed/ang_vel
+            out.append(w.goals)
+            out.append(self._step_count)
+            out.append(self._truncated_buf)
+            out.append(scenario.fb[scenario._fused_mask])
+            out.append(w._seed_state_t)
+            return out
+
+        def _after_warmup() -> None:
+            base_hook.after_warmup()
+            # The tail's *masked* neighbor rebuild (inside ``reset_in_graph`` ->
+            # ``_launch_obs``) only touches the envs the reset mask selects; after the
+            # carries above are restored to their pre-warm-up values, the grid still
+            # holds neighbor lists built from warm-up's now-discarded positions for
+            # every env the mask did not select. A full, unmasked rebuild here
+            # re-derives the grid from the restored state. See
+            # ``WholeStepHook.after_warmup``'s docstring for the long version.
+            w.build_neighbors(reset_mask=None)
+
+        return WholeStepHook(
+            run=_run,
+            prepare=_prepare,
+            token=_token,
+            carries=_carries,
+            after_warmup=_after_warmup,
+        )
 
     def _taped_step(self, actions: torch.Tensor | None = None) -> bool:
         """Whether the coming step will be recorded on the Warp tape.
@@ -191,8 +346,7 @@ class Environment:
         # RNG-only, never reach for episode state.
         self.world.generator = torch.Generator(device=self.device)
         self.world.generator.manual_seed(seed)
-        self.world.kernel_seed = int(seed)
-        self.world._kernel_step = 0
+        self.world.set_kernel_seed(int(seed))
 
     @property
     def graph_mode(self) -> bool:
@@ -292,6 +446,16 @@ class Environment:
             ``truncated`` is a **persistent buffer** written in place every step (like
             the fused obs/reward buffers), not a fresh allocation — the same
             ``clone_outputs`` contract as the rest of the tuple applies to it.
+
+            When ``auto_reset=True`` and the scenario supports it, this whole tail
+            (step-count increment, ``truncated``, the mask-fill, and ``reset_world``)
+            already happened *inside* ``self.world.step(actions)`` above, as part of the
+            same graph replay — see ``self._reset_in_graph`` / ``World.ran_post_physics``
+            and the class docstring's "For an eligible scenario" paragraph. The code
+            below still runs the equivalent host-side arithmetic, but only when that
+            in-graph tail did **not** run (a taped/grad step, an ineligible scenario, or
+            ``auto_reset=False``), so this docstring's description of what ``step`` does
+            is accurate either way — only *where* the work happens changes.
         """
         act_dim = self.world.act_dim
         if actions.shape != (self.n_envs, self.n_agents, act_dim):
@@ -318,15 +482,33 @@ class Environment:
 
         # Reward/done/info describe the transition just taken (terminal state).
         reward = self.scenario.rewards()
-        self._step_count += 1
+        # ``tail_ran`` is True iff the composed hook's episode-end kernel + masked
+        # reset already ran as *part of* ``self.world.step`` above (a captured replay,
+        # or the eager-persistent fallback running the identical hook eagerly) --
+        # ``ran_post_physics`` is exactly that gate, and is False on a taped/grad step
+        # or when ``self._reset_in_graph`` is False, both of which must keep the old
+        # host-side tail below.
+        tail_ran = self._reset_in_graph and self.world.ran_post_physics
+        if not tail_ran:
+            self._step_count += 1
+        # ``terminated`` reads the fused ``done`` buffer regardless of ``tail_ran``: the
+        # in-graph tail's reset pass is obs-only (``full_pass=0``), so it never touches
+        # ``done`` -- this still describes the pre-reset transition exactly as it always
+        # has, whether or not that transition's episode also just ended and got reset.
         terminated = self.scenario.done()
         if self.max_steps is not None:
-            truncated = torch.ge(self._step_count, self.max_steps, out=self._truncated_buf)
+            if tail_ran:
+                # The episode-end kernel already wrote this in place (see
+                # swarp/core/episode_kernels.py); redoing the host ``torch.ge`` would
+                # just recompute the same value one host round-trip later.
+                truncated = self._truncated_buf
+            else:
+                truncated = torch.ge(self._step_count, self.max_steps, out=self._truncated_buf)
         else:
             truncated = self._never_truncated
         info = self.scenario.info()
 
-        if self.auto_reset:
+        if self.auto_reset and not tail_ran:
             episode_end = torch.logical_or(terminated, truncated, out=self._episode_end_buf)
             # Obs-only reset pass: reward/done/info were already returned for this
             # transition and their (fused) buffers must not be clobbered.

@@ -22,6 +22,7 @@ import warp as wp
 from swarp._overloads import concrete
 from swarp.core.cached_launch import CachedLaunch, ptr_key
 from swarp.core.config import Obstacles, WorldConfig
+from swarp.core.rng import advance_seed_kernel
 from swarp.core.state import VEC2
 from swarp.core.world import World
 from swarp.dynamics.base import AgentConfig, ControlMode, DynamicsModel
@@ -140,6 +141,23 @@ class NavigationScenario(FusedScenario):
         # cost to once, at capture time.
         self._reset_launch = CachedLaunch()
         self._obs_launch = CachedLaunch()
+        # The one-thread "advance the device seed counter" launch that must run
+        # immediately before every ``_reset_launch`` (see swarp/core/rng.py, "advance,
+        # then use"). Its own CachedLaunch so the eager auto-reset hot path doesn't pay a
+        # fresh wp.launch pack for it every step either.
+        self._seed_launch = CachedLaunch()
+        # Separate ``CachedLaunch`` instances for the in-graph tail (``reset_in_graph``),
+        # rather than sharing the three above with the eager path. Sharing would still be
+        # *correct* — a graph node bakes its kernel params at record time, so an eager
+        # call packing the same cache after capture would just repack params a replay
+        # never reads — but it entangles two independent lifecycles: the eager path's
+        # param mutations happen every eager step, while a *captured* launch is packed
+        # once, at warm-up, and never touched again until a genuine recapture. Keeping
+        # them apart costs one small object each and means a change to one path's
+        # packing can never accidentally perturb the other's cache state.
+        self._seed_launch_g = CachedLaunch()
+        self._reset_launch_g = CachedLaunch()
+        self._obs_launch_g = CachedLaunch()
         # Goals are engine-independent per-agent targets, written in place on every
         # reset; allocated here (not in reset_world) so the fused spec can adopt them.
         self.world.goals = torch.zeros(n_envs, self.n_agents, 2, device=device, dtype=dtype)
@@ -249,8 +267,39 @@ class NavigationScenario(FusedScenario):
         cell = side / g
         return lim, cell, cell - min_dist, g, g * g, True
 
-    def _launch_reset(self, env_mask: torch.Tensor | None) -> None:
-        """Launch the masked device-side reset (see :meth:`reset_world`)."""
+    def _launch_reset(self, env_mask: torch.Tensor | None, *, in_graph: bool = False) -> None:
+        """Launch the masked device-side reset (see :meth:`reset_world`).
+
+        ``in_graph=True`` is the tail :meth:`reset_in_graph` runs from inside the
+        captured whole-step graph (or the eager persistent fallback's hook). It differs
+        from the normal (eager, ``Environment.reset``/``reset_at``/auto-reset-outside-
+        capture) call in three ways, all because the surrounding graph replay has
+        already done the equivalent work this step:
+
+        * the mask/use_mask pair is read straight off the fused reset-mask buffer
+          (``self._wp[self._fused_mask]``, ``use_mask=1``) instead of going through
+          :meth:`reset_mask_wp`, which does a torch ``copy_`` into that same buffer —
+          the episode-end kernel earlier in the same ``run`` already stamped it, so
+          copying it onto itself would be redundant even before considering that a
+          torch op has no business inside a captured region;
+        * :meth:`sync_fused_handles` is not called — it is host-side (a data-pointer
+          compare per watched buffer) and ``prepare_fused`` already ran it once, eagerly,
+          before this step's replay; a captured launch cannot re-run it anyway;
+        * the launches are not wrapped in :func:`torch_stream_scope` — the capture
+          region already records on Warp's own stream (see the module docstring in
+          ``swarp/interop/persistent.py``), and the captured STEP pass
+          (``_launch_fused_step``) stays raw for the same reason.
+
+        It also skips :meth:`~swarp.core.world.World.mark_pos_dirty`: that bumps
+        ``state_version``, a host attribute read once per *eager* step to decide
+        whether the grid can be reused — meaningless to touch once per graph replay,
+        since the version bookkeeping around a captured step is frozen at capture time
+        (the graph's neighbor-reuse decision was already baked in when it was recorded).
+        The grid the next replay reads is instead refreshed by :meth:`reset_in_graph`'s
+        following :meth:`_launch_obs`, whose ``full_pass=0`` rebuild is masked to the
+        envs that just reset — the only ones whose positions moved since the step pass
+        built its lists.
+        """
         w = self.world
         lim, cell, jitter, g, n_cells, stratified = self._reset_grid()
 
@@ -263,36 +312,60 @@ class NavigationScenario(FusedScenario):
                 (n_cells, w.n_envs), dtype=torch.int32, device=w.device
             )
             self._reset_perm_wp = wp.from_torch(self._reset_perm)
-        mask, use_mask = self.reset_mask_wp(env_mask)
+
+        if in_graph:
+            mask, use_mask = self._wp[self._fused_mask], wp.int32(1)
+        else:
+            mask, use_mask = self.reset_mask_wp(env_mask)
 
         st = w.state_wp()
         if self.fused_active:
             # Reuse the fused spec's cached, pointer-resynced handle instead of
             # re-wrapping ``world.goals`` (a ``wp.from_torch`` + ``.contiguous()``) on
-            # every reset. ``sync_fused_handles`` must run first: it is what notices a
-            # grad-path reassignment and rebuilds the handle before this kernel writes
-            # through it.
+            # every reset. ``sync_fused_handles`` must run first (eager path only — see
+            # the docstring above for why the in-graph tail skips it): it is what
+            # notices a grad-path reassignment and rebuilds the handle before this
+            # kernel writes through it.
             self.ensure_fused()
-            self.sync_fused_handles()
+            if not in_graph:
+                self.sync_fused_handles()
             goals = self._wp["goals"]
         else:
             goals = wp.from_torch(w.goals.contiguous(), dtype=VEC2[w.wp_dtype])
         scalar = w.wp_dtype
-        seed = wp.int32(w.next_kernel_seed())
-        with torch_stream_scope(w.device):
-            # ``mask``, ``use_mask`` and ``seed`` genuinely vary call to call (a mask
-            # pointer swap never happens, but its *value* and use_mask do, and the seed
-            # always does); everything else — the grid geometry (n_agents/world_size
-            # derived, so config-invariant), the state/goal/perm handles — is
-            # step-invariant in the persistent hot path, so only those three are
-            # explicitly re-set below rather than folded into the cache key.
-            launch = self._reset_launch.get(
+        seed_cache = self._seed_launch_g if in_graph else self._seed_launch
+        reset_cache = self._reset_launch_g if in_graph else self._reset_launch
+
+        def _do_launches() -> None:
+            # Advance, then use (see swarp/core/rng.py): bump World.seed_state's counter
+            # first, so the reset kernel below reads the fresh value. Both launches share
+            # the array by pointer only — ``seed_state`` itself never moves, which is what
+            # lets a captured graph replay this pair with a different draw every time
+            # despite baking the launch once at capture time.
+            seed_launch = seed_cache.get(
+                advance_seed_kernel,
+                dim=1,
+                inputs=[w.seed_state],
+                device=w.device,
+                key=(ptr_key(w.seed_state),),
+            )
+            seed_launch.launch()
+
+            # ``mask`` and ``use_mask`` genuinely vary call to call (a mask pointer swap
+            # never happens, but its *value* and use_mask do); everything else — the grid
+            # geometry (n_agents/world_size derived, so config-invariant), the
+            # state/goal/perm/seed handles — is step-invariant in the persistent hot
+            # path, so only those two are explicitly re-set below rather than folded into
+            # the cache key. ``seed_state`` is in the key (not re-set) precisely because
+            # it is pointer-stable: its *contents* change every call via the advance
+            # launch above, not via a param re-set here.
+            launch = reset_cache.get(
                 concrete(nav_reset_kernel, scalar),
                 dim=w.n_envs,
                 inputs=[
                     mask,
                     use_mask,
-                    seed,
+                    w.seed_state,
                     scalar(lim),
                     scalar(cell),
                     scalar(jitter),
@@ -312,6 +385,7 @@ class NavigationScenario(FusedScenario):
                 key=(
                     w.n_envs,
                     ptr_key(mask),
+                    ptr_key(w.seed_state),
                     lim,
                     cell,
                     jitter,
@@ -329,10 +403,14 @@ class NavigationScenario(FusedScenario):
                 ),
             )
             launch.set_param_by_name("use_mask", use_mask)
-            launch.set_param_by_name("seed", seed)
             launch.launch()
-        w.mark_pos_dirty()
 
+        if in_graph:
+            _do_launches()
+        else:
+            with torch_stream_scope(w.device):
+                _do_launches()
+            w.mark_pos_dirty()
 
     def reset_world(
         self, env_mask: torch.Tensor | None = None, *, obs_only: bool = False
@@ -368,6 +446,39 @@ class NavigationScenario(FusedScenario):
         self._nbr_cache = None
         self.finish_reset(env_mask, obs_only=obs_only)
 
+    # ------------------------------------------------- capture-safe reset (auto_reset)
+
+    def supports_graph_reset(self) -> bool:
+        """``True`` iff this scenario has no obstacles.
+
+        With ``n_obstacles == 0`` the whole reset is :meth:`_launch_reset` — pure Warp
+        launches against pointer-stable buffers, seeded from the device-resident
+        ``World.seed_state`` (see ``swarp/core/rng.py``) — which is exactly what
+        :meth:`~swarp.scenarios.fused.FusedScenario.supports_graph_reset` asks for. With
+        obstacles, :meth:`reset_world` also draws ``w.sample_uniform(...)`` for the
+        obstacle poses: that pulls from ``world.generator``, a ``torch.Generator`` whose
+        philox offset is not capture-safe (the same reason auto-reset as a whole used to
+        stay outside the graph, per the ``swarp/interop/persistent.py`` module
+        docstring), and then calls ``w.set_obstacles(...)`` to re-install the spec — a
+        torch op with no capture-safety guarantee of its own. Neither belongs inside
+        ``wp.ScopedCapture``, so a scenario with obstacles keeps the whole reset on the
+        eager tail, same as before this whole effort.
+        """
+        return self.n_obstacles == 0
+
+    def reset_in_graph(self) -> None:
+        """The capture-safe reset tail: masked spawn/goal draw, then an obs-only
+        refresh over the same mask.
+
+        Reachable only when :meth:`supports_graph_reset` is ``True``, i.e.
+        ``n_obstacles == 0`` — see that method for why obstacles rule this out. The mask
+        itself was already stamped by the episode-end kernel earlier in the same
+        ``run`` (``Environment``'s composed :class:`~swarp.core.hooks.WholeStepHook`),
+        so neither call needs (or is given) an explicit ``env_mask``.
+        """
+        self._launch_reset(env_mask=None, in_graph=True)
+        self._launch_obs(advance_prev=0, full_pass=0, in_graph=True)
+
     # --------------------------------------------------------- fused fast path
 
     def fused_spec(self, n_envs: int) -> tuple[Buf, ...]:
@@ -400,7 +511,7 @@ class NavigationScenario(FusedScenario):
         if pass_.full_pass:
             self._launch_reward()
 
-    def _launch_obs(self, advance_prev: int, full_pass: int) -> None:
+    def _launch_obs(self, advance_prev: int, full_pass: int, *, in_graph: bool = False) -> None:
         w = self.world
         n_envs = w.n_envs
         resetmask = self._wp["resetmask"]
@@ -435,8 +546,11 @@ class NavigationScenario(FusedScenario):
         # launch only ever runs once (at capture time, inside wp.ScopedCapture), so
         # caching it costs nothing and the *reused* handle across capture epochs is
         # exactly what the recapture token (bumped by sync_fused_handles on a pointer
-        # move) already guards against going stale.
-        launch = self._obs_launch.get(
+        # move) already guards against going stale. ``in_graph`` (the tail
+        # ``reset_in_graph`` runs) gets its own cache — see the note by
+        # ``self._seed_launch_g`` in ``__init__``.
+        obs_cache = self._obs_launch_g if in_graph else self._obs_launch
+        launch = obs_cache.get(
             concrete(nav_obs_kernel, self.world.wp_dtype),
             dim=(n_envs, self.n_agents),
             inputs=[
