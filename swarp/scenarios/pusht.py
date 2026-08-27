@@ -42,11 +42,14 @@ import warp as wp
 from swarp._overloads import concrete
 from swarp.core.bodies import body_state_gather_kernel
 from swarp.core.config import ObstacleKind, Obstacles, ObstacleShape, WorldConfig
+from swarp.core.state import VEC2
 from swarp.core.world import World
 from swarp.dynamics.base import AgentConfig, ControlMode, DynamicsModel
+from swarp.interop.autograd import torch_stream_scope
 from swarp.scenarios.fused import Buf, FusedPass, FusedScenario
 from swarp.scenarios.pusht_kernels import (
     pusht_obs_kernel,
+    pusht_reset_kernel,
     pusht_reward_kernel,
 )
 
@@ -287,61 +290,52 @@ class PushTScenario(FusedScenario):
     def reset_world(
         self, env_mask: torch.Tensor | None = None, *, obs_only: bool = False
     ) -> None:
+        """Masked reset in one Warp launch (see :mod:`swarp.scenarios.reset_kernels`).
+
+        The body buffers are written **in place** by the kernel, so the fused path's
+        cached Warp handles and the whole-step graph stay valid across resets; the grad
+        path's ``_refresh`` still reassigns them (fresh tensors for the tape), which the
+        framework's handle resync catches on the next no-grad step.
+        """
         w = self.world
-        n = w.n_envs
         lim = self.world_size - 2.0 * self.agent_radius
         tlim = self.world_size - self.tee_radius
-        spawn = w.sample_uniform((n, self.n_agents, 2), -lim, lim)
-        tee = w.sample_uniform((n, 2), -tlim, tlim)
-        # Push any agent that landed inside the T's bounding disk out to its rim. With a
-        # stiff contact_k a spawn overlap is a violent ejection (k * depth * sub_dt is
-        # metres per second), so the reset must not start interpenetrating.
+        # Any agent inside the T's bounding disk is pushed out to its rim by the kernel:
+        # with a stiff contact_k a spawn overlap is a violent ejection.
         clear = self.tee_radius + 2.0 * self.agent_radius
-        d = spawn - tee.unsqueeze(1)  # [n, A, 2]
-        dn = d.norm(dim=-1, keepdim=True)
-        # Straight up (arbitrary but deterministic) for an agent exactly on the centre.
-        unit = torch.where(dn > 1.0e-9, d / dn.clamp(min=1.0e-9), torch.tensor(
-            [0.0, 1.0], device=w.device, dtype=w.dtype).expand_as(d))
-        spawn = torch.where(dn < clear, tee.unsqueeze(1) + unit * clear, spawn).clamp(-lim, lim)
-        theta = w.sample_uniform((n,), -math.pi, math.pi)
-        if self.goal_spawn_radius is None:
-            goal = w.sample_uniform((n, 2), -tlim, tlim)
-        else:
-            # Uniform in a disk of goal_spawn_radius around the T spawn (curriculum).
-            gdir = w.sample_uniform((n,), -math.pi, math.pi)
-            grad = self.goal_spawn_radius * w.sample_uniform((n,), 0.0, 1.0).sqrt()
-            goal = (
-                tee + torch.stack([grad * gdir.cos(), grad * gdir.sin()], dim=-1)
-            ).clamp(-tlim, tlim)
-        if self.goal_spawn_angle is None:
-            goal_th = w.sample_uniform((n,), -math.pi, math.pi)
-        else:
-            goal_th = theta + w.sample_uniform(
-                (n,), -self.goal_spawn_angle, self.goal_spawn_angle
+        mask, use_mask = self.reset_mask_wp(env_mask)
+        st = w.state_wp()
+        scalar = w.wp_dtype
+        vec2 = VEC2[scalar]
+        with torch_stream_scope(w.device):
+            wp.launch(
+                concrete(pusht_reset_kernel, scalar),
+                dim=w.n_envs,
+                inputs=[
+                    mask,
+                    use_mask,
+                    wp.int32(w.next_kernel_seed()),
+                    scalar(lim),
+                    scalar(tlim),
+                    scalar(clear),
+                    scalar(0.0 if self.goal_spawn_radius is None else self.goal_spawn_radius),
+                    scalar(0.0 if self.goal_spawn_angle is None else self.goal_spawn_angle),
+                    wp.int32(0 if self.goal_spawn_radius is None else 1),
+                    wp.int32(0 if self.goal_spawn_angle is None else 1),
+                    wp.int32(self.n_agents),
+                    st.pos,
+                    st.vel,
+                    wp.from_torch(self.tee_pos.contiguous(), dtype=vec2),
+                    wp.from_torch(self.tee_vel.contiguous(), dtype=vec2),
+                    wp.from_torch(self.tee_theta.contiguous()),
+                    wp.from_torch(self.tee_ang_vel.contiguous()),
+                    wp.from_torch(self.goal_pos.contiguous(), dtype=vec2),
+                    wp.from_torch(self.goal_theta.contiguous()),
+                ],
+                device=w.device,
+                record_tape=False,
             )
-        zeros_2 = torch.zeros_like(self.tee_pos)
-        zeros_1 = torch.zeros_like(self.tee_theta)
-
-        # In-place body updates (copy_) so the fused path's cached wp handles and the
-        # whole-step graph stay valid across resets; the grad path's _refresh still
-        # reassigns them (fresh tensors for the tape), which the framework's handle
-        # resync catches on the next no-grad step.
-        w.write_state(env_mask, pos=spawn, vel=0.0)
-        if env_mask is None:
-            self.tee_pos.copy_(tee)
-            self.tee_vel.zero_()
-            self.tee_theta.copy_(theta)
-            self.tee_ang_vel.zero_()
-            self.goal_pos.copy_(goal)
-            self.goal_theta.copy_(goal_th)
-        else:
-            m2 = env_mask.view(-1, 1)
-            self.tee_pos.copy_(torch.where(m2, tee, self.tee_pos))
-            self.tee_vel.copy_(torch.where(m2, zeros_2, self.tee_vel))
-            self.tee_theta.copy_(torch.where(env_mask, theta, self.tee_theta))
-            self.tee_ang_vel.copy_(torch.where(env_mask, zeros_1, self.tee_ang_vel))
-            self.goal_pos.copy_(torch.where(m2, goal, self.goal_pos))
-            self.goal_theta.copy_(torch.where(env_mask, goal_th, self.goal_theta))
+        w.mark_pos_dirty()
 
         self._install_obstacles()
         self.finish_reset(env_mask, obs_only=obs_only)

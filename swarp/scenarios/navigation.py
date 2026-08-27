@@ -128,13 +128,11 @@ class NavigationScenario(FusedScenario):
         # with alloc="if_none". Reassigned by the torch path when eager_trims is off,
         # which is what watch=True catches.
         self._prev_dist: torch.Tensor | None = None
-        # Lazily sized by _launch_reset: the Fisher-Yates scratch and the uint8 reset
-        # mask, plus their Warp views (built once — the tensors are never reallocated
-        # for a given batch, so the handles stay pointer-stable).
+        # Lazily sized by _launch_reset: the Fisher-Yates scratch and its Warp view
+        # (built once — never reallocated for a given batch, so the handle stays
+        # pointer-stable). The reset mask itself comes from FusedScenario.
         self._reset_perm: torch.Tensor | None = None
         self._reset_perm_wp = None
-        self._reset_mask: torch.Tensor | None = None
-        self._reset_mask_wp = None
         # Goals are engine-independent per-agent targets, written in place on every
         # reset; allocated here (not in reset_world) so the fused spec can adopt them.
         self.world.goals = torch.zeros(n_envs, self.n_agents, 2, device=device, dtype=dtype)
@@ -254,11 +252,7 @@ class NavigationScenario(FusedScenario):
                 (w.n_envs, n_cells), dtype=torch.int32, device=w.device
             )
             self._reset_perm_wp = wp.from_torch(self._reset_perm)
-        if self._reset_mask is None or self._reset_mask.shape != (w.n_envs,):
-            self._reset_mask = torch.zeros(w.n_envs, dtype=torch.uint8, device=w.device)
-            self._reset_mask_wp = wp.from_torch(self._reset_mask)
-        if env_mask is not None:
-            self._reset_mask.copy_(env_mask)  # bool -> uint8
+        mask, use_mask = self.reset_mask_wp(env_mask)
 
         st = w.state_wp()
         goals = wp.from_torch(w.goals.contiguous(), dtype=VEC2[w.wp_dtype])
@@ -268,8 +262,8 @@ class NavigationScenario(FusedScenario):
                 concrete(nav_reset_kernel, scalar),
                 dim=w.n_envs,
                 inputs=[
-                    self._reset_mask_wp,
-                    wp.int32(0 if env_mask is None else 1),
+                    mask,
+                    use_mask,
                     wp.int32(w.next_kernel_seed()),
                     scalar(lim),
                     scalar(cell),

@@ -17,11 +17,14 @@ import warp as wp
 
 from swarp._overloads import concrete
 from swarp.core.config import WorldConfig
+from swarp.core.state import VEC2
 from swarp.core.world import World
 from swarp.dynamics.base import AgentConfig, ControlMode, DynamicsModel
+from swarp.interop.autograd import torch_stream_scope
 from swarp.scenarios.fused import Buf, FusedPass, FusedScenario
 from swarp.scenarios.sampling_kernels import (
     sampling_obs_reward_kernel,
+    sampling_reset_kernel,
     sampling_scatter_kernel,
 )
 
@@ -113,21 +116,36 @@ class SamplingScenario(FusedScenario):
     def reset_world(
         self, env_mask: torch.Tensor | None = None, *, obs_only: bool = False
     ) -> None:
+        """Masked reset in one Warp launch (see :mod:`swarp.scenarios.reset_kernels`)."""
         w = self.world
-        n = w.n_envs
         lim = self.world_size - 2.0 * self.agent_radius
-        spawn = w.sample_uniform((n, self.n_agents, 2), -lim, lim)
-        centers = w.sample_uniform((n, self.n_gaussians, 2), -lim, lim)
-
-        w.write_state(env_mask, pos=spawn, vel=0.0)
-        if env_mask is None:
-            self.centers.copy_(centers)
-            self.consumed.zero_()
-        else:
-            self.centers.copy_(torch.where(env_mask.view(-1, 1, 1), centers, self.centers))
-            self.consumed.copy_(
-                torch.where(env_mask.view(-1, 1), torch.zeros_like(self.consumed), self.consumed)
+        mask, use_mask = self.reset_mask_wp(env_mask)
+        st = w.state_wp()
+        scalar = w.wp_dtype
+        aux = wp.from_torch(self.centers.contiguous(), dtype=VEC2[scalar])
+        flags = wp.from_torch(self.consumed.view(torch.uint8))
+        with torch_stream_scope(w.device):
+            wp.launch(
+                concrete(sampling_reset_kernel, scalar),
+                dim=w.n_envs,
+                inputs=[
+                    mask,
+                    use_mask,
+                    wp.int32(w.next_kernel_seed()),
+                    scalar(lim),
+                    scalar(lim),
+                    wp.int32(self.n_agents),
+                    wp.int32(self.n_gaussians),
+                    wp.int32(self.consumed.shape[1]),
+                    st.pos,
+                    st.vel,
+                    aux,
+                    flags,
+                ],
+                device=w.device,
+                record_tape=False,
             )
+        w.mark_pos_dirty()
         self.finish_reset(env_mask, obs_only=obs_only)
 
     # ---------------------------------------- torch reference path (parity oracle)

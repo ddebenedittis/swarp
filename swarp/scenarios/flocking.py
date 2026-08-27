@@ -17,7 +17,11 @@ from swarp._overloads import concrete
 from swarp.core.config import WorldConfig
 from swarp.core.world import World
 from swarp.dynamics.base import AgentConfig, ControlMode, DynamicsModel
-from swarp.scenarios.flocking_kernels import flocking_obs_reward_kernel
+from swarp.interop.autograd import torch_stream_scope
+from swarp.scenarios.flocking_kernels import (
+    flocking_obs_reward_kernel,
+    flocking_reset_kernel,
+)
 from swarp.scenarios.fused import Buf, FusedPass, FusedScenario
 
 
@@ -86,12 +90,31 @@ class FlockingScenario(FusedScenario):
     def reset_world(
         self, env_mask: torch.Tensor | None = None, *, obs_only: bool = False
     ) -> None:
+        """Masked reset in one Warp launch (see :mod:`swarp.scenarios.reset_kernels`)."""
         w = self.world
-        n = w.n_envs
         lim = self.world_size - 2.0 * self.agent_radius
-        spawn = w.sample_uniform((n, self.n_agents, 2), -lim, lim)
-        vel = w.sample_uniform((n, self.n_agents, 2), -0.3 * self.max_speed, 0.3 * self.max_speed)
-        w.write_state(env_mask, pos=spawn, vel=vel)
+        vel_lim = 0.3 * self.max_speed
+        mask, use_mask = self.reset_mask_wp(env_mask)
+        st = w.state_wp()
+        scalar = w.wp_dtype
+        with torch_stream_scope(w.device):
+            wp.launch(
+                concrete(flocking_reset_kernel, scalar),
+                dim=w.n_envs,
+                inputs=[
+                    mask,
+                    use_mask,
+                    wp.int32(w.next_kernel_seed()),
+                    scalar(lim),
+                    scalar(vel_lim),
+                    wp.int32(self.n_agents),
+                    st.pos,
+                    st.vel,
+                ],
+                device=w.device,
+                record_tape=False,
+            )
+        w.mark_pos_dirty()
         self.finish_reset(env_mask, obs_only=obs_only)
 
     # ---------------------------------------- torch reference path (parity oracle)

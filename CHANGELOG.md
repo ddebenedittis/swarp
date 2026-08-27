@@ -16,6 +16,27 @@ All notable changes to `swarp`. Newest first. Nothing has been released yet — 
   `use_graph=False`): ~1.7-1.8x, e.g. 16000x16 from 5.1M to 8.9M env-steps/s. Outputs are
   bit-identical — only which kernel object reaches `wp.launch` changes.
 
+- **Every scenario's masked reset is now a single Warp launch.** Under `auto_reset` the
+  reset runs on every step for the whole batch, and it was 83-96% of the step time for all
+  seven scenarios. Each now does its whole draw in one masked kernel, one thread per env
+  (`swarp/scenarios/reset_kernels.py` holds the shared piece and documents the RNG trap
+  that shape depends on). At 8192 envs x 8 agents, graph on, `auto_reset=True`:
+
+      scenario     before      after
+      flocking    1.190 ms   0.849 ms   1.40x
+      formation   1.321 ms   0.831 ms   1.59x
+      discovery   1.404 ms   1.017 ms   1.38x
+      sampling    1.427 ms   1.079 ms   1.32x
+      transport   2.437 ms   1.512 ms   1.61x
+      pusht       6.053 ms   4.482 ms   1.35x
+
+  Pusht gains least because its reset is no longer dominated by the draw: 61% of what
+  remains is `_install_obstacles` re-installing the retained obstacle spec (16 `write`
+  calls, each a fresh `wp.from_torch` plus a `wp.copy`), which is untouched here.
+
+  `FusedScenario.reset_mask_wp` owns the uint8 mask buffer and its pointer-stable Warp
+  handle, so that plumbing exists once rather than seven times.
+
 - **Navigation's masked reset is one Warp launch instead of ~25 torch ops.** Under
   `auto_reset` the reset runs on every step for the whole batch (there is no host-side "is
   anything done?" gate, by design), and it was **86%** of the step time at 16,384x16 —
@@ -38,9 +59,9 @@ All notable changes to `swarp`. Newest first. Nothing has been released yet — 
 
 ### Changed
 
-- **Seeded trajectories differ from previous versions.** The navigation reset no longer
-  draws from `world.generator`, so every downstream torch draw sits at a different point
-  in that stream. Reproducibility is unchanged going forward — same `seed` in, same
+- **Seeded trajectories differ from previous versions.** No scenario's reset draws from
+  `world.generator` any more, so every downstream torch draw sits at a different point in
+  that stream. Reproducibility is unchanged going forward — same `seed` in, same
   trajectory out — and `World.next_kernel_seed` gives the kernel RNG its own deterministic
   host-side stream, reset alongside the generator, with no device->host round-trip.
 

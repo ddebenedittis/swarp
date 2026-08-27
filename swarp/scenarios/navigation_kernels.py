@@ -30,6 +30,7 @@ import warp as wp
 from swarp._overloads import register
 from swarp.core.state import VEC2
 from swarp.dynamics.base import P_RADIUS
+from swarp.scenarios.reset_kernels import _as
 
 
 @wp.func
@@ -264,16 +265,6 @@ def _obs_signature(dtype) -> list:
         u8_2,  # overflow
         a2s,  # prev_dist
     ]
-
-
-@wp.func
-def _as(x: wp.float32, ref: wp.float32) -> wp.float32:
-    return x
-
-
-@wp.func
-def _as(x: wp.float32, ref: wp.float64) -> wp.float64:
-    return wp.float64(x)
 
 
 @wp.kernel

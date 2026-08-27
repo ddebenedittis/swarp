@@ -102,10 +102,21 @@ def test_transport_shaping_reward_positive_when_closer(device):
 
 
 def test_transport_differentiable_rollout():
-    """BPTT: the package-to-goal loss backprops to the action sequence."""
+    """BPTT: the package-to-goal loss backprops to the action sequence.
+
+    The agents are placed **on** the package rather than left where the reset drew them:
+    the loss only depends on the actions through an agent-package contact, so with the
+    zero action below a purely random spawn makes this a test of whether the seed happened
+    to overlap someone with the package. It used to pass for exactly that reason, and any
+    change to the reset's RNG stream silently turned it into a no-op assertion.
+    """
     scenario = TransportScenario(n_agents=3, n_packages=1)
     env = Environment(scenario, n_envs=2, device="cpu", dt=0.05, seed=0, fused=False)
     env.reset()
+    touching = scenario.pkg_pos[:, 0].unsqueeze(1) + torch.tensor(
+        [[scenario.agent_radius + scenario.package_radius, 0.0]]
+    )
+    env.world.write_state(None, pos=touching.expand(-1, scenario.n_agents, -1).clone())
     actions = torch.zeros(2, 3, env.world.act_dim, requires_grad=True)
     loss = torch.zeros((), dtype=torch.float32)
     for _ in range(4):

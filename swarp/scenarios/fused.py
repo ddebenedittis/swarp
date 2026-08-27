@@ -394,6 +394,30 @@ class FusedScenario(Scenario):
         else:
             self.post_step_torch()
 
+    def reset_mask_wp(self, env_mask: torch.Tensor | None):
+        """``(mask, use_mask)`` for a masked reset kernel: a uint8 ``[n_envs]`` Warp view
+        and the flag saying whether the kernel should consult it.
+
+        Every scenario's reset kernel takes the mask this way, so the buffer and its Warp
+        handle are allocated once here rather than seven times. The tensor is never
+        reallocated for a given batch size, so the handle stays pointer-stable — which is
+        what lets a captured graph and the fused handle cache keep working across resets.
+
+        ``env_mask=None`` (reset everything) leaves the buffer alone and returns
+        ``use_mask=0``: the kernel then skips the lookup instead of reading a buffer we
+        would otherwise have to fill with ones.
+        """
+        n_envs = self.world.n_envs
+        mask = getattr(self, "_reset_mask_t", None)
+        if mask is None or mask.shape != (n_envs,):
+            mask = torch.zeros(n_envs, dtype=torch.uint8, device=self.world.device)
+            self._reset_mask_t = mask
+            self._reset_mask_handle = wp.from_torch(mask)
+        if env_mask is None:
+            return self._reset_mask_handle, wp.int32(0)
+        mask.copy_(env_mask)  # bool -> uint8
+        return self._reset_mask_handle, wp.int32(1)
+
     def finish_reset(self, env_mask: torch.Tensor | None, *, obs_only: bool) -> None:
         """Close out ``reset_world``: the fused reset pass, or the torch refresh.
 

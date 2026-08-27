@@ -202,3 +202,192 @@ def test_float64_world_resets_in_float64(device):
         assert _min_pairwise(env.world.state.pos) >= scen.min_spawn_separation - 1e-6
     finally:
         env.close()
+
+# --------------------------------------------------------------- every scenario
+
+# What each scenario's reset must freshly draw, beyond the agent spawns: the attribute
+# holding per-env state, and whether it is a flag buffer that must come back cleared.
+RESET_STATE = {
+    "navigation": [("world.goals", "draw")],
+    "flocking": [],
+    "formation": [("world.goals", "draw")],
+    # "reclaim": episode progress that accumulates and must not survive a reset. It is
+    # not asserted zero straight after one, because the obs pass that closes a reset
+    # immediately re-marks whatever already sits within range of a fresh spawn.
+    "discovery": [("targets", "draw"), ("covered", "reclaim")],
+    "sampling": [("centers", "draw"), ("consumed", "reclaim")],
+    "transport": [
+        ("pkg_pos", "draw"),
+        ("goal", "draw"),
+        ("pkg_vel", "clear"),
+        ("pkg_theta", "clear"),
+        ("pkg_ang_vel", "clear"),
+    ],
+    "pusht": [
+        ("tee_pos", "draw"),
+        ("goal_pos", "draw"),
+        ("tee_vel", "clear"),
+        ("tee_ang_vel", "clear"),
+    ],
+}
+
+
+def _resolve(env, path):
+    obj = env.scenario
+    for part in path.split("."):
+        obj = getattr(obj, part)
+    return obj
+
+
+def _scenario_env(name, *, n_envs=256, n_agents=6, device="cpu", seed=0):
+    from swarp.scenarios import SCENARIOS
+
+    scen = SCENARIOS[name](n_agents=n_agents)
+    return Environment(scen, n_envs=n_envs, device=device, seed=seed, max_steps=200)
+
+
+@pytest.mark.parametrize("name", sorted(RESET_STATE))
+def test_reset_draws_fresh_state(name):
+    """A reset redraws the episode's per-env state and clears its flags."""
+    env = _scenario_env(name)
+    try:
+        env.reset(seed=0)
+        before = {p: _resolve(env, p).clone() for p, _ in RESET_STATE[name]}
+        env.reset()
+        for path, kind in RESET_STATE[name]:
+            now = _resolve(env, path)
+            if kind == "clear":
+                assert not now.any(), f"{name}.{path} not cleared by reset"
+            elif kind == "draw":
+                assert not torch.equal(before[path], now), f"{name}.{path} not redrawn"
+    finally:
+        env.close()
+
+
+@pytest.mark.parametrize("name", sorted(RESET_STATE))
+def test_reset_reclaims_accumulated_progress(name):
+    """Episode progress must not carry into the next episode.
+
+    Asserted against an episode that actually accumulated some, rather than against zero
+    right after a reset: the fused obs pass that closes a reset re-marks whatever is
+    already within range of the new spawn, so a couple of flags are legitimately set
+    before the first step.
+    """
+    fields = [p for p, k in RESET_STATE[name] if k == "reclaim"]
+    if not fields:
+        pytest.skip(f"{name} has no accumulating episode state")
+    env = _scenario_env(name, n_envs=64)
+    try:
+        env.reset(seed=0)
+        actions = torch.zeros(64, env.n_agents, env.world.act_dim, device=env.device)
+        gen = torch.Generator(device=env.device).manual_seed(0)
+        with torch.no_grad():
+            for _ in range(40):
+                actions.uniform_(-1.0, 1.0, generator=gen)
+                env.step(actions)
+        earned = {p: _resolve(env, p).sum().item() for p in fields}
+        assert any(v > 0 for v in earned.values()), "nothing accumulated — test is vacuous"
+        env.reset()
+        for path in fields:
+            after = _resolve(env, path).sum().item()
+            assert after < earned[path], f"{name}.{path} survived the reset"
+    finally:
+        env.close()
+
+
+@pytest.mark.parametrize("name", sorted(RESET_STATE))
+def test_masked_reset_touches_only_selected_envs(name):
+    """The mask is applied in the kernel: unselected envs keep every field they had."""
+    env = _scenario_env(name, n_envs=64)
+    try:
+        env.reset(seed=0)
+        paths = ["world.state.pos"] + [p for p, _ in RESET_STATE[name]]
+        before = {p: _resolve(env, p).clone() for p in paths}
+        mask = torch.zeros(64, dtype=torch.bool, device=env.device)
+        mask[::2] = True
+        env.reset_at(mask)
+        for path in paths:
+            now = _resolve(env, path)
+            assert torch.equal(now[~mask], before[path][~mask]), (
+                f"{name}.{path} changed in an env the mask excluded"
+            )
+    finally:
+        env.close()
+
+
+@pytest.mark.parametrize("name", sorted(RESET_STATE))
+def test_reset_spawns_inside_the_world(name):
+    env = _scenario_env(name)
+    try:
+        env.reset(seed=0)
+        scen = env.scenario
+        lim = scen.world_size - 2.0 * scen.agent_radius
+        assert env.world.state.pos.abs().max().item() <= lim + 1e-5
+        assert torch.isfinite(env.world.state.pos).all()
+    finally:
+        env.close()
+
+
+@pytest.mark.parametrize("name", sorted(RESET_STATE))
+def test_reset_spawns_are_spread_not_collapsed(name):
+    """Guards the ``@wp.func`` RNG trap: a helper that takes the state by value returns
+    the *same* draw every call, which puts every agent of an env on one point while still
+    landing inside the world (see :mod:`swarp.scenarios.reset_kernels`)."""
+    env = _scenario_env(name, n_envs=128, n_agents=6)
+    try:
+        env.reset(seed=0)
+        pos = env.world.state.pos
+        assert pos.std().item() > 0.05, f"{name} spawns are degenerate"
+        spread = (pos - pos.mean(dim=1, keepdim=True)).norm(dim=-1).max().item()
+        assert spread > 1e-3, f"{name} collapsed every agent in an env onto one point"
+    finally:
+        env.close()
+
+
+@pytest.mark.parametrize("name", sorted(RESET_STATE))
+def test_reset_same_seed_reproduces(name):
+    def draw(seed):
+        env = _scenario_env(name, seed=seed)
+        try:
+            env.reset(seed=seed)
+            return env.world.state.pos.clone()
+        finally:
+            env.close()
+
+    assert torch.equal(draw(3), draw(3))
+    assert not torch.equal(draw(3), draw(4))
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("name", sorted(RESET_STATE))
+def test_reset_is_host_sync_free_for_every_scenario(device, name):
+    env = _scenario_env(name, n_envs=64, device=device)
+    try:
+        env.reset(seed=0)  # warm up (buffers, kernel load)
+        mask = torch.zeros(64, dtype=torch.bool, device=device)
+        mask[::2] = True
+        with torch.no_grad(), forbid_host_transfers():
+            env.scenario.reset_world(mask)
+    finally:
+        env.close()
+
+
+def test_pusht_reset_clears_the_tee():
+    """No agent may start inside the T's bounding disk: with a stiff contact_k a spawn
+    overlap is a violent ejection, so the kernel pushes them out to the rim."""
+    env = _scenario_env("pusht", n_envs=512, n_agents=4)
+    try:
+        env.reset(seed=0)
+        scen = env.scenario
+        d = (env.world.state.pos - scen.tee_pos.unsqueeze(1)).norm(dim=-1)
+        clear = scen.tee_radius + 2.0 * scen.agent_radius
+        lim = scen.world_size - 2.0 * scen.agent_radius
+        inside = d < clear - 1e-4
+        # The push-out is followed by a clamp back into the square (as in the torch reset
+        # this replaces), so the rim is missed only for a T sitting near the wall — and
+        # then the agent must be *at* that wall. Anything else is a push-out that failed.
+        at_wall = (env.world.state.pos.abs() >= lim - 1e-4).any(dim=-1)
+        assert bool((~inside | at_wall).all()), "an agent spawned inside the T, off-wall"
+        assert inside.float().mean().item() < 0.05, "the clamp should be the rare case"
+    finally:
+        env.close()

@@ -25,6 +25,7 @@ import warp as wp
 
 from swarp._overloads import register
 from swarp.core.state import VEC2
+from swarp.scenarios.reset_kernels import _as
 
 
 @wp.kernel
@@ -174,6 +175,60 @@ def _reward_signature(dtype) -> list:
     ]
 
 
+
+@wp.kernel
+def formation_reset_kernel(
+    reset_mask: wp.array(dtype=wp.uint8),
+    use_mask: wp.int32,
+    seed: wp.int32,
+    lim: Any,
+    clim: Any,
+    n_agents: wp.int32,
+    slot_offsets: Any,
+    pos: Any,
+    vel: Any,
+    goals: Any,
+):
+    """Masked episode reset: uniform spawns, zero velocity, formation slots.
+
+    The formation centre is drawn **once per env** and every slot is that centre plus its
+    fixed offset — which is why this is a thread per env rather than per agent.
+    """
+    e = wp.tid()
+    if use_mask == 1 and reset_mask[e] == wp.uint8(0):
+        return
+    rng = wp.rand_init(seed, e)
+    zero = _as(0.0, lim)
+    two = _as(2.0, lim)
+    one = _as(1.0, lim)
+
+    cx = (_as(wp.randf(rng), clim) * two - one) * clim
+    cy = (_as(wp.randf(rng), clim) * two - one) * clim
+    for a in range(n_agents):
+        px = (_as(wp.randf(rng), lim) * two - one) * lim
+        py = (_as(wp.randf(rng), lim) * two - one) * lim
+        pos[e, a] = wp.vector(px, py)
+        vel[e, a] = wp.vector(zero, zero)
+        off = slot_offsets[a]
+        goals[e, a] = wp.vector(cx + off[0], cy + off[1])
+
+
+def _reset_signature(dtype) -> list:
+    a2v = wp.array2d(dtype=VEC2[dtype])
+    return [
+        wp.array(dtype=wp.uint8),  # reset_mask
+        wp.int32,  # use_mask
+        wp.int32,  # seed
+        dtype,  # lim
+        dtype,  # clim
+        wp.int32,  # n_agents
+        wp.array(dtype=VEC2[dtype]),  # slot_offsets
+        a2v,  # pos
+        a2v,  # vel
+        a2v,  # goals
+    ]
+
 for _T in (wp.float32, wp.float64):
     register(formation_obs_kernel, _T, _obs_signature(_T))
     register(formation_reward_kernel, _T, _reward_signature(_T))
+    register(formation_reset_kernel, _T, _reset_signature(_T))

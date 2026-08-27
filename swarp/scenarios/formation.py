@@ -27,9 +27,15 @@ import warp as wp
 
 from swarp._overloads import concrete
 from swarp.core.config import WorldConfig
+from swarp.core.state import VEC2
 from swarp.core.world import World
 from swarp.dynamics.base import AgentConfig, ControlMode, DynamicsModel
-from swarp.scenarios.formation_kernels import formation_obs_kernel, formation_reward_kernel
+from swarp.interop.autograd import torch_stream_scope
+from swarp.scenarios.formation_kernels import (
+    formation_obs_kernel,
+    formation_reset_kernel,
+    formation_reward_kernel,
+)
 from swarp.scenarios.fused import Buf, FusedPass, FusedScenario
 
 
@@ -85,6 +91,8 @@ class FormationScenario(FusedScenario):
         self._slot_offsets = self.formation_radius * torch.stack(
             [torch.cos(ang), torch.sin(ang)], dim=-1
         )  # [n_agents, 2]
+        # Warp view of the fixed slot offsets, built once for the reset kernel.
+        self._slot_offsets_wp = None
         # Left None so the first refresh seeds the shaping baseline from the spawn
         # distance (shaping 0) rather than from zeros; the fused spec adopts it with
         # alloc="if_none". The torch path reassigns it, which watch=True catches.
@@ -101,19 +109,39 @@ class FormationScenario(FusedScenario):
     def reset_world(
         self, env_mask: torch.Tensor | None = None, *, obs_only: bool = False
     ) -> None:
+        """Masked reset in one Warp launch (see :mod:`swarp.scenarios.reset_kernels`)."""
         w = self.world
-        n = w.n_envs
         lim = self.world_size - 2.0 * self.agent_radius
-        spawn = w.sample_uniform((n, self.n_agents, 2), -lim, lim)
         # Formation centre kept within bounds so all slots stay inside the world.
         clim = max(0.0, self.world_size - self.formation_radius - self.agent_radius)
-        center = w.sample_uniform((n, 1, 2), -clim, clim)
-        goals = center + self._slot_offsets.unsqueeze(0)  # [n_envs, n_agents, 2]
-        w.write_state(env_mask, pos=spawn, vel=0.0)
-        if env_mask is None:
-            w.goals.copy_(goals)
-        else:
-            w.goals.copy_(torch.where(env_mask.view(-1, 1, 1), goals, w.goals))
+        mask, use_mask = self.reset_mask_wp(env_mask)
+        if self._slot_offsets_wp is None:
+            self._slot_offsets_wp = wp.from_torch(
+                self._slot_offsets.contiguous(), dtype=VEC2[w.wp_dtype]
+            )
+        st = w.state_wp()
+        scalar = w.wp_dtype
+        goals = wp.from_torch(w.goals.contiguous(), dtype=VEC2[scalar])
+        with torch_stream_scope(w.device):
+            wp.launch(
+                concrete(formation_reset_kernel, scalar),
+                dim=w.n_envs,
+                inputs=[
+                    mask,
+                    use_mask,
+                    wp.int32(w.next_kernel_seed()),
+                    scalar(lim),
+                    scalar(clim),
+                    wp.int32(self.n_agents),
+                    self._slot_offsets_wp,
+                    st.pos,
+                    st.vel,
+                    goals,
+                ],
+                device=w.device,
+                record_tape=False,
+            )
+        w.mark_pos_dirty()
         self.finish_reset(env_mask, obs_only=obs_only)
 
     # ---------------------------------------- torch reference path (parity oracle)

@@ -35,12 +35,15 @@ import warp as wp
 
 from swarp._overloads import concrete
 from swarp.core.config import Obstacles, WorldConfig
+from swarp.core.state import VEC2
 from swarp.core.world import World
 from swarp.dynamics.base import AgentConfig, ControlMode, DynamicsModel
+from swarp.interop.autograd import torch_stream_scope
 from swarp.scenarios.fused import Buf, FusedPass, FusedScenario
 from swarp.scenarios.transport_kernels import (
     transport_body_kernel,
     transport_obs_kernel,
+    transport_reset_kernel,
     transport_reward_kernel,
 )
 
@@ -143,35 +146,44 @@ class TransportScenario(FusedScenario):
     def reset_world(
         self, env_mask: torch.Tensor | None = None, *, obs_only: bool = False
     ) -> None:
+        """Masked reset in one Warp launch (see :mod:`swarp.scenarios.reset_kernels`).
+
+        The package buffers are written **in place** by the kernel, so the fused path's
+        cached Warp handles and the whole-step graph stay valid across resets; the grad
+        path's ``_refresh`` still reassigns them (fresh tensors for the tape), which the
+        framework's handle resync catches on the next no-grad step.
+        """
         w = self.world
-        n = w.n_envs
         lim = self.world_size - 2.0 * self.agent_radius
         plim = self.world_size - self.package_radius
-        spawn = w.sample_uniform((n, self.n_agents, 2), -lim, lim)
-        pkg = w.sample_uniform((n, self.n_packages, 2), -plim, plim)
-        goal = w.sample_uniform((n, self.n_packages, 2), -plim, plim)
-
-        # In-place package updates (copy_) so the fused path's cached wp handles
-        # and the whole-step graph stay valid across resets; the grad path's
-        # _refresh still reassigns them (fresh tensors for the tape), which the
-        # framework's handle resync catches on the next no-grad step.
-        w.write_state(env_mask, pos=spawn, vel=0.0)
-        if env_mask is None:
-            self.pkg_pos.copy_(pkg)
-            self.pkg_vel.zero_()
-            self.pkg_theta.zero_()
-            self.pkg_ang_vel.zero_()
-            self.goal.copy_(goal)
-        else:
-            m3 = env_mask.view(-1, 1, 1)
-            m2 = env_mask.view(-1, 1)
-            zeros_p2 = torch.zeros_like(self.pkg_vel)
-            zeros_p = torch.zeros_like(self.pkg_theta)
-            self.pkg_pos.copy_(torch.where(m3, pkg, self.pkg_pos))
-            self.pkg_vel.copy_(torch.where(m3, zeros_p2, self.pkg_vel))
-            self.pkg_theta.copy_(torch.where(m2, zeros_p, self.pkg_theta))
-            self.pkg_ang_vel.copy_(torch.where(m2, zeros_p, self.pkg_ang_vel))
-            self.goal.copy_(torch.where(m3, goal, self.goal))
+        mask, use_mask = self.reset_mask_wp(env_mask)
+        st = w.state_wp()
+        scalar = w.wp_dtype
+        vec2 = VEC2[scalar]
+        with torch_stream_scope(w.device):
+            wp.launch(
+                concrete(transport_reset_kernel, scalar),
+                dim=w.n_envs,
+                inputs=[
+                    mask,
+                    use_mask,
+                    wp.int32(w.next_kernel_seed()),
+                    scalar(lim),
+                    scalar(plim),
+                    wp.int32(self.n_agents),
+                    wp.int32(self.n_packages),
+                    st.pos,
+                    st.vel,
+                    wp.from_torch(self.pkg_pos.contiguous(), dtype=vec2),
+                    wp.from_torch(self.pkg_vel.contiguous(), dtype=vec2),
+                    wp.from_torch(self.pkg_theta.contiguous()),
+                    wp.from_torch(self.pkg_ang_vel.contiguous()),
+                    wp.from_torch(self.goal.contiguous(), dtype=vec2),
+                ],
+                device=w.device,
+                record_tape=False,
+            )
+        w.mark_pos_dirty()
 
         self._install_obstacles()
         if not self.fused_active:

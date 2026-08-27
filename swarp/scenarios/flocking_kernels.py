@@ -23,6 +23,7 @@ import warp as wp
 
 from swarp._overloads import register
 from swarp.core.state import VEC2
+from swarp.scenarios.reset_kernels import _as
 
 
 @wp.kernel
@@ -142,5 +143,53 @@ def _signature(dtype) -> list:
     ]
 
 
+
+@wp.kernel
+def flocking_reset_kernel(
+    reset_mask: wp.array(dtype=wp.uint8),
+    use_mask: wp.int32,
+    seed: wp.int32,
+    lim: Any,
+    vel_lim: Any,
+    n_agents: wp.int32,
+    pos: Any,
+    vel: Any,
+):
+    """Masked episode reset: uniform spawns and a uniform drift velocity.
+
+    Writes ``pos`` and ``vel`` only — ``theta``/``speed``/``ang_vel`` are untouched, as
+    the torch reset it replaces was (flocking's agents are holonomic, so those fields are
+    never read). One launch replaces two ``sample_uniform``s and the masked blend.
+    """
+    e = wp.tid()
+    if use_mask == 1 and reset_mask[e] == wp.uint8(0):
+        return
+    rng = wp.rand_init(seed, e)
+    two = _as(2.0, lim)
+    one = _as(1.0, lim)
+    for a in range(n_agents):
+        px = (_as(wp.randf(rng), lim) * two - one) * lim
+        py = (_as(wp.randf(rng), lim) * two - one) * lim
+        pos[e, a] = wp.vector(px, py)
+    for a in range(n_agents):
+        vx = (_as(wp.randf(rng), vel_lim) * two - one) * vel_lim
+        vy = (_as(wp.randf(rng), vel_lim) * two - one) * vel_lim
+        vel[e, a] = wp.vector(vx, vy)
+
+
+def _reset_signature(dtype) -> list:
+    a2v = wp.array2d(dtype=VEC2[dtype])
+    return [
+        wp.array(dtype=wp.uint8),  # reset_mask
+        wp.int32,  # use_mask
+        wp.int32,  # seed
+        dtype,  # lim
+        dtype,  # vel_lim
+        wp.int32,  # n_agents
+        a2v,  # pos
+        a2v,  # vel
+    ]
+
 for _T in (wp.float32, wp.float64):
     register(flocking_obs_reward_kernel, _T, _signature(_T))
+    register(flocking_reset_kernel, _T, _reset_signature(_T))
