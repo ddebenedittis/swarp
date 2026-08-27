@@ -9,7 +9,7 @@ import warp as wp
 
 from swarp.core.cached_launch import CachedLaunch, ptr_key
 from swarp.core.config import WorldConfig
-from swarp.core.episode_kernels import episode_end_kernel
+from swarp.core.episode_kernels import episode_end_kernel, step_count_kernel
 from swarp.core.hooks import WholeStepHook
 from swarp.dynamics.base import action_bounds
 from swarp.scenarios.base import Scenario
@@ -57,8 +57,10 @@ class Environment:
     increment/compare/mask-fill/``reset_world`` call this docstring describes above
     still happen, just as ``wp.launch``\\ es inside the capture instead of Python calling
     them each step. A scenario that samples with a ``torch.Generator`` during reset (or
-    allocates) is not eligible and keeps paying the old eager tail every step, same as
-    before this was added.
+    allocates) is not eligible and keeps paying the eager ``reset_world`` every step, same
+    as before this was added — but not the bookkeeping around it: the step count and
+    ``truncated`` ride inside the graph for *every* whole-step-hook configuration,
+    ``auto_reset=False`` included.
 
     Args:
         use_graph: persistent-buffer execution backed by a whole-step CUDA graph.
@@ -179,8 +181,13 @@ class Environment:
         # exactly as capture-safe, paying the old host tail for no reason.
         self._reset_in_graph = self._whole_step and auto_reset and scenario.supports_graph_reset()
         if self._whole_step:
+            # Either composition advances ``_step_count``/``_truncated_buf`` inside the
+            # hook, so ``step`` skips that host arithmetic whenever the hook ran; the
+            # reset composition additionally runs the scenario's own reset.
             if self._reset_in_graph:
                 self._hook = self._compose_graph_reset_hook(scenario, self._hook)
+            else:
+                self._hook = self._compose_step_count_hook(self._hook)
             runtime.set_post_physics(self._hook)
         else:
             self._hook = None
@@ -323,6 +330,76 @@ class Environment:
             after_warmup=_after_warmup,
         )
 
+    def _compose_step_count_hook(self, base_hook: WholeStepHook) -> WholeStepHook:
+        """Fold just the step-count bookkeeping into ``base_hook``.
+
+        The counterpart to :meth:`_compose_graph_reset_hook` for every step that has no
+        in-graph reset to run: ``auto_reset=False``, and ``auto_reset=True`` on a scenario
+        whose reset is not capture-safe. Both still owe the same two lines —
+        ``step_count += 1`` and ``truncated = step_count >= max_steps`` — and paying them
+        host-side is two torch kernel launches per step over ``[n_envs]``, which on a
+        4-agent config is about half the wall clock (the device finishes the replay long
+        before the host finishes issuing the step). Inside the capture they cost nothing.
+
+        Auto-reset that stays host-side keeps working unchanged: this kernel only advances
+        the counter, and ``step``'s ``masked_fill_`` still zeroes it for the envs that just
+        reset, after the reset itself.
+        """
+        launch = CachedLaunch()
+        handles: dict[str, wp.array] = {}
+
+        def _ensure_handles() -> None:
+            # Both buffers are allocated once in ``__init__`` and never reassigned, so a
+            # handle built here stays valid; it is built lazily anyway, to keep
+            # constructing an ``Environment`` free of Warp work the caller may never use.
+            if handles:
+                return
+            handles["step_count"] = wp.from_torch(self._step_count)
+            handles["truncated"] = wp.from_torch(
+                self._truncated_buf.view(torch.uint8), dtype=wp.uint8
+            )
+
+        def _prepare() -> None:
+            base_hook.prepare()
+            _ensure_handles()
+
+        def _run() -> None:
+            base_hook.run()
+            max_steps = wp.int32(self.max_steps if self.max_steps is not None else 0)
+            packed = launch.get(
+                step_count_kernel,
+                dim=self.n_envs,
+                inputs=[max_steps, handles["step_count"], handles["truncated"]],
+                device=self.device,
+                # ``max_steps`` is out of the key and re-set below for the same reason as
+                # in ``_compose_graph_reset_hook``: a caller may reassign
+                # ``env.max_steps``, and the response that actually works under capture is
+                # the recapture ``_token`` forces, not a repack of the cached launch.
+                key=(self.n_envs, ptr_key(handles["step_count"]), ptr_key(handles["truncated"])),
+            )
+            packed.set_param_by_name("max_steps", max_steps)
+            packed.launch()
+
+        def _token() -> object:
+            return (base_hook.token(), self.max_steps)
+
+        def _carries() -> list[torch.Tensor]:
+            # The two buffers the launch above advances in place. Without them, graph
+            # warm-up would leave the step count one ahead and ``truncated`` describing a
+            # step that never happened.
+            out = list(base_hook.carries())
+            out.append(self._step_count)
+            out.append(self._truncated_buf)
+            return out
+
+        return WholeStepHook(
+            run=_run,
+            prepare=_prepare,
+            token=_token,
+            carries=_carries,
+            after_warmup=base_hook.after_warmup,
+        )
+
     def _taped_step(self, actions: torch.Tensor | None = None) -> bool:
         """Whether the coming step will be recorded on the Warp tape.
 
@@ -458,15 +535,17 @@ class Environment:
             the fused obs/reward buffers), not a fresh allocation — the same
             ``clone_outputs`` contract as the rest of the tuple applies to it.
 
-            When ``auto_reset=True`` and the scenario supports it, this whole tail
-            (step-count increment, ``truncated``, the mask-fill, and ``reset_world``)
-            already happened *inside* ``self.world.step(actions)`` above, as part of the
-            same graph replay — see ``self._reset_in_graph`` / ``World.ran_post_physics``
-            and the class docstring's "For an eligible scenario" paragraph. The code
-            below still runs the equivalent host-side arithmetic, but only when that
-            in-graph tail did **not** run (a taped/grad step, an ineligible scenario, or
-            ``auto_reset=False``), so this docstring's description of what ``step`` does
-            is accurate either way — only *where* the work happens changes.
+            Wherever a whole-step hook is in play, the step-count increment and
+            ``truncated`` already happened *inside* ``self.world.step(actions)`` above, as
+            part of the same graph replay (``step_count_kernel``); when ``auto_reset=True``
+            and the scenario supports it, so did the mask-fill and ``reset_world``
+            (``episode_end_kernel`` plus the scenario's own reset) — see
+            ``self._reset_in_graph`` / ``World.ran_post_physics`` and the class docstring's
+            "For an eligible scenario" paragraph. The code below still runs the equivalent
+            host-side arithmetic, but only for the parts that did **not** run in the hook
+            (all of it on a taped/grad step or with no hook at all), so this docstring's
+            description of what ``step`` does is accurate either way — only *where* the
+            work happens changes.
         """
         act_dim = self.world.act_dim
         if actions.shape != (self.n_envs, self.n_agents, act_dim):
@@ -500,7 +579,11 @@ class Environment:
         # or when ``self._reset_in_graph`` is False, both of which must keep the old
         # host-side tail below.
         tail_ran = self._reset_in_graph and self.world.ran_post_physics
-        if not tail_ran:
+        # Both hook compositions advance the step count and write ``truncated``
+        # (``episode_end_kernel`` / ``step_count_kernel``), so the host arithmetic is owed
+        # only when neither ran: a taped/grad step, or no whole-step hook at all.
+        counted = self._whole_step and self.world.ran_post_physics
+        if not counted:
             self._step_count += 1
         # ``terminated`` reads the fused ``done`` buffer regardless of ``tail_ran``: the
         # in-graph tail's reset pass is obs-only (``full_pass=0``), so it never touches
@@ -508,8 +591,8 @@ class Environment:
         # has, whether or not that transition's episode also just ended and got reset.
         terminated = self.scenario.done()
         if self.max_steps is not None:
-            if tail_ran:
-                # The episode-end kernel already wrote this in place (see
+            if counted:
+                # The hook's kernel already wrote this in place (see
                 # swarp/core/episode_kernels.py); redoing the host ``torch.ge`` would
                 # just recompute the same value one host round-trip later.
                 truncated = self._truncated_buf

@@ -1,4 +1,4 @@
-"""The episode-end kernel: ``Environment.step``'s host tail, folded into a launch.
+"""The episode-end kernels: ``Environment.step``'s host tail, folded into a launch.
 
 ``Environment`` (not any scenario) owns ``max_steps``/``step_count``/``truncated`` — they
 are engine-level bookkeeping, not part of a scenario's own terminal condition — so this is
@@ -19,6 +19,16 @@ buffer :meth:`~swarp.scenarios.fused.FusedScenario.reset_mask_wp` fills from Pyt
 eager path, filled here instead so the whole tail can live inside the captured whole-step
 graph. No dtype overload needed: every argument is integer/byte, so this sits outside the
 ``_signature(dtype)`` / ``wp.overload`` machinery the physics kernels use.
+
+:func:`step_count_kernel` is the same arithmetic with the reset dropped — the first two
+lines only. It covers every *other* step: ``auto_reset=False``, and ``auto_reset=True``
+on a scenario whose reset cannot be captured. Those steps still have to advance the
+counter and decide ``truncated``, and doing it host-side costs two torch launches (a
+``+= 1`` and a ``torch.ge``) that measure ~44 us together on a 4-agent config — half the
+step, spent on two elementwise passes over ``[n_envs]``. In the graph they are free.
+It deliberately does *not* stamp the reset mask: with no reset to run there is nothing to
+stamp, and a stamped mask would force
+:meth:`~swarp.scenarios.fused.FusedScenario.prepare_fused` back into zeroing it every step.
 """
 
 from __future__ import annotations
@@ -56,4 +66,28 @@ def episode_end_kernel(
     reset_mask[e] = m
     if m != wp.uint8(0):
         sc = wp.int32(0)
+    step_count[e] = sc
+
+
+@wp.kernel
+def step_count_kernel(
+    max_steps: wp.int32,
+    step_count: wp.array(dtype=wp.int32),
+    truncated: wp.array(dtype=wp.uint8),
+):
+    """Thread per env: advance the step count and decide ``truncated``, nothing else.
+
+    ``max_steps <= 0`` means "no time limit" and writes all-False, exactly as in
+    :func:`episode_end_kernel`. The counter is *not* zeroed on truncation here: without
+    auto-reset the count keeps running past the limit (and ``truncated`` stays True) until
+    the caller resets, which is what the host ``+= 1`` / ``torch.ge`` pair this replaces
+    did. When auto-reset is on but running host-side, ``Environment.step``'s own
+    ``masked_fill_`` still does the zeroing, after the reset it belongs to.
+    """
+    e = wp.tid()
+    sc = step_count[e] + wp.int32(1)
+    tr = wp.uint8(0)
+    if max_steps > wp.int32(0) and sc >= max_steps:
+        tr = wp.uint8(1)
+    truncated[e] = tr
     step_count[e] = sc
