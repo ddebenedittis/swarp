@@ -12,8 +12,12 @@ them to measure those.
 
 ``use_graph`` is pinned rather than left at ``Environment``'s ``"auto"`` so this
 benchmark keeps measuring one fixed configuration and its numbers stay comparable
-across commits. ``--graph`` adds whole-step CUDA-graph capture (what ``"auto"`` now
-selects on a CUDA device); ``swarp.benchmark.scenarios`` reports both side by side.
+across commits. It is pinned **on** by default: whole-step CUDA-graph capture is the
+fastest configuration and the one ``"auto"`` selects on a CUDA device, so it is the
+path a regression matters most on. ``--no-graph`` pins it off — that is the
+configuration the ``docs/benchmarks.md`` throughput table reports. On CPU there is no
+capture to enable, so the graph is forced off whatever the flag says.
+``swarp.benchmark.scenarios`` reports both side by side.
 """
 
 from __future__ import annotations
@@ -73,10 +77,15 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=100)
     parser.add_argument(
         "--graph",
-        action="store_true",
-        help="fold obs/reward into a whole-step CUDA graph (Environment's 'auto' default)",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="fold obs/reward into a whole-step CUDA graph (Environment's 'auto' default, "
+        "and the fastest configuration). --no-graph pins it off, which is what the "
+        "docs/benchmarks.md throughput table reports.",
     )
     args = parser.parse_args()
+    # Capture needs CUDA; asking for it on CPU only buys a fallback warning.
+    use_graph = args.graph and args.device.startswith("cuda")
 
     if args.device.startswith("cuda"):
         name = torch.cuda.get_device_name(args.device)
@@ -84,7 +93,7 @@ def main() -> None:
     else:
         print("device: cpu (no GPU in use — throughput will be far below GPU numbers)")
     print(f"timed steps per config: {args.steps}")
-    print(f"whole-step CUDA graph: {'on' if args.graph else 'off'}\n")
+    print(f"whole-step CUDA graph: {'on' if use_graph else 'off'}\n")
 
     header = (
         f"{'n_envs':>8} {'n_agents':>9} {'ms/step':>9} {'env-steps/s':>14} {'agent-steps/s':>15}"
@@ -94,7 +103,7 @@ def main() -> None:
     for n_envs in ENV_COUNTS:
         for n_agents in AGENT_COUNTS:
             try:
-                r = bench_one(n_envs, n_agents, args.device, args.steps, use_graph=args.graph)
+                r = bench_one(n_envs, n_agents, args.device, args.steps, use_graph=use_graph)
             except torch.cuda.OutOfMemoryError:
                 print(f"{n_envs:>8} {n_agents:>9} {'OOM':>9}")
                 torch.cuda.empty_cache()

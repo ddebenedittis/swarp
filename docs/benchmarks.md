@@ -20,45 +20,53 @@ The benchmark entry points (`swarp/benchmark/`):
 (dynamics, neighbor lists, soft collisions, obs/reward) under `torch.no_grad()` with
 random actions kept on-device. Measurement conditions: **100 timed steps per config**
 (after 10 warm-up steps), float32, `dt=0.05`, `substeps=1`, fused Warp obs/reward kernels
-and no CUDA-graph capture (`use_graph=False`, which `throughput.py` pins so this table
-stays comparable across commits — `Environment`'s own default is now `use_graph="auto"`,
-i.e. capture *on* for a fused scenario on a CUDA device; `--graph` measures that), on the
+and no CUDA-graph capture — run it as `python -m swarp.benchmark.throughput --no-graph`,
+which pins capture off so this table stays comparable across commits. The plain command
+leaves capture *on* (`throughput.py`'s default, matching `Environment`'s `use_graph="auto"`
+for a fused scenario on a CUDA device) and reports the faster numbers. On the
 RTX 3070 Laptop GPU:
 
 ```
   n_envs  n_agents   ms/step    env-steps/s   agent-steps/s
 -----------------------------------------------------------
-    1000         4      0.73      1,361,898       5,447,591
-    1000        16      0.64      1,566,530      25,064,480
-    1000        64      0.71      1,417,162      90,698,363
-    4000         4      0.65      6,181,194      24,724,776
-    4000        16      0.66      6,083,722      97,339,558
-    4000        64      0.63      6,333,313     405,332,016
-    8000         4      0.69     11,633,037      46,532,147
-    8000        16      0.71     11,290,530     180,648,480
-    8000        64      1.08      7,437,094     475,974,017
-   16000         4      0.79     20,140,930      80,563,719
-   16000        16      0.66     24,088,449     385,415,179
-   16000        64      2.09      7,671,187     490,955,980
+    1000         4      1.67        597,883       2,391,531
+    1000        16      1.68        594,768       9,516,284
+    1000        64      1.67        599,083      38,341,308
+    4000         4      1.62      2,461,680       9,846,719
+    4000        16      1.65      2,429,189      38,867,024
+    4000        64      1.63      2,455,776     157,169,634
+    8000         4      1.61      4,983,550      19,934,199
+    8000        16      1.62      4,923,460      78,775,364
+    8000        64      1.61      4,970,447     318,108,588
+   16000         4      1.58     10,127,806      40,511,225
+   16000        16      1.59     10,035,537     160,568,595
+   16000        64      2.06      7,781,203     497,997,017
 ```
 
 > **Reproducing these requires a cold GPU.** On this laptop the eager (graph-off) path is
-> dominated by per-step launch overhead, which makes it acutely sensitive to SM clock. The
-> `4000×16` row above was measured at 6.08 M env-steps/s on an idle machine; the *same
-> commit* measures ~1.2–1.8 M after a sustained load has pulled the clock from 2100 MHz to
-> ~1700 MHz — a 4–5× swing with no code change, and a ~33% spread between consecutive runs.
-> Before reading any before/after comparison as a regression, re-measure both trees
-> **interleaved** in the same session and check the spread. The graph-on path does not have
-> this problem: a step is one graph replay, so `--graph` at `4000×16` reproduces within ~4%
-> (0.15 ms/step) regardless of thermal state.
+> dominated by per-step launch overhead, which makes it acutely sensitive to SM boost
+> state — a machine that has been running sustained GPU work for a while settles onto a
+> lower clock than one measured fresh, and the eager path (which never keeps the SM busy
+> enough on its own to re-boost) inherits whatever clock state it finds. The table above
+> was reproducible to within ~3% across three separate runs, cold and after other GPU work,
+> so it should be taken as this machine's current settled-clock number rather than a
+> best-case one; treat any large deviation (a former revision of this table showed rows
+> above 6 M env-steps/s at `4000×16` on a freshly-idle machine) as a clock-state difference,
+> not a code regression, and re-measure both trees **interleaved** in the same session
+> before concluding otherwise. The graph-on path does not have this problem: a step is one
+> graph replay, so it stays close to its own number (`4000×16` was ~0.15 ms/step here)
+> regardless of thermal/boost state.
 
 The tape-free hot path is allocation-free at steady state (recycled scratch plus a
 ping-pong output buffer), which is what makes almost every config land on the same
-~0.65–0.8 ms/step host floor: up to 16,000 envs × 16 agents the step is latency-bound,
-not throughput-bound, and env-steps/s scales essentially linearly with `n_envs`. Only the
-two largest configs (8,000–16,000 envs × 64 agents, i.e. ≥ 512k agents) become genuinely
-GPU-bound in the neighbor/force kernels — and those are where `agent-steps/s` peaks at
-~490 M.
+host-launch-bound floor on this run (~1.6–1.7 ms/step eager): up to 16,000 envs × 16
+agents the step is latency-bound, not throughput-bound, and env-steps/s scales
+essentially linearly with `n_envs`. Only the two largest configs (8,000–16,000 envs ×
+64 agents, i.e. ≥ 512k agents) become genuinely GPU-bound in the neighbor/force kernels
+— and those are where `agent-steps/s` peaks at ~500 M. The captured-graph path removes
+the launch floor entirely (see below): the same grid at `--graph` runs `1000×4` at
+0.08 ms/step versus 1.67 ms eager, ~21× faster, with the gap narrowing toward the
+GPU-bound configs where launch overhead was never the constraint.
 
 Raising `n_agents` at fixed `n_envs` is close to free until that point, which is the
 structural difference from per-entity simulators: the step is a fixed handful of Warp
@@ -208,8 +216,9 @@ where launch overhead is the binding constraint.
 These numbers are higher than the [Throughput](#throughput) table's because this task is
 obstacle-free open-field navigation (matched to what the other simulators do), and
 because the top configuration adds CUDA-graph capture. That is now `Environment`'s
-default (`use_graph="auto"` — on for a fused scenario on a CUDA device); the
-[Throughput](#throughput) table above deliberately pins it off.
+default (`use_graph="auto"` — on for a fused scenario on a CUDA device), and
+`throughput.py`'s; the [Throughput](#throughput) table above deliberately pins it off
+with `--no-graph`.
 
 ### swarp (optimized) vs the field — matched task & observations
 
