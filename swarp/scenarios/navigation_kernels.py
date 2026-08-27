@@ -286,7 +286,7 @@ def nav_reset_kernel(
     n_cells: wp.int32,
     stratified: wp.int32,
     n_agents: wp.int32,
-    perm: wp.array2d(dtype=wp.int32),
+    perm: wp.array2d(dtype=wp.int32),  # [n_cells, n_envs] — env-major would not coalesce
     pos: Any,
     theta: Any,
     vel: Any,
@@ -297,10 +297,18 @@ def nav_reset_kernel(
     """One masked episode reset per env: spawns, goals, headings, zeroed velocities.
 
     Thread per **env**, not per agent: the distinct-cell draw is a partial Fisher-Yates
-    over ``perm[e]``, which is inherently sequential. That is the whole reason this is a
-    kernel rather than the torch chain it replaces — ``argsort`` is the only way to get a
-    uniform random k-subset out of batched torch ops, and under ``auto_reset`` it costs a
-    sort over ``[n_envs, n_cells]`` twice on *every* step.
+    over this env's slice of ``perm``, which is inherently sequential. That is the whole
+    reason this is a kernel rather than the torch chain it replaces — ``argsort`` is the
+    only way to get a uniform random k-subset out of batched torch ops, and under
+    ``auto_reset`` it costs a sort over ``[n_envs, n_cells]`` twice on *every* step.
+
+    ``perm`` is **cell-major**, ``[n_cells, n_envs]``, and every access is ``perm[i, e]``:
+    with one thread per env, the threads of a warp move through the Fisher-Yates in
+    lockstep on ``i``, so a cell-major layout puts their 32 accesses in one contiguous
+    line. The obvious ``[n_envs, n_cells]`` gives each thread a private contiguous row and
+    strides adjacent threads ``n_cells * 4`` bytes apart — a separate memory transaction
+    per lane, for a scratch buffer this kernel touches ``2 * (n_cells + n_agents)`` times
+    per env. The permutation drawn is identical either way; only the addressing changes.
 
     ``stratified == 0`` is the packing-limit fallback: no grid both fits the points and
     leaves jitter room, so draw uniformly and give up the separation guarantee rather than
@@ -344,16 +352,16 @@ def nav_reset_kernel(
 
     # Spawns, then goals: two independent uniform k-subsets of the cell grid.
     for i in range(n_cells):
-        perm[e, i] = i
+        perm[i, e] = i
     for i in range(n_agents):
         j = i + wp.int32(wp.randf(rng) * wp.float32(n_cells - i))
         if j > n_cells - 1:
             j = n_cells - 1
-        swap = perm[e, i]
-        perm[e, i] = perm[e, j]
-        perm[e, j] = swap
+        swap = perm[i, e]
+        perm[i, e] = perm[j, e]
+        perm[j, e] = swap
     for a in range(n_agents):
-        c = perm[e, a]
+        c = perm[a, e]
         x = _as(wp.float32(c % grid), lim) * cell + half
         y = _as(wp.float32(c / grid), lim) * cell + half
         x += (_as(wp.randf(rng), lim) - mid) * jitter
@@ -361,16 +369,16 @@ def nav_reset_kernel(
         pos[e, a] = wp.vector(x, y)
 
     for i in range(n_cells):
-        perm[e, i] = i
+        perm[i, e] = i
     for i in range(n_agents):
         j = i + wp.int32(wp.randf(rng) * wp.float32(n_cells - i))
         if j > n_cells - 1:
             j = n_cells - 1
-        swap = perm[e, i]
-        perm[e, i] = perm[e, j]
-        perm[e, j] = swap
+        swap = perm[i, e]
+        perm[i, e] = perm[j, e]
+        perm[j, e] = swap
     for a in range(n_agents):
-        c = perm[e, a]
+        c = perm[a, e]
         x = _as(wp.float32(c % grid), lim) * cell + half
         y = _as(wp.float32(c / grid), lim) * cell + half
         x += (_as(wp.randf(rng), lim) - mid) * jitter

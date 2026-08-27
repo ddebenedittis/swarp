@@ -129,8 +129,8 @@ class NavigationScenario(FusedScenario):
         # with alloc="if_none". Reassigned by the torch path when eager_trims is off,
         # which is what watch=True catches.
         self._prev_dist: torch.Tensor | None = None
-        # Lazily sized by _launch_reset: the Fisher-Yates scratch and its Warp view
-        # (built once — never reallocated for a given batch, so the handle stays
+        # Lazily sized by _launch_reset: the cell-major Fisher-Yates scratch and its Warp
+        # view (built once — never reallocated for a given batch, so the handle stays
         # pointer-stable). The reset mask itself comes from FusedScenario.
         self._reset_perm: torch.Tensor | None = None
         self._reset_perm_wp = None
@@ -254,9 +254,13 @@ class NavigationScenario(FusedScenario):
         w = self.world
         lim, cell, jitter, g, n_cells, stratified = self._reset_grid()
 
-        if self._reset_perm is None or self._reset_perm.shape != (w.n_envs, n_cells):
+        # Cell-major, not env-major: one thread per env walks this buffer in lockstep with
+        # its warp neighbours, so ``[n_cells, n_envs]`` coalesces where the natural
+        # ``[n_envs, n_cells]`` would stride each lane ``n_cells * 4`` bytes apart. See
+        # ``nav_reset_kernel``.
+        if self._reset_perm is None or self._reset_perm.shape != (n_cells, w.n_envs):
             self._reset_perm = torch.zeros(
-                (w.n_envs, n_cells), dtype=torch.int32, device=w.device
+                (n_cells, w.n_envs), dtype=torch.int32, device=w.device
             )
             self._reset_perm_wp = wp.from_torch(self._reset_perm)
         mask, use_mask = self.reset_mask_wp(env_mask)
