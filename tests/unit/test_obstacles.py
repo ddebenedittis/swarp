@@ -155,6 +155,47 @@ def test_in_place_install_makes_no_host_read(device):
     torch.testing.assert_close(_t(st.obs_pos), pos)
 
 
+@pytest.mark.parametrize("device", DEVICES)
+def test_in_place_install_follows_a_reassigned_source_tensor(device):
+    """A fresh source tensor must be picked up, not written through a stale Warp view.
+
+    ``Stepper._src_handle`` caches the zero-copy wrap of each install source, because
+    rebuilding it per field per step was most of the cost of a reset that re-samples
+    obstacle poses. The cache is what this pins: the grad path's ``_refresh`` reassigns
+    these tensors (fresh buffers for the tape) rather than updating them in place, and a
+    handle still pointing at the old address would silently install stale poses.
+    """
+    st = _stepper(device)
+    radius = _radius(3, device)
+    pos = _pos(4, 3, device)
+    st.set_obstacles(Obstacles(pos, radius))  # reallocates
+    st.set_obstacles(Obstacles(pos, radius))  # warm the in-place path and the handle cache
+
+    replacement = _pos(4, 3, device) + 0.5  # a different allocation, different values
+    assert replacement.data_ptr() != pos.data_ptr()
+    st.set_obstacles(Obstacles(replacement, radius))
+    torch.testing.assert_close(_t(st.obs_pos), replacement)
+
+    # ...and an in-place edit of the *new* tensor still lands, i.e. the rebuilt handle
+    # views it rather than a copy of it.
+    replacement.add_(0.25)
+    st.set_obstacles(Obstacles(replacement, radius))
+    torch.testing.assert_close(_t(st.obs_pos), replacement)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_in_place_install_reuses_one_source_handle(device):
+    """The steady state builds no new wrap: same tensor in, same cached view out."""
+    st = _stepper(device)
+    pos, radius = _pos(4, 3, device), _radius(3, device)
+    st.set_obstacles(Obstacles(pos, radius))
+    st.set_obstacles(Obstacles(pos, radius))
+    first = st._src_handles["obs_pos"][1]
+    pos.add_(0.01)
+    st.set_obstacles(Obstacles(pos, radius))
+    assert st._src_handles["obs_pos"][1] is first, "the source wrap was rebuilt needlessly"
+
+
 @pytest.mark.gpu(reason="torch.cuda.memory_allocated is the allocation oracle")
 def test_in_place_install_allocates_nothing():
     """Zero bytes from torch's allocator across the call, spec construction included.

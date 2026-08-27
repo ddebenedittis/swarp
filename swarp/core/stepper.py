@@ -193,6 +193,9 @@ class Stepper:
         # kernel would drop). ``enable_slim2d`` lets the ablation disable it.
         self.has_drone: bool = any(c.model == DynamicsModel.DRONE for c in configs)
         self.enable_slim2d: bool = True
+        # field name -> (identity key, Warp view, the tensor it views). Zero-copy wraps of
+        # the obstacle install's *source* tensors, kept across installs; see _src_handle.
+        self._src_handles: dict[str, tuple[tuple, wp.array, torch.Tensor]] = {}
 
     # ------------------------------------------------------------------ setup
 
@@ -247,6 +250,35 @@ class Stepper:
         )
         self._install(obs, in_place=in_place)
 
+    def _src_handle(self, name: str, src: torch.Tensor, wp_dtype) -> wp.array:
+        """A cached zero-copy Warp view of one install *source* tensor.
+
+        ``wp.from_torch`` is not free — it builds a fresh ``wp.array`` wrapper, re-derives
+        the strides and re-checks the dtype — and a scenario that re-samples obstacle
+        poses every reset pays it once per field on every step under ``auto_reset``. For
+        Push-T that was 22 wraps per reset and, with the copies they feed, 61% of the
+        reset. The sources are updated **in place** (that is what keeps the install
+        allocation-free and capture-legal), so the wrapper is valid for as long as the
+        tensor is.
+
+        Keyed by field name and validated against the tensor's data pointer, shape and
+        dtype, so the grad path's ``_refresh`` — which reassigns fresh tensors for the
+        tape — rebuilds instead of writing through a stale view. ``data_ptr()`` is a
+        host-side attribute read, not a device round-trip, so this stays legal on the
+        no-host-copy hot path.
+
+        The viewed tensor is retained deliberately: holding it alive is what stops the
+        allocator from recycling its address under a *different* tensor, which would make
+        a stale handle pass the pointer check.
+        """
+        key = (src.data_ptr(), tuple(src.shape), wp_dtype)
+        cached = self._src_handles.get(name)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        view = wp.from_torch(src, dtype=wp_dtype)
+        self._src_handles[name] = (key, view, src)
+        return view
+
     def _install(self, obs: Obstacles, *, in_place: bool) -> None:
         """Write a resolved obstacle set into the Warp arrays (the single install path)."""
         vec2 = VEC2[self.dtype]
@@ -269,10 +301,10 @@ class Stepper:
                     else:
                         arr.fill_(fill)
                 else:
-                    wp.copy(arr, wp.from_torch(src, dtype=wp_dtype))
+                    wp.copy(arr, self._src_handle(name, src, wp_dtype))
                 return
             if src is not None:
-                arr = wp.clone(wp.from_torch(src, dtype=wp_dtype))
+                arr = wp.clone(self._src_handle(name, src, wp_dtype))
             elif fill == 0.0:
                 arr = wp.zeros(shape, dtype=wp_dtype, device=dev)
             else:

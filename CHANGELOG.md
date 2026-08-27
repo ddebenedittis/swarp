@@ -16,6 +16,22 @@ All notable changes to `swarp`. Newest first. Nothing has been released yet — 
   `use_graph=False`): ~1.7-1.8x, e.g. 16000x16 from 5.1M to 8.9M env-steps/s. Outputs are
   bit-identical — only which kernel object reaches `wp.launch` changes.
 
+- **The obstacle install caches the Warp view of each source tensor.** `Stepper._install`
+  rebuilt a `wp.from_torch` wrapper per field per call, which a scenario re-sampling
+  obstacle poses pays on every step under `auto_reset` — 22 wraps per reset for Push-T.
+  The sources are updated in place (that is what keeps the install allocation-free and
+  capture-legal), so the wrapper stays valid; it is now kept, keyed by field and validated
+  against the tensor's data pointer, shape and dtype so the grad path's `_refresh`
+  rebuilds instead of writing through a stale view. At 8192x8, graph on, `auto_reset=True`:
+  Push-T 4.477 -> 4.138 ms (-7.6%), transport 1.586 -> 1.422 ms (-10.3%). Navigation, which
+  installs no obstacles, is unchanged (-0.2%, run-to-run noise), and
+  `swarp.benchmark.throughput` is flat.
+
+  What remains of Push-T's reset is the 16 `wp.copy`s themselves plus `_body_seed` and its
+  box-pose derivation. Cutting those means installing only the fields that changed, which
+  contradicts `set_obstacles`' documented contract that an absent field always means the
+  default rather than "keep the previous value" — so it is left alone.
+
 - **Every scenario's masked reset is now a single Warp launch.** Under `auto_reset` the
   reset runs on every step for the whole batch, and it was 83-96% of the step time for all
   seven scenarios. Each now does its whole draw in one masked kernel, one thread per env
