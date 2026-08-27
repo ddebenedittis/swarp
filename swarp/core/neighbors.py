@@ -94,6 +94,41 @@ def _brute_force(
     neighbor_true[e, a] = total
 
 
+@wp.kernel
+def _brute_force_masked(
+    pos: wp.array2d(dtype=Any),
+    radius: Any,
+    reset_mask: wp.array(dtype=wp.uint8),
+    neighbor_idx: wp.array3d(dtype=wp.int32),
+    neighbor_count: wp.array2d(dtype=wp.int32),
+    neighbor_true: wp.array2d(dtype=wp.int32),
+):
+    """Same as :func:`_brute_force`, but skips every env ``reset_mask`` does not select.
+
+    Only ever launched for the obs-only auto-reset pass (see
+    ``NeighborGrid._query_brute_into``/``World.build_neighbors``): an env that did not
+    reset has positions identical to what the just-completed step build already put in
+    ``neighbor_idx``/``neighbor_count``/``neighbor_true``, so leaving those entries
+    untouched is exactly correct, not merely an approximation.
+    """
+    e, a = wp.tid()
+    if reset_mask[e] == wp.uint8(0):
+        return
+    n_agents = pos.shape[1]
+    max_neighbors = neighbor_idx.shape[2]
+    p = pos[e, a]
+    count = wp.int32(0)  # written (capped at max_neighbors)
+    total = wp.int32(0)  # true in-radius count (uncapped)
+    for b in range(n_agents):
+        if b != a and wp.length(pos[e, b] - p) <= radius:
+            total += wp.int32(1)
+            if count < max_neighbors:
+                neighbor_idx[e, a, count] = b
+                count += wp.int32(1)
+    neighbor_count[e, a] = count
+    neighbor_true[e, a] = total
+
+
 # --------------------------------------------------------------------------
 # Batched uniform-grid backend (radix-sort). Unlike ``wp.HashGrid`` (which wraps
 # cell coordinates modulo its dims and so aliases envs into shared cells), this
@@ -236,6 +271,18 @@ for _T in (wp.float32, wp.float64):
         [
             wp.array2d(dtype=VEC2[_T]),
             _T,
+            wp.array3d(dtype=wp.int32),
+            wp.array2d(dtype=wp.int32),
+            wp.array2d(dtype=wp.int32),
+        ],
+    )
+    register(
+        _brute_force_masked,
+        _T,
+        [
+            wp.array2d(dtype=VEC2[_T]),
+            _T,
+            wp.array(dtype=wp.uint8),
             wp.array3d(dtype=wp.int32),
             wp.array2d(dtype=wp.int32),
             wp.array2d(dtype=wp.int32),
@@ -391,16 +438,43 @@ class NeighborGrid:
         # this exactly once anyway (at capture); it is the eager auto_reset rebuild,
         # every step, that this amortizes.
         self._brute_launch = CachedLaunch()
+        # Separate cache + separate kernel (``_brute_force_masked``) for the masked
+        # variant, rather than one kernel toggled by a ``use_mask`` int: that would mean
+        # every unmasked call (every step, every other scenario) also needs a real
+        # ``reset_mask`` array argument just to satisfy the kernel signature, and the
+        # int would have to be re-set by name on every launch per the ``CachedLaunch``
+        # docstring's rule for varying-but-cached-kernel params. Two kernels keep the
+        # far more common unmasked path exactly as it was.
+        self._brute_masked_launch = CachedLaunch()
 
-    def build(self, pos: wp.array) -> None:
-        """Refresh the padded lists from positions [n_envs, n_agents] (vec2)."""
-        self.query_into(pos, self.neighbor_idx, self.neighbor_count)
+    def build(self, pos: wp.array, reset_mask: wp.array | None = None) -> None:
+        """Refresh the padded lists from positions [n_envs, n_agents] (vec2).
 
-    def query_into(self, pos: wp.array, neighbor_idx: wp.array, neighbor_count: wp.array) -> None:
+        ``reset_mask`` is forwarded to :meth:`query_into` — see there for the safety
+        contract. ``None`` (the default) always does a full rebuild.
+        """
+        self.query_into(pos, self.neighbor_idx, self.neighbor_count, reset_mask=reset_mask)
+
+    def query_into(
+        self,
+        pos: wp.array,
+        neighbor_idx: wp.array,
+        neighbor_count: wp.array,
+        reset_mask: wp.array | None = None,
+    ) -> None:
         """Write padded lists into caller-owned buffers using the selected method.
 
         Launches use ``record_tape=False``: neighbor construction is a discrete,
         non-differentiable pass and must not be replayed by tape adjoints.
+
+        ``reset_mask`` (uint8 ``[n_envs]``, ``1`` = rebuild this env) restricts the
+        rebuild to the envs it selects, skipping the rest — valid **only** when every
+        env *not* selected has positions unchanged since this grid's lists were last
+        built, which is true of exactly one caller: the obs-only auto-reset pass (see
+        ``World.build_neighbors``). It is honoured by the ``"brute"`` method only;
+        ``"grid"``/``"uniform_grid"`` are global batched passes (a hash-grid rebuild, a
+        radix sort) that a per-env skip cannot decompose locally, so they silently do a
+        full rebuild regardless — always correct, just not the optimization.
         """
         self.build_count += 1
         if self.method == "grid":
@@ -408,7 +482,7 @@ class NeighborGrid:
         elif self.method == "uniform_grid":
             self._query_uniform_into(pos, neighbor_idx, neighbor_count)
         else:
-            self._query_brute_into(pos, neighbor_idx, neighbor_count)
+            self._query_brute_into(pos, neighbor_idx, neighbor_count, reset_mask=reset_mask)
 
     def _ensure_grid(self) -> None:
         """Lazily allocate the hash grid, at the same ``grid_dim`` ``__init__`` would use.
@@ -445,14 +519,34 @@ class NeighborGrid:
             record_tape=False,
         )
 
-    def _query_brute_into(self, pos, neighbor_idx, neighbor_count) -> None:
-        # No genuinely per-call argument here at all (radius is fixed at construction) —
-        # every argument is either config-invariant or a pointer-stable persistent-mode
-        # handle, so a cache hit needs no set_param_* calls, just .launch().
-        launch = self._brute_launch.get(
-            concrete(_brute_force, self.dtype),
+    def _query_brute_into(self, pos, neighbor_idx, neighbor_count, reset_mask=None) -> None:
+        if reset_mask is None:
+            # No genuinely per-call argument here at all (radius is fixed at
+            # construction) — every argument is either config-invariant or a
+            # pointer-stable persistent-mode handle, so a cache hit needs no
+            # set_param_* calls, just .launch().
+            launch = self._brute_launch.get(
+                concrete(_brute_force, self.dtype),
+                dim=(self.n_envs, self.n_agents),
+                inputs=[pos, self.dtype(self.radius)],
+                outputs=[neighbor_idx, neighbor_count, self.neighbor_true_count],
+                device=self.device,
+                key=(
+                    self.n_envs,
+                    self.n_agents,
+                    ptr_key(pos),
+                    self.radius,
+                    ptr_key(neighbor_idx),
+                    ptr_key(neighbor_count),
+                    ptr_key(self.neighbor_true_count),
+                ),
+            )
+            launch.launch()
+            return
+        launch = self._brute_masked_launch.get(
+            concrete(_brute_force_masked, self.dtype),
             dim=(self.n_envs, self.n_agents),
-            inputs=[pos, self.dtype(self.radius)],
+            inputs=[pos, self.dtype(self.radius), reset_mask],
             outputs=[neighbor_idx, neighbor_count, self.neighbor_true_count],
             device=self.device,
             key=(
@@ -460,6 +554,7 @@ class NeighborGrid:
                 self.n_agents,
                 ptr_key(pos),
                 self.radius,
+                ptr_key(reset_mask),
                 ptr_key(neighbor_idx),
                 ptr_key(neighbor_count),
                 ptr_key(self.neighbor_true_count),

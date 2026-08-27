@@ -121,6 +121,60 @@ def test_scenarios_without_a_watched_buffer_pin_the_token_structurally():
 
 
 @pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("scenario_name", ["NavigationScenario", "FormationScenario"])
+def test_masked_obs_only_reset_matches_a_full_recompute(device, scenario_name):
+    """The obs-only auto-reset pass skips recomputing ``obs``/``prev`` for envs the
+    reset mask does not select (see the ``full_pass == 0 and reset_mask[e] == 0``
+    early-out in ``navigation_kernels.nav_obs_kernel`` / ``formation_kernels.
+    formation_obs_kernel``, and ``NeighborGrid``'s masked brute-force build). That is
+    an optimization, not an approximation: what it leaves behind for a non-reset env
+    must be bit-identical to what a full, unmasked recompute over the same state would
+    have written. This forces exactly that comparison — a real (partial) masked pass,
+    then an unmasked one over the identical post-reset state — for both scenarios whose
+    obs kernel carries both ``full_pass`` and ``reset_mask``.
+    """
+    from swarp import Environment
+    from swarp.interop.autograd import torch_stream_scope
+    from swarp.scenarios import FormationScenario, NavigationScenario
+
+    n_envs, n_agents = 24, 5
+    cls = {"NavigationScenario": NavigationScenario, "FormationScenario": FormationScenario}[
+        scenario_name
+    ]
+    scen = cls(n_agents=n_agents)
+    env = Environment(
+        scen, n_envs=n_envs, device=device, dt=0.05, seed=0, max_steps=5, auto_reset=True
+    )
+    env.reset(seed=0)
+    # Force exactly every other env to truncate on this step (step_count == max_steps
+    # after the increment) so the auto_reset mask is guaranteed partial — neither all
+    # envs nor none, which is the only shape that exercises the masked path at all.
+    step_count = torch.zeros(n_envs, device=device, dtype=torch.int32)
+    step_count[::2] = env.max_steps - 1
+    env._step_count.copy_(step_count)
+    act = torch.zeros(n_envs, n_agents, env.act_dim, device=device)
+    with torch.no_grad():
+        env.step(act)
+
+    mask = scen.fb["resetmask"].clone()
+    assert bool(mask.any()) and not bool(mask.all()), "test needs a partial reset"
+    masked = {k: scen.fb[k].clone() for k in ("obs", "prev")}
+
+    # Force a full, unmasked recompute of the same obs-only pass over the identical
+    # current state (no further physics): mark every env "reset" for the kernels'
+    # purposes and relaunch. This is the parity oracle for the masked pass above.
+    scen.fb["resetmask"].fill_(1)
+    with torch_stream_scope(env.world.device):
+        scen.launch_fused(FusedPass("reset", full=False))
+
+    for name, before in masked.items():
+        assert torch.equal(before, scen.fb[name]), (
+            f"{scenario_name}.fb[{name!r}] differs between the masked auto-reset pass "
+            "and an unmasked recompute over the same state"
+        )
+
+
+@pytest.mark.parametrize("device", DEVICES)
 def test_reset_mask_is_zeroed_before_a_step_and_stamped_on_a_reset(device):
     from swarp import Environment, NavigationScenario
 

@@ -399,7 +399,16 @@ class NavigationScenario(FusedScenario):
     def _launch_obs(self, advance_prev: int, full_pass: int) -> None:
         w = self.world
         n_envs = w.n_envs
-        w.build_neighbors()  # build the grid on the current state; no torch wrap needed
+        resetmask = self._wp["resetmask"]
+        # ``full_pass == 0`` occurs *only* on the obs-only auto-reset pass (see
+        # FusedPass.full_pass / Environment.step's auto_reset branch): a standalone
+        # reset()/reset_at() always has full_pass == 1, and STEP is the module-level
+        # ``FusedPass("step")`` constant, whose ``full`` also defaults True. That is
+        # exactly the one pass where every env ``resetmask`` doesn't select has
+        # positions unchanged since the grid's lists were last built (the STEP pass
+        # moments earlier), so masking the rebuild here can never be reached by a
+        # normal step or a full reset.
+        w.build_neighbors(reset_mask=resetmask if full_pass == 0 else None)
         grid = w.stepper.grid(n_envs)
         scalar = w.wp_dtype
         st = w.state_wp()
@@ -408,7 +417,6 @@ class NavigationScenario(FusedScenario):
         # Touching uses the static per-agent radius (matches the torch reference's
         # World.agent_radius); per-env randomization affects forces, not this count.
         params = w.stepper.params.floats
-        resetmask = self._wp["resetmask"]
         obs, touch, dist, shaping = (
             self._wp["obs"],
             self._wp["touch"],

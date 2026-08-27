@@ -331,7 +331,7 @@ class World:
 
     # -------------------------------------------------------------- neighbors
 
-    def build_neighbors(self) -> None:
+    def build_neighbors(self, *, reset_mask: wp.array | None = None) -> None:
         """Build the within-radius neighbor grid on the *current* (post-step) state,
         without wrapping the result as torch tensors.
 
@@ -344,10 +344,20 @@ class World:
         cannot afford (see ``CLAUDE.md``, "Speed Is a First-Class Citizen"), so every
         fused ``_launch_obs``/reset path calls this instead of :meth:`neighbors`.
 
-        Stamps ``grid.built_version`` with the stepper's current ``state_version``, so
-        the next step can recognize that its input state already has a matching
-        neighbor list and skip substep 0's rebuild (``WorldConfig.neighbor_reuse``) —
-        turning the two builds per step (this one plus the force-time query) into one.
+        ``reset_mask``, when given, restricts the rebuild to the envs it selects (uint8
+        ``[n_envs]``, ``1`` = rebuild) — see :meth:`NeighborGrid.query_into` for the
+        exact safety contract. It is **only** correct for the obs-only auto-reset pass,
+        where every env the mask does not select has positions unchanged since this
+        grid's lists were last built; a caller anywhere else must pass ``None``. Pass it
+        explicitly — there is no way to enable it by omission.
+
+        Stamps ``grid.built_version`` with the stepper's current ``state_version`` either
+        way: even a masked build leaves the grid fully valid for every env (the selected
+        envs were rebuilt, the rest are byte-identical to the last full build they
+        matched), so the stamp means exactly what it always means. That lets the next
+        step recognize that its input state already has a matching neighbor list and
+        skip substep 0's rebuild (``WorldConfig.neighbor_reuse``) — turning the two
+        builds per step (this one plus the force-time query) into one.
         """
         if not self.stepper.collisions:
             raise RuntimeError("neighbor lists require WorldConfig.collisions=True")
@@ -364,14 +374,14 @@ class World:
             if self._persistent and not self._detached:
                 # The persistent state's pos is already a Warp array — build directly on
                 # it (no re-wrap).
-                grid.build(self.runtime.state.pos)
+                grid.build(self.runtime.state.pos, reset_mask=reset_mask)
             else:
                 pos_wp = wp.from_torch(
                     self.state.pos.detach().contiguous(),
                     dtype=VEC2[self.wp_dtype],
                     requires_grad=False,
                 )
-                grid.build(pos_wp)
+                grid.build(pos_wp, reset_mask=reset_mask)
         grid.built_version = self.stepper.state_version
 
     def neighbors(self) -> tuple[torch.Tensor, torch.Tensor]:

@@ -49,6 +49,13 @@ def formation_obs_kernel(
 ):
     """Thread per (env, agent): obs row + shaping/touching/in-formation buffers."""
     e, a = wp.tid()
+    if full_pass == 0 and reset_mask[e] == wp.uint8(0):
+        # Obs-only auto-reset pass: an env this mask didn't select has state
+        # identical to what the STEP pass moments earlier already wrote into
+        # every output buffer below, so redoing the all-pairs touch count and
+        # shaping math for it is pure waste. Reset envs (reset_mask[e] == 1)
+        # still fall through and get recomputed.
+        return
     p = pos[e, a]
     v = vel[e, a]
     g = goals[e, a]
