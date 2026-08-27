@@ -609,8 +609,25 @@ class Stepper:
         *,
         reuse_neighbors: bool = False,
         skip_drone: bool = False,
+        write_in_place: bool = False,
     ) -> None:
-        """Advance one full env step. Functional: ``state_in`` is never written.
+        """Advance one full env step.
+
+        Functional by default: ``state_in`` is never written, and ``state_out``
+        (plus ``buffers.inter_states`` for substeps > 1) receives the result.
+
+        ``write_in_place=True`` is an opt-in for the no-grad persistent hot path:
+        every stage of the substep chain aliases ``state_in`` (which must then
+        also be ``state_out``), so the integrate kernel reads and writes the same
+        ``(e, a)`` slot. This is safe only because the elementwise slim-2D Euler
+        kernel reads its inputs into locals before writing outputs, and because
+        the force pass that reads cross-thread neighbour state is a separate,
+        fully-completed ``wp.launch`` before the integrate kernel that writes —
+        see ``docs/writing-a-scenario.md`` / the persistent-runtime module
+        docstring for the full argument. It is gated to require the ``slim``
+        Euler path (below); passing it when ``slim`` would be False raises,
+        since the full/RK4 ``integrate_kernel`` has not been cleared for aliased
+        in-place writes here.
 
         With ``reuse_neighbors=True`` (the no-grad hot path) substep 0 skips its
         neighbor rebuild and reads the grid's existing lists when they were built
@@ -621,7 +638,6 @@ class Stepper:
         get overwritten by the next build before then).
         """
         n_envs = state_in.pos.shape[0]
-        chain = [state_in, *buffers.inter_states, state_out]
         world = self.world
         slim = (
             self.enable_slim2d
@@ -629,6 +645,18 @@ class Stepper:
             and not buffers.taped
             and world.integrator == Integrator.EULER
         )
+        if write_in_place:
+            if not slim:
+                raise ValueError(
+                    "write_in_place=True requires the slim Euler 2D path "
+                    "(enable_slim2d, no drone agents, untaped, Integrator.EULER); "
+                    "the full/RK4 integrate_kernel is not cleared for in-place writes."
+                )
+            if state_out is not state_in:
+                raise ValueError("write_in_place=True requires state_out is state_in")
+            chain = [state_in] * (self.substeps + 1)
+        else:
+            chain = [state_in, *buffers.inter_states, state_out]
         grid = self.grid(n_envs) if self.collisions else None
         can_reuse = (
             reuse_neighbors

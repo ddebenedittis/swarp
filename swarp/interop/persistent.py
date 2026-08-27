@@ -2,12 +2,17 @@
 
 Isaac-Gym-style hot path: instead of allocating (or even re-wrapping) state each
 step, one :class:`StepRuntime` owns a fixed set of on-device buffers — the state,
-a scratch output, the substep scratch, and the action buffer — plus zero-copy
-torch views created once. Each step copies the incoming actions into the fixed
-buffer and either replays a captured CUDA graph (substeps + copy-back) or, when
-capture is unavailable, runs the same launches eagerly. Either way it returns the
-same stable torch views, so the scenario's obs/reward layer reads persistent
-memory with no per-step wrapping.
+a scratch output (used only by the non-slim drone/RK4 fallback and by the
+pre-capture warm-up), the substep scratch, and the action buffer — plus
+zero-copy torch views created once. Each step copies the incoming actions into
+the fixed buffer and either replays a captured CUDA graph or, when capture is
+unavailable, runs the same launches eagerly. For the common slim 2D Euler case
+the substep chain integrates straight into ``self.state`` in place (see
+``Stepper.launch_substeps``'s ``write_in_place``), so a real step issues no
+copy-back at all; drone fleets / RK4 fall back to the old scratch-output-then-
+copy-back sequence, which ``launch_substeps`` cannot yet do safely in place.
+Either way ``step`` returns the same stable torch views, so the scenario's
+obs/reward layer reads persistent memory with no per-step wrapping.
 
 Streams. Warp launches go to Warp's **own** created stream, not the legacy default
 stream — that is what makes capture legal at all. That stream carries the *blocking* flag,
@@ -93,14 +98,6 @@ class StepRuntime:
         )
         self.actions_view = wp.to_torch(self._actions, requires_grad=False)
 
-        # The slim 2D copy-back touches five fields; the drone fields of a 2D
-        # fleet stay zero and are never read, so they are never copied.
-        self._slim = (
-            stepper.enable_slim2d
-            and not stepper.has_drone
-            and stepper.world.integrator == Integrator.EULER
-        )
-
         # Capture eligibility: CUDA + an allocation-free neighbor backend.
         self._can_graph = use_graph and self.device.startswith("cuda")
         if self._can_graph and stepper.collisions:
@@ -151,7 +148,7 @@ class StepRuntime:
         """Register (or clear) the whole-step hook. Invalidates any existing graph.
 
         The runtime uses three of the hook's four members: :attr:`~swarp.core.hooks.
-        WholeStepHook.run` is captured / invoked eagerly after the physics copy-back,
+        WholeStepHook.run` is captured / invoked eagerly after the physics step,
         :attr:`~swarp.core.hooks.WholeStepHook.token` gates recapture, and
         :attr:`~swarp.core.hooks.WholeStepHook.carries` is snapshotted around warm-up.
         ``prepare`` is the caller's to run, eagerly, before the step — see
@@ -179,25 +176,56 @@ class StepRuntime:
 
     # ------------------------------------------------------------------ step
 
+    def _is_slim(self) -> bool:
+        """Whether the fleet currently qualifies for the in-place slim 2D Euler
+        path (``Stepper.launch_substeps(write_in_place=True)``).
+
+        Mirrors the ``slim`` predicate ``launch_substeps`` computes internally
+        (its ``not buffers.taped`` conjunct is always True here since these
+        buffers are allocated with ``requires_grad=False``). Computed fresh on
+        every call rather than cached: ``stepper.enable_slim2d`` is a mutable
+        test/parity knob (see ``test_slim_matches_full``) that can be toggled
+        after this runtime is constructed, and a cached value would drift out
+        of sync with what ``launch_substeps`` actually does. Drone fleets / RK4
+        fall back to the scratch-output + copy-back sequence below."""
+        stepper = self.stepper
+        return (
+            stepper.enable_slim2d
+            and not stepper.has_drone
+            and stepper.world.integrator == Integrator.EULER
+        )
+
     def _copy_back(self) -> None:
         """Copy the freshly computed output back into the persistent state.
 
-        Slim 2D fleets copy only the five live fields; the drone fields stay at
-        their (zero) allocation and are never read."""
-        n = 5 if self._slim else 9
+        Only used on the non-slim fallback (drone fleets / RK4), where
+        ``launch_substeps`` cannot write in place. Slim 2D fleets integrate
+        straight into ``self.state`` and never hit this."""
+        n = 9
         for dst, src in zip(self.state.arrays()[:n], self._state_out.arrays()[:n], strict=True):
             wp.copy(dst, src)
 
     def _run_eager(self) -> None:
-        self.stepper.launch_substeps(
-            self.state,
-            self._actions,
-            self._state_out,
-            self._buffers,
-            reuse_neighbors=True,
-            skip_drone=True,
-        )
-        self._copy_back()
+        if self._is_slim():
+            self.stepper.launch_substeps(
+                self.state,
+                self._actions,
+                self.state,
+                self._buffers,
+                reuse_neighbors=True,
+                skip_drone=True,
+                write_in_place=True,
+            )
+        else:
+            self.stepper.launch_substeps(
+                self.state,
+                self._actions,
+                self._state_out,
+                self._buffers,
+                reuse_neighbors=True,
+                skip_drone=True,
+            )
+            self._copy_back()
         if self._hook is not None:
             self._hook.run()
 
@@ -226,7 +254,14 @@ class StepRuntime:
         # Warm-up runs the whole step once *before* ScopedCapture (which forbids
         # allocation), purely to compile kernels and allocate scratch: the physics into
         # the scratch output with no copy-back, then the hook, which compiles the
-        # obs/reward kernels.
+        # obs/reward kernels. This stays out-of-place (``write_in_place=False``) even
+        # for a slim fleet that will capture in place below: advancing
+        # ``self.state`` here — deliberately or by aliasing accident — would leave the
+        # graph's *first* replay one step ahead of the eager path. Out-of-place warm-up
+        # still compiles the identical kernels (``write_in_place`` only changes which
+        # array pointers ``launch_integrate`` binds, not the kernel or its module) and
+        # allocates the identical scratch, so it satisfies capture's no-compile/
+        # no-allocation requirement for the in-place capture that follows just as well.
         #
         # Neither launch is side-effect-free, so snapshot everything they advance **in
         # place** up front and restore it afterwards. That is the hook's declared carries
@@ -263,15 +298,36 @@ class StepRuntime:
         if grid_valid:
             stepper.grid(self.n_envs).built_version = stepper.state_version
         with wp.ScopedCapture(device=stepper.device) as capture:
-            stepper.launch_substeps(
-                self.state,
-                self._actions,
-                self._state_out,
-                self._buffers,
-                reuse_neighbors=True,
-                skip_drone=True,
-            )
-            self._copy_back()
+            if self._is_slim():
+                # In-place: the integrate kernel reads its own (e, a) slot into
+                # locals before writing, and the force pass that reads neighbours
+                # cross-thread is a separate, already-completed launch — see
+                # ``Stepper.launch_substeps``'s ``write_in_place`` docstring. Every
+                # array the graph touches (state, actions, force/neighbor scratch,
+                # obstacle arrays) was already allocated by the warm-up above, so
+                # binding the integrate output to ``self.state`` instead of
+                # ``self._state_out`` triggers neither a fresh kernel compile (same
+                # ``concrete(...)`` overload either way) nor a capture-time
+                # allocation.
+                stepper.launch_substeps(
+                    self.state,
+                    self._actions,
+                    self.state,
+                    self._buffers,
+                    reuse_neighbors=True,
+                    skip_drone=True,
+                    write_in_place=True,
+                )
+            else:
+                stepper.launch_substeps(
+                    self.state,
+                    self._actions,
+                    self._state_out,
+                    self._buffers,
+                    reuse_neighbors=True,
+                    skip_drone=True,
+                )
+                self._copy_back()
             if self._hook is not None:
                 self._hook.run()
         self._graph = capture.graph
