@@ -61,7 +61,10 @@ class Environment:
             ``info`` values before returning them. Off by default, so :meth:`step` hands
             back **zero-copy views of buffers the next step overwrites** — fine for a
             policy that consumes them immediately, wrong for anything that retains them
-            (a replay buffer, a trajectory list). Turn this on, or clone at the call site.
+            (a replay buffer, a trajectory list). ``truncated`` is a persistent buffer
+            owned by the ``Environment`` itself (not the scenario's fused buffers) but is
+            overwritten in place every step the same way, so it needs the same treatment.
+            Turn this on, or clone at the call site.
         fused: use the scenario's fused Warp obs/reward kernels on the no-grad path.
             ``"auto"`` follows :attr:`~swarp.scenarios.base.Scenario.fused_available`;
             grad mode always falls back to the differentiable torch path.
@@ -123,6 +126,12 @@ class Environment:
         # Returned as ``truncated`` when there is no time limit. Allocated once: the hot
         # path must not allocate a fresh all-false tensor on every step.
         self._never_truncated = torch.zeros(n_envs, device=device, dtype=torch.bool)
+        # Persistent ``truncated``/``episode_end`` buffers: the hot path must not
+        # allocate a fresh bool tensor every step. ``truncated`` is handed back to the
+        # caller as a zero-copy view (like the fused obs/reward buffers) unless
+        # ``clone_outputs=True``; ``episode_end`` never escapes ``step``.
+        self._truncated_buf = torch.zeros(n_envs, device=device, dtype=torch.bool)
+        self._episode_end_buf = torch.zeros(n_envs, device=device, dtype=torch.bool)
         # Fused Warp obs/reward/done kernels for the no-grad hot path. "auto"
         # follows the scenario; grad mode always falls back to the torch path.
         self._fused = scenario.fused_available if fused == "auto" else bool(fused)
@@ -256,9 +265,7 @@ class Environment:
         self._set_fused_active()
         with torch.no_grad():
             self.scenario.reset_world(env_mask)
-        self._step_count = torch.where(
-            env_mask, torch.zeros_like(self._step_count), self._step_count
-        )
+        self._step_count.masked_fill_(env_mask, 0)
         return self.scenario.observations()
 
     def step(
@@ -281,6 +288,10 @@ class Environment:
             ``max_steps`` time limit, and is an all-false view when ``max_steps is
             None``. Episode end — for auto-reset and for the step counter — is
             ``terminated | truncated``.
+
+            ``truncated`` is a **persistent buffer** written in place every step (like
+            the fused obs/reward buffers), not a fresh allocation — the same
+            ``clone_outputs`` contract as the rest of the tuple applies to it.
         """
         act_dim = self.world.act_dim
         if actions.shape != (self.n_envs, self.n_agents, act_dim):
@@ -309,22 +320,19 @@ class Environment:
         reward = self.scenario.rewards()
         self._step_count += 1
         terminated = self.scenario.done()
-        truncated = (
-            self._step_count >= self.max_steps
-            if self.max_steps is not None
-            else self._never_truncated
-        )
+        if self.max_steps is not None:
+            truncated = torch.ge(self._step_count, self.max_steps, out=self._truncated_buf)
+        else:
+            truncated = self._never_truncated
         info = self.scenario.info()
 
         if self.auto_reset:
-            episode_end = terminated | truncated
+            episode_end = torch.logical_or(terminated, truncated, out=self._episode_end_buf)
             # Obs-only reset pass: reward/done/info were already returned for this
             # transition and their (fused) buffers must not be clobbered.
             with torch.no_grad():
                 self.scenario.reset_world(episode_end, obs_only=True)
-            self._step_count = torch.where(
-                episode_end, torch.zeros_like(self._step_count), self._step_count
-            )
+            self._step_count.masked_fill_(episode_end, 0)
 
         # Observations reflect the state after any auto-reset (next episode's
         # first obs for done envs), matching the gym/VMAS vec-env convention.

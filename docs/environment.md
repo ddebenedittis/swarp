@@ -64,7 +64,7 @@ This is the Gymnasium 5-tuple.
 - `obs` — `[n_envs, n_agents, obs_dim]`, the scenario's observation after any auto-reset.
 - `reward` — `[n_envs, n_agents]`, the scenario's per-agent term plus its shared global term.
 - `terminated` — `[n_envs]` bool, the scenario's own terminal condition (`Scenario.done`), one flag per env (agents in an env terminate together).
-- `truncated` — `[n_envs]` bool, the `max_steps` time limit. When `max_steps is None` this is a cached all-false buffer, so the hot path allocates nothing.
+- `truncated` — `[n_envs]` bool, the `max_steps` time limit. It is always a persistent buffer written in place (like `obs`/`reward`), so the hot path allocates nothing; when `max_steps is None` it is a cached all-false buffer that is never written.
 - `info` — a dict of whatever the scenario chooses to expose; navigation reports `dist_to_goal`, Push-T reports the pose error, and so on.
 
 Episode end — for `auto_reset` and for the internal step counter — is `terminated | truncated`.
