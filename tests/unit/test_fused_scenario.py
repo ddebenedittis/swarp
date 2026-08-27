@@ -199,6 +199,37 @@ def test_reset_mask_is_zeroed_before_a_step_and_stamped_on_a_reset(device):
     with torch.no_grad():
         env.step(torch.zeros(4, 3, env.act_dim, device=device))
     assert (scen.fb["resetmask"] == 0).all()  # a normal step resets no env
+    # ``prepare_fused`` stops zeroing once the buffer is *known* clean, so the mask has
+    # to stay zero over the steps that follow, not only over the first one after a reset.
+    assert not scen._fused_mask_dirty
+    with torch.no_grad():
+        for _ in range(3):
+            env.step(torch.zeros(4, 3, env.act_dim, device=device))
+            assert (scen.fb["resetmask"] == 0).all()
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_every_reset_mask_write_marks_the_buffer_dirty(device):
+    """The invariant the skipped memset in ``prepare_fused`` rests on.
+
+    ``prepare_fused`` zeroes the reset mask only when ``_fused_mask_dirty`` says a writer
+    touched it, so a writer that forgets to mark leaves its stamp standing for every
+    later step. This pins the two host-side writers; the third is the in-graph
+    ``episode_end_kernel``, which ``Environment._compose_graph_reset_hook`` covers by
+    marking unconditionally before every replay.
+    """
+    from swarp import Environment, NavigationScenario
+
+    env = Environment(NavigationScenario(n_agents=3), n_envs=4, device=device, dt=0.05, seed=0)
+    scen = env.scenario
+    mask = torch.tensor([True, False, True, False], device=device)
+    for write in (
+        lambda: env.reset(seed=0),  # finish_reset's fill_(1)
+        lambda: env.reset_at(mask),  # reset_mask_wp's copy_
+    ):
+        scen._fused_mask_dirty = False
+        write()
+        assert scen._fused_mask_dirty, "a reset-mask write did not mark the buffer dirty"
 
 
 # ------------------------------------------------------- the errors it prevents

@@ -252,6 +252,17 @@ class FusedScenario(Scenario):
 
     _fused_ready: bool = False
 
+    #: True whenever the reset-mask buffer may hold a non-zero byte; False only when it
+    #: is *known* all-zero. ``prepare_fused`` trusts this instead of unconditionally
+    #: zeroing the mask every step — with ``auto_reset=False`` the mask is zero on every
+    #: step but the one right after a reset, so an unconditional zero is a CUDA memset
+    #: launched forever for nothing. Every writer of the buffer is responsible for
+    #: calling :meth:`mark_reset_mask_dirty` the moment it writes a possibly-nonzero
+    #: byte into it; ``prepare_fused`` is the only reader, and it clears the flag right
+    #: after actually zeroing. Starts ``False``: :meth:`ensure_fused` allocates the
+    #: buffer with ``torch.zeros``, so there is nothing to clear yet.
+    _fused_mask_dirty: bool = False
+
     # ------------------------------------------------------------------ allocation
 
     def ensure_fused(self, n_envs: int | None = None) -> None:
@@ -294,6 +305,17 @@ class FusedScenario(Scenario):
         self._fused_mask = masks[0].name if masks else None
         self._fused_token_value = 0
         self._fused_ready = True
+
+    def mark_reset_mask_dirty(self) -> None:
+        """Record that the reset-mask buffer may now hold a non-zero byte.
+
+        Call this from every code path that writes (or may write) a possibly-nonzero
+        value into the ``reset_mask`` buffer. :meth:`prepare_fused` is the sole reader
+        of the flag this sets, and clears it once it has actually zeroed the buffer —
+        skipping that zero is only safe because every writer passes through here first.
+        Safe to call with no ``reset_mask`` buffer declared: the flag is then never read.
+        """
+        self._fused_mask_dirty = True
 
     def _fused_owner(self, b: Buf) -> tuple[object, str]:
         """Resolve ``b.attr`` to ``(owner, attribute name)``; ``"world.goals"`` is dotted."""
@@ -414,8 +436,13 @@ class FusedScenario(Scenario):
         when a graph backs the step, otherwise by :meth:`post_step` itself.
         """
         self.ensure_fused()
-        if self._fused_mask is not None:
+        if self._fused_mask is not None and self._fused_mask_dirty:
+            # Only zero when a writer marked the buffer dirty since the last zero. With
+            # ``auto_reset=False`` that is the step right after a reset and no other, so
+            # the alternative is a CUDA memset launched forever over a buffer that is
+            # already all zeros. See ``_fused_mask_dirty`` for the invariant it rests on.
             self.fb[self._fused_mask].zero_()  # a normal step resets no env
+            self._fused_mask_dirty = False
         self.sync_fused_handles()
 
     def post_step(self) -> None:
@@ -463,6 +490,7 @@ class FusedScenario(Scenario):
                 if env_mask is None:
                     return self._wp[self._fused_mask], wp.int32(0)
                 self.fb[self._fused_mask].copy_(env_mask)  # bool -> uint8
+                self.mark_reset_mask_dirty()
                 return self._wp[self._fused_mask], wp.int32(1)
 
         n_envs = self.world.n_envs
@@ -490,6 +518,7 @@ class FusedScenario(Scenario):
                 # buffer untouched (the reset kernel doesn't need it when use_mask=0, but
                 # the fused kernels below read it unconditionally).
                 self.fb[self._fused_mask].fill_(1)
+                self.mark_reset_mask_dirty()
             with torch_stream_scope(self.world.device):
                 self.launch_fused(FusedPass("reset", env_mask=env_mask, full=not obs_only))
         else:

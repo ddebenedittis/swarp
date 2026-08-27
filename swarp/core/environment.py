@@ -233,6 +233,17 @@ class Environment:
             handles["reset_mask"] = scenario._wp[mask_name]
 
         def _prepare() -> None:
+            # ``_run`` (below) is Python that only executes at warm-up and at capture
+            # time, never on a graph replay -- so marking the mask dirty from inside it
+            # would fire once and then never again. ``_prepare`` (this function) runs
+            # eagerly before every replay instead, so it marks the flag unconditionally,
+            # before delegating to ``base_hook.prepare()`` (``FusedScenario.prepare_fused``,
+            # which reads the flag): a replay always restamps the mask via
+            # ``episode_end_kernel`` inside ``_run``, so the buffer must be treated as
+            # dirty on every step regardless of what last step's contents were. This is
+            # also correct for the eager-persistent fallback, where ``_run`` does run
+            # per step and would otherwise mark it redundantly.
+            scenario.mark_reset_mask_dirty()
             base_hook.prepare()
             _ensure_episode_handles()
 
