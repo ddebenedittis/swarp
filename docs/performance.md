@@ -101,22 +101,25 @@ Two knobs with real cost:
 
 `auto_reset=True` is **not** free, and the reason is structural rather than incidental. `done` is a device tensor and the step promises no device→host round-trip, so there is no host-side "is anything done?" gate: the scenario's `reset_world` runs on **every** step, over the **whole** batch, and the per-env `reset_mask` selects what actually lands. Resetting one env out of 4096 therefore costs the same as resetting all of them.
 
-That makes the reset path's own cost the thing to watch. At 4096x8 on an RTX 3070 Laptop:
+That makes the reset path's own cost the thing to watch. It used to be a fixed *host-side* tail appended after the captured step — first a 16-iteration `torch.cdist` rejection loop in navigation's spawn sampler, run twice per reset (spawns, then goals), for 40.8 ms/step at 4096x8 (315x the plain step); stratified jittered-cell sampling replaced it, getting the pairwise separation by construction in a single draw. That left a torch draw still running every step, and at 16,384x16 it was **86%** of the step: two batched `argsort`s (the only way to get a uniform random k-subset out of batched torch ops), four `sample_uniform`s and the `torch.where` blends — around 25 ops, on a path that is bound by op count rather than by arithmetic. Consolidating that into one masked Warp launch per scenario (`nav_reset_kernel` and its siblings, one thread per env, drawing distinct cells by a partial Fisher–Yates over a scratch permutation; shared pieces in `swarp/scenarios/reset_kernels.py`) got the reset from 3.9 to 1.20 ms/step at 4096x8, and 1.3–1.6x on every other scenario's `auto_reset` steps.
 
-| | ms/step |
-|---|---|
-| `auto_reset=False` | 0.14 |
-| `auto_reset=True` | 1.20 |
+That 1.20 ms/step was still an eager tail after the graph replay, though — the masked reset kernel, the masked neighbor rebuild and the masked obs pass all ran as separate host-launched calls every step, on a config where the tail cost more than the physics it followed. The remaining fix was to stop treating the reset as something that happens *after* the graph: the reset RNG seed moves onto the device (a one-thread kernel advances it in place before each draw, reproducing the old host-side "increment then use" arithmetic exactly, so the drawn sequence is unchanged) and the whole masked sequence — episode-end test, seed advance, reset, neighbor rebuild, obs pass — gets folded into the same `wp.ScopedCapture` as the physics. A step under `auto_reset` is then one graph replay end to end, the same shape as a step without it. This is opt-in per scenario (`FusedScenario.supports_graph_reset()`; navigation qualifies when it has no obstacles, since sampling obstacle poses needs `world.generator` and a spec re-install, neither of which belongs inside a capture) — scenarios that don't qualify keep the eager tail above.
 
-Navigation's spawn sampler used to dominate that second row, twice over. First it was a fixed 16-iteration `torch.cdist` rejection loop, run twice per reset (spawns, then goals), for 40.8 ms/step — 315x the plain step; stratified jittered-cell sampling replaced it, getting the pairwise separation by construction in a single draw.
+Same guarantee, same distribution throughout — a *uniform* k-subset, which is the part worth protecting: a cheaper structured draw (cells by a random base and stride) passes every separation and bounds check while collapsing the reachable spawn layouts from C(25,16) ≈ 2.0M to 250, which surfaces much later as a generalization failure rather than as a test failure. `tests/unit/test_reset_kernel.py` pins it.
 
-That left a torch draw still running every step, and at 16,384x16 it was **86%** of the step: two batched `argsort`s (the only way to get a uniform random k-subset out of batched torch ops), four `sample_uniform`s and the `torch.where` blends — around 25 ops, on a path that is bound by op count rather than by arithmetic. The whole masked reset is now a single Warp launch (`nav_reset_kernel`), one thread per env, drawing its distinct cells by a partial Fisher–Yates over a scratch permutation. Every other scenario does the same — one masked kernel per reset, with the shared pieces in `swarp/scenarios/reset_kernels.py` — for 1.3-1.6x on their `auto_reset` steps. Same guarantee, same distribution — a *uniform* k-subset, which is the part worth protecting: a cheaper structured draw (cells by a random base and stride) passes every separation and bounds check while collapsing the reachable spawn layouts from C(25,16) ≈ 2.0M to 250, which surfaces much later as a generalization failure rather than as a test failure. `tests/unit/test_reset_kernel.py` pins it.
+At 4096x8 on an RTX 3070 Laptop, graph on, obstacle-free navigation:
 
-The reset went from 3.9 to 1.20 ms/step at 4096x8; at 16,384x16 the RL configuration (graph on, `auto_reset=True`) went from 4.2M to 13.8M env-steps/s.
+| | ms/step | vs `auto_reset=False` |
+|---|---|---|
+| `auto_reset=False` | 0.08 | — |
+| `auto_reset=True`, realistic (a slice of the batch resets each step) | 0.10 | 1.24x |
+| `auto_reset=True`, worst case (every env resets every step) | 0.13 | 1.60x |
+
+At 16,000x16 the gap narrows further in relative terms as the physics work grows to dominate the step: 0.40 ms/step without reset, 0.43 ms realistic, 0.87 ms worst case (2.2x) — against the 3.9 ms a *single* reset used to cost at the smaller 4096x8 config before any of this work. Resetting one env out of the batch now costs close to nothing extra; resetting the whole batch on the same step is the regime that still shows up, because the masked kernels still touch the same amount of data whether one env changed or all of them did.
 
 Two things follow for anyone writing a scenario:
 
-- Whatever `reset_world` does, it does on every step under `auto_reset`. Budget it as hot-path work, not as setup — and prefer one masked kernel over a chain of masked torch ops, because what costs you there is the number of launches, not the arithmetic.
+- Whatever `reset_world` does, it does on every step under `auto_reset`. Budget it as hot-path work, not as setup — and prefer one masked kernel over a chain of masked torch ops, because what costs you there is the number of launches, not the arithmetic. If the reset can be made capture-safe (no host-side RNG draws, no allocation, no branching on tensor values), `supports_graph_reset()` folds it into the graph and removes the launch cost entirely.
 - If you only need resets at episode boundaries you control, leave `auto_reset=False` and call `env.reset_at` yourself with a mask — you then pay the reset cost only on the steps that need it.
 
 ## Running the benchmarks
