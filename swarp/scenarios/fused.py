@@ -271,6 +271,15 @@ class FusedScenario(Scenario):
         self.fb = {}
         self._wp = {}
         self._fused_ptrs: dict[str, int] = {}
+        # name -> the resolved (owner, attribute name) for every buffer with an ``attr``,
+        # resolved once here instead of re-splitting and re-walking ``b.attr`` on every
+        # call (``_fused_owner`` allocates a list per call, and ``sync_fused_handles``
+        # runs per step). Caching the *owner object* holds because the only intermediate
+        # a dotted attr walks through is ``self.world``, which ``make_world`` assigns
+        # once and never reassigns — the same lifetime ``ensure_fused`` already assumes
+        # by caching Warp handles over this world's buffers. A buffer whose *attribute*
+        # is reassigned is the ``watch`` case, and that is handled below.
+        self._fused_attr: dict[str, tuple[object, str]] = {}
         for b in spec:
             if b.watch and b.attr is None:
                 raise ValueError(
@@ -278,6 +287,8 @@ class FusedScenario(Scenario):
                     "framework-owned buffer is never reassigned, so nothing can move"
                 )
             self._fused_bind(b, self._fused_acquire(b, n_envs))
+            if b.attr is not None:
+                self._fused_attr[b.name] = self._fused_owner(b)
         self._fused_carries = tuple(b for b in spec if b.carry)
         self._fused_watch = tuple(b for b in spec if b.watch)
         self._fused_mask = masks[0].name if masks else None
@@ -364,7 +375,7 @@ class FusedScenario(Scenario):
         """
         changed = False
         for b in self._fused_watch:
-            owner, attr = self._fused_owner(b)
+            owner, attr = self._fused_attr[b.name]
             t = getattr(owner, attr)
             if t.data_ptr() != self._fused_ptrs[b.name]:
                 self._fused_bind(b, t)
@@ -389,7 +400,7 @@ class FusedScenario(Scenario):
             if b.attr is None:
                 out.append(self.fb[b.name])
             else:
-                owner, attr = self._fused_owner(b)
+                owner, attr = self._fused_attr[b.name]
                 out.append(getattr(owner, attr))
         out.extend(self.engine_carries())
         return out
