@@ -122,8 +122,16 @@ class SamplingScenario(FusedScenario):
         mask, use_mask = self.reset_mask_wp(env_mask)
         st = w.state_wp()
         scalar = w.wp_dtype
-        aux = wp.from_torch(self.centers.contiguous(), dtype=VEC2[scalar])
-        flags = wp.from_torch(self.consumed.view(torch.uint8))
+        if self.fused_active:
+            # ``centers``/``consumed`` are adopted (``alloc="never"``) and never
+            # reassigned, so the fused spec's cached handles are always current —
+            # reuse them instead of re-wrapping on every reset.
+            self.ensure_fused()
+            aux = self._wp["centers"]
+            flags = self._wp["consumed"]
+        else:
+            aux = wp.from_torch(self.centers.contiguous(), dtype=VEC2[scalar])
+            flags = wp.from_torch(self.consumed.view(torch.uint8))
         with torch_stream_scope(w.device):
             wp.launch(
                 concrete(sampling_reset_kernel, scalar),

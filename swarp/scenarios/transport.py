@@ -160,6 +160,25 @@ class TransportScenario(FusedScenario):
         st = w.state_wp()
         scalar = w.wp_dtype
         vec2 = VEC2[scalar]
+        if self.fused_active:
+            # Reuse the fused spec's cached, pointer-resynced handles instead of
+            # re-wrapping these watched tensors on every reset (see navigation's
+            # ``_launch_reset`` for the same fix and its rationale). ``sync_fused_
+            # handles`` must run first: it is what notices a grad-path reassignment
+            # and rebuilds the handle before this kernel writes through it.
+            self.ensure_fused()
+            self.sync_fused_handles()
+            pkg_pos = self._wp["pkg_pos"]
+            pkg_vel = self._wp["pkg_vel"]
+            pkg_theta = self._wp["pkg_theta"]
+            pkg_ang_vel = self._wp["pkg_ang_vel"]
+            goal = self._wp["goal"]
+        else:
+            pkg_pos = wp.from_torch(self.pkg_pos.contiguous(), dtype=vec2)
+            pkg_vel = wp.from_torch(self.pkg_vel.contiguous(), dtype=vec2)
+            pkg_theta = wp.from_torch(self.pkg_theta.contiguous())
+            pkg_ang_vel = wp.from_torch(self.pkg_ang_vel.contiguous())
+            goal = wp.from_torch(self.goal.contiguous(), dtype=vec2)
         with torch_stream_scope(w.device):
             wp.launch(
                 concrete(transport_reset_kernel, scalar),
@@ -174,11 +193,11 @@ class TransportScenario(FusedScenario):
                     wp.int32(self.n_packages),
                     st.pos,
                     st.vel,
-                    wp.from_torch(self.pkg_pos.contiguous(), dtype=vec2),
-                    wp.from_torch(self.pkg_vel.contiguous(), dtype=vec2),
-                    wp.from_torch(self.pkg_theta.contiguous()),
-                    wp.from_torch(self.pkg_ang_vel.contiguous()),
-                    wp.from_torch(self.goal.contiguous(), dtype=vec2),
+                    pkg_pos,
+                    pkg_vel,
+                    pkg_theta,
+                    pkg_ang_vel,
+                    goal,
                 ],
                 device=w.device,
                 record_tape=False,

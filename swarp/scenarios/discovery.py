@@ -108,8 +108,16 @@ class DiscoveryScenario(FusedScenario):
         mask, use_mask = self.reset_mask_wp(env_mask)
         st = w.state_wp()
         scalar = w.wp_dtype
-        aux = wp.from_torch(self.targets.contiguous(), dtype=VEC2[scalar])
-        flags = wp.from_torch(self.covered.view(torch.uint8))
+        if self.fused_active:
+            # ``targets``/``covered`` are adopted (``alloc="never"``) and never
+            # reassigned, so the fused spec's cached handles are always current —
+            # reuse them instead of re-wrapping on every reset.
+            self.ensure_fused()
+            aux = self._wp["targets"]
+            flags = self._wp["covered"]
+        else:
+            aux = wp.from_torch(self.targets.contiguous(), dtype=VEC2[scalar])
+            flags = wp.from_torch(self.covered.view(torch.uint8))
         with torch_stream_scope(w.device):
             wp.launch(
                 concrete(discovery_reset_kernel, scalar),

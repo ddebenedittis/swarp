@@ -307,6 +307,27 @@ class PushTScenario(FusedScenario):
         st = w.state_wp()
         scalar = w.wp_dtype
         vec2 = VEC2[scalar]
+        if self.fused_active:
+            # Reuse the fused spec's cached, pointer-resynced handles instead of
+            # re-wrapping these watched tensors on every reset (see navigation's
+            # ``_launch_reset`` for the same fix and its rationale). ``sync_fused_
+            # handles`` must run first: it is what notices a grad-path reassignment
+            # and rebuilds the handle before this kernel writes through it.
+            self.ensure_fused()
+            self.sync_fused_handles()
+            tee_pos = self._wp["tee_pos"]
+            tee_vel = self._wp["tee_vel"]
+            tee_theta = self._wp["tee_theta"]
+            tee_ang_vel = self._wp["tee_ang_vel"]
+            goal_pos = self._wp["goal_pos"]
+            goal_theta = self._wp["goal_theta"]
+        else:
+            tee_pos = wp.from_torch(self.tee_pos.contiguous(), dtype=vec2)
+            tee_vel = wp.from_torch(self.tee_vel.contiguous(), dtype=vec2)
+            tee_theta = wp.from_torch(self.tee_theta.contiguous())
+            tee_ang_vel = wp.from_torch(self.tee_ang_vel.contiguous())
+            goal_pos = wp.from_torch(self.goal_pos.contiguous(), dtype=vec2)
+            goal_theta = wp.from_torch(self.goal_theta.contiguous())
         with torch_stream_scope(w.device):
             wp.launch(
                 concrete(pusht_reset_kernel, scalar),
@@ -325,12 +346,12 @@ class PushTScenario(FusedScenario):
                     wp.int32(self.n_agents),
                     st.pos,
                     st.vel,
-                    wp.from_torch(self.tee_pos.contiguous(), dtype=vec2),
-                    wp.from_torch(self.tee_vel.contiguous(), dtype=vec2),
-                    wp.from_torch(self.tee_theta.contiguous()),
-                    wp.from_torch(self.tee_ang_vel.contiguous()),
-                    wp.from_torch(self.goal_pos.contiguous(), dtype=vec2),
-                    wp.from_torch(self.goal_theta.contiguous()),
+                    tee_pos,
+                    tee_vel,
+                    tee_theta,
+                    tee_ang_vel,
+                    goal_pos,
+                    goal_theta,
                 ],
                 device=w.device,
                 record_tape=False,

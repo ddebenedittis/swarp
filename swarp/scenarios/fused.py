@@ -398,15 +398,30 @@ class FusedScenario(Scenario):
         """``(mask, use_mask)`` for a masked reset kernel: a uint8 ``[n_envs]`` Warp view
         and the flag saying whether the kernel should consult it.
 
-        Every scenario's reset kernel takes the mask this way, so the buffer and its Warp
-        handle are allocated once here rather than seven times. The tensor is never
-        reallocated for a given batch size, so the handle stays pointer-stable — which is
-        what lets a captured graph and the fused handle cache keep working across resets.
+        Every scenario's reset kernel takes the mask this way. When the fused spec is
+        active and declares a ``reset_mask`` buffer, this *is* the same device buffer
+        :meth:`finish_reset` later stamps for the fused obs/reward kernels
+        (``self.fb[self._fused_mask]``) — one upload, not two device buffers holding the
+        same value. Outside that (the torch-oracle path, or a scenario with no
+        ``reset_mask`` buffer) it falls back to a buffer owned by this method. Either way
+        the tensor is never reallocated for a given batch size, so the handle stays
+        pointer-stable — which is what lets a captured graph and the fused handle cache
+        keep working across resets.
 
         ``env_mask=None`` (reset everything) leaves the buffer alone and returns
         ``use_mask=0``: the kernel then skips the lookup instead of reading a buffer we
-        would otherwise have to fill with ones.
+        would otherwise have to fill with ones. (:meth:`finish_reset` still fills the
+        shared buffer with ones afterwards, for the fused kernels that read it
+        unconditionally.)
         """
+        if self.fused_active:
+            self.ensure_fused()
+            if self._fused_mask is not None:
+                if env_mask is None:
+                    return self._wp[self._fused_mask], wp.int32(0)
+                self.fb[self._fused_mask].copy_(env_mask)  # bool -> uint8
+                return self._wp[self._fused_mask], wp.int32(1)
+
         n_envs = self.world.n_envs
         mask = getattr(self, "_reset_mask_t", None)
         if mask is None or mask.shape != (n_envs,):
@@ -426,12 +441,12 @@ class FusedScenario(Scenario):
         if self.fused_active:
             self.ensure_fused()
             self.sync_fused_handles()  # this pass launches with the cached handles
-            if self._fused_mask is not None:
-                mask = self.fb[self._fused_mask]
-                if env_mask is None:
-                    mask.fill_(1)
-                else:
-                    mask.copy_(env_mask)  # bool -> uint8
+            if self._fused_mask is not None and env_mask is None:
+                # A masked reset already wrote this buffer from ``reset_mask_wp``; only
+                # the "reset everything" case needs the fill, since that call leaves the
+                # buffer untouched (the reset kernel doesn't need it when use_mask=0, but
+                # the fused kernels below read it unconditionally).
+                self.fb[self._fused_mask].fill_(1)
             with torch_stream_scope(self.world.device):
                 self.launch_fused(FusedPass("reset", env_mask=env_mask, full=not obs_only))
         else:

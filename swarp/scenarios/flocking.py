@@ -152,7 +152,7 @@ class FlockingScenario(FusedScenario):
     def _launch(self, full_pass: int) -> None:
         w = self.world
         n_envs = w.n_envs
-        w.neighbors()  # build the grid on the current state
+        w.build_neighbors()  # build the grid on the current state; no torch wrap needed
         grid = w.stepper.grid(n_envs)
         scalar = w.wp_dtype
         st = w.state_wp()

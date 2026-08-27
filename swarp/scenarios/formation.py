@@ -121,7 +121,15 @@ class FormationScenario(FusedScenario):
             )
         st = w.state_wp()
         scalar = w.wp_dtype
-        goals = wp.from_torch(w.goals.contiguous(), dtype=VEC2[scalar])
+        if self.fused_active:
+            # Reuse the fused spec's cached, pointer-resynced handle instead of
+            # re-wrapping ``world.goals`` on every reset (see navigation's
+            # ``_launch_reset`` for the same fix and its rationale).
+            self.ensure_fused()
+            self.sync_fused_handles()
+            goals = self._wp["goals"]
+        else:
+            goals = wp.from_torch(w.goals.contiguous(), dtype=VEC2[scalar])
         with torch_stream_scope(w.device):
             wp.launch(
                 concrete(formation_reset_kernel, scalar),

@@ -255,7 +255,17 @@ class NavigationScenario(FusedScenario):
         mask, use_mask = self.reset_mask_wp(env_mask)
 
         st = w.state_wp()
-        goals = wp.from_torch(w.goals.contiguous(), dtype=VEC2[w.wp_dtype])
+        if self.fused_active:
+            # Reuse the fused spec's cached, pointer-resynced handle instead of
+            # re-wrapping ``world.goals`` (a ``wp.from_torch`` + ``.contiguous()``) on
+            # every reset. ``sync_fused_handles`` must run first: it is what notices a
+            # grad-path reassignment and rebuilds the handle before this kernel writes
+            # through it.
+            self.ensure_fused()
+            self.sync_fused_handles()
+            goals = self._wp["goals"]
+        else:
+            goals = wp.from_torch(w.goals.contiguous(), dtype=VEC2[w.wp_dtype])
         scalar = w.wp_dtype
         with torch_stream_scope(w.device):
             wp.launch(
@@ -355,7 +365,7 @@ class NavigationScenario(FusedScenario):
     def _launch_obs(self, advance_prev: int, full_pass: int) -> None:
         w = self.world
         n_envs = w.n_envs
-        w.neighbors()  # build the grid on the current state (fills grid buffers)
+        w.build_neighbors()  # build the grid on the current state; no torch wrap needed
         grid = w.stepper.grid(n_envs)
         scalar = w.wp_dtype
         st = w.state_wp()

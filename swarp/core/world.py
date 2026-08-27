@@ -331,19 +331,23 @@ class World:
 
     # -------------------------------------------------------------- neighbors
 
-    def neighbors(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """Padded within-radius neighbor lists on the *current* (post-step) state.
+    def build_neighbors(self) -> None:
+        """Build the within-radius neighbor grid on the *current* (post-step) state,
+        without wrapping the result as torch tensors.
 
-        Returns zero-copy ``(neighbor_idx [n_envs, n_agents, K] int32,
-        neighbor_count [n_envs, n_agents] int32)`` views; they are overwritten
-        by the next call, so gather from them within the same step.
+        This is the build half of :meth:`neighbors`, split out for callers that only
+        need the grid populated — a fused kernel launch reads it straight from
+        ``self.stepper.grid(...)`` via cached Warp handles and never touches the torch
+        views, so the two ``wp.to_torch`` calls :meth:`neighbors` does on top of this
+        would be pure host-side overhead: allocated, returned, and immediately discarded
+        every step. That overhead is exactly what auto-reset's every-step ``reset_world``
+        cannot afford (see ``CLAUDE.md``, "Speed Is a First-Class Citizen"), so every
+        fused ``_launch_obs``/reset path calls this instead of :meth:`neighbors`.
 
-        This builds neighbors on the final post-step state (what observations and
-        rewards need). It also stamps ``grid.built_version`` with the stepper's
-        current ``state_version``, so the next step can recognize that its input
-        state already has a matching neighbor list and skip substep 0's rebuild
-        (``WorldConfig.neighbor_reuse``) — turning the two builds per step (this
-        one plus the force-time query) into one.
+        Stamps ``grid.built_version`` with the stepper's current ``state_version``, so
+        the next step can recognize that its input state already has a matching
+        neighbor list and skip substep 0's rebuild (``WorldConfig.neighbor_reuse``) —
+        turning the two builds per step (this one plus the force-time query) into one.
         """
         if not self.stepper.collisions:
             raise RuntimeError("neighbor lists require WorldConfig.collisions=True")
@@ -369,7 +373,22 @@ class World:
                 )
                 grid.build(pos_wp)
         grid.built_version = self.stepper.state_version
-        return grid.torch_views()
+
+    def neighbors(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Padded within-radius neighbor lists on the *current* (post-step) state.
+
+        Returns zero-copy ``(neighbor_idx [n_envs, n_agents, K] int32,
+        neighbor_count [n_envs, n_agents] int32)`` views; they are overwritten
+        by the next call, so gather from them within the same step.
+
+        This builds neighbors on the final post-step state (what observations and
+        rewards need) via :meth:`build_neighbors`, then wraps the result as torch
+        tensors. A caller that is going to read the grid through Warp handles instead
+        (any fused kernel launch) should call :meth:`build_neighbors` directly and skip
+        the wrap — see its docstring.
+        """
+        self.build_neighbors()
+        return self.stepper.grid(self.n_envs).torch_views()
 
     def mark_pos_dirty(self) -> None:
         """Invalidate any cached neighbor list after writing ``state.pos`` out of
@@ -392,5 +411,5 @@ class World:
         :meth:`neighbors`) and the redundant rebuild is skipped.
         """
         if rebuild:
-            self.neighbors()
+            self.build_neighbors()  # the torch views ``neighbors()`` would add go unused
         return self.stepper.grid(self.n_envs).edge_index()
