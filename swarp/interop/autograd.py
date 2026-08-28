@@ -13,6 +13,7 @@ overwriting an array recorded on a tape silently corrupts its adjoint. Under
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import NamedTuple
 
@@ -67,8 +68,15 @@ def fill_state_defaults(state: TorchState) -> TorchState:
     return state._replace(z=z, vz=vz, attitude=att, body_rates=br)
 
 
-def _wrap_input_state(tensors: TorchState, scalar, with_grad: bool):
-    """Wrap torch tensors as Warp arrays; optionally attach fresh grad buffers."""
+def wrap_input_state(tensors: TorchState, scalar, with_grad: bool):
+    """Wrap torch tensors as Warp arrays; optionally attach fresh grad buffers.
+
+    Part of this module's reusable torch<->Warp bridge, alongside
+    :func:`wrap_actions` and :func:`torch_stream_scope`: anything driving the
+    kernels from torch outside :class:`_WarpStepFn` (``swarp.interop.compile``'s
+    custom op does exactly this) needs the same wrapping to stay consistent with
+    what the adjoint replay expects.
+    """
     n = len(TorchState._fields)
     grads = TorchState(*(torch.zeros_like(t) for t in tensors)) if with_grad else None
     arrays = {}
@@ -83,8 +91,11 @@ def _wrap_input_state(tensors: TorchState, scalar, with_grad: bool):
     return WorldState(**arrays), grads
 
 
-def _wrap_actions(actions: torch.Tensor, scalar, with_grad: bool):
+def wrap_actions(actions: torch.Tensor, scalar, with_grad: bool):
     """Wrap ``[n_envs, n_agents, act_dim]`` actions as a scalar ``array3d``.
+
+    The action-side counterpart to :func:`wrap_input_state`, and public for the same
+    reason: an alternative front end to the step has to wrap actions the same way.
 
     Action arity is decoupled from geometry (``vec2``): the integrate kernel
     reads the scalar slots each model needs, so ``act_dim`` may exceed 2.
@@ -103,14 +114,56 @@ def _wrap_actions(actions: torch.Tensor, scalar, with_grad: bool):
 # wrapped ``wp.Stream`` keyed by (device, cudaStream_t pointer).
 _STREAM_CACHE: dict[tuple[str, int], object] = {}
 
+# Reading torch's current stream is on the per-step path, so it has to be cheap.
+# ``torch.cuda.current_stream()`` builds a Python ``Stream`` object and measured **17 us**
+# per call on an RTX 3070 Laptop — more than the ``ScopedStream`` it is called to avoid,
+# and ~10% of a graph-mode step. The private raw accessor hands back the bare
+# ``cudaStream_t`` as an int in **0.4 us**; it is the same one torch.compile's inductor
+# runtime uses. The ``getattr`` keeps us working if it is ever renamed.
+_RAW_STREAM = getattr(torch._C, "_cuda_getCurrentRawStream", None)
 
-def _torch_stream_scope(device: str):
+
+def _current_raw_stream(device: str) -> int:
+    """torch's current ``cudaStream_t`` for ``device``, as an int. ``0`` = legacy default."""
+    index = int(device.partition(":")[2]) if ":" in device else 0
+    if _RAW_STREAM is not None:
+        return _RAW_STREAM(index)
+    return torch.cuda.current_stream(index).cuda_stream
+
+
+def torch_stream_scope(device: str):
+    """Scope Warp launches onto torch's current stream (``ScopedDevice`` on CPU).
+
+    Every entry point that launches kernels against torch tensors has to open this
+    first, or the launches land on Warp's own stream, unordered against the torch ops
+    that produced their inputs. Cached per ``(device, cudaStream_t)`` — see the note above.
+
+    **Except on the legacy default stream**, where it is a no-op. Warp's own stream is
+    created with the *blocking* flag, so the driver already serializes it against stream 0
+    in both directions: a Warp launch issued after queued torch work waits for that work,
+    with no event of ours involved. (Measured, not assumed — queue ~550 ms of torch matmuls
+    on stream 0, then ``wp.synchronize_stream(device.stream)`` on a trivial Warp launch: it
+    returns after ~540 ms, i.e. it waited.) Skipping the scope there is therefore exactly
+    the behaviour that shipped before it existed, and it has to be skipped *cheaply*: this
+    is the per-step path, and a ``ScopedStream`` (22 us) or even a ``ScopedDevice`` (7 us)
+    is a measurable share of a 130-370 us graph-mode step.
+
+    Not scoping the device is safe because nothing in the step path relies on the ambient
+    one — every ``wp.launch`` in ``stepper``/``collisions``/``neighbors``/``bodies`` and in
+    the fused scenario kernels names its ``device=`` explicitly. A launch added without one
+    would silently follow Warp's default device here.
+
+    A caller running inside its own ``torch.cuda.Stream`` gets the real scope, which is the
+    case the blocking flag does *not* cover.
+    """
     if device.startswith("cuda"):
-        ts = torch.cuda.current_stream()
-        key = (device, ts.cuda_stream)
+        raw = _current_raw_stream(device)
+        if raw == 0:  # the legacy default stream; see above
+            return nullcontext()
+        key = (device, raw)
         wp_stream = _STREAM_CACHE.get(key)
         if wp_stream is None:
-            wp_stream = wp.stream_from_torch(ts)
+            wp_stream = wp.stream_from_torch(torch.cuda.current_stream())
             _STREAM_CACHE[key] = wp_stream
         return wp.ScopedStream(wp_stream)
     return wp.ScopedDevice(device)
@@ -186,10 +239,10 @@ class _WarpStepFn(torch.autograd.Function):
         state = TorchState(*state_tensors)
         n_envs = actions.shape[0]
 
-        with _torch_stream_scope(stepper.device):
+        with torch_stream_scope(stepper.device):
             if slot is None:
-                state_wp, in_grads = _wrap_input_state(state, scalar, with_grad=True)
-                actions_wp, act_grad = _wrap_actions(actions, scalar, with_grad=True)
+                state_wp, in_grads = wrap_input_state(state, scalar, with_grad=True)
+                actions_wp, act_grad = wrap_actions(actions, scalar, with_grad=True)
                 out_wp = stepper.alloc_state(n_envs, requires_grad=True)
                 buffers = stepper.make_buffers(n_envs, requires_grad=True)
             else:
@@ -224,7 +277,7 @@ class _WarpStepFn(torch.autograd.Function):
     @staticmethod
     def backward(ctx, *adj_out: torch.Tensor):
         stepper: Stepper = ctx.stepper
-        with _torch_stream_scope(stepper.device):
+        with torch_stream_scope(stepper.device):
             # Adjoint kernels accumulate (+=); zero all tape grads so repeated
             # backward calls on the same graph (retain_graph) stay correct.
             ctx.tape.zero()
@@ -265,7 +318,7 @@ def warp_step(
 
     scalar = _WP_SCALAR[actions.dtype]
     n_envs = actions.shape[0]
-    with _torch_stream_scope(stepper.device):
+    with torch_stream_scope(stepper.device):
         # When ``state`` is the previous step's cached output (the common hot-loop
         # case), its tensors already back a wrapped WorldState — reuse it instead
         # of re-running ``wp.from_torch`` on all nine fields.
@@ -273,7 +326,7 @@ def warp_step(
         if cached_in is not None:
             state_wp = cached_in
         else:
-            state_wp, _ = _wrap_input_state(state, scalar, with_grad=False)
+            state_wp, _ = wrap_input_state(state, scalar, with_grad=False)
         actions_wp = stepper.wrap_actions(actions, scalar)
         # Recycled ping-pong output (zero steady-state allocation); input and
         # output never alias. Returned tensors are valid until this batch size
@@ -295,7 +348,9 @@ def rollout(
 
     Args:
         state: initial state.
-        actions_seq: ``[T, n_envs, n_agents, 2]`` action sequence.
+        actions_seq: ``[T, n_envs, n_agents, act_dim]`` action sequence. ``act_dim``
+            is the max arity over the fleet's models — 2 for every 2D vehicle, 4 for a
+            drone's per-rotor thrusts.
         ring: optional :class:`GradRing` supplying reusable taped scratch; its
             ``capacity`` must be ``>= T``. Reused across iterations with no new
             allocations. ``None`` allocates fresh scratch each step.

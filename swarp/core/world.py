@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from typing import NamedTuple
 
 import torch
@@ -11,7 +12,7 @@ from swarp.core.config import Obstacles, WorldConfig
 from swarp.core.state import VEC2
 from swarp.core.stepper import Stepper
 from swarp.dynamics.base import AgentConfig, action_dim
-from swarp.interop.autograd import TorchState, warp_step
+from swarp.interop.autograd import TorchState, torch_stream_scope, warp_step
 
 TORCH_TO_WP = {torch.float32: wp.float32, torch.float64: wp.float64}
 
@@ -49,11 +50,19 @@ class World:
         substeps: int = 1,
         dtype: torch.dtype = torch.float32,
     ) -> None:
+        if n_envs < 1:
+            raise ValueError(f"n_envs must be >= 1, got {n_envs}")
         self.n_envs = n_envs
         self.n_agents = len(agent_configs)
-        self.device = device
+        self.device = str(device)
         self.dtype = dtype
-        self.wp_dtype = TORCH_TO_WP[dtype]
+        try:
+            self.wp_dtype = TORCH_TO_WP[dtype]
+        except KeyError:
+            supported = ", ".join(str(k) for k in TORCH_TO_WP)
+            raise TypeError(
+                f"unsupported dtype {dtype!r} for World; supported: {supported}"
+            ) from None
         self.agent_configs = agent_configs
         # Env-level action width: max arity over agent models (models ignore
         # slots beyond their own). All current 2D vehicle models use 2.
@@ -81,8 +90,12 @@ class World:
         self.action: torch.Tensor | None = None  # [n_envs, n_agents, act_dim]
         self.goals: torch.Tensor | None = None  # [n_envs, n_agents, 2]
         # The installed obstacle set, retained whole (see set_obstacles). The
-        # obstacle_* attributes below mirror its fields for the renderer / sensors,
-        # which read None as "all circles" / "no orientation".
+        # obstacle_* attributes below mirror the *installed spec* -- shape/extent/kind
+        # metadata that never changes, plus the spawn pose -- and read None as "all
+        # circles" / "no orientation". They are NOT the live pose: a movable obstacle is
+        # integrated in place inside the stepper's arrays, so obstacle_pos/_angle go
+        # stale the moment it is pushed. Both the renderer and the lidar take the pose
+        # from obstacle_state_views() for exactly that reason.
         self.obstacles: Obstacles | None = None
         self.obstacle_pos: torch.Tensor | None = None  # [n_envs, n_obstacles, 2]
         self.obstacle_radius: torch.Tensor | None = None  # [n_obstacles]
@@ -92,6 +105,36 @@ class World:
         self.obstacle_half_extents: torch.Tensor | None = None  # [n_obstacles, 2]
         self.obstacle_kind: torch.Tensor | None = None  # [n_obstacles] ObstacleKind tags
         self.generator: torch.Generator | None = None  # installed by Environment
+        # Seed stream for kernel-side RNG, advanced host-side. A Warp kernel needs an
+        # integer seed, and pulling one out of ``generator`` would mean a device->host
+        # copy on every reset — which is exactly what a masked reset exists to avoid. So
+        # this counter mirrors the generator's role without touching the device: same
+        # ``seed`` in, same sequence of kernel seeds out. Reset alongside the generator.
+        self.kernel_seed = 0
+        self._kernel_step = 0
+        # Device-side mirror of the pair above (base seed, counter), for a scenario that
+        # needs the seed value *inside* a launch that might end up captured — currently
+        # just NavigationScenario's reset, see swarp/core/rng.py for why a device array
+        # rather than a scalar. Allocated exactly once, here: its pointer is baked into
+        # any captured graph that reads it, so it must never move for the life of the
+        # World. Kept in sync with kernel_seed/_kernel_step by set_kernel_seed below.
+        #
+        # Torch-backed (not a bare ``wp.array``): a captured graph's warm-up runs the
+        # whole hook once, including the reset kernel's ``advance_seed_kernel`` -- which
+        # means warm-up genuinely advances this counter and it has to be snapshotted and
+        # restored like every other carry (``StepRuntime._ensure_graph``'s ``carries``
+        # list), and that mechanism deals in torch tensors (``.clone()`` / ``.copy_()``),
+        # not ``wp.array``. ``self.seed_state`` stays the ``wp.array`` handle every
+        # kernel launch binds; ``self._seed_state_t`` is the torch tensor a carry list
+        # holds. Both view the same storage, so a write through either is visible to the
+        # other with no copy.
+        #
+        # ``int32``, not ``uint32``: torch has no unsigned 32-bit dtype, so the pair is
+        # stored as its int32 bit pattern and the kernel side (``swarp/core/rng.py``)
+        # reinterprets each element back to ``uint32`` before doing the actual mixing
+        # arithmetic -- see that module for why the two are numerically identical.
+        self._seed_state_t = torch.zeros(2, dtype=torch.int32, device=self.device)
+        self.seed_state = wp.from_torch(self._seed_state_t)
         self.agent_radius = torch.tensor(
             [c.radius for c in agent_configs], device=device, dtype=dtype
         )
@@ -133,17 +176,29 @@ class World:
             self.state = warp_step(self.stepper, self.state, actions)
             self.ran_post_physics = False
 
-    def enable_persistent(self, use_graph: bool = True) -> None:
+    def enable_persistent(self, use_graph: bool = True, *, graph_requested: bool = True) -> None:
         """Switch to persistent-buffer execution (optionally CUDA-graph-backed).
 
         Builds a :class:`~swarp.interop.persistent.StepRuntime`, seeds it with the
         current state, and rebinds ``self.state`` to the runtime's stable
         zero-copy views. The no-grad :meth:`step` then routes through the runtime;
         grad steps transparently fall back to the functional path.
+
+        ``graph_requested=False`` says ``use_graph`` was *inferred* rather than asked for
+        (``Environment``'s ``use_graph="auto"``), which suppresses the warning when
+        capture turns out to be unavailable — see ``StepRuntime``'s ``warn_on_fallback``.
+        Eager persistent execution is still a real win over the functional step, so the
+        fallback is the intended outcome there, not a degradation worth reporting.
         """
         from swarp.interop.persistent import StepRuntime
 
-        self.runtime = StepRuntime(self.stepper, self.n_envs, self.act_dim, use_graph=use_graph)
+        self.runtime = StepRuntime(
+            self.stepper,
+            self.n_envs,
+            self.act_dim,
+            use_graph=use_graph,
+            warn_on_fallback=graph_requested,
+        )
         self.runtime.load_state(self.state)
         self.state = self.runtime.state_views
         self._persistent = True
@@ -224,6 +279,42 @@ class World:
 
     # ------------------------------------------------------------- randomness
 
+    def next_kernel_seed(self) -> int:
+        """A fresh deterministic seed for a kernel-side RNG. Host-side, no sync.
+
+        Mixes the base seed with a monotonic counter so that two draws in one step get
+        independent streams, and a rerun from the same ``seed`` reproduces both.
+        """
+        self._kernel_step += 1
+        return (self.kernel_seed * 0x9E3779B1 + self._kernel_step) & 0x7FFFFFFF
+
+    def set_kernel_seed(self, seed: int) -> None:
+        """Reseed the kernel-RNG stream: the host counter (:meth:`next_kernel_seed`,
+        still what the six non-navigation scenarios use) and the device mirror
+        (:attr:`seed_state`, what navigation's capture-safe reset uses) together.
+
+        Called on every ``Environment.reset(seed=...)`` / ``Environment.seed(...)``, and
+        equivalent to the zero-init done in ``__init__``. The device write is a host->device
+        copy, but it only ever happens on an explicit reseed — never inside a captured
+        step — so it does not touch the "no host<->device copy on the hot path" invariant.
+        """
+        self.kernel_seed = seed
+        self._kernel_step = 0
+        # Write through the torch tensor, not ``self.seed_state.assign(...)``: the two
+        # view the same storage, but ``assign`` is a Warp-side host->device copy that
+        # bypasses torch's allocator bookkeeping, and this keeps the write on the side
+        # the carry-snapshot mechanism (``.clone()``/``.copy_()``) already understands.
+        # ``base`` has to land in int32's range: ``seed & 0xFFFFFFFF`` is the unsigned
+        # 32-bit value the kernel side wants, and casting an int64 holding it down to
+        # int32 truncates to the low 32 bits -- i.e. reinterprets those same bits as
+        # two's complement, which is exactly what ``wp.uint32(int32)`` undoes on the
+        # kernel side (see swarp/core/rng.py).
+        base = torch.tensor(
+            seed & 0xFFFFFFFF, dtype=torch.int64, device=self._seed_state_t.device
+        ).to(torch.int32)
+        self._seed_state_t[0] = base
+        self._seed_state_t[1] = 0
+
     def sample_uniform(self, shape: tuple[int, ...], low: float, high: float) -> torch.Tensor:
         u = torch.rand(shape, generator=self.generator, device=self.device, dtype=self.dtype)
         return u * (high - low) + low
@@ -240,9 +331,11 @@ class World:
         body grouping. Re-installing a retained spec is also free — it is already resolved,
         and an unchanged obstacle count takes the in-place path (no graph recapture).
 
-        The ``obstacle_*`` attributes mirror the spec's fields for the renderer and the
-        lidar; they keep ``None`` for absent fields, which those layers read as "every
-        obstacle is a circle" / "no orientation".
+        The ``obstacle_*`` attributes mirror the spec's fields as shape/extent/kind
+        metadata (plus the spawn pose); they keep ``None`` for absent fields, which the
+        renderer and the lidar read as "every obstacle is a circle" / "no orientation".
+        For the *live* pose of a movable obstacle those layers use
+        :meth:`obstacle_state_views` instead.
         """
         obs = obstacles.resolve(self.device, self.dtype)
         self.obstacles = obs
@@ -288,6 +381,59 @@ class World:
 
     # -------------------------------------------------------------- neighbors
 
+    def build_neighbors(self, *, reset_mask: wp.array | None = None) -> None:
+        """Build the within-radius neighbor grid on the *current* (post-step) state,
+        without wrapping the result as torch tensors.
+
+        This is the build half of :meth:`neighbors`, split out for callers that only
+        need the grid populated — a fused kernel launch reads it straight from
+        ``self.stepper.grid(...)`` via cached Warp handles and never touches the torch
+        views, so the two ``wp.to_torch`` calls :meth:`neighbors` does on top of this
+        would be pure host-side overhead: allocated, returned, and immediately discarded
+        every step. That overhead is exactly what auto-reset's every-step ``reset_world``
+        cannot afford (see ``CLAUDE.md``, "Speed Is a First-Class Citizen"), so every
+        fused ``_launch_obs``/reset path calls this instead of :meth:`neighbors`.
+
+        ``reset_mask``, when given, restricts the rebuild to the envs it selects (uint8
+        ``[n_envs]``, ``1`` = rebuild) — see :meth:`NeighborGrid.query_into` for the
+        exact safety contract. It is **only** correct for the obs-only auto-reset pass,
+        where every env the mask does not select has positions unchanged since this
+        grid's lists were last built; a caller anywhere else must pass ``None``. Pass it
+        explicitly — there is no way to enable it by omission.
+
+        Stamps ``grid.built_version`` with the stepper's current ``state_version`` either
+        way: even a masked build leaves the grid fully valid for every env (the selected
+        envs were rebuilt, the rest are byte-identical to the last full build they
+        matched), so the stamp means exactly what it always means. That lets the next
+        step recognize that its input state already has a matching neighbor list and
+        skip substep 0's rebuild (``WorldConfig.neighbor_reuse``) — turning the two
+        builds per step (this one plus the force-time query) into one.
+        """
+        if not self.stepper.collisions:
+            raise RuntimeError("neighbor lists require WorldConfig.collisions=True")
+        grid = self.stepper.grid(self.n_envs)
+        # Scoped onto torch's current stream, so the build is ordered against the torch
+        # writes to ``state.pos`` that precede it and the graph replay that reads the lists
+        # on the next step. The exception is a *captured* invocation: navigation's fused
+        # ``_launch_obs`` calls this from inside ``wp.ScopedCapture``, where opening a
+        # ScopedStream onto torch's legacy stream would break the capture — there the build
+        # records onto the capture stream, which is exactly what it must do.
+        dev = wp.get_device(self.device)
+        capturing = dev.is_cuda and dev.is_capturing
+        with nullcontext() if capturing else torch_stream_scope(self.device):
+            if self._persistent and not self._detached:
+                # The persistent state's pos is already a Warp array — build directly on
+                # it (no re-wrap).
+                grid.build(self.runtime.state.pos, reset_mask=reset_mask)
+            else:
+                pos_wp = wp.from_torch(
+                    self.state.pos.detach().contiguous(),
+                    dtype=VEC2[self.wp_dtype],
+                    requires_grad=False,
+                )
+                grid.build(pos_wp, reset_mask=reset_mask)
+        grid.built_version = self.stepper.state_version
+
     def neighbors(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Padded within-radius neighbor lists on the *current* (post-step) state.
 
@@ -296,29 +442,13 @@ class World:
         by the next call, so gather from them within the same step.
 
         This builds neighbors on the final post-step state (what observations and
-        rewards need). It also stamps ``grid.built_version`` with the stepper's
-        current ``state_version``, so the next step can recognize that its input
-        state already has a matching neighbor list and skip substep 0's rebuild
-        (``WorldConfig.neighbor_reuse``) — turning the two builds per step (this
-        one plus the force-time query) into one.
+        rewards need) via :meth:`build_neighbors`, then wraps the result as torch
+        tensors. A caller that is going to read the grid through Warp handles instead
+        (any fused kernel launch) should call :meth:`build_neighbors` directly and skip
+        the wrap — see its docstring.
         """
-        if not self.stepper.collisions:
-            raise RuntimeError("neighbor lists require WorldConfig.collisions=True")
-        grid = self.stepper.grid(self.n_envs)
-        if self._persistent and not self._detached:
-            # The persistent state's pos is already a Warp array — build directly
-            # on it (no re-wrap). Runs on the default stream, ordered with the
-            # graph replay that reads the grid's lists on the next step.
-            grid.build(self.runtime.state.pos)
-        else:
-            pos_wp = wp.from_torch(
-                self.state.pos.detach().contiguous(),
-                dtype=VEC2[self.wp_dtype],
-                requires_grad=False,
-            )
-            grid.build(pos_wp)
-        grid.built_version = self.stepper.state_version
-        return grid.torch_views()
+        self.build_neighbors()
+        return self.stepper.grid(self.n_envs).torch_views()
 
     def mark_pos_dirty(self) -> None:
         """Invalidate any cached neighbor list after writing ``state.pos`` out of
@@ -341,5 +471,5 @@ class World:
         :meth:`neighbors`) and the redundant rebuild is skipped.
         """
         if rebuild:
-            self.neighbors()
+            self.build_neighbors()  # the torch views ``neighbors()`` would add go unused
         return self.stepper.grid(self.n_envs).edge_index()

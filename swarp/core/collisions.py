@@ -29,6 +29,7 @@ from typing import Any
 
 import warp as wp
 
+from swarp._overloads import concrete, register
 from swarp.core.config import ObstacleShape
 from swarp.core.state import VEC2
 from swarp.dynamics.base import P_MASS, P_RADIUS, AgentParams
@@ -63,10 +64,33 @@ def _normal_coeff(overlap: Any, vn: Any, k: Any, c: Any, damp_denom: Any, max_ov
 
 
 @wp.func
-def _pair_force(
+def pair_force(
     d: Any, rel_v: Any, min_dist: Any, k: Any, c: Any, damp_denom: Any, max_overlap: Any
 ):
-    """Spring-damper repulsion along d (from other to self) within min_dist."""
+    """Spring-damper repulsion along ``d`` (from other to self) within ``min_dist``.
+
+    The circle-circle half of the contact law, and the one reusable piece of it: a
+    custom contact model built on top of this engine calls it per pair instead of
+    reimplementing the normal, the depth saturation and the closing-velocity damping.
+    Callable from any Warp kernel (agent-agent, agent-obstacle, obstacle-obstacle all go
+    through it here) and generic over ``float32``/``float64``.
+
+    Args:
+        d: separation vector from the other body's centre to this one's.
+        rel_v: closing velocity, ``self - other``; only its normal component damps.
+        min_dist: sum of the two radii plus the contact margin — contact below this.
+        k: contact stiffness (N/m).
+        c: contact damping.
+        damp_denom: divisor applied to the whole normal coefficient, which is how the
+            per-agent mass normalization enters.
+        max_overlap: overlap saturation. Above zero the depth is passed through
+            ``max_overlap * tanh(overlap / max_overlap)``, bounding the impulse a deep
+            interpenetration can inject while leaving the shallow regime linear.
+
+    Returns:
+        The force on *self*, zero outside contact. Apply ``-f`` to the other body:
+        the caller owns Newton's third law, this returns one side.
+    """
     zero = type(k)(0.0)
     dist = wp.sqrt(wp.max(wp.dot(d, d), type(k)(_EPS2)))
     f = type(d)(zero, zero)
@@ -88,16 +112,25 @@ def _normal_force(
 
 
 @wp.func
-def _closest_on_segment(p: Any, center: Any, angle: Any, half_len: Any):
-    """Closest point on a segment core (center, orientation ``angle``, half
-    length ``half_len``) to ``p``. Differentiable (clamp subgradient)."""
+def closest_on_segment(p: Any, center: Any, angle: Any, half_len: Any):
+    """Closest point on a segment core to ``p``.
+
+    The segment is its centre, its orientation ``angle`` (rad), and its half length —
+    a capsule's core before the radius is added. Pair it with :func:`pair_force` to get
+    a capsule contact: the closest point is the effective circle centre, so
+    ``pair_force(p - closest_on_segment(...), ...)`` with ``min_dist = agent_radius +
+    capsule_radius + margin`` is the whole law.
+
+    Differentiable through the clamp (subgradient at the endpoints), so it is safe on a
+    taped step.
+    """
     d = type(p)(wp.cos(angle), wp.sin(angle))
     t = wp.clamp(wp.dot(p - center, d), -half_len, half_len)
     return center + t * d
 
 
 @wp.func
-def _box_force(
+def box_force(
     p: Any,
     v: Any,
     center: Any,
@@ -111,12 +144,25 @@ def _box_force(
     v_obs: Any,
     om_obs: Any,
 ):
-    """Contact force from an oriented box using its signed distance field, so
-    an agent whose center penetrates the box is still pushed out (a plain
-    closest-point clamp has a zero-force interior dead-zone).
+    """Contact force from an oriented box, via its signed distance field.
 
-    ``reach = agent_radius + margin``; contact when the signed distance from the
-    agent center to the box surface drops below ``reach``.
+    The box half of the contact law, and the counterpart to :func:`pair_force` for a
+    custom contact model. The SDF (rather than a closest-point clamp) is what keeps an
+    agent whose *centre* has penetrated the box pushed back out — a clamp has a
+    zero-force interior dead-zone, so a deep hit sails straight through.
+
+    Args:
+        p: agent centre. ``v``: agent velocity.
+        center, angle, half: the box's world pose and its half-extents.
+        reach: ``agent_radius + margin``. Contact when the signed distance from ``p`` to
+            the box surface drops below this.
+        k, c, damp_denom, max_overlap: as in :func:`pair_force`.
+        v_obs, om_obs: the box's own linear and angular velocity, so damping sees the
+            *closing* velocity rather than the agent's absolute one.
+
+    Returns:
+        The force on the agent. The box's reaction is ``-f`` at the contact point, which
+        is what :mod:`swarp.core.bodies` integrates for a movable box.
     """
     zero = type(k)(0.0)
     one = type(k)(1.0)
@@ -212,21 +258,21 @@ def _static_forces(
         omo = obs_ang_vel[e, o]
         if st == SHAPE_BOX:
             # box surface is the boundary itself; agent inflated by ra + margin
-            f += _box_force(
+            f += box_force(
                 p, v, center, obs_angle[e, o], obs_half[o], ra + margin, k, c, damp_denom,
                 max_overlap, vo, omo,
             )
         elif st == SHAPE_SEGMENT:
-            cp = _closest_on_segment(p, center, obs_angle[e, o], obs_half[o][0])
+            cp = closest_on_segment(p, center, obs_angle[e, o], obs_half[o][0])
             # surface point velocity: v_obs + om x (cp - centre)
             r = cp - center
             vs = vo + type(p)(-omo * r[1], omo * r[0])
-            f += _pair_force(
+            f += pair_force(
                 p - cp, v - vs, ra + obs_radius[o] + margin, k, c, damp_denom, max_overlap
             )
         else:  # SHAPE_CIRCLE
             # a spinning disc has no normal-direction surface motion (frictionless)
-            f += _pair_force(
+            f += pair_force(
                 p - center, v - vo, ra + obs_radius[o] + margin, k, c, damp_denom, max_overlap
             )
 
@@ -289,7 +335,7 @@ def collision_forces_kernel(
 
     for n_i in range(neighbor_count[e, a]):
         b = neighbor_idx[e, a, n_i]
-        f += _pair_force(
+        f += pair_force(
             p - pos[e, b], v - vel[e, b], ra + params[b, P_RADIUS] + margin, k, c, damp_denom,
             max_overlap,
         )
@@ -355,7 +401,7 @@ def collision_forces_kernel_per_env(
     for n_i in range(neighbor_count[e, a]):
         b = neighbor_idx[e, a, n_i]
         # neighbor b's radius is env-specific in the per-env layout
-        f += _pair_force(
+        f += pair_force(
             p - pos[e, b], v - vel[e, b], ra + params[e, b, P_RADIUS] + margin, k, c, damp_denom,
             max_overlap,
         )
@@ -415,8 +461,8 @@ def _signature(dtype, per_env: bool = False) -> list:
 
 
 for _T in (wp.float32, wp.float64):
-    wp.overload(collision_forces_kernel, _signature(_T))
-    wp.overload(collision_forces_kernel_per_env, _signature(_T, per_env=True))
+    register(collision_forces_kernel, _T, _signature(_T))
+    register(collision_forces_kernel_per_env, _T, _signature(_T, per_env=True))
 
 
 def launch_collision_forces(
@@ -454,7 +500,7 @@ def launch_collision_forces(
     else:
         kernel, floats = collision_forces_kernel_per_env, params.floats_per_env
     wp.launch(
-        kernel,
+        concrete(kernel, dtype),
         dim=(n_envs, n_agents),
         inputs=[
             pos,

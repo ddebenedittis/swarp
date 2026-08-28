@@ -209,3 +209,135 @@ def test_lidar_component_on_world(backend):
     assert ranges.shape == (4, 3, 6)
     assert torch.isfinite(ranges).all()
     assert (ranges >= 0).all() and (ranges <= 1.0).all()
+
+
+def test_segment_obstacle_is_excluded():
+    """A SEGMENT obstacle must be invisible, not a phantom circle at its midpoint.
+
+    ``Lidar.scan`` has no ray-segment test, so a segment fed through the ray-circle
+    formula would report a hit on a disc of the obstacle's ``radius`` centred at the
+    segment midpoint. The ray here points straight down the segment's own axis, where
+    the phantom disc sits, so an unfiltered scan reads well under ``max_range``.
+    """
+    from swarp.core.config import Obstacles, ObstacleShape
+
+    world = _tiny_world(dtype=torch.float64)
+    world.state = world.state._replace(
+        pos=torch.zeros(4, 3, 2, dtype=torch.float64),
+        theta=torch.zeros(4, 3, dtype=torch.float64),
+    )
+    n_envs = world.n_envs
+    world.set_obstacles(
+        Obstacles(
+            pos=torch.tensor([[[1.0, 0.0]]], dtype=torch.float64).expand(n_envs, 1, 2).clone(),
+            radius=torch.tensor([0.3], dtype=torch.float64),
+            shape=torch.tensor([int(ObstacleShape.SEGMENT)]),
+            half_extents=torch.tensor([[2.0, 0.0]], dtype=torch.float64),
+        )
+    )
+    # Ray 0 (angle 0) points straight at the segment's midpoint.
+    lidar = Lidar(n_rays=4, max_range=MAXR, include_agents=False)
+    ranges = lidar.scan(world)
+    assert torch.allclose(ranges, torch.full_like(ranges, MAXR))
+
+
+def test_movable_obstacle_scan_tracks_live_pose():
+    """The scan must follow a movable obstacle, not the pose the scenario installed.
+
+    A movable body is integrated in place inside the stepper's own arrays, so
+    ``world.obstacle_pos`` stays at the spawn pose forever. Reading it made the lidar
+    diverge from the truth by more than a world unit over a pusht rollout.
+    """
+    from swarp.core.config import ObstacleKind, Obstacles, WorldConfig
+    from swarp.core.world import World
+    from swarp.dynamics.base import AgentConfig, DynamicsModel
+
+    cfgs = [AgentConfig(model=DynamicsModel.HOLONOMIC, radius=0.05) for _ in range(3)]
+    world = World(
+        cfgs,
+        # Default obstacle damping fully decays the body's velocity at dt=0.1; the
+        # substeps and the softer damping are just what makes the puck actually move.
+        WorldConfig(collisions=True, obstacle_linear_damping=1.0),
+        n_envs=4,
+        device="cpu",
+        dtype=torch.float64,
+        substeps=4,
+    )
+    n_envs = world.n_envs
+    # Agent 0 drives +x into a light circular puck it can shove along; the other two
+    # are parked far away so only agent 0's contact matters.
+    world.state = world.state._replace(
+        pos=torch.tensor([[-0.3, 0.0], [-5.0, 5.0], [5.0, -5.0]], dtype=torch.float64)
+        .expand(n_envs, 3, 2)
+        .clone(),
+        theta=torch.zeros(n_envs, 3, dtype=torch.float64),
+    )
+    world.set_obstacles(
+        Obstacles(
+            pos=torch.zeros(n_envs, 1, 2, dtype=torch.float64),
+            radius=torch.tensor([0.1], dtype=torch.float64),
+            kind=torch.tensor([int(ObstacleKind.MOVABLE)]),
+            mass=torch.tensor([0.05], dtype=torch.float64),
+        )
+    )
+    lidar = Lidar(n_rays=4, max_range=MAXR, include_agents=False)
+    before = lidar.scan(world).clone()
+
+    actions = torch.zeros(n_envs, 3, world.act_dim, dtype=torch.float64)
+    actions[:, 0, 0] = 1.0  # push agent 0 straight at the puck
+    with torch.no_grad():
+        for _ in range(20):
+            world.step(actions)
+
+    live_pos = world.obstacle_state_views()[0]
+    assert not torch.allclose(live_pos, world.obstacle_pos)  # the installed pose went stale
+    after = lidar.scan(world)
+    assert not torch.allclose(after, before)
+    # Everything stayed on the x axis, so ray 0 of agent 0 still points at the puck and
+    # its range is the live centre-to-surface gap.
+    gap = (live_pos[:, 0, 0] - world.state.pos[:, 0, 0] - 0.1).clamp(max=MAXR)
+    torch.testing.assert_close(after[:, 0, 0], gap)
+
+
+def test_circle_filter_is_memoized_no_per_scan_sync():
+    """Deciding which obstacles are circles must cost syncs once, not once per scan.
+
+    ``is_circle.all()`` and ``nonzero()`` are both device->host stalls, and the answer is
+    fixed for as long as one obstacle set is installed — poses move, shape tags do not.
+    Guarding the entry points is the only way to see the difference: an un-memoized filter
+    still returns the right ranges, it just stalls the pipeline twice a step.
+    """
+    from unittest import mock
+
+    from swarp.core.config import Obstacles, ObstacleShape
+
+    world = _tiny_world(dtype=torch.float64)
+    world.state = world.state._replace(
+        pos=torch.zeros(4, 3, 2, dtype=torch.float64),
+        theta=torch.zeros(4, 3, dtype=torch.float64),
+    )
+    n_envs = world.n_envs
+    world.set_obstacles(
+        Obstacles(
+            pos=torch.tensor([[[1.0, 0.0], [0.0, 1.0]]], dtype=torch.float64)
+            .expand(n_envs, 2, 2)
+            .clone(),
+            radius=torch.tensor([0.3, 0.3], dtype=torch.float64),
+            shape=torch.tensor([int(ObstacleShape.SEGMENT), int(ObstacleShape.CIRCLE)]),
+            half_extents=torch.tensor([[2.0, 0.0], [0.0, 0.0]], dtype=torch.float64),
+        )
+    )
+    lidar = Lidar(n_rays=4, max_range=MAXR, include_agents=False)
+    warm = lidar.scan(world)  # one install -> one filter decision
+
+    def _raise(*a, **kw):
+        raise AssertionError("device->host transfer on a lidar scan")
+
+    with mock.patch.object(torch.Tensor, "__bool__", _raise), mock.patch.object(
+        torch.Tensor, "nonzero", _raise
+    ):
+        again = lidar.scan(world)
+    assert torch.equal(warm, again)
+    # The circle is still seen and the segment still is not: ray 1 (+y) hits, ray 0 does not.
+    assert again[0, 0, 1].item() < MAXR
+    assert again[0, 0, 0].item() == pytest.approx(MAXR)

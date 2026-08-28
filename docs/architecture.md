@@ -60,7 +60,7 @@ Key modules:
 ## Design invariants
 
 **The step is functional** (`state_in → state_out`).
-Every array written during a taped step — intermediate states, force buffers, neighbour lists — must be allocated **fresh per step**: overwriting an array recorded on a `wp.Tape` silently corrupts its adjoint.
+Every array written during a taped step — intermediate states, force buffers, neighbor lists — must be allocated **fresh per step**: overwriting an array recorded on a `wp.Tape` silently corrupts its adjoint.
 `Stepper` is the single place that knows this; the no-grad hot path recycles one cached `StepBuffers` per batch size.
 
 **Precision is explicit.**
@@ -68,10 +68,10 @@ Kernels are generic over dtype and instantiated for float32 and float64 via `wp.
 float64-on-CPU is what makes strict `torch.autograd.gradcheck` possible.
 
 **Collision forces are gather-based.**
-Each agent sums over its own neighbour list. No atomics: deterministic and race-free.
+Each agent sums over its own neighbor list. No atomics: deterministic and race-free.
 
-**Neighbour construction is not taped.**
-The neighbour *set* is discrete, so gradients flow through contact geometry, not through membership.
+**Neighbor construction is not taped.**
+The neighbor *set* is discrete, so gradients flow through contact geometry, not through membership.
 
 **`wp.HashGrid` wraps cell coordinates modulo its dims**, which aliases cells across the z-lifted env batching — brute force wins up to a few hundred agents per env, and `uniform_grid` takes over above that.
 
@@ -90,6 +90,16 @@ Obstacles collide with each other only when at least one of the pair is round; t
 
 **Discrete or communication action spaces.**
 Actions are continuous real vectors.
+
+**A dynamics model as a plug-in.**
+Adding one is an in-tree edit, not an extension point: the `DynamicsModel` enum
+(`swarp/dynamics/base.py`), a row of parameter columns in `PARAM_FIELDS` and
+`build_agent_params` beside it, a `TAG_*` constant, and a branch in each `if tag == …`
+chain in `swarp/dynamics/kernels.py` (`integrate`, the clamp, the action-arity table).
+That closed dispatch is deliberate and it is what buys the headline feature: one kernel
+steps a *mixed* fleet, because every agent's model is a branch inside the same thread
+rather than a separate launch per model. An open registry of Python-defined models cannot
+compile into that. Four models are in tree; a fifth is a patch, not a subclass.
 
 ## Roadmap
 

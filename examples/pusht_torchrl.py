@@ -173,21 +173,22 @@ def main() -> None:
 
     device = args.device
     n_agents = args.n_agents
-    env = SwarpEnv(
-        Environment(
-            PushTScenario(
-                n_agents=n_agents,
-                pos_shaping_factor=args.pos_shaping,
-                rot_shaping_factor=args.rot_shaping,
-            ),
-            n_envs=args.n_envs,
-            device=device,
-            dt=0.05,
-            substeps=args.substeps,
-            seed=0,
-            max_steps=args.max_steps,
-        )
+    sim = Environment(
+        PushTScenario(
+            n_agents=n_agents,
+            pos_shaping_factor=args.pos_shaping,
+            rot_shaping_factor=args.rot_shaping,
+        ),
+        n_envs=args.n_envs,
+        device=device,
+        dt=0.05,
+        substeps=args.substeps,
+        seed=0,
+        max_steps=args.max_steps,
     )
+    # swarp actions are physical, and SwarpEnv specs sim.action_bounds by default — the
+    # limits the kernels actually clamp against. Nothing to pass.
+    env = SwarpEnv(sim)
     obs_dim, act_dim = env.obs_dim, env.act_dim
 
     # Decentralised actor (shared weights), centralised critic — the usual MAPPO split.
@@ -286,11 +287,9 @@ def main() -> None:
     for it, batch in enumerate(collector):
         dist = batch.get(("next", "info", "tee_dist_to_goal"))
         ang = batch.get(("next", "info", "tee_angle_error"))
-        # `SwarpEnv` reports the max_steps time limit as `terminated`, which would make
-        # GAE cut the value bootstrap at every truncation. Recover the *task*
-        # termination (the on-goal condition) from info so only real terminals cut,
-        # and keep the wrapper's flag as `done` (terminated | truncated).
-        terminated = ((dist < scen.goal_tolerance) & (ang < scen.angle_tolerance)).unsqueeze(-1)
+        # The wrapper splits the two: `terminated` is the scenario's on-goal condition,
+        # `done` is that OR the max_steps timeout, so GAE bootstraps through a timeout.
+        terminated = batch.get(("next", "terminated"))
         batch.set(DONE_KEY, _expand(batch.get(("next", "done")), n_agents))
         batch.set(TERM_KEY, _expand(terminated, n_agents))
         with torch.no_grad():

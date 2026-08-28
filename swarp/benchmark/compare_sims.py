@@ -142,7 +142,7 @@ def _child(sim, scenario, n_envs, n_agents, steps, warmup, device) -> None:
     except CpuOnlyError:
         print("CPU-only")
         return
-    except Exception as e:  # noqa: BLE001 — sentinel for the parent; traceback -> stderr
+    except Exception as e:  # sentinel for the parent; traceback -> stderr
         if _is_oom(e):
             print("OOM")
             return
@@ -248,7 +248,8 @@ def run(args) -> None:
             print(f"    {sim}: {n} agents")
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
+    """The CLI, split out from :func:`main` so a test can build it without running."""
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -278,7 +279,11 @@ def main() -> None:
         metavar=("SIM", "SCENARIO", "N_ENVS", "N_AGENTS", "STEPS", "WARMUP", "DEVICE"),
         help=argparse.SUPPRESS,
     )
-    args = p.parse_args()
+    return p
+
+
+def main() -> None:
+    args = build_parser().parse_args()
 
     if args._child:
         sim, scenario, ne, na, steps, warmup, device = args._child

@@ -18,11 +18,14 @@ substep, so adjoint kernels must not re-query it).
 from __future__ import annotations
 
 import math
+import warnings
 from typing import Any
 
 import torch
 import warp as wp
 
+from swarp._overloads import concrete, register
+from swarp.core.cached_launch import CachedLaunch, ptr_key
 from swarp.core.state import VEC2
 
 VEC3 = {wp.float32: wp.vec3f, wp.float64: wp.vec3d}
@@ -91,16 +94,53 @@ def _brute_force(
     neighbor_true[e, a] = total
 
 
+@wp.kernel
+def _brute_force_masked(
+    pos: wp.array2d(dtype=Any),
+    radius: Any,
+    reset_mask: wp.array(dtype=wp.uint8),
+    neighbor_idx: wp.array3d(dtype=wp.int32),
+    neighbor_count: wp.array2d(dtype=wp.int32),
+    neighbor_true: wp.array2d(dtype=wp.int32),
+):
+    """Same as :func:`_brute_force`, but skips every env ``reset_mask`` does not select.
+
+    Only ever launched for the obs-only auto-reset pass (see
+    ``NeighborGrid._query_brute_into``/``World.build_neighbors``): an env that did not
+    reset has positions identical to what the just-completed step build already put in
+    ``neighbor_idx``/``neighbor_count``/``neighbor_true``, so leaving those entries
+    untouched is exactly correct, not merely an approximation.
+    """
+    e, a = wp.tid()
+    if reset_mask[e] == wp.uint8(0):
+        return
+    n_agents = pos.shape[1]
+    max_neighbors = neighbor_idx.shape[2]
+    p = pos[e, a]
+    count = wp.int32(0)  # written (capped at max_neighbors)
+    total = wp.int32(0)  # true in-radius count (uncapped)
+    for b in range(n_agents):
+        if b != a and wp.length(pos[e, b] - p) <= radius:
+            total += wp.int32(1)
+            if count < max_neighbors:
+                neighbor_idx[e, a, count] = b
+                count += wp.int32(1)
+    neighbor_count[e, a] = count
+    neighbor_true[e, a] = total
+
+
 # --------------------------------------------------------------------------
 # Batched uniform-grid backend (radix-sort). Unlike ``wp.HashGrid`` (which wraps
 # cell coordinates modulo its dims and so aliases envs into shared cells), this
 # gives every env a disjoint block of ``bins*bins`` cells in one linear key
 # ``e*bins*bins + cy*bins + cx``, so it stays linear in ``n_envs`` with no
-# cross-env aliasing. Positions are placed against a shared origin (the batch's
-# min corner) with an adaptive cell size ``max(radius, extent/bins)``; agents
-# past ``bins`` cells clamp to the edge cell (still correct — the distance
-# filter rejects false candidates, and a cell size >= radius guarantees every
-# true within-radius neighbor lands in the queried 3x3 block).
+# cross-env aliasing. Positions are placed against a shared origin with a cell size
+# ``max(radius, extent/bins)``; agents past ``bins`` cells clamp to the edge cell
+# (still correct — the distance filter rejects false candidates, and a cell size
+# >= radius guarantees every true within-radius neighbor lands in the queried 3x3
+# block). The origin/extent come either from a per-build reduction over the batch
+# (``_bounds_*`` + ``_finalize_grid``) or, when the caller pins a static world
+# rectangle, once at allocation — see ``NeighborGrid._fill_static_grid``.
 
 
 @wp.kernel
@@ -212,9 +252,10 @@ def _query_uniform(
 
 
 for _T in (wp.float32, wp.float64):
-    wp.overload(_fill_points, [wp.array2d(dtype=VEC2[_T]), _T, wp.array(dtype=VEC3[_T])])
-    wp.overload(
+    register(_fill_points, _T, [wp.array2d(dtype=VEC2[_T]), _T, wp.array(dtype=VEC3[_T])])
+    register(
         _query_grid,
+        _T,
         [
             wp.uint64,
             wp.array(dtype=VEC3[_T]),
@@ -224,8 +265,9 @@ for _T in (wp.float32, wp.float64):
             wp.array2d(dtype=wp.int32),
         ],
     )
-    wp.overload(
+    register(
         _brute_force,
+        _T,
         [
             wp.array2d(dtype=VEC2[_T]),
             _T,
@@ -234,14 +276,28 @@ for _T in (wp.float32, wp.float64):
             wp.array2d(dtype=wp.int32),
         ],
     )
-    wp.overload(_bounds_init, [_T, wp.array(dtype=_T)])
-    wp.overload(_bounds_reduce, [wp.array2d(dtype=VEC2[_T]), wp.array(dtype=_T)])
-    wp.overload(
+    register(
+        _brute_force_masked,
+        _T,
+        [
+            wp.array2d(dtype=VEC2[_T]),
+            _T,
+            wp.array(dtype=wp.uint8),
+            wp.array3d(dtype=wp.int32),
+            wp.array2d(dtype=wp.int32),
+            wp.array2d(dtype=wp.int32),
+        ],
+    )
+    register(_bounds_init, _T, [_T, wp.array(dtype=_T)])
+    register(_bounds_reduce, _T, [wp.array2d(dtype=VEC2[_T]), wp.array(dtype=_T)])
+    register(
         _finalize_grid,
+        _T,
         [wp.array(dtype=_T), _T, wp.int32, wp.array(dtype=_T), wp.array(dtype=_T)],
     )
-    wp.overload(
+    register(
         _compute_keys,
+        _T,
         [
             wp.array2d(dtype=VEC2[_T]),
             wp.array(dtype=_T),
@@ -252,8 +308,9 @@ for _T in (wp.float32, wp.float64):
             wp.array(dtype=wp.int32),
         ],
     )
-    wp.overload(
+    register(
         _query_uniform,
+        _T,
         [
             wp.array2d(dtype=VEC2[_T]),
             wp.array(dtype=_T),
@@ -288,6 +345,8 @@ class NeighborGrid:
       sorted by cell key with ``wp.utils.radix_sort_pairs``, and each agent
       queries its 3x3 cell neighborhood. Linear in ``n_envs`` and in agents;
       the intended choice for large per-env populations across many envs.
+      Pass ``bounds`` to pin the grid to a static world rectangle and drop the
+      per-build bounds reduction (see below).
     * ``"auto"`` (default) — ``uniform_grid`` when ``n_agents > 512``; brute
       otherwise.
     """
@@ -303,7 +362,14 @@ class NeighborGrid:
         grid_dim: int = 128,
         method: str = "auto",
         uniform_bins: int | None = None,
+        bounds: tuple[float, float, float, float] | None = None,
     ) -> None:
+        """``bounds`` is the world rectangle ``(x_min, x_max, y_min, y_max)`` — the same
+        ordering as :attr:`~swarp.core.config.WorldConfig.bounds`. Set it (with
+        ``method="uniform_grid"``) to pin the grid frame once instead of re-deriving it
+        from the batch on every build; see :meth:`_fill_static_grid`. ``None`` keeps the
+        adaptive per-build reduction.
+        """
         if radius <= 0.0:
             raise ValueError("radius must be positive")
         if method not in ("auto", "grid", "brute", "uniform_grid"):
@@ -321,10 +387,31 @@ class NeighborGrid:
         self.method = method
         # Cells per axis for the uniform grid: ~sqrt(n_agents) keeps occupancy
         # near one agent per cell (memory is n_envs * bins^2 int32 offsets).
+        if uniform_bins is not None and uniform_bins < 1:
+            raise ValueError("uniform_bins must be >= 1")
         self.uniform_bins = uniform_bins or max(4, min(128, int(math.ceil(math.sqrt(n_agents)))))
+        # Every query zeroes n_envs * bins^2 int32 cell_start/cell_end entries before the
+        # sort, so an over-fine grid spends more clearing empty cells than searching
+        # occupied ones — at 8 agents and bins=128 that is 16384 cells per env for 8
+        # points. Warn rather than raise: a deliberately sparse grid is legal, just
+        # rarely intended.
+        if self.method == "uniform_grid" and self.uniform_bins**2 > 16 * max(1, n_agents):
+            warnings.warn(
+                f"uniform_bins={self.uniform_bins} gives {self.uniform_bins**2} cells per env "
+                f"for {n_agents} agents; each query memsets all of them, which will dominate "
+                f"the search. The default heuristic (~sqrt(n_agents), here "
+                f"{max(4, min(128, int(math.ceil(math.sqrt(n_agents)))))}) keeps occupancy "
+                "near one agent per cell.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         self._points: wp.array | None = None
         self._grid: wp.HashGrid | None = None
         self._u_alloc = False  # uniform-grid buffers allocated lazily
+        # A pinned world rectangle lets the uniform grid skip its per-build bounds pass.
+        self._bounds = bounds
+        self._static_grid = bounds is not None and self.method == "uniform_grid"
+        self.grid_dim = grid_dim
         if method == "grid":
             self._points = wp.zeros(n_envs * n_agents, dtype=VEC3[dtype], device=device)
             self._grid = wp.HashGrid(grid_dim, grid_dim, grid_dim, device=device, dtype=dtype)
@@ -346,16 +433,48 @@ class NeighborGrid:
         # ``launch_substeps`` reuses them for substep 0 when it still matches.
         self.build_count: int = 0
         self.built_version: int = -1
+        # Cached, repack-once launch for the brute-force backend's eager (reset-path)
+        # rebuilds — see swarp/core/cached_launch.py. The captured step-time build pays
+        # this exactly once anyway (at capture); it is the eager auto_reset rebuild,
+        # every step, that this amortizes.
+        self._brute_launch = CachedLaunch()
+        # Separate cache + separate kernel (``_brute_force_masked``) for the masked
+        # variant, rather than one kernel toggled by a ``use_mask`` int: that would mean
+        # every unmasked call (every step, every other scenario) also needs a real
+        # ``reset_mask`` array argument just to satisfy the kernel signature, and the
+        # int would have to be re-set by name on every launch per the ``CachedLaunch``
+        # docstring's rule for varying-but-cached-kernel params. Two kernels keep the
+        # far more common unmasked path exactly as it was.
+        self._brute_masked_launch = CachedLaunch()
 
-    def build(self, pos: wp.array) -> None:
-        """Refresh the padded lists from positions [n_envs, n_agents] (vec2)."""
-        self.query_into(pos, self.neighbor_idx, self.neighbor_count)
+    def build(self, pos: wp.array, reset_mask: wp.array | None = None) -> None:
+        """Refresh the padded lists from positions [n_envs, n_agents] (vec2).
 
-    def query_into(self, pos: wp.array, neighbor_idx: wp.array, neighbor_count: wp.array) -> None:
+        ``reset_mask`` is forwarded to :meth:`query_into` — see there for the safety
+        contract. ``None`` (the default) always does a full rebuild.
+        """
+        self.query_into(pos, self.neighbor_idx, self.neighbor_count, reset_mask=reset_mask)
+
+    def query_into(
+        self,
+        pos: wp.array,
+        neighbor_idx: wp.array,
+        neighbor_count: wp.array,
+        reset_mask: wp.array | None = None,
+    ) -> None:
         """Write padded lists into caller-owned buffers using the selected method.
 
         Launches use ``record_tape=False``: neighbor construction is a discrete,
         non-differentiable pass and must not be replayed by tape adjoints.
+
+        ``reset_mask`` (uint8 ``[n_envs]``, ``1`` = rebuild this env) restricts the
+        rebuild to the envs it selects, skipping the rest — valid **only** when every
+        env *not* selected has positions unchanged since this grid's lists were last
+        built, which is true of exactly one caller: the obs-only auto-reset pass (see
+        ``World.build_neighbors``). It is honoured by the ``"brute"`` method only;
+        ``"grid"``/``"uniform_grid"`` are global batched passes (a hash-grid rebuild, a
+        radix sort) that a per-env skip cannot decompose locally, so they silently do a
+        full rebuild regardless — always correct, just not the optimization.
         """
         self.build_count += 1
         if self.method == "grid":
@@ -363,20 +482,27 @@ class NeighborGrid:
         elif self.method == "uniform_grid":
             self._query_uniform_into(pos, neighbor_idx, neighbor_count)
         else:
-            self._query_brute_into(pos, neighbor_idx, neighbor_count)
+            self._query_brute_into(pos, neighbor_idx, neighbor_count, reset_mask=reset_mask)
 
     def _ensure_grid(self) -> None:
+        """Lazily allocate the hash grid, at the same ``grid_dim`` ``__init__`` would use.
+
+        Reachable without ``method="grid"`` via :meth:`build_grid`, so hardcoding a
+        dimension here would silently discard ``WorldConfig.grid_dim``.
+        """
         if self._grid is None:
             self._points = wp.zeros(
                 self.n_envs * self.n_agents, dtype=VEC3[self.dtype], device=self.device
             )
-            self._grid = wp.HashGrid(128, 128, 128, device=self.device, dtype=self.dtype)
+            self._grid = wp.HashGrid(
+                self.grid_dim, self.grid_dim, self.grid_dim, device=self.device, dtype=self.dtype
+            )
 
     def _query_grid_into(self, pos, neighbor_idx, neighbor_count) -> None:
         self._ensure_grid()
         dim = (self.n_envs, self.n_agents)
         wp.launch(
-            _fill_points,
+            concrete(_fill_points, self.dtype),
             dim=dim,
             inputs=[pos, self.dtype(self.z_spacing)],
             outputs=[self._points],
@@ -385,7 +511,7 @@ class NeighborGrid:
         )
         self._grid.build(self._points, self.radius)
         wp.launch(
-            _query_grid,
+            concrete(_query_grid, self.dtype),
             dim=dim,
             inputs=[wp.uint64(self._grid.id), self._points, self.dtype(self.radius)],
             outputs=[neighbor_idx, neighbor_count, self.neighbor_true_count],
@@ -393,15 +519,48 @@ class NeighborGrid:
             record_tape=False,
         )
 
-    def _query_brute_into(self, pos, neighbor_idx, neighbor_count) -> None:
-        wp.launch(
-            _brute_force,
+    def _query_brute_into(self, pos, neighbor_idx, neighbor_count, reset_mask=None) -> None:
+        if reset_mask is None:
+            # No genuinely per-call argument here at all (radius is fixed at
+            # construction) — every argument is either config-invariant or a
+            # pointer-stable persistent-mode handle, so a cache hit needs no
+            # set_param_* calls, just .launch().
+            launch = self._brute_launch.get(
+                concrete(_brute_force, self.dtype),
+                dim=(self.n_envs, self.n_agents),
+                inputs=[pos, self.dtype(self.radius)],
+                outputs=[neighbor_idx, neighbor_count, self.neighbor_true_count],
+                device=self.device,
+                key=(
+                    self.n_envs,
+                    self.n_agents,
+                    ptr_key(pos),
+                    self.radius,
+                    ptr_key(neighbor_idx),
+                    ptr_key(neighbor_count),
+                    ptr_key(self.neighbor_true_count),
+                ),
+            )
+            launch.launch()
+            return
+        launch = self._brute_masked_launch.get(
+            concrete(_brute_force_masked, self.dtype),
             dim=(self.n_envs, self.n_agents),
-            inputs=[pos, self.dtype(self.radius)],
+            inputs=[pos, self.dtype(self.radius), reset_mask],
             outputs=[neighbor_idx, neighbor_count, self.neighbor_true_count],
             device=self.device,
-            record_tape=False,
+            key=(
+                self.n_envs,
+                self.n_agents,
+                ptr_key(pos),
+                self.radius,
+                ptr_key(reset_mask),
+                ptr_key(neighbor_idx),
+                ptr_key(neighbor_count),
+                ptr_key(self.neighbor_true_count),
+            ),
         )
+        launch.launch()
 
     def _ensure_uniform(self) -> None:
         if self._u_alloc:
@@ -420,7 +579,38 @@ class NeighborGrid:
         self._u_vals = z(2 * n, wp.int32)
         self._u_cell_start = z(n_cells, wp.int32)
         self._u_cell_end = z(n_cells, wp.int32)
+        if self._static_grid:
+            self._fill_static_grid()
         self._u_alloc = True
+
+    def _fill_static_grid(self) -> None:
+        """Fill origin/cell size once from the pinned world rectangle.
+
+        This is the whole point of ``bounds``: with the grid frame fixed, every build
+        skips ``_bounds_init``/``_bounds_reduce``/``_finalize_grid`` — a global-atomic
+        reduction over all ``n_envs * n_agents`` positions that was costing 10-17% of the
+        build. All seven built-in scenarios pin a static world rectangle, so the batch
+        extent the dynamic path measures is bounded by it anyway.
+
+        **Why this stays exact.** The clamp that maps out-of-range positions into the edge
+        cell is safe for any origin as long as ``cell_size >= radius``, which the
+        ``max(radius, ...)`` below guarantees. A point clamped down to cell 0 has
+        ``x < origin``; a point genuinely in cell ``k >= 2`` has
+        ``x >= origin + 2 * cell_size``, so the two are more than ``radius`` apart and were
+        never true neighbors — the 3x3 block it fails to reach holds nothing it could
+        have matched. Symmetrically at the far edge. Everything else that lands in the
+        same cell without being in range is a mere *candidate*, and the exact distance
+        filter in ``_query_uniform`` rejects it.
+
+        The tradeoff, honestly: the cell size now follows the world rectangle rather than
+        the batch's own extent, so a batch that happens to be tightly clustered gets
+        coarser cells (more candidates per query) than the adaptive path would have
+        picked. In exchange every build is three launches shorter.
+        """
+        x_min, x_max, y_min, y_max = self._bounds
+        extent = max(x_max - x_min, y_max - y_min)
+        self._u_origin.assign([x_min, y_min])
+        self._u_cell_size.assign([max(self.radius, extent / self.uniform_bins)])
 
     def _query_uniform_into(self, pos, neighbor_idx, neighbor_count) -> None:
         self._ensure_uniform()
@@ -429,20 +619,32 @@ class NeighborGrid:
         bins = self.uniform_bins
         dim = (n_envs, n_agents)
         common = dict(device=self.device, record_tape=False)
-        # Origin (batch min corner) + adaptive cell size, all device-side (no sync).
+        if not self._static_grid:
+            # Origin (batch min corner) + adaptive cell size, all device-side (no sync).
+            wp.launch(
+                concrete(_bounds_init, self.dtype),
+                dim=1,
+                inputs=[self.dtype(1e30)],
+                outputs=[self._u_bounds],
+                **common,
+            )
+            wp.launch(
+                concrete(_bounds_reduce, self.dtype),
+                dim=dim,
+                inputs=[pos],
+                outputs=[self._u_bounds],
+                **common,
+            )
+            wp.launch(
+                concrete(_finalize_grid, self.dtype),
+                dim=1,
+                inputs=[self._u_bounds, self.dtype(self.radius), bins],
+                outputs=[self._u_origin, self._u_cell_size],
+                **common,
+            )
+        # else: origin/cell size were pinned once in _fill_static_grid.
         wp.launch(
-            _bounds_init, dim=1, inputs=[self.dtype(1e30)], outputs=[self._u_bounds], **common
-        )
-        wp.launch(_bounds_reduce, dim=dim, inputs=[pos], outputs=[self._u_bounds], **common)
-        wp.launch(
-            _finalize_grid,
-            dim=1,
-            inputs=[self._u_bounds, self.dtype(self.radius), bins],
-            outputs=[self._u_origin, self._u_cell_size],
-            **common,
-        )
-        wp.launch(
-            _compute_keys,
+            concrete(_compute_keys, self.dtype),
             dim=dim,
             inputs=[pos, self._u_origin, self._u_cell_size, bins, n_agents],
             outputs=[self._u_keys, self._u_vals],
@@ -460,7 +662,7 @@ class NeighborGrid:
             **common,
         )
         wp.launch(
-            _query_uniform,
+            concrete(_query_uniform, self.dtype),
             dim=dim,
             inputs=[
                 pos,
@@ -515,7 +717,7 @@ class NeighborGrid:
         idx = idx.long()
         device = idx.device
         ar = torch.arange(self.max_neighbors, device=device)
-        mask = ar.view(1, 1, -1) < cnt.long().unsqueeze(-1)  # [E?, valid slots]
+        mask = ar.view(1, 1, -1) < cnt.long().unsqueeze(-1)  # [n_envs, n_agents, max_neighbors]
         env_offset = torch.arange(self.n_envs, device=device).view(-1, 1, 1) * self.n_agents
         senders = (idx + env_offset)[mask]
         receivers = (torch.arange(self.n_agents, device=device).view(1, -1, 1) + env_offset).expand(

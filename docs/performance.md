@@ -4,6 +4,7 @@ The defaults are already the fast configuration: `Environment(fused="auto", use_
 This page explains what those two switches do, what they cost, and how the step plugs into `torch.compile` and TorchRL.
 
 Headline: the full navigation hot path sustains **24.1 M env-steps/s** at 16,000 envs × 16 agents on one RTX 3070 Laptop GPU, peaking at 491 M agent-steps/s at 16,000 × 64.
+That figure is the fused kernels *without* capture — `use_graph=False`, the configuration `swarp.benchmark.throughput` pins — so it is the floor the graph builds on rather than the number the defaults produce; capture on top reaches 35.6 M env-steps/s at 16,384 × 16 ([table below](#whole-step-cuda-graph)).
 Full tables and the head-to-heads against VMAS, JaxMARL and CAMAR are in [Benchmarks](benchmarks.md).
 
 ## The no-grad hot path
@@ -38,10 +39,10 @@ The graph roughly doubles the fused throughput again, for ~2.5–5× end-to-end 
 
 Details that matter in practice:
 
-- Capture runs on a side stream (CUDA forbids capturing the legacy default stream); the graph is *replayed* on the current stream, so masked auto-resets and observation reads stay ordered with the replay without a device sync.
+- Warp launches go to Warp's *own* created stream, which is what makes capture legal in the first place. That stream is created with the **blocking** flag, so the driver serializes it against the legacy default stream both ways — which is what keeps masked auto-resets and observation reads ordered with the replay, with no device sync and nothing for swarp to do. Under a **user-created** `torch.cuda.Stream` that guarantee lapses, so every eager entry point (the replay, the eager fallback, the pre-capture warm-up, `World.neighbors`, the fused obs/reward launches, the lidar scan) opens a scope onto torch's current stream; on the default stream that scope is deliberately a no-op behind a 0.4 us stream check, since paying for it there cost 10-36% of a graph-mode step (most of it inside `torch.cuda.current_stream()`, which builds a Python object and measured 17 us against 0.4 us for the raw accessor). The capture itself can never be scoped: `wp.ScopedCapture` captures the current stream, and capturing torch's legacy stream is a hard CUDA error, so capture stays on Warp's own stream. Replaying a graph on the legacy stream is fine; only capturing it is not.
 - Auto-reset stays **outside** the graph: it uses a `torch.Generator` whose philox offset is not capture-safe.
 - Passing `use_graph=True` demands persistent execution even where capture is unavailable — it then falls back to eager persistent execution with a one-time warning. `use_graph=False` forces the plain functional step.
-- Capture is unavailable on CPU, and with the `wp.HashGrid` `"grid"` neighbour backend, which allocates during a build.
+- Capture is unavailable on CPU, and with the `wp.HashGrid` `"grid"` neighbor backend, which allocates during a build.
 
 `env.graph_mode` reports whether a graph is actually in play.
 
@@ -66,12 +67,18 @@ The op is functional: the forward allocates fresh outputs (no buffer recycling, 
 ```python
 from swarp.interop.torchrl import SwarpEnv
 
-env = SwarpEnv(swarp.make("navigation", n_envs=4096, device="cuda:0"))
+sim = swarp.make("navigation", n_envs=4096, device="cuda:0")
+env = SwarpEnv(sim)                       # action_spec == sim.action_bounds
 ```
 
 - `batch_size=[n_envs]`, everything on-device.
-- `"observation"` `[n_envs, n_agents, obs_dim]`; `"action"` `[n_envs, n_agents, act_dim]` bounded to the normalized `[-1, 1]` range the kernels clamp against; `reward` `[n_envs, n_agents, 1]`; a shared per-env `done` `[n_envs, 1]`.
+- `"observation"` `[n_envs, n_agents, obs_dim]`; `"action"` `[n_envs, n_agents, act_dim]`; `reward` `[n_envs, n_agents, 1]`; a shared per-env `done` `[n_envs, 1]`.
 - A non-empty scenario `info()` is spec'd and forwarded as a nested `info` composite, reachable at the **flat** path `("next", "info", <key>)`.
+
+:::{note}
+swarp actions are physical, so the action spec defaults to `env.action_bounds` — the box the kernels actually clamp to.
+Pass an explicit scalar pair (`action_low=-1.0, action_high=1.0`) if you want a normalized box instead — see [Action bounds are physical](environment.md#action-bounds-are-physical).
+:::
 
 :::{warning}
 `SwarpEnv` is flat — there is no `("agents", …)` group — so info is at `("next", "info", <key>)`, **not** the group-nested path TorchRL's `VmasEnv` uses.
@@ -82,13 +89,38 @@ Downstream code written against `VmasEnv` needs the flat path here.
 
 ## Choosing a batch shape
 
-Almost every batch size lands on the same ~0.65–0.8 ms/step host floor, so raising `n_agents` is close to free until the neighbour and force kernels saturate the GPU.
+Almost every batch size lands on the same ~0.65–0.8 ms/step host floor, so raising `n_agents` is close to free until the neighbor and force kernels saturate the GPU.
 If you have a throughput target, raise `n_agents` before `n_envs`.
 
 Two knobs with real cost:
 
 - `substeps` multiplies the physics work linearly. Only raise it for stiff contacts (Push-T derives `substeps >= 8` at `dt=0.05` in its own `make_world`).
 - `max_neighbors` sets the padded list width. Too small silently truncates — except that it does not, because `World.neighbor_overflow()` flags it; check that flag once when tuning rather than guessing.
+
+## The cost of `auto_reset`
+
+`auto_reset=True` is **not** free, and the reason is structural rather than incidental. `done` is a device tensor and the step promises no device→host round-trip, so there is no host-side "is anything done?" gate: the scenario's `reset_world` runs on **every** step, over the **whole** batch, and the per-env `reset_mask` selects what actually lands. Resetting one env out of 4096 therefore costs the same as resetting all of them.
+
+That makes the reset path's own cost the thing to watch. It used to be a fixed *host-side* tail appended after the captured step — first a 16-iteration `torch.cdist` rejection loop in navigation's spawn sampler, run twice per reset (spawns, then goals), for 40.8 ms/step at 4096x8 (315x the plain step); stratified jittered-cell sampling replaced it, getting the pairwise separation by construction in a single draw. That left a torch draw still running every step, and at 16,384x16 it was **86%** of the step: two batched `argsort`s (the only way to get a uniform random k-subset out of batched torch ops), four `sample_uniform`s and the `torch.where` blends — around 25 ops, on a path that is bound by op count rather than by arithmetic. Consolidating that into one masked Warp launch per scenario (`nav_reset_kernel` and its siblings, one thread per env, drawing distinct cells by a partial Fisher–Yates over a scratch permutation; shared pieces in `swarp/scenarios/reset_kernels.py`) got the reset from 3.9 to 1.20 ms/step at 4096x8, and 1.3–1.6x on every other scenario's `auto_reset` steps.
+
+That 1.20 ms/step was still an eager tail after the graph replay, though — the masked reset kernel, the masked neighbor rebuild and the masked obs pass all ran as separate host-launched calls every step, on a config where the tail cost more than the physics it followed. The remaining fix was to stop treating the reset as something that happens *after* the graph: the reset RNG seed moves onto the device (a one-thread kernel advances it in place before each draw, reproducing the old host-side "increment then use" arithmetic exactly, so the drawn sequence is unchanged) and the whole masked sequence — episode-end test, seed advance, reset, neighbor rebuild, obs pass — gets folded into the same `wp.ScopedCapture` as the physics. A step under `auto_reset` is then one graph replay end to end, the same shape as a step without it. This is opt-in per scenario (`FusedScenario.supports_graph_reset()`; navigation qualifies when it has no obstacles, since sampling obstacle poses needs `world.generator` and a spec re-install, neither of which belongs inside a capture) — scenarios that don't qualify keep the eager tail above.
+
+Same guarantee, same distribution throughout — a *uniform* k-subset, which is the part worth protecting: a cheaper structured draw (cells by a random base and stride) passes every separation and bounds check while collapsing the reachable spawn layouts from C(25,16) ≈ 2.0M to 250, which surfaces much later as a generalization failure rather than as a test failure. `tests/unit/test_reset_kernel.py` pins it.
+
+At 4096x8 on an RTX 3070 Laptop, graph on, obstacle-free navigation:
+
+| | ms/step | vs `auto_reset=False` |
+|---|---|---|
+| `auto_reset=False` | 0.08 | — |
+| `auto_reset=True`, realistic (a slice of the batch resets each step) | 0.10 | 1.24x |
+| `auto_reset=True`, worst case (every env resets every step) | 0.13 | 1.60x |
+
+At 16,000x16 the gap narrows further in relative terms as the physics work grows to dominate the step: 0.40 ms/step without reset, 0.43 ms realistic, 0.87 ms worst case (2.2x) — against the 3.9 ms a *single* reset used to cost at the smaller 4096x8 config before any of this work. Resetting one env out of the batch now costs close to nothing extra; resetting the whole batch on the same step is the regime that still shows up, because the masked kernels still touch the same amount of data whether one env changed or all of them did.
+
+Two things follow for anyone writing a scenario:
+
+- Whatever `reset_world` does, it does on every step under `auto_reset`. Budget it as hot-path work, not as setup — and prefer one masked kernel over a chain of masked torch ops, because what costs you there is the number of launches, not the arithmetic. If the reset can be made capture-safe (no host-side RNG draws, no allocation, no branching on tensor values), `supports_graph_reset()` folds it into the graph and removes the launch cost entirely.
+- If you only need resets at episode boundaries you control, leave `auto_reset=False` and call `env.reset_at` yourself with a mask — you then pay the reset cost only on the steps that need it.
 
 ## Running the benchmarks
 

@@ -82,7 +82,13 @@ def _make_swarp(n_envs: int, n_agents: int, device: str):
     return env, step
 
 
-def _make_vmas(n_envs: int, n_agents: int, device: str, collisions: bool):
+def make_vmas(n_envs: int, n_agents: int, device: str, collisions: bool):
+    """Build the VMAS ``navigation`` baseline and its step closure.
+
+    Returns ``(env, step)``. Shared with
+    :mod:`swarp.benchmark._adapters.vmas_adapter` so the cross-simulator table and this
+    module's own comparison time the *same* baseline configuration.
+    """
     _ensure_vmas()
     from vmas import make_env
 
@@ -108,8 +114,8 @@ def _make_vmas(n_envs: int, n_agents: int, device: str, collisions: bool):
 
 _BUILDERS = {
     "swarp": lambda ne, na, dev: _make_swarp(ne, na, dev),
-    "vmas-lidar": lambda ne, na, dev: _make_vmas(ne, na, dev, True),
-    "vmas-simple": lambda ne, na, dev: _make_vmas(ne, na, dev, False),
+    "vmas-lidar": lambda ne, na, dev: make_vmas(ne, na, dev, True),
+    "vmas-simple": lambda ne, na, dev: make_vmas(ne, na, dev, False),
 }
 SIMS = tuple(_BUILDERS)
 
@@ -250,7 +256,8 @@ def run_memory(args) -> None:
 # --------------------------------------------------------------------- main
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
+    """The CLI, split out from :func:`main` so a test can build it without running."""
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -268,7 +275,11 @@ def main() -> None:
         metavar=("SIM", "N_ENVS", "N_AGENTS", "STEPS"),
         help=argparse.SUPPRESS,
     )
-    args = p.parse_args()
+    return p
+
+
+def main() -> None:
+    args = build_parser().parse_args()
 
     if args._mem_child:
         sim, ne, na, steps = args._mem_child

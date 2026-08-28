@@ -41,6 +41,23 @@ All four are differentiable and integrate with either semi-implicit Euler or cla
 
 Every slot is clamped inside the kernel against that agent's limits (`max_speed`, `max_accel`, `max_ang_vel`, `max_ang_accel`, `max_steer`, `thrust_max`).
 
+### Per-slot action bounds
+
+Those limits *are* the action space — actions are physical and nothing rescales them:
+
+| model / mode | slot 0 | slot 1 | slots 2–3 |
+|---|---|---|---|
+| `HOLONOMIC`, `VELOCITY` | `±max_speed` | `±max_speed` | — |
+| `HOLONOMIC`, `ACCELERATION` | `±max_accel` | `±max_accel` | — |
+| `DIFF_DRIVE`, `VELOCITY` | `±max_speed` | `±max_ang_vel` | — |
+| `DIFF_DRIVE`, `ACCELERATION` | `±max_accel` | `±max_ang_accel` | — |
+| `KINEMATIC_BICYCLE` | `±max_accel` | `±max_steer` (an angle) | — |
+| `DRONE` | `[0, thrust_max]` | `[0, thrust_max]` | `[0, thrust_max]` |
+
+`action_bounds(cfg)` returns this row for one `AgentConfig`, and `env.action_bounds` returns the whole `[n_agents, act_dim]` box — see [Actions](environment.md#actions) for why an RL wrapper should be given it rather than a `[-1, 1]` default.
+
+The holonomic rows are the box *circumscribing* the true feasible set: that model clamps the action's norm (`clamp_norm(a, max_speed)`), so its reachable region is the inscribed disc. The box edges are still exact along each axis, which is all a per-slot bound can say.
+
 ### The quadrotor
 
 The drone is a first-class model, not a bolt-on: its integration is the `TAG_DRONE` branch of the same kernel, and its extra state lives in the same `WorldState`.
@@ -54,7 +71,7 @@ from swarp.dynamics.drone import drone_config
 cfg = drone_config(mass=1.0, thrust_max=10.0, arm_length=0.15, inertia_zz=0.02)
 ```
 
-`radius` is the horizontal footprint the shared 2D neighbour and contact machinery uses.
+`radius` is the horizontal footprint the shared 2D neighbor and contact machinery uses.
 
 :::{note}
 The attitude loop is much stiffer than the 2D models'.

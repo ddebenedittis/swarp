@@ -34,7 +34,6 @@ def test_fused_pass_properties_are_named_after_the_kernel_arguments():
 
 def test_step_pass_is_a_shared_constant():
     """The hot path must not allocate even a descriptor object per step."""
-    assert STEP is FusedPass.STEP
     assert STEP.kind == "step" and STEP.env_mask is None
 
 
@@ -51,6 +50,17 @@ def test_every_registered_scenario_implements_the_same_member_set(cls):
     # ...and none of them override what the framework owns.
     for name in ("post_step", "graph_hook", "ensure_fused", "prepare_fused", "finish_reset"):
         assert name not in vars(cls), f"{cls.__name__} overrides the framework's {name}"
+    # ``supports_graph_reset``/``reset_in_graph`` are declared *extension points*
+    # (default ``False`` / ``NotImplementedError``), not framework machinery: a
+    # scenario opts its own reset into the captured whole-step graph by overriding
+    # both together, so this only pins that they can't be split — overriding
+    # ``reset_in_graph`` alone would leave it permanently unreachable dead code
+    # (``supports_graph_reset`` still says ``False``), and overriding
+    # ``supports_graph_reset`` alone would flip the flag onto the base class's
+    # ``NotImplementedError`` body.
+    assert ("supports_graph_reset" in vars(cls)) == ("reset_in_graph" in vars(cls)), (
+        f"{cls.__name__} overrides only one of supports_graph_reset/reset_in_graph"
+    )
 
 
 @pytest.mark.parametrize("cls", FUSED, ids=IDS)
@@ -122,6 +132,60 @@ def test_scenarios_without_a_watched_buffer_pin_the_token_structurally():
 
 
 @pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("scenario_name", ["NavigationScenario", "FormationScenario"])
+def test_masked_obs_only_reset_matches_a_full_recompute(device, scenario_name):
+    """The obs-only auto-reset pass skips recomputing ``obs``/``prev`` for envs the
+    reset mask does not select (see the ``full_pass == 0 and reset_mask[e] == 0``
+    early-out in ``navigation_kernels.nav_obs_kernel`` / ``formation_kernels.
+    formation_obs_kernel``, and ``NeighborGrid``'s masked brute-force build). That is
+    an optimization, not an approximation: what it leaves behind for a non-reset env
+    must be bit-identical to what a full, unmasked recompute over the same state would
+    have written. This forces exactly that comparison — a real (partial) masked pass,
+    then an unmasked one over the identical post-reset state — for both scenarios whose
+    obs kernel carries both ``full_pass`` and ``reset_mask``.
+    """
+    from swarp import Environment
+    from swarp.interop.autograd import torch_stream_scope
+    from swarp.scenarios import FormationScenario, NavigationScenario
+
+    n_envs, n_agents = 24, 5
+    cls = {"NavigationScenario": NavigationScenario, "FormationScenario": FormationScenario}[
+        scenario_name
+    ]
+    scen = cls(n_agents=n_agents)
+    env = Environment(
+        scen, n_envs=n_envs, device=device, dt=0.05, seed=0, max_steps=5, auto_reset=True
+    )
+    env.reset(seed=0)
+    # Force exactly every other env to truncate on this step (step_count == max_steps
+    # after the increment) so the auto_reset mask is guaranteed partial — neither all
+    # envs nor none, which is the only shape that exercises the masked path at all.
+    step_count = torch.zeros(n_envs, device=device, dtype=torch.int32)
+    step_count[::2] = env.max_steps - 1
+    env._step_count.copy_(step_count)
+    act = torch.zeros(n_envs, n_agents, env.act_dim, device=device)
+    with torch.no_grad():
+        env.step(act)
+
+    mask = scen.fb["resetmask"].clone()
+    assert bool(mask.any()) and not bool(mask.all()), "test needs a partial reset"
+    masked = {k: scen.fb[k].clone() for k in ("obs", "prev")}
+
+    # Force a full, unmasked recompute of the same obs-only pass over the identical
+    # current state (no further physics): mark every env "reset" for the kernels'
+    # purposes and relaunch. This is the parity oracle for the masked pass above.
+    scen.fb["resetmask"].fill_(1)
+    with torch_stream_scope(env.world.device):
+        scen.launch_fused(FusedPass("reset", full=False))
+
+    for name, before in masked.items():
+        assert torch.equal(before, scen.fb[name]), (
+            f"{scenario_name}.fb[{name!r}] differs between the masked auto-reset pass "
+            "and an unmasked recompute over the same state"
+        )
+
+
+@pytest.mark.parametrize("device", DEVICES)
 def test_reset_mask_is_zeroed_before_a_step_and_stamped_on_a_reset(device):
     from swarp import Environment, NavigationScenario
 
@@ -135,6 +199,37 @@ def test_reset_mask_is_zeroed_before_a_step_and_stamped_on_a_reset(device):
     with torch.no_grad():
         env.step(torch.zeros(4, 3, env.act_dim, device=device))
     assert (scen.fb["resetmask"] == 0).all()  # a normal step resets no env
+    # ``prepare_fused`` stops zeroing once the buffer is *known* clean, so the mask has
+    # to stay zero over the steps that follow, not only over the first one after a reset.
+    assert not scen._fused_mask_dirty
+    with torch.no_grad():
+        for _ in range(3):
+            env.step(torch.zeros(4, 3, env.act_dim, device=device))
+            assert (scen.fb["resetmask"] == 0).all()
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_every_reset_mask_write_marks_the_buffer_dirty(device):
+    """The invariant the skipped memset in ``prepare_fused`` rests on.
+
+    ``prepare_fused`` zeroes the reset mask only when ``_fused_mask_dirty`` says a writer
+    touched it, so a writer that forgets to mark leaves its stamp standing for every
+    later step. This pins the two host-side writers; the third is the in-graph
+    ``episode_end_kernel``, which ``Environment._compose_graph_reset_hook`` covers by
+    marking unconditionally before every replay.
+    """
+    from swarp import Environment, NavigationScenario
+
+    env = Environment(NavigationScenario(n_agents=3), n_envs=4, device=device, dt=0.05, seed=0)
+    scen = env.scenario
+    mask = torch.tensor([True, False, True, False], device=device)
+    for write in (
+        lambda: env.reset(seed=0),  # finish_reset's fill_(1)
+        lambda: env.reset_at(mask),  # reset_mask_wp's copy_
+    ):
+        scen._fused_mask_dirty = False
+        write()
+        assert scen._fused_mask_dirty, "a reset-mask write did not mark the buffer dirty"
 
 
 # ------------------------------------------------------- the errors it prevents

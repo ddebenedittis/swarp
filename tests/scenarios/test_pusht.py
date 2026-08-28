@@ -51,9 +51,9 @@ def test_pusht_api_and_finiteness(device):
     gen = torch.Generator(device=device).manual_seed(0)
     for _ in range(10):
         a = torch.rand(8, 4, env.world.act_dim, generator=gen, device=device) * 2 - 1
-        obs, rew, done, info = env.step(a)
+        obs, rew, term, trunc, info = env.step(a)
         assert torch.isfinite(obs).all() and torch.isfinite(rew).all()
-        assert rew.shape == (8, 4) and done.shape == (8,)
+        assert rew.shape == (8, 4) and term.shape == (8,) and trunc.shape == (8,)
         assert info["tee_dist_to_goal"].shape == (8,)
         assert info["tee_angle_error"].shape == (8,)
         # the wrapped heading error always lands in [0, pi]
@@ -70,7 +70,7 @@ def test_pusht_determinism(device):
         out = []
         for _ in range(8):
             a = torch.rand(4, 4, env.world.act_dim, generator=gen, device=device) * 2 - 1
-            obs, rew, _, _ = env.step(a)
+            obs, rew, *_ = env.step(a)
             out += [obs, rew, env.scenario.tee_pos.clone(), env.scenario.tee_theta.clone()]
         return out
 
@@ -206,3 +206,41 @@ def test_pusht_differentiable_rollout():
     loss.backward()
     assert actions.grad is not None and torch.isfinite(actions.grad).all()
     assert actions.grad.abs().sum() > 0.0
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_contact_denominator_uses_agent_mass_not_tee_mass(device):
+    """The oracle's implicit-damping denominator is the *agent's* solve, not the T's.
+
+    The engine reuses the agent-side force verbatim and negates it onto the body
+    (``swarp.core.bodies._reaction``), so its ``damp_denom`` is built from the agent's
+    mass. Reading ``tee_mass`` there instead made the torch reference — the parity oracle
+    and the whole grad path — disagree with the engine for any T that is not unit mass.
+    """
+    def force(tee_mass):
+        s = PushTScenario(n_agents=1, world_size=1.0, tee_mass=tee_mass)
+        s.make_world(n_envs=1, device=device, dt=0.05, substeps=8, dtype=torch.float32,
+                     world_config=None)
+        _park(s, device)
+        # Just touching the crossbar's left face, at that box's own height: overlap ==
+        # contact_margin > 0, and a +x velocity so the damping term is live too.
+        left = s.box_off[0][0] - s.box_half[0][0]
+        pos = torch.tensor(
+            [[[left - s.agent_radius, s.box_off[0][1]]]], device=device, dtype=torch.float32
+        )
+        vel = torch.tensor([[[0.5, 0.0]]], device=device, dtype=torch.float32)
+        return s, pos, vel, s._box_contact(pos, vel)[0]
+
+    s1, pos, vel, f1 = force(1.0)
+    _, _, _, f3 = force(3.0)
+    assert f1.abs().max().item() > 0.0, "the agents were not in contact: the test is vacuous"
+    torch.testing.assert_close(f1, f3, rtol=0, atol=0)
+
+    # ...and it really is the agent mass in there: the whole coefficient scales by the
+    # ratio of the two denominators, clamp and all.
+    s1._agent_mass = s1._agent_mass * 2.0
+    f_heavy = s1._box_contact(pos, vel)[0]
+    sub_dt = s1.dt / s1.body_substeps
+    d1 = 1.0 + s1.contact_c * sub_dt / 1.0
+    d2 = 1.0 + s1.contact_c * sub_dt / 2.0
+    torch.testing.assert_close(f_heavy, f1 * (d1 / d2), rtol=1e-6, atol=0)

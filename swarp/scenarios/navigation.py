@@ -13,16 +13,26 @@ neighbors (relative position/velocity + validity mask, padded-list order).
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import torch
 import warp as wp
 
+from swarp._overloads import concrete
+from swarp.core.cached_launch import CachedLaunch, ptr_key
 from swarp.core.config import Obstacles, WorldConfig
+from swarp.core.rng import advance_seed_kernel
+from swarp.core.state import VEC2
 from swarp.core.world import World
 from swarp.dynamics.base import AgentConfig, ControlMode, DynamicsModel
+from swarp.interop.autograd import torch_stream_scope
 from swarp.scenarios.fused import Buf, FusedPass, FusedScenario
-from swarp.scenarios.navigation_kernels import nav_obs_kernel, nav_reward_kernel
+from swarp.scenarios.navigation_kernels import (
+    nav_obs_kernel,
+    nav_reset_kernel,
+    nav_reward_kernel,
+)
 
 
 class NavigationScenario(FusedScenario):
@@ -65,6 +75,10 @@ class NavigationScenario(FusedScenario):
             min_spawn_separation if min_spawn_separation is not None else 3.0 * agent_radius
         )
         self.neighbor_method = neighbor_method
+        # Provisional obs width so ``obs_dim`` answers before ``make_world``: it mirrors
+        # this scenario's own ``max_neighbors`` default. ``make_world`` re-derives it
+        # from the *resolved* config, so a ``world_config`` override still wins.
+        self._k_obs = min(self.neighbor_obs, min(32, max(4, self.n_agents)))
 
     # ------------------------------------------------------------------ world
 
@@ -86,11 +100,11 @@ class NavigationScenario(FusedScenario):
             for _ in range(self.n_agents)
         ]
 
-    def make_world(self, n_envs, device, dt, substeps, dtype) -> World:
+    def make_world(self, n_envs, device, dt, substeps, dtype, world_config=None) -> World:
         configs = self._agent_configs()
         margin = 0.5 * self.agent_radius
         reach = 2.0 * self.agent_radius + margin
-        world_config = WorldConfig(
+        cfg = WorldConfig(
             collisions=True,
             collision_k=100.0,
             collision_c=1.0,
@@ -100,10 +114,10 @@ class NavigationScenario(FusedScenario):
             neighbor_radius=max(self.neighbor_radius or 0.0, reach),
             max_neighbors=min(32, max(4, self.n_agents)),
             neighbor_method=self.neighbor_method,
-        )
+        ).override_with(world_config)
         self.world = World(
             configs,
-            world_config,
+            cfg,
             n_envs=n_envs,
             device=device,
             dt=dt,
@@ -116,13 +130,41 @@ class NavigationScenario(FusedScenario):
         # with alloc="if_none". Reassigned by the torch path when eager_trims is off,
         # which is what watch=True catches.
         self._prev_dist: torch.Tensor | None = None
+        # Lazily sized by _launch_reset: the cell-major Fisher-Yates scratch and its Warp
+        # view (built once — never reallocated for a given batch, so the handle stays
+        # pointer-stable). The reset mask itself comes from FusedScenario.
+        self._reset_perm: torch.Tensor | None = None
+        self._reset_perm_wp = None
+        # Cached, repack-once launches for the eager reset path (see CLAUDE.md, "Speed
+        # Is a First-Class Citizen" / swarp/core/cached_launch.py). Never touched inside
+        # a captured step: the whole-step graph already amortizes wp.launch's packing
+        # cost to once, at capture time.
+        self._reset_launch = CachedLaunch()
+        self._obs_launch = CachedLaunch()
+        # The one-thread "advance the device seed counter" launch that must run
+        # immediately before every ``_reset_launch`` (see swarp/core/rng.py, "advance,
+        # then use"). Its own CachedLaunch so the eager auto-reset hot path doesn't pay a
+        # fresh wp.launch pack for it every step either.
+        self._seed_launch = CachedLaunch()
+        # Separate ``CachedLaunch`` instances for the in-graph tail (``reset_in_graph``),
+        # rather than sharing the three above with the eager path. Sharing would still be
+        # *correct* — a graph node bakes its kernel params at record time, so an eager
+        # call packing the same cache after capture would just repack params a replay
+        # never reads — but it entangles two independent lifecycles: the eager path's
+        # param mutations happen every eager step, while a *captured* launch is packed
+        # once, at warm-up, and never touched again until a genuine recapture. Keeping
+        # them apart costs one small object each and means a change to one path's
+        # packing can never accidentally perturb the other's cache state.
+        self._seed_launch_g = CachedLaunch()
+        self._reset_launch_g = CachedLaunch()
+        self._obs_launch_g = CachedLaunch()
         # Goals are engine-independent per-agent targets, written in place on every
         # reset; allocated here (not in reset_world) so the fused spec can adopt them.
         self.world.goals = torch.zeros(n_envs, self.n_agents, 2, device=device, dtype=dtype)
         # Persistent eager-trim scratch (allocated lazily on first refresh).
         self._eager_k_all: int = -1
         self._eager_k: int = -1
-        self._k_obs = min(self.neighbor_obs, world_config.max_neighbors)
+        self._k_obs = min(self.neighbor_obs, cfg.max_neighbors)
         if self.n_obstacles > 0:
             # Install the (zeroed) obstacle set once, here: ``World`` then retains the
             # resolved spec, so every reset just writes new poses into its own tensor and
@@ -149,48 +191,250 @@ class NavigationScenario(FusedScenario):
     def obs_dim(self) -> int:
         return 9 + 5 * self._k_obs
 
-    def _sample_separated(self, n_envs: int, n_points: int, min_dist: float, tries: int = 16):
-        """Uniform positions with pairwise separation via bounded resampling.
+    #: Cells per spawn point the stratified sampler aims for. More cells keep the choice
+    #: of cell closer to uniform; the cap that actually binds is jitter room per cell.
+    _SPAWN_CELL_OVERSAMPLE = 8
 
-        Host-sync-free: runs a fixed ``tries`` iterations with no early-exit
-        ``.any()`` check, so it never forces a device→host round-trip (safe to
-        call inside a masked reset on the step loop).
+    def _sample_separated(self, n_envs: int, n_points: int, min_dist: float):
+        """Positions with a **guaranteed** pairwise separation of ``min_dist``.
+
+        Stratified jittered-cell sampling. The spawn square is cut into a ``g x g`` grid of
+        cells of side ``s``; each env draws ``n_points`` *distinct* cells, and each point is
+        jittered uniformly inside a centred sub-square of side ``s - min_dist``. Two points
+        in different cells then differ by at least ``min_dist`` along whichever axis
+        separates their cells, so the separation holds *by construction*.
+
+        That replaces a fixed 16-iteration ``torch.cdist`` rejection loop, which cost a
+        batched distance matrix per iteration and could still return overlapping points.
+
+        This is the **reference** implementation, not the one the step loop runs: making
+        the draw cheap was not in fact the only lever, and ``reset_world`` now launches
+        :data:`~swarp.scenarios.navigation_kernels.nav_reset_kernel` instead — one masked
+        Warp launch where this is ~25 torch ops, which is what a path bound by op count
+        cares about. Both are kept, sharing no code, so the kernel can be tested against
+        this one's invariants the way the fused obs/reward kernels are. See
+        ``docs/performance.md``.
+
+        Host-sync-free (``torch.rand`` / ``argsort`` / arithmetic on ``world.generator``),
+        so it stays safe inside a masked reset on the step loop.
+
+        Falls back to plain uniform sampling when no grid can both hold ``n_points`` cells
+        and leave jitter room — i.e. when the requested separation is at the packing limit
+        for this world. Better an honest uniform draw than a grid silently packed so tight
+        that every point sits pinned at its cell centre.
         """
         w = self.world
         lim = self.world_size - 2.0 * self.agent_radius
-        pos = w.sample_uniform((n_envs, n_points, 2), -lim, lim)
-        if n_points == 1:
-            return pos
-        eye = torch.eye(n_points, device=w.device, dtype=w.dtype) * 1e9
-        for _ in range(tries):
-            d = torch.cdist(pos, pos) + eye
-            conflict = (d.min(dim=-1).values < min_dist).unsqueeze(-1)  # [n_envs, n_points, 1]
-            resampled = w.sample_uniform((n_envs, n_points, 2), -lim, lim)
-            pos = torch.where(conflict, resampled, pos)
-        return pos
+        shape = (n_envs, n_points, 2)
+        if n_points == 1 or min_dist <= 0.0:
+            return w.sample_uniform(shape, -lim, lim)
+
+        side = 2.0 * lim
+        g = math.ceil(math.sqrt(n_points * self._SPAWN_CELL_OVERSAMPLE))
+        g = min(g, int(side // (2.0 * min_dist)))  # keep at least min_dist of jitter room
+        g = max(g, math.ceil(math.sqrt(n_points)))  # ...but the points have to fit
+        if side / g <= min_dist:
+            return w.sample_uniform(shape, -lim, lim)
+        s = side / g
+        jitter = s - min_dist
+
+        # n_points distinct cells per env. argsort of random keys is a batched partial
+        # permutation: distinctness is structural, where a rejection loop only ever
+        # approaches it. Cheap because g*g stays O(n_points), not O(world / min_dist).
+        cell = w.sample_uniform((n_envs, g * g), 0.0, 1.0).argsort(dim=-1)[:, :n_points]
+        col = (cell % g).to(w.dtype)
+        row = torch.div(cell, g, rounding_mode="floor").to(w.dtype)
+        centers = torch.stack([col, row], dim=-1) * s + (0.5 * s - lim)
+        return centers + (w.sample_uniform(shape, 0.0, 1.0) - 0.5) * jitter
+
+    def _reset_grid(self) -> tuple[float, float, float, int, int, bool]:
+        """Cell geometry for the stratified spawn draw: ``(lim, cell, jitter, g, ncell,
+        stratified)``.
+
+        The same derivation :meth:`_sample_separated` documents, hoisted so the kernel can
+        take it as scalars. ``stratified=False`` is the packing-limit fallback.
+        """
+        lim = self.world_size - 2.0 * self.agent_radius
+        min_dist = self.min_spawn_separation
+        if self.n_agents == 1 or min_dist <= 0.0:
+            return lim, 0.0, 0.0, 1, 1, False
+        side = 2.0 * lim
+        g = math.ceil(math.sqrt(self.n_agents * self._SPAWN_CELL_OVERSAMPLE))
+        g = min(g, int(side // (2.0 * min_dist)))
+        g = max(g, math.ceil(math.sqrt(self.n_agents)))
+        if side / g <= min_dist:
+            return lim, 0.0, 0.0, 1, 1, False
+        cell = side / g
+        return lim, cell, cell - min_dist, g, g * g, True
+
+    def _launch_reset(self, env_mask: torch.Tensor | None, *, in_graph: bool = False) -> None:
+        """Launch the masked device-side reset (see :meth:`reset_world`).
+
+        ``in_graph=True`` is the tail :meth:`reset_in_graph` runs from inside the
+        captured whole-step graph (or the eager persistent fallback's hook). It differs
+        from the normal (eager, ``Environment.reset``/``reset_at``/auto-reset-outside-
+        capture) call in three ways, all because the surrounding graph replay has
+        already done the equivalent work this step:
+
+        * the mask/use_mask pair is read straight off the fused reset-mask buffer
+          (``self._wp[self._fused_mask]``, ``use_mask=1``) instead of going through
+          :meth:`reset_mask_wp`, which does a torch ``copy_`` into that same buffer —
+          the episode-end kernel earlier in the same ``run`` already stamped it, so
+          copying it onto itself would be redundant even before considering that a
+          torch op has no business inside a captured region;
+        * :meth:`sync_fused_handles` is not called — it is host-side (a data-pointer
+          compare per watched buffer) and ``prepare_fused`` already ran it once, eagerly,
+          before this step's replay; a captured launch cannot re-run it anyway;
+        * the launches are not wrapped in :func:`torch_stream_scope` — the capture
+          region already records on Warp's own stream (see the module docstring in
+          ``swarp/interop/persistent.py``), and the captured STEP pass
+          (``_launch_fused_step``) stays raw for the same reason.
+
+        It also skips :meth:`~swarp.core.world.World.mark_pos_dirty`: that bumps
+        ``state_version``, a host attribute read once per *eager* step to decide
+        whether the grid can be reused — meaningless to touch once per graph replay,
+        since the version bookkeeping around a captured step is frozen at capture time
+        (the graph's neighbor-reuse decision was already baked in when it was recorded).
+        The grid the next replay reads is instead refreshed by :meth:`reset_in_graph`'s
+        following :meth:`_launch_obs`, whose ``full_pass=0`` rebuild is masked to the
+        envs that just reset — the only ones whose positions moved since the step pass
+        built its lists.
+        """
+        w = self.world
+        lim, cell, jitter, g, n_cells, stratified = self._reset_grid()
+
+        # Cell-major, not env-major: one thread per env walks this buffer in lockstep with
+        # its warp neighbours, so ``[n_cells, n_envs]`` coalesces where the natural
+        # ``[n_envs, n_cells]`` would stride each lane ``n_cells * 4`` bytes apart. See
+        # ``nav_reset_kernel``.
+        if self._reset_perm is None or self._reset_perm.shape != (n_cells, w.n_envs):
+            self._reset_perm = torch.zeros(
+                (n_cells, w.n_envs), dtype=torch.int32, device=w.device
+            )
+            self._reset_perm_wp = wp.from_torch(self._reset_perm)
+
+        if in_graph:
+            mask, use_mask = self._wp[self._fused_mask], wp.int32(1)
+        else:
+            mask, use_mask = self.reset_mask_wp(env_mask)
+
+        st = w.state_wp()
+        if self.fused_active:
+            # Reuse the fused spec's cached, pointer-resynced handle instead of
+            # re-wrapping ``world.goals`` (a ``wp.from_torch`` + ``.contiguous()``) on
+            # every reset. ``sync_fused_handles`` must run first (eager path only — see
+            # the docstring above for why the in-graph tail skips it): it is what
+            # notices a grad-path reassignment and rebuilds the handle before this
+            # kernel writes through it.
+            self.ensure_fused()
+            if not in_graph:
+                self.sync_fused_handles()
+            goals = self._wp["goals"]
+        else:
+            goals = wp.from_torch(w.goals.contiguous(), dtype=VEC2[w.wp_dtype])
+        scalar = w.wp_dtype
+        seed_cache = self._seed_launch_g if in_graph else self._seed_launch
+        reset_cache = self._reset_launch_g if in_graph else self._reset_launch
+
+        def _do_launches() -> None:
+            # Advance, then use (see swarp/core/rng.py): bump World.seed_state's counter
+            # first, so the reset kernel below reads the fresh value. Both launches share
+            # the array by pointer only — ``seed_state`` itself never moves, which is what
+            # lets a captured graph replay this pair with a different draw every time
+            # despite baking the launch once at capture time.
+            seed_launch = seed_cache.get(
+                advance_seed_kernel,
+                dim=1,
+                inputs=[w.seed_state],
+                device=w.device,
+                key=(ptr_key(w.seed_state),),
+            )
+            seed_launch.launch()
+
+            # ``mask`` and ``use_mask`` genuinely vary call to call (a mask pointer swap
+            # never happens, but its *value* and use_mask do); everything else — the grid
+            # geometry (n_agents/world_size derived, so config-invariant), the
+            # state/goal/perm/seed handles — is step-invariant in the persistent hot
+            # path, so only those two are explicitly re-set below rather than folded into
+            # the cache key. ``seed_state`` is in the key (not re-set) precisely because
+            # it is pointer-stable: its *contents* change every call via the advance
+            # launch above, not via a param re-set here.
+            launch = reset_cache.get(
+                concrete(nav_reset_kernel, scalar),
+                dim=w.n_envs,
+                inputs=[
+                    mask,
+                    use_mask,
+                    w.seed_state,
+                    scalar(lim),
+                    scalar(cell),
+                    scalar(jitter),
+                    wp.int32(g),
+                    wp.int32(n_cells),
+                    wp.int32(1 if stratified else 0),
+                    wp.int32(self.n_agents),
+                    self._reset_perm_wp,
+                    st.pos,
+                    st.theta,
+                    st.vel,
+                    st.speed,
+                    st.ang_vel,
+                    goals,
+                ],
+                device=w.device,
+                key=(
+                    w.n_envs,
+                    ptr_key(mask),
+                    ptr_key(w.seed_state),
+                    lim,
+                    cell,
+                    jitter,
+                    g,
+                    n_cells,
+                    stratified,
+                    self.n_agents,
+                    ptr_key(self._reset_perm_wp),
+                    ptr_key(st.pos),
+                    ptr_key(st.theta),
+                    ptr_key(st.vel),
+                    ptr_key(st.speed),
+                    ptr_key(st.ang_vel),
+                    ptr_key(goals),
+                ),
+            )
+            launch.set_param_by_name("use_mask", use_mask)
+            launch.launch()
+
+        if in_graph:
+            _do_launches()
+        else:
+            with torch_stream_scope(w.device):
+                _do_launches()
+            w.mark_pos_dirty()
 
     def reset_world(
         self, env_mask: torch.Tensor | None = None, *, obs_only: bool = False
     ) -> None:
         """Reset all envs (``env_mask=None``) or the ``True`` entries of a
-        boolean ``[n_envs]`` mask. Host-sync-free: the full batch is always
-        sampled and blended with ``torch.where`` so no variable-length gather or
-        ``.any()`` is needed."""
-        w = self.world
-        n = w.n_envs  # always sample full width; blend selected envs with where
-        spawn = self._sample_separated(n, self.n_agents, self.min_spawn_separation)
-        goals = self._sample_separated(n, self.n_agents, self.min_spawn_separation)
-        theta = w.sample_uniform((n, self.n_agents), -torch.pi, torch.pi)
+        boolean ``[n_envs]`` mask.
 
-        w.write_state(env_mask, pos=spawn, theta=theta, vel=0.0, speed=0.0, ang_vel=0.0)
-        if env_mask is None:
-            w.goals.copy_(goals)
-        else:
-            w.goals.copy_(torch.where(env_mask.view(-1, 1, 1), goals, w.goals))
+        Host-sync-free, and device-side: one masked Warp launch writes spawns, goals,
+        headings and zeroed velocities. Under ``auto_reset`` this runs on **every** step
+        (the mask is applied in the kernel, so there is no host-side "is anything done?"
+        gate that could skip it), which is why it is one launch rather than the ~25 torch
+        ops it replaces — two batched ``argsort``s, four ``sample_uniform``s and the
+        ``torch.where`` blends. That was 86% of the RL step time at 16384x16.
+
+        :meth:`_sample_separated` stays the torch reference for the same draw, and the
+        kernel is validated against its invariants rather than its values: the two
+        deliberately do not share code, and their RNG streams are independent.
+        """
+        w = self.world
+        self._launch_reset(env_mask)
 
         if self.n_obstacles > 0:
             lim = self.world_size - self.obstacle_radius
-            obs_pos = w.sample_uniform((n, self.n_obstacles, 2), -lim, lim)
+            obs_pos = w.sample_uniform((w.n_envs, self.n_obstacles, 2), -lim, lim)
             if env_mask is None:
                 w.obstacle_pos.copy_(obs_pos)
             else:
@@ -201,6 +445,39 @@ class NavigationScenario(FusedScenario):
 
         self._nbr_cache = None
         self.finish_reset(env_mask, obs_only=obs_only)
+
+    # ------------------------------------------------- capture-safe reset (auto_reset)
+
+    def supports_graph_reset(self) -> bool:
+        """``True`` iff this scenario has no obstacles.
+
+        With ``n_obstacles == 0`` the whole reset is :meth:`_launch_reset` — pure Warp
+        launches against pointer-stable buffers, seeded from the device-resident
+        ``World.seed_state`` (see ``swarp/core/rng.py``) — which is exactly what
+        :meth:`~swarp.scenarios.fused.FusedScenario.supports_graph_reset` asks for. With
+        obstacles, :meth:`reset_world` also draws ``w.sample_uniform(...)`` for the
+        obstacle poses: that pulls from ``world.generator``, a ``torch.Generator`` whose
+        philox offset is not capture-safe (the same reason auto-reset as a whole used to
+        stay outside the graph, per the ``swarp/interop/persistent.py`` module
+        docstring), and then calls ``w.set_obstacles(...)`` to re-install the spec — a
+        torch op with no capture-safety guarantee of its own. Neither belongs inside
+        ``wp.ScopedCapture``, so a scenario with obstacles keeps the whole reset on the
+        eager tail, same as before this whole effort.
+        """
+        return self.n_obstacles == 0
+
+    def reset_in_graph(self) -> None:
+        """The capture-safe reset tail: masked spawn/goal draw, then an obs-only
+        refresh over the same mask.
+
+        Reachable only when :meth:`supports_graph_reset` is ``True``, i.e.
+        ``n_obstacles == 0`` — see that method for why obstacles rule this out. The mask
+        itself was already stamped by the episode-end kernel earlier in the same
+        ``run`` (``Environment``'s composed :class:`~swarp.core.hooks.WholeStepHook`),
+        so neither call needs (or is given) an explicit ``env_mask``.
+        """
+        self._launch_reset(env_mask=None, in_graph=True)
+        self._launch_obs(advance_prev=0, full_pass=0, in_graph=True)
 
     # --------------------------------------------------------- fused fast path
 
@@ -221,21 +498,32 @@ class NavigationScenario(FusedScenario):
         )
 
     def launch_fused(self, pass_: FusedPass) -> None:
-        """Observations, then the reward — the latter only on a step.
+        """Observations, then the reward — on every pass except an obs-only auto-reset.
 
-        A reset must leave ``reward``/``done`` alone: an auto-reset's were already returned
-        for the transition just taken. A standalone reset still passes ``full_pass=1``,
-        which fills the ``info`` outputs; those all come off the obs kernel. Either way the
-        shaping baseline rebases only the envs the reset mask selects.
+        A mid-step auto-reset must leave ``reward``/``done`` alone: they were already
+        returned for the transition just taken, and ``full_pass=0`` is what skips the
+        launch. A *standalone* ``reset``/``reset_at`` instead has to recompute them, since
+        the reward kernel is the only writer of the fused ``done`` — otherwise the first
+        ``done()`` after a reset would still report the pre-reset episode, unlike the torch
+        oracle. Either way the shaping baseline rebases only the envs the mask selects.
         """
         self._launch_obs(advance_prev=pass_.advance_prev, full_pass=pass_.full_pass)
-        if pass_.is_step:
+        if pass_.full_pass:
             self._launch_reward()
 
-    def _launch_obs(self, advance_prev: int, full_pass: int) -> None:
+    def _launch_obs(self, advance_prev: int, full_pass: int, *, in_graph: bool = False) -> None:
         w = self.world
         n_envs = w.n_envs
-        w.neighbors()  # build the grid on the current state (fills grid buffers)
+        resetmask = self._wp["resetmask"]
+        # ``full_pass == 0`` occurs *only* on the obs-only auto-reset pass (see
+        # FusedPass.full_pass / Environment.step's auto_reset branch): a standalone
+        # reset()/reset_at() always has full_pass == 1, and STEP is the module-level
+        # ``FusedPass("step")`` constant, whose ``full`` also defaults True. That is
+        # exactly the one pass where every env ``resetmask`` doesn't select has
+        # positions unchanged since the grid's lists were last built (the STEP pass
+        # moments earlier), so masking the rebuild here can never be reached by a
+        # normal step or a full reset.
+        w.build_neighbors(reset_mask=resetmask if full_pass == 0 else None)
         grid = w.stepper.grid(n_envs)
         scalar = w.wp_dtype
         st = w.state_wp()
@@ -244,8 +532,26 @@ class NavigationScenario(FusedScenario):
         # Touching uses the static per-agent radius (matches the torch reference's
         # World.agent_radius); per-env randomization affects forces, not this count.
         params = w.stepper.params.floats
-        wp.launch(
-            nav_obs_kernel,
+        obs, touch, dist, shaping = (
+            self._wp["obs"],
+            self._wp["touch"],
+            self._wp["dist"],
+            self._wp["shaping"],
+        )
+        ongoal, overflow = self._wp["ongoal"], self._wp["overflow"]
+        # ``advance_prev``/``full_pass`` are the only genuinely per-call arguments (STEP
+        # vs. RESET, full vs. obs-only); everything else is either static config or a
+        # pointer-stable persistent-mode handle, so it lives in the cache key instead.
+        # Shared by the captured STEP pass and the eager RESET pass: the STEP pass's
+        # launch only ever runs once (at capture time, inside wp.ScopedCapture), so
+        # caching it costs nothing and the *reused* handle across capture epochs is
+        # exactly what the recapture token (bumped by sync_fused_handles on a pointer
+        # move) already guards against going stale. ``in_graph`` (the tail
+        # ``reset_in_graph`` runs) gets its own cache — see the note by
+        # ``self._seed_launch_g`` in ``__init__``.
+        obs_cache = self._obs_launch_g if in_graph else self._obs_launch
+        launch = obs_cache.get(
+            concrete(nav_obs_kernel, self.world.wp_dtype),
             dim=(n_envs, self.n_agents),
             inputs=[
                 st.pos,
@@ -257,31 +563,49 @@ class NavigationScenario(FusedScenario):
                 grid.neighbor_count,
                 grid.neighbor_true_count,
                 params,
-                self._wp["resetmask"],
+                resetmask,
                 wp.int32(self._k_obs),
                 scalar(self.pos_shaping_factor),
                 scalar(self.goal_tolerance),
                 wp.int32(advance_prev),
                 wp.int32(full_pass),
             ],
-            outputs=[
-                self._wp["obs"],
-                self._wp["touch"],
-                self._wp["dist"],
-                self._wp["shaping"],
-                self._wp["ongoal"],
-                self._wp["overflow"],
-                prev,
-            ],
+            outputs=[obs, touch, dist, shaping, ongoal, overflow, prev],
             device=w.device,
-            record_tape=False,
+            key=(
+                n_envs,
+                self.n_agents,
+                ptr_key(st.pos),
+                ptr_key(st.vel),
+                ptr_key(st.theta),
+                ptr_key(st.ang_vel),
+                ptr_key(goals),
+                ptr_key(grid.neighbor_idx),
+                ptr_key(grid.neighbor_count),
+                ptr_key(grid.neighbor_true_count),
+                ptr_key(params),
+                ptr_key(resetmask),
+                self._k_obs,
+                self.pos_shaping_factor,
+                self.goal_tolerance,
+                ptr_key(obs),
+                ptr_key(touch),
+                ptr_key(dist),
+                ptr_key(shaping),
+                ptr_key(ongoal),
+                ptr_key(overflow),
+                ptr_key(prev),
+            ),
         )
+        launch.set_param_by_name("advance_prev", wp.int32(advance_prev))
+        launch.set_param_by_name("full_pass", wp.int32(full_pass))
+        launch.launch()
 
     def _launch_reward(self) -> None:
         w = self.world
         scalar = w.wp_dtype
         wp.launch(
-            nav_reward_kernel,
+            concrete(nav_reward_kernel, self.world.wp_dtype),
             dim=w.n_envs,
             inputs=[
                 self._wp["touch"],

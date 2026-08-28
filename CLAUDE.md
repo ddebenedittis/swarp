@@ -8,7 +8,7 @@ VMAS, but the step is compiled Warp kernels instead of per-entity PyTorch ops. A
 lives on-device as `[n_envs, n_agents]` Warp arrays; the hot loop does no host↔device copies.
 
 `VectorizedMultiAgentSimulator/` is **not** a submodule and not part of this package: it is
-an optional, gitignored local VMAS clone that `benchmark/compare_vmas.py` falls back to when
+an optional, gitignored local VMAS clone that `swarp/benchmark/compare_vmas.py` falls back to when
 `vmas` is not importable. It is ruff-excluded. Do not edit it.
 
 ## Build & Run
@@ -25,7 +25,7 @@ uv pip install --group docs                # docs toolchain (no torch/warp neede
 uv run --no-sync sphinx-build -b html -W docs docs/_build/html   # build the docs site
 ```
 
-Markers declared in `pyproject.toml`: `gpu` (needs CUDA), `slow`, `viz` (needs the `viz`
+Markers declared in `pyproject.toml`: `gpu` (needs CUDA) and `viz` (needs the `viz`
 extra). Benchmark numbers and the multi-venv cross-simulator setup live in
 `docs/benchmarks.md` — keep them out of the README.
 

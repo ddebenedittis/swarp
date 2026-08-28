@@ -5,6 +5,13 @@ least ``agents_per_target`` agents are within ``covering_range`` of it; the team
 earns a one-off shared reward the step a target is first covered. Agents also pay
 a small per-step time penalty and a per-contact collision penalty. Coverage is
 computed with ``torch.cdist`` over agent/target positions.
+
+**Scaling.** That ``cdist`` — and the matching loop in the fused kernels — is
+**O(n_agents * n_targets)** all-pairs work, and the inter-agent observation is
+**O(n_agents^2)**; neither consults the neighbor list. Deliberate: the fused path is
+tested for bit-exact parity against this torch path, and the neighbor list is truncated
+at ``max_neighbors``, so using it would make the two disagree by construction on
+overflow. Budget for the quadratic term before scaling ``n_agents`` into the hundreds.
 """
 
 from __future__ import annotations
@@ -14,12 +21,17 @@ from typing import Any
 import torch
 import warp as wp
 
+from swarp._overloads import concrete
+from swarp.core.cached_launch import CachedLaunch, ptr_key
 from swarp.core.config import WorldConfig
+from swarp.core.state import VEC2
 from swarp.core.world import World
 from swarp.dynamics.base import AgentConfig, ControlMode, DynamicsModel
+from swarp.interop.autograd import torch_stream_scope
 from swarp.scenarios.discovery_kernels import (
     discovery_cover_kernel,
     discovery_obs_kernel,
+    discovery_reset_kernel,
     discovery_reward_kernel,
 )
 from swarp.scenarios.fused import Buf, FusedPass, FusedScenario
@@ -50,7 +62,7 @@ class DiscoveryScenario(FusedScenario):
         self.collision_penalty = collision_penalty
         self.max_speed = max_speed
 
-    def make_world(self, n_envs, device, dt, substeps, dtype) -> World:
+    def make_world(self, n_envs, device, dt, substeps, dtype, world_config=None) -> World:
         cfgs = [
             AgentConfig(
                 model=DynamicsModel.HOLONOMIC,
@@ -67,8 +79,8 @@ class DiscoveryScenario(FusedScenario):
             collision_margin=margin,
             bounds=(-self.world_size, self.world_size, -self.world_size, self.world_size),
             bounds_mode="soft",
-            max_neighbors=min(8, max(2, self.n_agents)),
-        )
+            max_neighbors=min(32, max(4, self.n_agents)),
+        ).override_with(world_config)
         self.world = World(
             cfgs, cfg, n_envs=n_envs, device=device, dt=dt, substeps=substeps, dtype=dtype
         )
@@ -82,6 +94,11 @@ class DiscoveryScenario(FusedScenario):
             n_envs, self.n_targets, dtype=torch.bool, device=device
         )
         self._cache: dict[str, torch.Tensor] | None = None
+        # Cached, repack-once launches for the eager reset path — see
+        # swarp/core/cached_launch.py.
+        self._reset_launch = CachedLaunch()
+        self._cover_launch = CachedLaunch()
+        self._obs_launch = CachedLaunch()
         return self.world
 
     @property
@@ -91,21 +108,59 @@ class DiscoveryScenario(FusedScenario):
     def reset_world(
         self, env_mask: torch.Tensor | None = None, *, obs_only: bool = False
     ) -> None:
+        """Masked reset in one Warp launch (see :mod:`swarp.scenarios.reset_kernels`)."""
         w = self.world
-        n = w.n_envs
         lim = self.world_size - 2.0 * self.agent_radius
-        spawn = w.sample_uniform((n, self.n_agents, 2), -lim, lim)
-        targets = w.sample_uniform((n, self.n_targets, 2), -lim, lim)
-
-        w.write_state(env_mask, pos=spawn, vel=0.0)
-        if env_mask is None:
-            self.targets.copy_(targets)
-            self.covered.zero_()
+        mask, use_mask = self.reset_mask_wp(env_mask)
+        st = w.state_wp()
+        scalar = w.wp_dtype
+        if self.fused_active:
+            # ``targets``/``covered`` are adopted (``alloc="never"``) and never
+            # reassigned, so the fused spec's cached handles are always current —
+            # reuse them instead of re-wrapping on every reset.
+            self.ensure_fused()
+            aux = self._wp["targets"]
+            flags = self._wp["covered"]
         else:
-            self.targets.copy_(torch.where(env_mask.view(-1, 1, 1), targets, self.targets))
-            self.covered.copy_(
-                torch.where(env_mask.view(-1, 1), torch.zeros_like(self.covered), self.covered)
+            aux = wp.from_torch(self.targets.contiguous(), dtype=VEC2[scalar])
+            flags = wp.from_torch(self.covered.view(torch.uint8))
+        seed = wp.int32(w.next_kernel_seed())
+        with torch_stream_scope(w.device):
+            launch = self._reset_launch.get(
+                concrete(discovery_reset_kernel, scalar),
+                dim=w.n_envs,
+                inputs=[
+                    mask,
+                    use_mask,
+                    seed,
+                    scalar(lim),
+                    scalar(lim),
+                    wp.int32(self.n_agents),
+                    wp.int32(self.n_targets),
+                    wp.int32(self.covered.shape[1]),
+                    st.pos,
+                    st.vel,
+                    aux,
+                    flags,
+                ],
+                device=w.device,
+                key=(
+                    w.n_envs,
+                    ptr_key(mask),
+                    lim,
+                    self.n_agents,
+                    self.n_targets,
+                    self.covered.shape[1],
+                    ptr_key(st.pos),
+                    ptr_key(st.vel),
+                    ptr_key(aux),
+                    ptr_key(flags),
+                ),
             )
+            launch.set_param_by_name("use_mask", use_mask)
+            launch.set_param_by_name("seed", seed)
+            launch.launch()
+        w.mark_pos_dirty()
         self.finish_reset(env_mask, obs_only=obs_only)
 
     # ---------------------------------------- torch reference path (parity oracle)
@@ -142,7 +197,6 @@ class DiscoveryScenario(FusedScenario):
             "rel_targets": (self.targets.unsqueeze(1) - pos.unsqueeze(2)).reshape(
                 w.n_envs, w.n_agents, self.n_targets * 2
             ),
-            "covered_frac": self.covered.float().mean(-1),
         }
 
     # --------------------------------------------------------- fused fast path
@@ -160,63 +214,93 @@ class DiscoveryScenario(FusedScenario):
         )
 
     def launch_fused(self, pass_: FusedPass) -> None:
-        """Coverage, observations, and — on a step only — the reward.
+        """Coverage, observations, and — outside an obs-only auto-reset — the reward.
 
         Discovery's kernels take *neither* ``advance_prev`` nor ``full_pass``: there is no
-        shaping baseline to rebase, and "a reset must not clobber the reward already
-        returned for this transition" is expressed by simply not launching the reward
-        kernel. Coverage still runs on a reset, updating the ``covered`` latch exactly as
-        the torch ``_refresh`` does.
+        shaping baseline to rebase, so the pass flags only decide whether the reward kernel
+        runs at all. An obs-only auto-reset skips it, keeping the reward/done already
+        returned for the transition just taken; a standalone reset launches it, because the
+        reward kernel is the only writer of the fused ``done`` and the torch oracle
+        recomputes both. Coverage always runs, updating the ``covered`` latch exactly as
+        the torch ``_refresh`` does — which is what makes the reset-pass reward correct.
         """
-        self._launch_cover()
-        self._launch_obs()
-        if pass_.is_step:
+        st = self.world.state_wp()  # one wrap for both launches
+        self._launch_cover(st)
+        self._launch_obs(st)
+        if pass_.full_pass:
             self._launch_reward()
 
-    def _launch_cover(self) -> None:
+    def _launch_cover(self, st) -> None:
         w = self.world
         scalar = w.wp_dtype
-        wp.launch(
-            discovery_cover_kernel,
+        targets, covered, newly = self._wp["targets"], self._wp["covered"], self._wp["newly"]
+        # No per-call-varying argument at all: every entry is either static config or a
+        # pointer-stable persistent-mode handle, so a hit needs no set_param_* calls.
+        launch = self._cover_launch.get(
+            concrete(discovery_cover_kernel, self.world.wp_dtype),
             dim=(w.n_envs, self.n_targets),
             inputs=[
-                w.state_wp().pos,
-                self._wp["targets"],
+                st.pos,
+                targets,
                 wp.int32(self.n_agents),
                 scalar(self.covering_range**2),
                 wp.int32(self.agents_per_target),
             ],
-            outputs=[self._wp["covered"], self._wp["newly"]],
+            outputs=[covered, newly],
             device=w.device,
-            record_tape=False,
+            key=(
+                w.n_envs,
+                self.n_targets,
+                ptr_key(st.pos),
+                ptr_key(targets),
+                self.n_agents,
+                self.covering_range,
+                self.agents_per_target,
+                ptr_key(covered),
+                ptr_key(newly),
+            ),
         )
+        launch.launch()
 
-    def _launch_obs(self) -> None:
+    def _launch_obs(self, st) -> None:
         w = self.world
         scalar = w.wp_dtype
-        st = w.state_wp()
-        wp.launch(
-            discovery_obs_kernel,
+        targets, covered = self._wp["targets"], self._wp["covered"]
+        obs, touch = self._wp["obs"], self._wp["touch"]
+        launch = self._obs_launch.get(
+            concrete(discovery_obs_kernel, self.world.wp_dtype),
             dim=(w.n_envs, self.n_agents),
             inputs=[
                 st.pos,
                 st.vel,
-                self._wp["targets"],
-                self._wp["covered"],
+                targets,
+                covered,
                 wp.int32(self.n_agents),
                 wp.int32(self.n_targets),
                 scalar((2.0 * self.agent_radius) ** 2),
             ],
-            outputs=[self._wp["obs"], self._wp["touch"]],
+            outputs=[obs, touch],
             device=w.device,
-            record_tape=False,
+            key=(
+                w.n_envs,
+                self.n_agents,
+                self.n_targets,
+                ptr_key(st.pos),
+                ptr_key(st.vel),
+                ptr_key(targets),
+                ptr_key(covered),
+                self.agent_radius,
+                ptr_key(obs),
+                ptr_key(touch),
+            ),
         )
+        launch.launch()
 
     def _launch_reward(self) -> None:
         w = self.world
         scalar = w.wp_dtype
         wp.launch(
-            discovery_reward_kernel,
+            concrete(discovery_reward_kernel, self.world.wp_dtype),
             dim=w.n_envs,
             inputs=[
                 self._wp["touch"],
@@ -261,6 +345,14 @@ class DiscoveryScenario(FusedScenario):
         return self.covered.all(dim=-1)
 
     def info(self) -> dict[str, Any]:
-        if self.fused_active:
-            return {"covered_frac": self.covered.float().mean(-1)}
-        return {"covered_frac": self._cache["covered_frac"]}
+        """The covered fraction, read off the live ``covered`` latch on both paths.
+
+        ``.to(dtype).mean(-1)`` rather than the ``.float().mean(-1)`` this used to be: in a
+        float64 world the old form silently reported float32. It is *not* reduced into a
+        preallocated buffer, though that looks like the obvious win — measured on an RTX
+        3070 Laptop, ``torch.sum(bool, out=float)`` + ``mul_`` costs 73 us against 57 us for
+        the allocating mean, and cost discovery's graph-mode step ~7%. The bool->float cast
+        is one kernel either way, and torch's caching allocator makes the allocation it
+        avoids nearly free.
+        """
+        return {"covered_frac": self.covered.to(self.world.dtype).mean(-1)}

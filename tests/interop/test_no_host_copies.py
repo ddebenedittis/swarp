@@ -48,28 +48,42 @@ def test_hot_loop_api_guard(device):
     env.step(actions)  # warmup outside the guard (kernel compilation etc.)
     with torch.no_grad(), forbid_host_transfers():
         for _ in range(20):
-            obs, rew, done, info = env.step(actions)
+            obs, rew, term, trunc, info = env.step(actions)
     assert obs.device.type == torch.device(device).type
 
 
-@pytest.mark.parametrize("device", DEVICES)
-def test_transport_obstacle_reinstall_no_host_transfer(device):
-    """Transport re-installs its packages as obstacles every step, from inside the
-    whole-step hook. That must not sync.
-
-    ``Obstacles.any_movable`` costs a reduction plus ``.item()`` on a *fresh* spec and is
-    memoized on a retained one, so the scenario has to hold one instance and re-install it
-    rather than rebuild it per call. Auto-reset is on with a short ``max_steps`` so the
-    guarded window crosses several resets, which is where the rebuild used to happen.
-    """
+def _transport():
     from swarp import TransportScenario
 
-    scen = TransportScenario(n_agents=4, n_packages=2)
+    return TransportScenario(n_agents=4, n_packages=2)
+
+
+def _pusht():
+    from swarp import PushTScenario
+
+    return PushTScenario(n_agents=2)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("factory", [_transport, _pusht], ids=["transport", "pusht"])
+def test_obstacle_reinstall_no_host_transfer(device, factory):
+    """Both body scenarios re-install their obstacle spec on every reset. That must not sync.
+
+    ``Obstacles.any_movable`` costs a reduction plus ``.item()`` on a *fresh* spec and is
+    memoized on a retained one, so a scenario has to hold one instance and re-install it
+    rather than rebuild it per call. Auto-reset is on with a short ``max_steps`` so the
+    guarded window crosses several resets, which is where the rebuild used to happen.
+
+    Transport re-installs from inside the captured whole-step hook (its spec carries no
+    movable obstacle); Push-T's T *is* a movable body, so its install stays outside any
+    capture — but it still has to be sync-free, which is what this pins.
+    """
+    scen = factory()
     env = Environment(
         scen, n_envs=32, device=device, dt=0.05, seed=0, auto_reset=True, max_steps=3
     )
     env.reset(seed=0)
-    actions = torch.zeros(32, 4, 2, device=device)
+    actions = torch.zeros(32, env.n_agents, env.act_dim, device=device)
     with torch.no_grad():
         for _ in range(4):  # warmup: kernel compilation, graph capture
             env.step(actions)

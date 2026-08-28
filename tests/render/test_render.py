@@ -26,6 +26,22 @@ def make_env(n_envs=4, n_agents=3, n_obstacles=2, world_size=1.0, device="cpu"):
 # --------------------------------------------------------------- geometry
 
 
+def test_overlay_tags_are_the_core_enum_values():
+    """The renderer's obstacle tags are derived from the enums, not a second literal list.
+
+    Re-listing ``0, 1, 2`` here would only pin the copy in place; comparing against the
+    enum is what makes a renumbered :class:`ObstacleShape` fail instead of silently
+    drawing boxes as circles.
+    """
+    from swarp.core.config import ObstacleKind, ObstacleShape
+    from swarp.render import overlays
+
+    assert overlays.SHAPE_CIRCLE == ObstacleShape.CIRCLE
+    assert overlays.SHAPE_BOX == ObstacleShape.BOX
+    assert overlays.SHAPE_SEGMENT == ObstacleShape.SEGMENT
+    assert overlays.KIND_MOVABLE == ObstacleKind.MOVABLE
+
+
 def test_extract_geometry_shapes_and_is_cpu_numpy():
     env, scenario = make_env(n_agents=3, n_obstacles=2, world_size=1.0)
     g = extract_geometry(env.world, env_idx=1, scenario=scenario)
@@ -645,13 +661,13 @@ def test_reached_goal_renders_differently_from_a_distant_one():
 
 
 def test_pts_is_pixel_identical_to_the_scalar_transform():
-    from swarp.render.overlays import _p, _pts
+    from swarp.render.overlays import to_px, to_px_batch
 
     cam = Camera(bounds=(-1.0, 2.0, -1.0, 1.0), viewport=(5, 7, 333, 211), zoom=1.3)
     cam.pan(11.0, -23.0)
     rng = np.random.default_rng(0)
     pts = rng.uniform(-1.5, 1.5, size=(64, 2))
-    assert _pts(cam, pts) == [list(_p(cam, p)) for p in pts]
+    assert to_px_batch(cam, pts) == [list(to_px(cam, p)) for p in pts]
 
 
 def test_supersampled_frame_keeps_shape_and_antialiases():

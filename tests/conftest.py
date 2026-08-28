@@ -252,8 +252,8 @@ def fused_rollout(env, n_steps, device, n_agents, spec, *, dtype=torch.float32):
             a = torch.empty(env.n_envs, n_agents, 2, device=device, dtype=dtype).uniform_(
                 -1, 1, generator=gen
             )
-            obs, rew, done, info = env.step(a)
-            out.append(tuple(_pick(f, obs, rew, done, info).clone() for f in spec.fields))
+            obs, rew, term, trunc, info = env.step(a)
+            out.append(tuple(_pick(f, obs, rew, term | trunc, info).clone() for f in spec.fields))
     return out
 
 
@@ -277,12 +277,70 @@ def assert_grad_falls_back_to_torch(env, device, n_agents, spec):
         if i == spec.grad_index:
             act = act.clone().requires_grad_(True)
             with torch.enable_grad():
-                obs, rew, done, _ = env.step(act)
+                obs, rew, *_ = env.step(act)
             assert obs.requires_grad  # torch reference path was taken
             target = rew if spec.grad_backprop == "rew" else obs
             target.pow(2).sum().backward()
             assert act.grad is not None
         else:
             with torch.no_grad():
-                obs, rew, done, _ = env.step(act)
+                obs, rew, *_ = env.step(act)
             assert torch.isfinite(rew).all()
+
+
+def _assert_field(name, a, b, spec, when):
+    """Discrete fields exactly, continuous ones within the scenario's parity bound."""
+    if a.dtype in (torch.bool, torch.uint8, torch.int32, torch.int64):
+        assert torch.equal(a, b), f"{name} {when}"
+    else:
+        torch.testing.assert_close(a, b, rtol=spec.rtol, atol=spec.atol, msg=f"{name} {when}")
+
+
+def _outputs(env, spec):
+    """The ``spec.fields`` the scenario reports *right now*, without stepping."""
+    obs = env.scenario.observations()
+    rew = env.scenario.rewards()
+    done = env.scenario.done()
+    info = env.scenario.info()
+    return {f: _pick(f, obs, rew, done, info).clone() for f in spec.fields}
+
+
+def assert_reset_parity(make_env, device, n_agents, spec, *, dtype=torch.float32):
+    """A **standalone** reset must leave the fused outputs where the torch oracle does.
+
+    The distinction that makes this worth its own test: a mid-step auto-reset is
+    *obs-only* — reward/done/info for the transition just taken were already returned and
+    their buffers must survive — but :meth:`~swarp.core.environment.Environment.reset` and
+    :meth:`~swarp.core.environment.Environment.reset_at` are full passes, and the torch
+    reference path recomputes everything on both. A fused ``launch_fused`` that skipped its
+    reward launch on every reset left ``reward``/``done`` reporting the *previous* episode,
+    which no rollout-only parity test can see: those cross auto-resets only.
+
+    ``make_env(fused: bool)`` builds one env per path (same seed, same settings). The two
+    are driven with one shared action sequence so their states stay comparable, then reset
+    on a half mask.
+    """
+    fe, te = make_env(True), make_env(False)
+    for env in (fe, te):
+        env.reset(seed=0)
+    for f in spec.fields:
+        _assert_field(f, _outputs(fe, spec)[f], _outputs(te, spec)[f], spec, "after reset()")
+
+    gen = torch.Generator(device=device).manual_seed(spec.action_seed)
+    acts = [
+        torch.empty(fe.n_envs, n_agents, 2, device=device, dtype=dtype).uniform_(
+            -1, 1, generator=gen
+        )
+        for _ in range(3)
+    ]
+    with torch.no_grad():
+        for a in acts:
+            for env in (fe, te):
+                env.step(a)
+        mask = torch.zeros(fe.n_envs, dtype=torch.bool, device=device)
+        mask[::2] = True
+        for env in (fe, te):
+            env.reset_at(mask)
+    f_out, t_out = _outputs(fe, spec), _outputs(te, spec)
+    for f in spec.fields:
+        _assert_field(f, f_out[f], t_out[f], spec, "after reset_at(half)")

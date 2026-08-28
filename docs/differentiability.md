@@ -74,7 +74,7 @@ Knowing where the gradient stops matters more than the headline.
 
 **Saturated actions.** Limits are clamped inside the kernel, so an action past its bound gets zero gradient. That is correct — and verified finite, not NaN — but a policy initialized far outside the action range will see no signal until it comes back in.
 
-**Neighbour membership.** The neighbour set is a discrete structure and is built with `record_tape=False`. Gradients flow through contact *geometry* (how deep the overlap is, how fast the closing velocity), not through *which* pairs are in contact.
+**Neighbor membership.** The neighbor set is a discrete structure and is built with `record_tape=False`. Gradients flow through contact *geometry* (how deep the overlap is, how fast the closing velocity), not through *which* pairs are in contact.
 
 **Movable rigid bodies.** `swarp/core/bodies.py` advances body state with `record_tape=False`, so no gradient flows through a body's motion. A scenario that needs one keeps its own torch-side copy and integrates it there:
 
@@ -85,7 +85,7 @@ Both give BPTT body→agent→action across a rollout, but not through the intra
 
 ## The functional-step invariant
 
-Every array written during a taped step — intermediate states, force buffers, neighbour lists — must be allocated **fresh per step**.
+Every array written during a taped step — intermediate states, force buffers, neighbor lists — must be allocated **fresh per step**.
 Overwriting an array that is recorded on a `wp.Tape` silently corrupts its adjoint: no error, just wrong gradients.
 
 `Stepper` is the single place that knows this. Grad-mode steps are strictly functional; the no-grad hot path recycles one cached `StepBuffers` per batch size.

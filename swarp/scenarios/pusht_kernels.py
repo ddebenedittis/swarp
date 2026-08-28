@@ -28,7 +28,9 @@ from typing import Any
 
 import warp as wp
 
+from swarp._overloads import register
 from swarp.core.state import VEC2
+from swarp.scenarios.reset_kernels import _as
 
 
 @wp.kernel
@@ -215,6 +217,121 @@ def _reward_signature(dtype) -> list:
     ]
 
 
+
+@wp.kernel
+def pusht_reset_kernel(
+    reset_mask: wp.array(dtype=wp.uint8),
+    use_mask: wp.int32,
+    seed: wp.int32,
+    lim: Any,
+    tlim: Any,
+    clear: Any,
+    goal_radius: Any,
+    goal_angle: Any,
+    use_goal_radius: wp.int32,
+    use_goal_angle: wp.int32,
+    n_agents: wp.int32,
+    pos: Any,
+    vel: Any,
+    tee_pos: Any,
+    tee_vel: Any,
+    tee_theta: Any,
+    tee_ang_vel: Any,
+    goal_pos: Any,
+    goal_theta: Any,
+):
+    """Masked episode reset: T pose, goal pose, and spawns cleared of the T.
+
+    Any agent inside the T's bounding disk is pushed out to its rim before the episode
+    starts: with a stiff ``contact_k`` a spawn overlap is a violent ejection
+    (``k * depth * sub_dt`` is metres per second), so the reset must not start
+    interpenetrating. An agent exactly on the centre goes straight up — arbitrary, but
+    deterministic, matching the torch reset this replaces.
+
+    ``use_goal_radius``/``use_goal_angle`` select the curriculum draws: a goal uniform in
+    the square, or uniform in a disk of ``goal_radius`` around the T; a goal heading
+    uniform, or within ``goal_angle`` of the T's own.
+    """
+    e = wp.tid()
+    if use_mask == 1 and reset_mask[e] == wp.uint8(0):
+        return
+    rng = wp.rand_init(seed, e)
+    zero = _as(0.0, lim)
+    two = _as(2.0, lim)
+    one = _as(1.0, lim)
+    pi = _as(3.14159265358979, lim)
+
+    tx = (_as(wp.randf(rng), tlim) * two - one) * tlim
+    ty = (_as(wp.randf(rng), tlim) * two - one) * tlim
+    tee = wp.vector(tx, ty)
+    theta = (_as(wp.randf(rng), lim) * two - one) * pi
+
+    tee_pos[e] = tee
+    tee_vel[e] = wp.vector(zero, zero)
+    tee_theta[e] = theta
+    tee_ang_vel[e] = zero
+
+    for a in range(n_agents):
+        px = (_as(wp.randf(rng), lim) * two - one) * lim
+        py = (_as(wp.randf(rng), lim) * two - one) * lim
+        dx = px - tx
+        dy = py - ty
+        dn = wp.sqrt(dx * dx + dy * dy)
+        if dn < clear:
+            if dn > _as(1.0e-9, lim):
+                px = tx + dx / dn * clear
+                py = ty + dy / dn * clear
+            else:
+                px = tx
+                py = ty + clear
+        px = wp.clamp(px, -lim, lim)
+        py = wp.clamp(py, -lim, lim)
+        pos[e, a] = wp.vector(px, py)
+        vel[e, a] = wp.vector(zero, zero)
+
+    if use_goal_radius == 1:
+        gdir = (_as(wp.randf(rng), lim) * two - one) * pi
+        grad = goal_radius * wp.sqrt(_as(wp.randf(rng), lim))
+        gx = wp.clamp(tx + grad * wp.cos(gdir), -tlim, tlim)
+        gy = wp.clamp(ty + grad * wp.sin(gdir), -tlim, tlim)
+    else:
+        gx = (_as(wp.randf(rng), tlim) * two - one) * tlim
+        gy = (_as(wp.randf(rng), tlim) * two - one) * tlim
+    goal_pos[e] = wp.vector(gx, gy)
+
+    if use_goal_angle == 1:
+        goal_theta[e] = theta + (_as(wp.randf(rng), lim) * two - one) * goal_angle
+    else:
+        goal_theta[e] = (_as(wp.randf(rng), lim) * two - one) * pi
+
+
+def _reset_signature(dtype) -> list:
+    a1v = wp.array(dtype=VEC2[dtype])
+    a1s = wp.array(dtype=dtype)
+    a2v = wp.array2d(dtype=VEC2[dtype])
+    return [
+        wp.array(dtype=wp.uint8),  # reset_mask
+        wp.int32,  # use_mask
+        wp.int32,  # seed
+        dtype,  # lim
+        dtype,  # tlim
+        dtype,  # clear
+        dtype,  # goal_radius
+        dtype,  # goal_angle
+        wp.int32,  # use_goal_radius
+        wp.int32,  # use_goal_angle
+        wp.int32,  # n_agents
+        a2v,  # pos
+        a2v,  # vel
+        a1v,  # tee_pos
+        a1v,  # tee_vel
+        a1s,  # tee_theta
+        a1s,  # tee_ang_vel
+        a1v,  # goal_pos
+        a1s,  # goal_theta
+    ]
+
 for _T in (wp.float32, wp.float64):
-    wp.overload(pusht_obs_kernel, _obs_signature(_T))
-    wp.overload(pusht_reward_kernel, _reward_signature(_T))
+    register(pusht_obs_kernel, _T, _obs_signature(_T))
+    register(pusht_reward_kernel, _T, _reward_signature(_T))
+    register(pusht_reset_kernel, _T, _reset_signature(_T))

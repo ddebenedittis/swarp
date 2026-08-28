@@ -27,12 +27,12 @@ from swarp.render.hud import (
 )
 from swarp.render.input import InteractionController, ViewState
 from swarp.render.layout import MosaicLayout, compute_mosaic_layout, tile_at
-from swarp.render.overlays import DEFAULT_ENABLED, _p, _r_px
+from swarp.render.overlays import DEFAULT_ENABLED, radius_px, to_px
 from swarp.render.renderer import (
-    _bounds_from_geometry,
-    _ensure_pygame,
+    bounds_from_geometry,
     draw_scene,
     draw_supersampled,
+    ensure_pygame,
 )
 from swarp.render.style import Style
 
@@ -102,7 +102,7 @@ class Viewer:
 
     def _camera_for(self, geometry) -> Camera:
         if self._camera is None:
-            bounds = geometry.bounds or _bounds_from_geometry(geometry)
+            bounds = geometry.bounds or bounds_from_geometry(geometry)
             self._camera = Camera(bounds, viewport=self._focus_viewport())
         return self._camera
 
@@ -129,7 +129,7 @@ class Viewer:
         w, h = self.size
         w = max(min_size, w + direction * step)
         h = max(min_size, h + direction * step)
-        self._handle_resize(_ensure_pygame(), (w, h))
+        self._handle_resize(ensure_pygame(), (w, h))
 
     def _tile_env_at(self, screen_xy) -> int | None:
         return tile_at(self._ensure_layout(), screen_xy) if self.mosaic else None
@@ -311,15 +311,15 @@ class Viewer:
                 surface,
                 style.bounds_color,
                 True,
-                [_p(camera, c) for c in corners],
+                [to_px(camera, c) for c in corners],
                 style.tile_border_width,
             )
         for i in range(geometry.n_agents):
             pygame.draw.circle(
                 surface,
                 style.agent_color(i, geometry.model[i]),
-                _p(camera, geometry.pos[i]),
-                _r_px(camera, geometry.radius[i], floor=style.tile_agent_min_px),
+                to_px(camera, geometry.pos[i]),
+                radius_px(camera, geometry.radius[i], floor=style.tile_agent_min_px),
             )
         surface.set_clip(prev)
         border = style.tile_focus_border if focused else style.tile_border
@@ -335,7 +335,7 @@ class Viewer:
             self.env.world, layout.tile_envs, with_edges=False, with_extras=False
         )
         for tile_rect, env_idx, g in zip(layout.tiles, layout.tile_envs, tiles, strict=True):
-            cam = Camera(g.bounds or _bounds_from_geometry(g), viewport=tile_rect)
+            cam = Camera(g.bounds or bounds_from_geometry(g), viewport=tile_rect)
             self._draw_tile(
                 pygame, surface, g, cam, tile_rect, style, focused=env_idx == self.state.focus_env
             )
@@ -370,7 +370,7 @@ class Viewer:
 
     def render_array(self, *, hud: bool = False) -> np.ndarray:
         """Render the current view (single env or mosaic) to an ``(H, W, 3)`` uint8 array."""
-        pygame = _ensure_pygame()
+        pygame = ensure_pygame()
         surface = pygame.Surface(self.size)
         self._render_onto(pygame, surface, hud=hud)
         arr = pygame.surfarray.array3d(surface)
@@ -378,7 +378,7 @@ class Viewer:
 
     def render_human_frame(self) -> None:
         """Update a persistent window with one frame (VMAS ``render(mode='human')`` style)."""
-        pygame = _ensure_pygame()
+        pygame = ensure_pygame()
         if self._window is None:
             pygame.display.init()
             self._window = pygame.display.set_mode(self.size)
@@ -395,7 +395,7 @@ class Viewer:
     def close(self) -> None:
         """Close the window if one is open."""
         if self._window is not None:
-            _ensure_pygame().display.quit()
+            ensure_pygame().display.quit()
             self._window = None
 
     # ------------------------------------------------------------------- run
@@ -423,7 +423,7 @@ class Viewer:
         also closes the window (useful for scripted/headless-dummy runs). Up/down change the
         playback speed around the nominal ``fps`` (see :meth:`_steps_this_frame`).
         """
-        pygame = _ensure_pygame()
+        pygame = ensure_pygame()
         pygame.display.init()
         self._window = pygame.display.set_mode(self.size)
         pygame.display.set_caption("swarp viewer")

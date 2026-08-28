@@ -32,7 +32,9 @@ from typing import Any
 
 import warp as wp
 
+from swarp._overloads import register
 from swarp.core.state import VEC2
+from swarp.scenarios.reset_kernels import _as
 
 
 @wp.kernel
@@ -180,9 +182,7 @@ def transport_reward_kernel(
             shaping_sum += ps
         if full_pass == 1:
             dist_out[e, k] = d
-            if d < goal_tolerance:
-                pass
-            else:
+            if d >= goal_tolerance:
                 all_og = wp.uint8(0)
     if full_pass == 1:
         bonus = zero
@@ -253,7 +253,79 @@ def _reward_signature(dtype) -> list:
     ]
 
 
+
+@wp.kernel
+def transport_reset_kernel(
+    reset_mask: wp.array(dtype=wp.uint8),
+    use_mask: wp.int32,
+    seed: wp.int32,
+    lim: Any,
+    plim: Any,
+    n_agents: wp.int32,
+    n_packages: wp.int32,
+    pos: Any,
+    vel: Any,
+    pkg_pos: Any,
+    pkg_vel: Any,
+    pkg_theta: Any,
+    pkg_ang_vel: Any,
+    goal: Any,
+):
+    """Masked episode reset: uniform spawns, fresh package and goal poses, zeroed motion.
+
+    One launch for what was three ``sample_uniform``s and five masked blends — the
+    package pose is per-env state, so it is drawn once per env thread.
+    """
+    e = wp.tid()
+    if use_mask == 1 and reset_mask[e] == wp.uint8(0):
+        return
+    rng = wp.rand_init(seed, e)
+    zero = _as(0.0, lim)
+    two = _as(2.0, lim)
+    one = _as(1.0, lim)
+
+    for a in range(n_agents):
+        px = (_as(wp.randf(rng), lim) * two - one) * lim
+        py = (_as(wp.randf(rng), lim) * two - one) * lim
+        pos[e, a] = wp.vector(px, py)
+        vel[e, a] = wp.vector(zero, zero)
+
+    for i in range(n_packages):
+        qx = (_as(wp.randf(rng), plim) * two - one) * plim
+        qy = (_as(wp.randf(rng), plim) * two - one) * plim
+        pkg_pos[e, i] = wp.vector(qx, qy)
+        pkg_vel[e, i] = wp.vector(zero, zero)
+        pkg_theta[e, i] = zero
+        pkg_ang_vel[e, i] = zero
+
+    for i in range(n_packages):
+        gx = (_as(wp.randf(rng), plim) * two - one) * plim
+        gy = (_as(wp.randf(rng), plim) * two - one) * plim
+        goal[e, i] = wp.vector(gx, gy)
+
+
+def _reset_signature(dtype) -> list:
+    a2v = wp.array2d(dtype=VEC2[dtype])
+    a2s = wp.array2d(dtype=dtype)
+    return [
+        wp.array(dtype=wp.uint8),  # reset_mask
+        wp.int32,  # use_mask
+        wp.int32,  # seed
+        dtype,  # lim
+        dtype,  # plim
+        wp.int32,  # n_agents
+        wp.int32,  # n_packages
+        a2v,  # pos
+        a2v,  # vel
+        a2v,  # pkg_pos
+        a2v,  # pkg_vel
+        a2s,  # pkg_theta
+        a2s,  # pkg_ang_vel
+        a2v,  # goal
+    ]
+
 for _T in (wp.float32, wp.float64):
-    wp.overload(transport_body_kernel, _body_signature(_T))
-    wp.overload(transport_obs_kernel, _obs_signature(_T))
-    wp.overload(transport_reward_kernel, _reward_signature(_T))
+    register(transport_body_kernel, _T, _body_signature(_T))
+    register(transport_obs_kernel, _T, _obs_signature(_T))
+    register(transport_reward_kernel, _T, _reward_signature(_T))
+    register(transport_reset_kernel, _T, _reset_signature(_T))

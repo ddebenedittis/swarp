@@ -11,9 +11,16 @@ circle centred at ``c`` with radius ``rad``,
     range = proj - sqrt(rad^2 - perp2)   (first intersection, else max_range).
 
 Only circular targets are supported (agents by their radius, circle obstacles by
-theirs); box/segment obstacles are ignored by the lidar for now (they still act
-in the collision step). Rays are spaced uniformly over ``2*pi``; with
-``body_frame=True`` they rotate with each agent's heading ``theta``.
+theirs), because that closed form is the whole geometry back-end: there is no
+ray-box or ray-segment test here. :meth:`Lidar.scan` therefore **excludes**
+non-circular obstacles from the scan — it filters on
+:class:`~swarp.core.config.ObstacleShape` before casting. They are invisible to the
+sensor but still act in the collision step. Feeding a box or a segment through the
+circle test instead of dropping it would report a phantom hit on a disc of the
+obstacle's ``radius`` centred at its origin, which for a segment is its midpoint.
+
+Rays are spaced uniformly over ``2*pi``; with ``body_frame=True`` they rotate with
+each agent's heading ``theta``.
 """
 
 from __future__ import annotations
@@ -22,6 +29,7 @@ import math
 
 import torch
 
+from swarp.core.config import ObstacleShape
 from swarp.sensors.lidar_kernels import lidar_scan_warp
 
 
@@ -91,13 +99,18 @@ class Lidar:
     Two interchangeable backends, selected by ``backend``:
 
     * ``"torch"`` (default) — the pure-torch broadcast :func:`lidar_scan`.
-      Differentiable, but materializes an ``[E, A, R, T, 2]`` intermediate, so
-      memory grows with the target count ``T``.
+      Differentiable, but materializes a dense ``[E, A, R, T]`` family (``proj``,
+      ``perp2``, ``thc``, ``t``, ``valid``), so memory grows with the target count
+      ``T``.
     * ``"warp"`` — the Warp kernel :func:`~swarp.sensors.lidar_kernels.lidar_scan_warp`.
       Numerically equivalent ranges with no dense intermediate (flat memory in
       ``T``), which keeps high ray counts affordable. **Inference-only**: when
       gradients are required the scan transparently falls back to the torch path,
       so ``backend="warp"`` means "warp for inference, torch for grad."
+
+      One behavioural difference: it returns a **view of a reused buffer** that the next
+      same-shaped scan overwrites, where the torch path allocates fresh output. Fine to
+      concatenate into an observation (that copies); ``clone()`` it to keep it.
     """
 
     def __init__(
@@ -124,10 +137,29 @@ class Lidar:
         self.include_agents = include_agents
         self.include_obstacles = include_obstacles
         self.backend = backend
+        # Memoized circle filter, see :meth:`_obstacle_targets`. Keyed on the identity of
+        # the installed shape/radius tensors, so it survives every scan against one
+        # obstacle set and is rebuilt when a different set is installed.
+        self._filter_key: tuple[int, int, int] | None = None
+        self._filter_keep: torch.Tensor | None = None
+        self._filter_radius: torch.Tensor | None = None
 
     def scan(self, world) -> torch.Tensor:
-        obs_pos = world.obstacle_pos if self.include_obstacles else None
-        obs_rad = world.obstacle_radius if self.include_obstacles else None
+        """Ranges ``[n_envs, n_agents, n_rays]`` against the world's *live* geometry.
+
+        Two things this does that the free :func:`lidar_scan` cannot, because they need
+        the ``World``:
+
+        * It reads the obstacle pose from
+          :meth:`~swarp.core.world.World.obstacle_state_views`, not from
+          ``world.obstacle_pos``. A movable obstacle is advanced in place inside the
+          stepper's own arrays, so the tensor the scenario *installed* is the spawn pose
+          and goes stale the moment the body is pushed.
+        * It drops non-circular obstacles, since the geometry back-end is ray-circle only
+          (see the module docstring). The filter lives here, above the backend split, so
+          the torch and Warp paths see identical targets and stay in parity.
+        """
+        obs_pos, obs_rad = self._obstacle_targets(world) if self.include_obstacles else (None, None)
         pos = world.state.pos
         # The Warp backend is inference-only; fall back to the differentiable
         # torch path whenever a gradient is actually being tracked.
@@ -147,5 +179,40 @@ class Lidar:
             obstacle_pos=obs_pos,
             obstacle_radius=obs_rad,
         )
+
+    def _obstacle_targets(self, world) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Live ``(pos [E, C, 2], radius [C])`` for the circle obstacles only.
+
+        ``world.obstacle_pos is None`` means no obstacle set is installed — the stepper
+        still holds a dummy ``(1, 1)`` array, which is why the guard is on the world's
+        mirror of the spec rather than on the view.
+
+        The filter itself is **memoized**, because deciding it costs two device→host
+        syncs (``is_circle.all()`` and ``nonzero``) and the answer only changes when a new
+        obstacle set is installed. Which shapes exist is static per install — obstacle
+        *poses* move, their shape tags do not — so the cache is keyed on the identity of
+        the shape/radius tensors and the obstacle count. Without it a lidar scan stalls the
+        pipeline twice per step, which is the whole point of keeping the loop on device.
+        """
+        if world.obstacle_pos is None or world.obstacle_radius is None:
+            return None, None
+        live_pos = world.obstacle_state_views()[0]
+        shape = world.obstacle_shape
+        if shape is None:
+            return live_pos, world.obstacle_radius  # documented "all circles"
+        radius = world.obstacle_radius
+        key = (shape.data_ptr(), radius.data_ptr(), int(shape.shape[0]))
+        if key != self._filter_key:
+            is_circle = shape == int(ObstacleShape.CIRCLE)
+            if bool(is_circle.all()):  # sync #1, once per install
+                keep, kept_radius = None, radius
+            else:
+                keep = is_circle.nonzero(as_tuple=False).squeeze(-1)  # sync #2
+                kept_radius = radius.index_select(0, keep)
+            self._filter_key, self._filter_keep, self._filter_radius = key, keep, kept_radius
+        if self._filter_keep is None:
+            return live_pos, self._filter_radius
+        # The one remaining per-scan op: an allocation, not a sync.
+        return live_pos.index_select(1, self._filter_keep), self._filter_radius
 
     __call__ = scan

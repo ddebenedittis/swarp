@@ -51,15 +51,38 @@ class WholeStepHook:
             mask, re-wrapping a handle whose tensor moved. Defaults to a no-op.
         token: a token that changes whenever :attr:`run`'s cached buffer handles do,
             so the runtime knows to recapture. Defaults to a constant ``0``, which is
-            correct exactly when no handle can ever move.
+            correct exactly when no handle can ever move. The return type is ``object``
+            rather than ``int``: the runtime only ever compares two tokens for equality
+            (``__eq__``, via the recapture-key tuple in ``StepRuntime._graph_key``), so
+            any comparable value works — an ``int``, or a tuple when more than one thing
+            can independently force a recapture (``Environment`` composes one from the
+            scenario's own token *and* ``max_steps``, since the episode-end launch bakes
+            ``max_steps`` in by value).
         carries: the persistent buffers :attr:`run` advances **in place** (a shaping
             baseline, a coverage latch, movable-body state). Graph warm-up invokes
             ``run`` on the input state purely to compile kernels, so these are
             snapshotted before and restored after it; anything omitted here is
             silently advanced one extra time at capture. Defaults to empty.
+        after_warmup: run once, after graph warm-up's carries have been restored, to
+            re-derive state that is a *function* of the carries rather than a snapshot
+            of them. Defaults to a no-op.
+
+            The motivating case is the neighbor grid. ``carries`` fixes every buffer
+            warm-up wrote in place, but a *masked* reset's neighbor rebuild
+            (``World.build_neighbors(reset_mask=...)``) only touches the envs the reset
+            mask selects — by design, see that method's docstring — so after the
+            restore the grid still holds neighbor lists built from warm-up's (now
+            discarded) positions for exactly those envs, while ``built_version`` claims
+            it matches the restored state. A snapshot cannot fix this because the grid
+            is not itself in the carry list (rebuilding it is cheap and pointer-stable
+            handles don't need snapshotting) — only its *contents* are wrong, and only
+            for a subset of envs a masked rebuild will not touch again until they next
+            reset. A full, unmasked rebuild after the restore re-derives the grid from
+            the now-correct state and is the one thing that fixes it.
     """
 
     run: Callable[[], None]
     prepare: Callable[[], None] = _noop
-    token: Callable[[], int] = _zero
+    token: Callable[[], object] = _zero
     carries: Callable[[], list[torch.Tensor]] = _no_carries
+    after_warmup: Callable[[], None] = _noop

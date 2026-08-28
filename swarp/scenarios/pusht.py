@@ -39,13 +39,18 @@ from typing import Any
 import torch
 import warp as wp
 
+from swarp._overloads import concrete
 from swarp.core.bodies import body_state_gather_kernel
+from swarp.core.cached_launch import CachedLaunch, ptr_key
 from swarp.core.config import ObstacleKind, Obstacles, ObstacleShape, WorldConfig
+from swarp.core.state import VEC2
 from swarp.core.world import World
 from swarp.dynamics.base import AgentConfig, ControlMode, DynamicsModel
+from swarp.interop.autograd import torch_stream_scope
 from swarp.scenarios.fused import Buf, FusedPass, FusedScenario
 from swarp.scenarios.pusht_kernels import (
     pusht_obs_kernel,
+    pusht_reset_kernel,
     pusht_reward_kernel,
 )
 
@@ -81,6 +86,11 @@ class PushTScenario(FusedScenario):
         self.tee_mass = tee_mass
         self.world_size = world_size
         self.max_speed = max_speed
+        # contact_k/contact_c ARE the engine's WorldConfig.collision_k/collision_c —
+        # the same spring-damper law, named for the agent<->T contact that dominates
+        # here. contact_margin is NOT the engine's collision_margin (which is derived
+        # from agent_radius in make_world): it is this scenario's own agent<->T
+        # activation gap, used by the torch reference path below.
         self.contact_k = contact_k
         self.contact_c = contact_c
         self.contact_margin = contact_margin
@@ -147,7 +157,7 @@ class PushTScenario(FusedScenario):
         self.goal_spawn_radius: float | None = None
         self.goal_spawn_angle: float | None = None
 
-    def make_world(self, n_envs, device, dt, substeps, dtype) -> World:
+    def make_world(self, n_envs, device, dt, substeps, dtype, world_config=None) -> World:
         cfgs = [
             AgentConfig(
                 model=DynamicsModel.HOLONOMIC,
@@ -183,12 +193,25 @@ class PushTScenario(FusedScenario):
             obstacle_linear_damping=self.linear_damping,
             obstacle_angular_damping=self.angular_damping,
             contact_max_overlap=self.max_overlap,
-        )
+        ).override_with(world_config)
         self.dt = dt
         self.world = World(
             cfgs, cfg, n_envs=n_envs, device=device, dt=dt, substeps=substeps, dtype=dtype
         )
         tt = {"device": device, "dtype": dtype}
+        # Agent masses, for the oracle's contact denominator. The implicit damping solve
+        # belongs to whoever the impulse is applied to, and on the engine side that is the
+        # *agent*: :func:`swarp.core.bodies._reaction` reuses the agent-side force verbatim
+        # and negates it, so its ``damp_denom`` is built from the agent's mass. ``[1, A, 1]``
+        # so it broadcasts over the ``[E, A, B]`` contact grid.
+        self._agent_mass = torch.tensor([c.mass for c in cfgs], **tt).view(1, -1, 1)
+        # Teammate index for the torch observation: row ``a`` is every agent but ``a``, in
+        # ascending order. Fixed by ``n_agents``, so it is built here rather than rebuilt
+        # (four ops and two allocations) on every ``observations()`` call.
+        na = self.n_agents
+        idx = torch.arange(na, device=device)
+        others = idx.unsqueeze(0).expand(na, -1)[idx.unsqueeze(1) != idx.unsqueeze(0)]
+        self._others = others.view(na, na - 1)  # [A, A-1]
         # Env-independent obstacle attributes (both boxes, every env).
         self._obs_shape = torch.full((self.n_boxes,), int(ObstacleShape.BOX), device=device,
                                      dtype=torch.int32)
@@ -212,12 +235,44 @@ class PushTScenario(FusedScenario):
         self.tee_ang_vel = torch.zeros(n_envs, **tt)
         self.goal_pos = torch.zeros(n_envs, 2, **tt)
         self.goal_theta = torch.zeros(n_envs, **tt)
+        # The per-shape world poses handed to the engine. These are *derived* from
+        # ``tee_*`` (unlike transport's package poses, which the obstacle spec can alias
+        # directly), so they get buffers of their own that ``_install_obstacles`` writes
+        # into. Persistent, because the ``Obstacles`` spec built just below aliases them:
+        # that is what lets every later install re-use one already-resolved spec.
+        self._box_centers = torch.zeros(n_envs, self.n_boxes, 2, **tt)
+        self._box_angles = torch.zeros(n_envs, self.n_boxes, **tt)
+        self._box_vel = torch.zeros(n_envs, self.n_boxes, 2, **tt)
+        self._box_ang_vel = torch.zeros(n_envs, self.n_boxes, **tt)
+        # Built and resolved once. ``resolve`` is a no-op for a field that is already on
+        # the right device/dtype and contiguous, so the resolved spec's tensors *share
+        # storage* with the four buffers above — writing them is writing the spec.
+        self._obstacles = Obstacles(
+            self._box_centers,
+            self._obs_radius,
+            shape=self._obs_shape,
+            angle=self._box_angles,  # per-env: the T rotates independently in each env
+            half_extents=self._obs_half,
+            vel=self._box_vel,
+            ang_vel=self._box_ang_vel,
+            kind=self._obs_kind,
+            mass=self._obs_mass,
+            inertia=self._obs_inertia,
+            body=self._obs_body,
+            body_offset=self._box_off_t,
+        ).resolve(self.world.device, self.world.dtype)
         # Shaping baselines: left None so the first refresh seeds them from the fresh pose
         # (shaping 0) rather than from zeros; the spec adopts them with alloc="if_none".
         self._prev_dist: torch.Tensor | None = None
         self._prev_ang: torch.Tensor | None = None
         self._prev_adist: torch.Tensor | None = None  # [n_envs, n_agents]
         self._cache: dict[str, torch.Tensor] | None = None
+        # Cached, repack-once launches for the eager reset path — see
+        # swarp/core/cached_launch.py. ``_launch_body_sync`` is excluded: it only ever
+        # runs on the STEP pass, i.e. inside capture, where it is paid exactly once.
+        self._reset_launch = CachedLaunch()
+        self._obs_launch = CachedLaunch()
+        self._reward_launch = CachedLaunch()
         return self.world
 
     # Push-T's two paths do not compute the same thing, by design: the fused path lets the
@@ -242,76 +297,120 @@ class PushTScenario(FusedScenario):
     def reset_world(
         self, env_mask: torch.Tensor | None = None, *, obs_only: bool = False
     ) -> None:
+        """Masked reset in one Warp launch (see :mod:`swarp.scenarios.reset_kernels`).
+
+        The body buffers are written **in place** by the kernel, so the fused path's
+        cached Warp handles and the whole-step graph stay valid across resets; the grad
+        path's ``_refresh`` still reassigns them (fresh tensors for the tape), which the
+        framework's handle resync catches on the next no-grad step.
+        """
         w = self.world
-        n = w.n_envs
         lim = self.world_size - 2.0 * self.agent_radius
         tlim = self.world_size - self.tee_radius
-        spawn = w.sample_uniform((n, self.n_agents, 2), -lim, lim)
-        tee = w.sample_uniform((n, 2), -tlim, tlim)
-        # Push any agent that landed inside the T's bounding disk out to its rim. With a
-        # stiff contact_k a spawn overlap is a violent ejection (k * depth * sub_dt is
-        # metres per second), so the reset must not start interpenetrating.
+        # Any agent inside the T's bounding disk is pushed out to its rim by the kernel:
+        # with a stiff contact_k a spawn overlap is a violent ejection.
         clear = self.tee_radius + 2.0 * self.agent_radius
-        d = spawn - tee.unsqueeze(1)  # [n, A, 2]
-        dn = d.norm(dim=-1, keepdim=True)
-        # Straight up (arbitrary but deterministic) for an agent exactly on the centre.
-        unit = torch.where(dn > 1.0e-9, d / dn.clamp(min=1.0e-9), torch.tensor(
-            [0.0, 1.0], device=w.device, dtype=w.dtype).expand_as(d))
-        spawn = torch.where(dn < clear, tee.unsqueeze(1) + unit * clear, spawn).clamp(-lim, lim)
-        theta = w.sample_uniform((n,), -math.pi, math.pi)
-        if self.goal_spawn_radius is None:
-            goal = w.sample_uniform((n, 2), -tlim, tlim)
+        mask, use_mask = self.reset_mask_wp(env_mask)
+        st = w.state_wp()
+        scalar = w.wp_dtype
+        vec2 = VEC2[scalar]
+        if self.fused_active:
+            # Reuse the fused spec's cached, pointer-resynced handles instead of
+            # re-wrapping these watched tensors on every reset (see navigation's
+            # ``_launch_reset`` for the same fix and its rationale). ``sync_fused_
+            # handles`` must run first: it is what notices a grad-path reassignment
+            # and rebuilds the handle before this kernel writes through it.
+            self.ensure_fused()
+            self.sync_fused_handles()
+            tee_pos = self._wp["tee_pos"]
+            tee_vel = self._wp["tee_vel"]
+            tee_theta = self._wp["tee_theta"]
+            tee_ang_vel = self._wp["tee_ang_vel"]
+            goal_pos = self._wp["goal_pos"]
+            goal_theta = self._wp["goal_theta"]
         else:
-            # Uniform in a disk of goal_spawn_radius around the T spawn (curriculum).
-            gdir = w.sample_uniform((n,), -math.pi, math.pi)
-            grad = self.goal_spawn_radius * w.sample_uniform((n,), 0.0, 1.0).sqrt()
-            goal = (
-                tee + torch.stack([grad * gdir.cos(), grad * gdir.sin()], dim=-1)
-            ).clamp(-tlim, tlim)
-        if self.goal_spawn_angle is None:
-            goal_th = w.sample_uniform((n,), -math.pi, math.pi)
-        else:
-            goal_th = theta + w.sample_uniform(
-                (n,), -self.goal_spawn_angle, self.goal_spawn_angle
+            tee_pos = wp.from_torch(self.tee_pos.contiguous(), dtype=vec2)
+            tee_vel = wp.from_torch(self.tee_vel.contiguous(), dtype=vec2)
+            tee_theta = wp.from_torch(self.tee_theta.contiguous())
+            tee_ang_vel = wp.from_torch(self.tee_ang_vel.contiguous())
+            goal_pos = wp.from_torch(self.goal_pos.contiguous(), dtype=vec2)
+            goal_theta = wp.from_torch(self.goal_theta.contiguous())
+        seed = wp.int32(w.next_kernel_seed())
+        goal_radius = 0.0 if self.goal_spawn_radius is None else self.goal_spawn_radius
+        goal_angle = 0.0 if self.goal_spawn_angle is None else self.goal_spawn_angle
+        use_goal_radius = 0 if self.goal_spawn_radius is None else 1
+        use_goal_angle = 0 if self.goal_spawn_angle is None else 1
+        with torch_stream_scope(w.device):
+            launch = self._reset_launch.get(
+                concrete(pusht_reset_kernel, scalar),
+                dim=w.n_envs,
+                inputs=[
+                    mask,
+                    use_mask,
+                    seed,
+                    scalar(lim),
+                    scalar(tlim),
+                    scalar(clear),
+                    scalar(goal_radius),
+                    scalar(goal_angle),
+                    wp.int32(use_goal_radius),
+                    wp.int32(use_goal_angle),
+                    wp.int32(self.n_agents),
+                    st.pos,
+                    st.vel,
+                    tee_pos,
+                    tee_vel,
+                    tee_theta,
+                    tee_ang_vel,
+                    goal_pos,
+                    goal_theta,
+                ],
+                device=w.device,
+                key=(
+                    w.n_envs,
+                    ptr_key(mask),
+                    lim,
+                    tlim,
+                    clear,
+                    goal_radius,
+                    goal_angle,
+                    use_goal_radius,
+                    use_goal_angle,
+                    self.n_agents,
+                    ptr_key(st.pos),
+                    ptr_key(st.vel),
+                    ptr_key(tee_pos),
+                    ptr_key(tee_vel),
+                    ptr_key(tee_theta),
+                    ptr_key(tee_ang_vel),
+                    ptr_key(goal_pos),
+                    ptr_key(goal_theta),
+                ),
             )
-        zeros_2 = torch.zeros_like(self.tee_pos)
-        zeros_1 = torch.zeros_like(self.tee_theta)
-
-        # In-place body updates (copy_) so the fused path's cached wp handles and the
-        # whole-step graph stay valid across resets; the grad path's _refresh still
-        # reassigns them (fresh tensors for the tape), which the framework's handle
-        # resync catches on the next no-grad step.
-        w.write_state(env_mask, pos=spawn, vel=0.0)
-        if env_mask is None:
-            self.tee_pos.copy_(tee)
-            self.tee_vel.zero_()
-            self.tee_theta.copy_(theta)
-            self.tee_ang_vel.zero_()
-            self.goal_pos.copy_(goal)
-            self.goal_theta.copy_(goal_th)
-        else:
-            m2 = env_mask.view(-1, 1)
-            self.tee_pos.copy_(torch.where(m2, tee, self.tee_pos))
-            self.tee_vel.copy_(torch.where(m2, zeros_2, self.tee_vel))
-            self.tee_theta.copy_(torch.where(env_mask, theta, self.tee_theta))
-            self.tee_ang_vel.copy_(torch.where(env_mask, zeros_1, self.tee_ang_vel))
-            self.goal_pos.copy_(torch.where(m2, goal, self.goal_pos))
-            self.goal_theta.copy_(torch.where(env_mask, goal_th, self.goal_theta))
+            launch.set_param_by_name("use_mask", use_mask)
+            launch.set_param_by_name("seed", seed)
+            launch.launch()
+        w.mark_pos_dirty()
 
         self._install_obstacles()
         self.finish_reset(env_mask, obs_only=obs_only)
 
     def _box_poses(self) -> tuple[torch.Tensor, torch.Tensor]:
         """The two box centres ``[n_envs, n_boxes, 2]`` and angles ``[n_envs, n_boxes]``
-        for the current T pose (torch; the fused path does this inside the body kernel)."""
+        for the current T pose, written **into** the persistent pose buffers.
+
+        Torch (the fused path does this inside the body kernel). Returns the buffers so the
+        caller can go on using them as plain tensors.
+        """
         th = self.tee_theta.detach()
         ca, sa = torch.cos(th), torch.sin(th)  # [E]
         ox, oy = self._box_off_t[:, 0], self._box_off_t[:, 1]  # [B]
         # rotate each local offset into world: R(theta) @ off
         wx = ca.unsqueeze(1) * ox - sa.unsqueeze(1) * oy  # [E, B]
         wy = sa.unsqueeze(1) * ox + ca.unsqueeze(1) * oy
-        centers = self.tee_pos.detach().unsqueeze(1) + torch.stack([wx, wy], dim=-1)
-        return centers, th.unsqueeze(1).expand(-1, self.n_boxes)
+        self._box_centers.copy_(self.tee_pos.detach().unsqueeze(1) + torch.stack([wx, wy], dim=-1))
+        self._box_angles.copy_(th.unsqueeze(1).expand(-1, self.n_boxes))
+        return self._box_centers, self._box_angles
 
     def _install_obstacles(self) -> None:
         """Seed the engine's movable body from ``tee_*``.
@@ -320,34 +419,34 @@ class PushTScenario(FusedScenario):
         body instead of the engine). The engine derives the body's own pose from the root
         shape and takes its velocity from the root, so writing the shapes' world poses is
         enough to hand over the whole state.
+
+        The spec is built once, in ``make_world``, and **re-installed** rather than
+        rebuilt: it aliases the four ``_box_*`` buffers this method writes, and both
+        ``Obstacles.resolve`` and ``Obstacles.any_movable`` memoize, so the re-install
+        neither allocates a 12-field spec nor pays ``any_movable``'s reduction plus
+        ``.item()`` device->host sync. Building a fresh spec per call — as this used to —
+        put that sync on every reset, i.e. on every step under ``auto_reset=True``.
+
+        Unlike transport's, this install is *never* inside a graph capture: the T is a
+        movable body, so ``Stepper._install`` always derives the body group in torch. It
+        therefore has to be sync-free, not capture-safe. ``_box_*`` are framework-side
+        buffers that nothing outside this method reassigns — the grad path reassigns
+        ``tee_*``, which these are *derived from* rather than aliases of — so the retained
+        spec can never go stale and needs no pointer re-check.
         """
-        centers, angles = self._box_poses()
+        centers, _ = self._box_poses()
         # Each box's own velocity: the body's linear velocity plus omega x r, where r is
         # the lever from the T centroid to that box centre. Contact damping needs it —
         # without it the agents are damped against their absolute velocity and the
         # moving T applies drag unrelated to the contact.
         r = centers - self.tee_pos.detach().unsqueeze(1)  # [E, B, 2]
         om = self.tee_ang_vel.detach().unsqueeze(1)  # [E, 1]
-        vel = self.tee_vel.detach().unsqueeze(1) + torch.stack(
-            [-om * r[..., 1], om * r[..., 0]], dim=-1
+        self._box_vel.copy_(
+            self.tee_vel.detach().unsqueeze(1)
+            + torch.stack([-om * r[..., 1], om * r[..., 0]], dim=-1)
         )
-        ang_vel = om.expand(-1, self.n_boxes)
-        self.world.set_obstacles(
-            Obstacles(
-                centers,
-                self._obs_radius,
-                shape=self._obs_shape,
-                angle=angles,  # per-env: the T rotates independently in each env
-                half_extents=self._obs_half,
-                vel=vel,
-                ang_vel=ang_vel,
-                kind=self._obs_kind,
-                mass=self._obs_mass,
-                inertia=self._obs_inertia,
-                body=self._obs_body,
-                body_offset=self._box_off_t,
-            )
-        )
+        self._box_ang_vel.copy_(om.expand(-1, self.n_boxes))
+        self.world.set_obstacles(self._obstacles)
 
     def _sync_from_engine(self) -> None:
         """Copy the engine's body state into ``tee_*`` (the obs/reward inputs).
@@ -457,17 +556,18 @@ class PushTScenario(FusedScenario):
         the engine's copy is what got seeded *from* it) and passes ``advance_prev=0`` so the
         reward kernel rebases the shaping baselines for the reset envs.
         """
+        state = self.world.state_wp()  # one wrap for every launch in this pass
         if pass_.is_step:
             self._launch_body_sync()
-        self._launch_obs()
-        self._launch_reward(advance_prev=pass_.advance_prev, full_pass=pass_.full_pass)
+        self._launch_obs(state)
+        self._launch_reward(state, advance_prev=pass_.advance_prev, full_pass=pass_.full_pass)
 
     def _launch_body_sync(self) -> None:
         """Lift the engine's root-body state into the cached ``tee_*`` Warp arrays."""
         w = self.world
         st = w.stepper
         wp.launch(
-            body_state_gather_kernel,
+            concrete(body_state_gather_kernel, self.world.wp_dtype),
             dim=w.n_envs,
             inputs=[st.body_pos, st.body_angle, st.body_vel, st.body_ang_vel, wp.int32(0)],
             outputs=[
@@ -480,38 +580,59 @@ class PushTScenario(FusedScenario):
             record_tape=False,
         )
 
-    def _launch_obs(self) -> None:
+    def _launch_obs(self, st) -> None:
         w = self.world
-        st = w.state_wp()
-        wp.launch(
-            pusht_obs_kernel,
+        tee_pos, tee_theta = self._wp["tee_pos"], self._wp["tee_theta"]
+        goal_pos, goal_theta = self._wp["goal_pos"], self._wp["goal_theta"]
+        obs = self._wp["obs"]
+        # No per-call-varying argument: pointer-stable persistent-mode/watched handles.
+        launch = self._obs_launch.get(
+            concrete(pusht_obs_kernel, self.world.wp_dtype),
             dim=(w.n_envs, self.n_agents),
-            inputs=[
-                st.pos,
-                st.vel,
-                self._wp["tee_pos"],
-                self._wp["tee_theta"],
-                self._wp["goal_pos"],
-                self._wp["goal_theta"],
-            ],
-            outputs=[self._wp["obs"]],
+            inputs=[st.pos, st.vel, tee_pos, tee_theta, goal_pos, goal_theta],
+            outputs=[obs],
             device=w.device,
-            record_tape=False,
+            key=(
+                w.n_envs,
+                self.n_agents,
+                ptr_key(st.pos),
+                ptr_key(st.vel),
+                ptr_key(tee_pos),
+                ptr_key(tee_theta),
+                ptr_key(goal_pos),
+                ptr_key(goal_theta),
+                ptr_key(obs),
+            ),
         )
+        launch.launch()
 
-    def _launch_reward(self, advance_prev: int, full_pass: int) -> None:
+    def _launch_reward(self, st, advance_prev: int, full_pass: int) -> None:
         w = self.world
         scalar = w.wp_dtype
-        wp.launch(
-            pusht_reward_kernel,
+        tee_pos, tee_theta = self._wp["tee_pos"], self._wp["tee_theta"]
+        goal_pos, goal_theta = self._wp["goal_pos"], self._wp["goal_theta"]
+        resetmask = self._wp["resetmask"]
+        prev_dist, prev_ang, prev_adist = (
+            self._wp["prev_dist"],
+            self._wp["prev_ang"],
+            self._wp["prev_adist"],
+        )
+        reward, done, dist, ang = (
+            self._wp["reward"],
+            self._wp["done"],
+            self._wp["dist"],
+            self._wp["ang"],
+        )
+        launch = self._reward_launch.get(
+            concrete(pusht_reward_kernel, self.world.wp_dtype),
             dim=w.n_envs,
             inputs=[
-                w.state_wp().pos,
-                self._wp["tee_pos"],
-                self._wp["tee_theta"],
-                self._wp["goal_pos"],
-                self._wp["goal_theta"],
-                self._wp["resetmask"],
+                st.pos,
+                tee_pos,
+                tee_theta,
+                goal_pos,
+                goal_theta,
+                resetmask,
                 wp.int32(self.n_agents),
                 scalar(self.pos_shaping_factor),
                 scalar(self.rot_shaping_factor),
@@ -524,22 +645,41 @@ class PushTScenario(FusedScenario):
                 wp.int32(advance_prev),
                 wp.int32(full_pass),
             ],
-            outputs=[
-                self._wp["prev_dist"],
-                self._wp["prev_ang"],
-                self._wp["prev_adist"],
-                self._wp["reward"],
-                self._wp["done"],
-                self._wp["dist"],
-                self._wp["ang"],
-            ],
+            outputs=[prev_dist, prev_ang, prev_adist, reward, done, dist, ang],
             device=w.device,
-            record_tape=False,
+            key=(
+                w.n_envs,
+                ptr_key(st.pos),
+                ptr_key(tee_pos),
+                ptr_key(tee_theta),
+                ptr_key(goal_pos),
+                ptr_key(goal_theta),
+                ptr_key(resetmask),
+                self.n_agents,
+                self.pos_shaping_factor,
+                self.rot_shaping_factor,
+                self.agent_dist_shaping,
+                self.push_point_offset,
+                self.joint_shaping,
+                self.goal_tolerance,
+                self.angle_tolerance,
+                self.goal_reward,
+                ptr_key(prev_dist),
+                ptr_key(prev_ang),
+                ptr_key(prev_adist),
+                ptr_key(reward),
+                ptr_key(done),
+                ptr_key(dist),
+                ptr_key(ang),
+            ),
         )
+        launch.set_param_by_name("advance_prev", wp.int32(advance_prev))
+        launch.set_param_by_name("full_pass", wp.int32(full_pass))
+        launch.launch()
 
     def _box_contact(self, pos: torch.Tensor, vel: torch.Tensor) -> tuple[torch.Tensor, ...]:
         """Per (env, agent, box) oriented-box SDF contact, mirroring
-        :func:`swarp.core.collisions._box_force` (exterior clamp + interior nearest
+        :func:`swarp.core.collisions.box_force` (exterior clamp + interior nearest
         face). Returns the force on the T ``[E, A, B, 2]`` and its torque ``[E, A, B]``
         about the body centroid."""
         th = self.tee_theta  # [E]
@@ -574,8 +714,9 @@ class PushTScenario(FusedScenario):
 
         overlap = (self.agent_radius + self.contact_margin) - s
         active = (overlap > 0).to(pos.dtype)
-        # Smooth depth saturation, mirroring pusht_body_kernel: bounds the impulse a
-        # frozen-pose sweep can inject without a gradient-killing hard clamp.
+        # Smooth depth saturation, mirroring :func:`swarp.core.collisions._normal_coeff`:
+        # bounds the impulse a frozen-pose sweep can inject without a gradient-killing
+        # hard clamp.
         mo = self.max_overlap
         overlap = mo * torch.tanh(overlap.clamp(min=0.0) / mo)
         # closest surface point (box frame) -> lever arm about the tee centroid
@@ -590,10 +731,16 @@ class PushTScenario(FusedScenario):
         rvx = self.tee_vel[:, None, None, 0] - om * ry - vel[..., 0].unsqueeze(-1)
         rvy = self.tee_vel[:, None, None, 1] + om * rx - vel[..., 1].unsqueeze(-1)
         vn = rvx * mx + rvy * my
-        # Linearly-implicit damping + repulsive clamp; see pusht_body_kernel.
+        # Linearly-implicit damping + repulsive clamp; see
+        # :func:`swarp.core.collisions._normal_coeff` for the derivation. The mass in the
+        # denominator is the **agent's**, not the T's: the engine solves the implicit step
+        # for the body the impulse acts on, and reuses that one number as the reaction on
+        # the T (:func:`swarp.core.bodies._reaction`). ``sub_dt`` *does* stay this loop's
+        # own — the implicit term belongs to the scheme applying the impulse, and here that
+        # scheme is the oracle's ``body_substeps`` loop rather than the engine's substep.
         sub_dt = self.dt / self.body_substeps
         coeff = (self.contact_k * overlap - self.contact_c * vn) / (
-            1.0 + self.contact_c * sub_dt / self.tee_mass
+            1.0 + self.contact_c * sub_dt / self._agent_mass
         )
         coeff = coeff.clamp(min=0.0) * active
         fx, fy = coeff * mx, coeff * my
@@ -604,9 +751,10 @@ class PushTScenario(FusedScenario):
         pos, vel = w.state.pos, w.state.vel  # [n_envs, n_agents, 2]
 
         if integrate:
-            # Substepped exactly like pusht_body_kernel: the contact force is recomputed
-            # from the frozen agent state each sub-step, which is what keeps a stiff
-            # contact_k stable. Gradients flow through every sub-step.
+            # Substepped exactly like :func:`swarp.core.bodies.obstacle_dynamics_kernel`
+            # (whose per-shape reaction is :func:`swarp.core.bodies._reaction`): the contact
+            # force is recomputed from the frozen agent state each sub-step, which is what
+            # keeps a stiff contact_k stable. Gradients flow through every sub-step.
             sub_dt = self.dt / self.body_substeps
             b = self.world_size - self.tee_radius
             for _ in range(self.body_substeps):
@@ -685,10 +833,7 @@ class PushTScenario(FusedScenario):
         th = self.tee_theta.unsqueeze(1).expand(-1, na)
         angles = torch.stack([th.cos(), th.sin(), raw.cos(), raw.sin()], dim=-1)
         # Teammates' positions relative to each agent, ascending index, self skipped.
-        idx = torch.arange(na, device=s.pos.device)
-        others = idx.unsqueeze(0).expand(na, -1)[idx.unsqueeze(1) != idx.unsqueeze(0)]
-        others = others.view(na, na - 1)  # [A, A-1]
-        rel = (s.pos[:, others] - s.pos.unsqueeze(2)).flatten(2)  # [E, A, 2(A-1)]
+        rel = (s.pos[:, self._others] - s.pos.unsqueeze(2)).flatten(2)  # [E, A, 2(A-1)]
         return torch.cat(
             [s.pos, s.vel, self._cache["tee_rel"], tee_to_goal, angles, rel], dim=-1
         )
@@ -713,8 +858,6 @@ class PushTScenario(FusedScenario):
         Same two boxes the body is built from, placed at ``(goal_pos, goal_theta)``:
         the outline shows exactly where the T has to end up.
         """
-        if self.goal_pos is None:
-            return {}
         th = float(self.goal_theta[env_idx])
         gx, gy = (float(v) for v in self.goal_pos[env_idx])
         ca, sa = math.cos(th), math.sin(th)

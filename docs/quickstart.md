@@ -13,10 +13,10 @@ env = swarp.make("navigation", n_envs=4096, n_agents=8, device="cuda:0", dt=0.05
 obs = env.reset()                                   # [n_envs, n_agents, obs_dim], on the GPU
 for _ in range(100):
     actions = torch.rand(4096, 8, env.act_dim, device="cuda:0") * 2 - 1
-    obs, reward, done, info = env.step(actions)     # every tensor stays on the GPU
+    obs, reward, term, trunc, info = env.step(actions)  # every tensor stays on the GPU
 ```
 
-`make` routes its keyword arguments by name: those the `Environment` constructor accepts (`device`, `dt`, `substeps`, `dtype`, `max_steps`, `seed`, `auto_reset`, `use_graph`, `clone_outputs`, `fused`) go to it, and everything else (`n_agents`, `world_size`, `model`, …) goes to the scenario constructor.
+`make` routes its keyword arguments by name: those the `Environment` constructor accepts (`device`, `dt`, `substeps`, `dtype`, `max_steps`, `seed`, `auto_reset`, `use_graph`, `clone_outputs`, `fused`, `world_config`) go to it, and everything else (`n_agents`, `world_size`, `model`, …) goes to the scenario constructor.
 The two parameter sets are disjoint, so the split is unambiguous.
 Valid names are the keys of `swarp.SCENARIOS`: `navigation`, `flocking`, `formation`, `discovery`, `sampling`, `transport`, `pusht`.
 
@@ -60,7 +60,7 @@ The constructor arguments worth knowing:
 ## What `step` returns
 
 ```python
-obs, reward, done, info = env.step(actions)
+obs, reward, terminated, truncated, info = env.step(actions)
 ```
 
 | value | shape | notes |
@@ -68,7 +68,8 @@ obs, reward, done, info = env.step(actions)
 | `actions` (in) | `[n_envs, n_agents, act_dim]` | `env.act_dim` is the max action arity over the agent models: 2 for the 2D vehicles, 4 for the quadrotor |
 | `obs` | `[n_envs, n_agents, obs_dim]` | `env.obs_dim` comes from the scenario |
 | `reward` | `[n_envs, n_agents]` | per-agent term plus the scenario's shared global term |
-| `done` | `[n_envs]`, bool | one flag per env, shared by its agents |
+| `terminated` | `[n_envs]`, bool | the scenario's terminal condition; one flag per env, shared by its agents |
+| `truncated` | `[n_envs]`, bool | the `max_steps` time limit; all-false when `max_steps is None` |
 | `info` | `dict[str, Tensor]` | whatever the scenario emits; navigation reports `dist_to_goal` |
 
 Actions are clamped to each agent's configured limits inside the kernel, so a policy that emits values in `[-1, 1]` is always safe.
@@ -88,13 +89,13 @@ With `auto_reset=True` the returned `obs` already reflects the reset — for a f
 
 ## Graph observations
 
-For GNN policies, the current within-radius neighbour graph is available as a COO edge index:
+For GNN policies, the current within-radius neighbor graph is available as a COO edge index:
 
 ```python
 edge_index = env.radius_graph()   # [2, E] int, on the env device
 ```
 
-It reuses the neighbour lists `step` already built, so there is no rebuild — just the single sync needed to materialize `E`.
+It reuses the neighbor lists `step` already built, so there is no rebuild — just the single sync needed to materialize `E`.
 
 ## Where to go next
 

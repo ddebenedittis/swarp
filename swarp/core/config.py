@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, replace
 from enum import IntEnum
 
 import torch
@@ -187,6 +187,14 @@ class WorldConfig:
         collision_k: spring stiffness of the soft penalty.
         collision_c: damping coefficient (normal direction).
         collision_margin: forces activate within this gap around touching radii.
+        obstacle_linear_damping: viscous drag on ``MOVABLE`` obstacles, standing in for
+            table friction — a pushed body settles at ``sum(f) / (mass * damping)``
+            instead of accelerating without limit. ``0`` is a frictionless coasting puck.
+        obstacle_angular_damping: the same, for a movable body's spin.
+        contact_max_overlap: depth at which the contact spring saturates, smoothly
+            (``0`` disables). Bounds the impulse a deep overlap can inject; must stay
+            *above* the depth a velocity-mode agent settles at, or agents walk through
+            movable bodies.
         bounds: world rectangle ``(x_min, x_max, y_min, y_max)``, or ``None``.
         bounds_mode: ``"soft"`` (spring-damper walls) or ``"clamp"``
             (positions hard-clamped inside; differentiable subgradient).
@@ -199,6 +207,11 @@ class WorldConfig:
         grid_dim: hash-grid bucket dimension per axis.
         uniform_bins: cells per axis for the ``"uniform_grid"`` backend
             (``None`` -> a ~sqrt(n_agents) heuristic).
+        integrator: substep integration scheme, :class:`~swarp.dynamics.base.Integrator`.
+        neighbor_reuse: reuse the list the previous step's post-step build produced for
+            substep 0 instead of rebuilding it — one build per step rather than two at
+            ``substeps=1``, and exact (the reused list is bit-identical to a fresh build
+            on the same positions). No-grad path only; a taped step always rebuilds.
     """
 
     collisions: bool = True
@@ -230,6 +243,33 @@ class WorldConfig:
     # engaged on the no-grad path (the taped path rebuilds so adjoints stay
     # correct). See :meth:`swarp.core.stepper.Stepper.launch_substeps`.
     neighbor_reuse: bool = True
+
+    def override_with(self, other: WorldConfig | None) -> WorldConfig:
+        """This config with ``other``'s **non-default** fields applied on top.
+
+        Scenarios compute most of a ``WorldConfig`` from their own parameters — bounds
+        from ``world_size``, ``neighbor_radius`` from the contact reach — so a caller's
+        override cannot simply replace it wholesale without destroying those. Only the
+        fields ``other`` sets away from the ``WorldConfig()`` defaults are taken, which
+        is what makes ``world_config=WorldConfig(collision_k=50.0)`` mean "everything the
+        scenario decided, but with that stiffness".
+
+        The one thing this cannot express is forcing a field *back* to its
+        ``WorldConfig()`` default against a scenario that changed it — that is
+        indistinguishable from not asking. Build the scenario's ``World`` yourself when
+        you need that.
+
+        Returns ``self`` unchanged when there is nothing to apply.
+        """
+        if other is None:
+            return self
+        default = WorldConfig()
+        changed = {
+            f.name: getattr(other, f.name)
+            for f in fields(self)
+            if getattr(other, f.name) != getattr(default, f.name)
+        }
+        return replace(self, **changed) if changed else self
 
     def __post_init__(self) -> None:
         if self.bounds_mode not in ("soft", "clamp"):

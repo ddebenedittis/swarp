@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import torch
 from tensordict import TensorDict
-from torchrl.data import Bounded, Composite, Unbounded
+from torchrl.data import Bounded, Categorical, Composite, Unbounded
 from torchrl.envs import EnvBase
 
 from swarp.core.environment import Environment
@@ -24,9 +24,60 @@ class SwarpEnv(EnvBase):
     """A swarp ``Environment`` as a batched TorchRL ``EnvBase``.
 
     Observations are keyed ``"observation"`` ``[n_envs, n_agents, obs_dim]``;
-    actions ``"action"`` ``[n_envs, n_agents, act_dim]`` (bounded to the
-    normalized ``[-1, 1]`` range the swarp kernels clamp against); reward
-    ``[n_envs, n_agents, 1]``; a shared per-env ``done`` ``[n_envs, 1]``.
+    actions ``"action"`` ``[n_envs, n_agents, act_dim]``; reward
+    ``[n_envs, n_agents, 1]``; shared per-env ``done``/``terminated``/``truncated``
+    ``[n_envs, 1]``.
+
+    Action bounds
+    -------------
+    swarp actions are **physical, not normalized**: the kernels clamp them to the
+    per-agent limits in :class:`~swarp.dynamics.base.AgentConfig`, and nothing rescales
+    them on the way in. So the default action spec is
+    :attr:`~swarp.core.environment.Environment.action_bounds` — the box the kernels
+    actually enforce, per agent and per slot. No argument needed::
+
+        tenv = SwarpEnv(env)                  # spec == env.action_bounds
+
+    That matters because a fixed ``[-1, 1]`` box (what this used to default to) is correct
+    *only* for a holonomic fleet with ``max_speed == 1.0`` under
+    :attr:`~swarp.dynamics.base.ControlMode.VELOCITY`. Every built-in scenario happens to
+    use exactly that, so the old default was right out of the box and went wrong silently
+    the moment anything changed:
+
+    - ``max_speed=3.0`` throttled the policy to a third of the achievable velocity;
+    - ``ControlMode.ACCELERATION`` bounds against ``max_accel``, which the built-ins set
+      to ``2 * max_speed``;
+    - the kinematic bicycle's second slot is a steering *angle* (``±max_steer``,
+      default ``pi/4``), not a speed;
+    - a quadrotor's four slots are per-rotor thrusts in ``[0, thrust_max]``, so under
+      ``[-1, 1]`` **the drone could not reach hover** (``mass * gravity`` needs ~2.45 N
+      per rotor against a declared cap of 1.0) and the whole negative half of the box
+      mapped to identical, zero-gradient dynamics.
+
+    To override, pass a scalar (broadcast over every agent and slot) or any tensor
+    broadcastable to ``[n_envs, n_agents, act_dim]`` — a single scalar pair cannot express
+    the bicycle's or the drone's box, which is why per-slot tensors are allowed::
+
+        tenv = SwarpEnv(env, action_low=-1.0, action_high=1.0)   # opt back in to a unit box
+
+    Either bound left ``None`` takes its side from ``env.action_bounds``, so overriding
+    one does not revert the other to a guess.
+
+    Termination
+    -----------
+    TorchRL owns resetting: its collectors read ``done`` and call ``_reset`` themselves.
+    So ``Environment(auto_reset=True)`` is **rejected** at construction — with it on, the
+    observation returned alongside a ``True`` ``done`` is already the *next* episode's
+    first observation, and every transition at an episode boundary would train on an
+    observation from a different episode than its reward. Build the env with
+    ``auto_reset=False`` (the default) and let TorchRL do it.
+
+    ``terminated`` is the scenario's own terminal condition; ``truncated`` is the
+    ``max_steps`` time limit; ``done`` is their OR, which is what TorchRL's resetters
+    key off. Because the time limit no longer masquerades as a terminal state, GAE and
+    the other value estimators bootstrap correctly through a timeout instead of
+    truncating the return at every episode boundary — a scenario with a ``max_steps``
+    no longer needs to reconstruct its real terminal condition from ``info``.
 
     Scenario ``info()``
     -------------------
@@ -51,8 +102,27 @@ class SwarpEnv(EnvBase):
     """
 
     def __init__(
-        self, env: Environment, action_low: float = -1.0, action_high: float = 1.0
+        self,
+        env: Environment,
+        action_low: float | torch.Tensor | None = None,
+        action_high: float | torch.Tensor | None = None,
     ) -> None:
+        if env.auto_reset:
+            raise ValueError(
+                "SwarpEnv requires Environment(auto_reset=False): TorchRL resets envs "
+                "itself from the done flags, and swarp's auto-reset returns the *next* "
+                "episode's first observation alongside a True done, so the terminal "
+                "transition a collector stores would pair a reward with an observation "
+                "from a different episode."
+            )
+        # Default to the box the kernels actually clamp against. Either bound left None
+        # takes its side from ``env.action_bounds``, so overriding one does not silently
+        # revert the other to a guess.
+        lo_default, hi_default = env.action_bounds
+        if action_low is None:
+            action_low = lo_default
+        if action_high is None:
+            action_high = hi_default
         super().__init__(device=env.device, batch_size=torch.Size([env.n_envs]))
         self._env = env
         self.n_agents = env.n_agents
@@ -65,10 +135,39 @@ class SwarpEnv(EnvBase):
         self._info_keys = list(info.keys())
         self._make_specs(action_low, action_high, obs.dtype, info)
 
+    def _action_bound(self, val: float | torch.Tensor, dtype: torch.dtype):
+        """Normalize one action bound to what ``Bounded`` wants.
+
+        A scalar is passed straight through, so an explicit scalar pair still produces a
+        plain scalar-bounded spec; anything else is broadcast to the full
+        ``[n_envs, n_agents, act_dim]`` action shape, which is the only form that can
+        carry a per-slot box (bicycle: accel + steering angle; drone: four one-sided
+        rotor thrusts) — and therefore the form the ``env.action_bounds`` default takes.
+        """
+        shape = (self._env.n_envs, self.n_agents, self.act_dim)
+        if not isinstance(val, torch.Tensor):
+            return float(val)
+        t = val.to(device=self.device, dtype=dtype)
+        if t.ndim == 0:
+            return float(t)
+        try:
+            return t.expand(shape).contiguous()
+        except RuntimeError as exc:
+            raise ValueError(
+                f"action bound of shape {tuple(t.shape)} is not broadcastable to the "
+                f"action shape {shape}. Environment.action_bounds returns "
+                f"[n_agents, act_dim] tensors, which are."
+            ) from exc
+
     def _make_specs(
-        self, low: float, high: float, dtype: torch.dtype, info: dict[str, torch.Tensor]
+        self,
+        low: float | torch.Tensor,
+        high: float | torch.Tensor,
+        dtype: torch.dtype,
+        info: dict[str, torch.Tensor],
     ) -> None:
         ne, na = self._env.n_envs, self.n_agents
+        low, high = self._action_bound(low, dtype), self._action_bound(high, dtype)
         self.observation_spec = Composite(
             observation=Unbounded(shape=(ne, na, self.obs_dim), dtype=dtype, device=self.device),
             shape=(ne,),
@@ -99,10 +198,15 @@ class SwarpEnv(EnvBase):
             shape=(ne,),
             device=self.device,
         )
-        # A single shared done/terminated per env.
+        # A single shared done/terminated/truncated per env. ``Categorical(n=2)`` rather
+        # than ``Unbounded``: these are two-valued, and it is the spec TorchRL's own env
+        # constructors use, so ``check_env_specs`` and the transforms that read the domain
+        # (rather than only the dtype) see what they expect.
         self.done_spec = Composite(
-            done=Unbounded(shape=(ne, 1), dtype=torch.bool, device=self.device),
-            terminated=Unbounded(shape=(ne, 1), dtype=torch.bool, device=self.device),
+            **{
+                key: Categorical(n=2, shape=(ne, 1), dtype=torch.bool, device=self.device)
+                for key in ("done", "terminated", "truncated")
+            },
             shape=(ne,),
             device=self.device,
         )
@@ -122,6 +226,7 @@ class SwarpEnv(EnvBase):
                 "observation": obs,
                 "done": torch.zeros(ne, 1, dtype=torch.bool, device=self.device),
                 "terminated": torch.zeros(ne, 1, dtype=torch.bool, device=self.device),
+                "truncated": torch.zeros(ne, 1, dtype=torch.bool, device=self.device),
             },
             batch_size=self.batch_size,
             device=self.device,
@@ -135,33 +240,45 @@ class SwarpEnv(EnvBase):
 
     def _step(self, tensordict: TensorDict) -> TensorDict:
         action = tensordict.get("action")
-        obs, reward, done, info = self._env.step(action)
+        obs, reward, terminated, truncated, info = self._env.step(action)
         # Fused / graph-mode outputs are zero-copy views into persistent buffers
-        # overwritten next step; collectors hold refs across steps, so clone.
-        obs, reward, done = obs.clone(), reward.clone(), done.clone()
-        done = done.reshape(-1, 1)
+        # overwritten next step; collectors hold refs across steps, so they must be
+        # copied — unless the Environment was built with ``clone_outputs=True``, which
+        # already did exactly that (info values included) and would make this a second,
+        # pointless copy of every tensor on every step.
+        if not self._env.clone_outputs:
+            obs, reward = obs.clone(), reward.clone()
+            terminated, truncated = terminated.clone(), truncated.clone()
+        terminated = terminated.reshape(-1, 1)
+        truncated = truncated.reshape(-1, 1)
         out = TensorDict(
             {
                 "observation": obs,
                 "reward": reward.unsqueeze(-1),
-                "done": done,
-                "terminated": done,
+                "done": terminated | truncated,
+                "terminated": terminated,
+                "truncated": truncated,
             },
             batch_size=self.batch_size,
             device=self.device,
         )
         if self._info_keys:
-            out.set("info", self._info_td(info))
+            out.set("info", self._info_td(info, copy=not self._env.clone_outputs))
         return out
 
-    def _info_td(self, info: dict[str, torch.Tensor]) -> TensorDict:
-        """Pack the scenario info dict into a nested TensorDict (tensors kept on-device)."""
+    def _info_td(self, info: dict[str, torch.Tensor], *, copy: bool = True) -> TensorDict:
+        """Pack the scenario info dict into a nested TensorDict (tensors kept on-device).
+
+        ``copy=False`` only where the Environment already handed back clones.
+        """
         return TensorDict(
-            {key: info[key].clone() for key in self._info_keys},
+            {key: info[key].clone() if copy else info[key] for key in self._info_keys},
             batch_size=self.batch_size,
             device=self.device,
         )
 
     def _set_seed(self, seed: int | None) -> None:
+        # TorchRL's contract is "set the RNG state", and collectors call this during
+        # worker setup — so it must not restart the episode the way reset(seed=...) does.
         if seed is not None:
-            self._env.reset(seed=seed)
+            self._env.seed(seed)

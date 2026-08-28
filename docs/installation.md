@@ -62,8 +62,8 @@ import torch, swarp
 
 env = swarp.make("navigation", n_envs=64, n_agents=4, device="cpu")
 obs = env.reset()
-obs, reward, done, info = env.step(torch.zeros(64, 4, env.act_dim))
-print(obs.shape, reward.shape, done.shape)   # (64, 4, 19) (64, 4) (64,)
+obs, reward, term, trunc, info = env.step(torch.zeros(64, 4, env.act_dim))
+print(obs.shape, reward.shape, term.shape)   # (64, 4, 19) (64, 4) (64,)
 ```
 
 The first call compiles the Warp kernel modules and caches them under `~/.cache/warp/`, so it is noticeably slower than the ones that follow.

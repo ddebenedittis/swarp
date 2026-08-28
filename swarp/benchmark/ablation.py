@@ -7,16 +7,20 @@ per row::
     baseline -> +eager-trims -> +nbr-dedupe -> +slim-2d -> +fused-obs-rew -> +cuda-graph
 
 Each variant is defined by the feature toggles it enables on top of the previous
-one. Toggles that the current checkout does not yet expose make the row report
-``n/a`` (genuine feature-detection), so this script is useful from the very
-first commit while the stages land incrementally.
+one. All five toggles now ship, so every row is timed on a current checkout; the
+feature probing behind the ``n/a`` status is kept because it costs nothing and is
+what lets this script run against an *older* checkout — bisecting a throughput
+regression is exactly when you want the stages that do not exist yet to report
+``n/a`` rather than crash.
 
 Two guarantees are enforced before a row is timed:
 
 * **Parity** — every variant replays the same seeded 5-step trajectory from
-  ``reset(seed=0)`` and is compared against the ``baseline`` variant
-  (``allclose`` on obs/reward at f32 rtol 1e-5, exact match on ``done``). A
-  mismatch prints a loud ``PARITY FAIL`` and skips timing for that row.
+  ``reset(seed=0)`` and is compared against the ``baseline`` variant (``allclose``
+  on obs/reward, exact match on ``done``). The tolerance is the *scenario's*
+  :attr:`~swarp.scenarios.base.Scenario.parity_rtol`, not a constant of this module
+  — see :func:`parity_ok`. A mismatch prints a loud ``PARITY FAIL`` and skips
+  timing for that row.
 * **Neighbor builds/step** — the ``NeighborGrid.build_count`` delta across the
   timed window is reported (``builds`` column), so the neighbor-dedupe stage can
   be seen to drop it from 2 to 1 per step at ``substeps=1``.
@@ -190,15 +194,19 @@ def _trajectory(env: Environment, action_seq: list[torch.Tensor]) -> dict:
     obs_l, rew_l, done_l = [], [], []
     with torch.no_grad():
         for a in action_seq:
-            obs, rew, done, _ = env.step(a)
+            obs, rew, term, trunc, _ = env.step(a)
             obs_l.append(obs.detach().clone())
             rew_l.append(rew.detach().clone())
-            done_l.append(done.detach().clone())
+            done_l.append((term | trunc).detach().clone())
     return {"obs": obs_l, "reward": rew_l, "done": done_l}
 
 
-def _parity_ok(ref: dict, cur: dict, rtol: float, atol: float) -> tuple[bool, str]:
+def parity_ok(ref: dict, cur: dict, rtol: float, atol: float) -> tuple[bool, str]:
     """Compare two trajectories field by field within ``(rtol, atol)``.
+
+    The shared parity gate for every benchmark that claims a speedup: a number is only
+    meaningful next to evidence the fast path still computes the same trajectory, so
+    :mod:`swarp.benchmark.scenarios` calls this too.
 
     The tolerance is **the scenario's**, not this module's: it is the scenario that knows
     why its optimized and reference paths differ (see
@@ -222,7 +230,12 @@ def _parity_ok(ref: dict, cur: dict, rtol: float, atol: float) -> tuple[bool, st
 # ------------------------------------------------------------------- timing
 
 
-def _sync(device: str) -> None:
+def sync_device(device: str) -> None:
+    """Block until the device is idle, or do nothing on CPU.
+
+    Every wall-clock measurement in the benchmark package brackets its loop with this;
+    without it a CUDA timing measures launch throughput, not the work.
+    """
     if device.startswith("cuda"):
         torch.cuda.synchronize()
 
@@ -245,13 +258,13 @@ def _time_env(env: Environment, n_envs: int, n_agents: int, device: str, steps: 
         for _ in range(warmup):
             actions.uniform_(-1.0, 1.0, generator=gen)
             env.step(actions)
-        _sync(device)
+        sync_device(device)
         build0 = _grid_build_count(env)
         t0 = time.perf_counter()
         for _ in range(steps):
             actions.uniform_(-1.0, 1.0, generator=gen)
             env.step(actions)
-        _sync(device)
+        sync_device(device)
         elapsed = time.perf_counter() - t0
         build1 = _grid_build_count(env)
     builds_per_step = None if build0 is None or build1 is None else (build1 - build0) / steps
@@ -294,7 +307,7 @@ def bench_one(
         cur_traj = _trajectory(env, action_seq)
         if ref_traj is not None:
             scen = type(env.scenario)
-            ok, why = _parity_ok(ref_traj, cur_traj, scen.parity_rtol, scen.parity_atol)
+            ok, why = parity_ok(ref_traj, cur_traj, scen.parity_rtol, scen.parity_atol)
             if not ok:
                 row["status"] = "parity-fail"
                 row["detail"] = why
@@ -355,11 +368,11 @@ def _bench_grad_one(
     try:
         for _ in range(2):  # warmup
             run_once()
-        _sync(device)
+        sync_device(device)
         t0 = time.perf_counter()
         for _ in range(iters):
             run_once()
-        _sync(device)
+        sync_device(device)
         elapsed = time.perf_counter() - t0
     except torch.cuda.OutOfMemoryError:
         torch.cuda.empty_cache()

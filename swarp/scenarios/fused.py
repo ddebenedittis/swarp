@@ -39,6 +39,7 @@ import warp as wp
 
 from swarp.core.hooks import WholeStepHook
 from swarp.core.state import VEC2
+from swarp.interop.autograd import torch_stream_scope
 from swarp.scenarios.base import Scenario
 
 #: How a :class:`Buf` is seen from torch and from Warp, in one field.
@@ -108,11 +109,11 @@ class FusedPass:
     The three kernel flags the seven scenarios actually need are all derivable from
     ``(kind, full)``, but *where* each puts them differs: navigation and formation carry
     them on the obs kernel, transport and pusht on the reward kernel, flocking and
-    sampling only take ``full_pass``, and discovery takes neither and instead expresses
-    "a reset must not clobber the reward" by *omitting* the reward launch. So this
-    describes the pass and :meth:`FusedScenario.launch_fused` maps it onto the
-    scenario's own sequence. The properties are named after the kernel arguments they
-    feed, so that mapping reads as a rename rather than a translation.
+    sampling only take ``full_pass``, and discovery takes neither — it reads ``full_pass``
+    in ``launch_fused`` itself to decide whether the reward kernel runs. So this describes
+    the pass and :meth:`FusedScenario.launch_fused` maps it onto the scenario's own
+    sequence. The properties are named after the kernel arguments they feed, so that
+    mapping reads as a rename rather than a translation.
 
     Attributes:
         kind: ``"step"`` (post-physics) or ``"reset"``.
@@ -145,7 +146,6 @@ class FusedPass:
 
 #: The one pass on the hot path. A module constant so a step allocates nothing at all.
 STEP = FusedPass("step")
-FusedPass.STEP = STEP  # type: ignore[attr-defined]
 
 
 class FusedScenario(Scenario):
@@ -163,7 +163,11 @@ class FusedScenario(Scenario):
       is the parity oracle and stays entirely the scenario's own.
 
     and optionally :meth:`engine_carries` when the fused launches also advance state
-    that lives in the engine rather than in the spec.
+    that lives in the engine rather than in the spec, and optionally
+    :meth:`supports_graph_reset` / :meth:`reset_in_graph` together when the scenario's
+    whole reset is itself capture-safe and can be folded into the whole-step graph (see
+    their docstrings; ``False`` is the correct default for a scenario that samples with
+    a ``torch.Generator`` or allocates during reset).
     """
 
     fused_available = True
@@ -202,6 +206,34 @@ class FusedScenario(Scenario):
     def reset_torch(self, env_mask: torch.Tensor | None) -> None:
         """Refresh the torch reference cache after a reset (non-fused path)."""
 
+    def supports_graph_reset(self) -> bool:
+        """Whether this scenario's ``reset_world`` can be folded into the captured
+        whole-step graph — i.e. it is pure Warp launches against pointer-stable buffers
+        with a device-side RNG, with no torch sampling and no allocation.
+
+        ``False`` by default: this is an opt-in, not a framework guarantee, because
+        satisfying it is scenario-specific work (a masked reset kernel keyed off a
+        device-resident seed, per ``swarp/core/rng.py``) that the other six built-ins
+        have not done. A scenario that overrides this to ``True`` must also override
+        :meth:`reset_in_graph`.
+        """
+        return False
+
+    def reset_in_graph(self) -> None:
+        """The capture-safe reset tail: the masked reset kernel(s) plus an obs-only
+        refresh, run from inside the whole-step graph right after the episode-end
+        kernel has stamped the reset mask.
+
+        Same capture-safety contract as :meth:`launch_fused`'s ``kind="step"`` case: only
+        ``wp.launch`` / neighbor-grid builds against pointer-stable handles, no
+        allocation, no host reads. Only reachable when :meth:`supports_graph_reset`
+        returns ``True``, so the default body is unreachable rather than a silent no-op.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__}.supports_graph_reset() returned True but "
+            "reset_in_graph() was not overridden"
+        )
+
     def engine_carries(self) -> list[torch.Tensor]:
         """Extra warm-up carries that live in the engine rather than in the spec.
 
@@ -219,6 +251,17 @@ class FusedScenario(Scenario):
     _wp: dict[str, wp.array]
 
     _fused_ready: bool = False
+
+    #: True whenever the reset-mask buffer may hold a non-zero byte; False only when it
+    #: is *known* all-zero. ``prepare_fused`` trusts this instead of unconditionally
+    #: zeroing the mask every step — with ``auto_reset=False`` the mask is zero on every
+    #: step but the one right after a reset, so an unconditional zero is a CUDA memset
+    #: launched forever for nothing. Every writer of the buffer is responsible for
+    #: calling :meth:`mark_reset_mask_dirty` the moment it writes a possibly-nonzero
+    #: byte into it; ``prepare_fused`` is the only reader, and it clears the flag right
+    #: after actually zeroing. Starts ``False``: :meth:`ensure_fused` allocates the
+    #: buffer with ``torch.zeros``, so there is nothing to clear yet.
+    _fused_mask_dirty: bool = False
 
     # ------------------------------------------------------------------ allocation
 
@@ -239,6 +282,15 @@ class FusedScenario(Scenario):
         self.fb = {}
         self._wp = {}
         self._fused_ptrs: dict[str, int] = {}
+        # name -> the resolved (owner, attribute name) for every buffer with an ``attr``,
+        # resolved once here instead of re-splitting and re-walking ``b.attr`` on every
+        # call (``_fused_owner`` allocates a list per call, and ``sync_fused_handles``
+        # runs per step). Caching the *owner object* holds because the only intermediate
+        # a dotted attr walks through is ``self.world``, which ``make_world`` assigns
+        # once and never reassigns — the same lifetime ``ensure_fused`` already assumes
+        # by caching Warp handles over this world's buffers. A buffer whose *attribute*
+        # is reassigned is the ``watch`` case, and that is handled below.
+        self._fused_attr: dict[str, tuple[object, str]] = {}
         for b in spec:
             if b.watch and b.attr is None:
                 raise ValueError(
@@ -246,12 +298,24 @@ class FusedScenario(Scenario):
                     "framework-owned buffer is never reassigned, so nothing can move"
                 )
             self._fused_bind(b, self._fused_acquire(b, n_envs))
-        self._fused_spec = spec
+            if b.attr is not None:
+                self._fused_attr[b.name] = self._fused_owner(b)
         self._fused_carries = tuple(b for b in spec if b.carry)
         self._fused_watch = tuple(b for b in spec if b.watch)
         self._fused_mask = masks[0].name if masks else None
         self._fused_token_value = 0
         self._fused_ready = True
+
+    def mark_reset_mask_dirty(self) -> None:
+        """Record that the reset-mask buffer may now hold a non-zero byte.
+
+        Call this from every code path that writes (or may write) a possibly-nonzero
+        value into the ``reset_mask`` buffer. :meth:`prepare_fused` is the sole reader
+        of the flag this sets, and clears it once it has actually zeroed the buffer —
+        skipping that zero is only safe because every writer passes through here first.
+        Safe to call with no ``reset_mask`` buffer declared: the flag is then never read.
+        """
+        self._fused_mask_dirty = True
 
     def _fused_owner(self, b: Buf) -> tuple[object, str]:
         """Resolve ``b.attr`` to ``(owner, attribute name)``; ``"world.goals"`` is dotted."""
@@ -333,7 +397,7 @@ class FusedScenario(Scenario):
         """
         changed = False
         for b in self._fused_watch:
-            owner, attr = self._fused_owner(b)
+            owner, attr = self._fused_attr[b.name]
             t = getattr(owner, attr)
             if t.data_ptr() != self._fused_ptrs[b.name]:
                 self._fused_bind(b, t)
@@ -358,7 +422,7 @@ class FusedScenario(Scenario):
             if b.attr is None:
                 out.append(self.fb[b.name])
             else:
-                owner, attr = self._fused_owner(b)
+                owner, attr = self._fused_attr[b.name]
                 out.append(getattr(owner, attr))
         out.extend(self.engine_carries())
         return out
@@ -372,8 +436,13 @@ class FusedScenario(Scenario):
         when a graph backs the step, otherwise by :meth:`post_step` itself.
         """
         self.ensure_fused()
-        if self._fused_mask is not None:
+        if self._fused_mask is not None and self._fused_mask_dirty:
+            # Only zero when a writer marked the buffer dirty since the last zero. With
+            # ``auto_reset=False`` that is the step right after a reset and no other, so
+            # the alternative is a CUDA memset launched forever over a buffer that is
+            # already all zeros. See ``_fused_mask_dirty`` for the invariant it rests on.
             self.fb[self._fused_mask].zero_()  # a normal step resets no env
+            self._fused_mask_dirty = False
         self.sync_fused_handles()
 
     def post_step(self) -> None:
@@ -382,12 +451,58 @@ class FusedScenario(Scenario):
         The fused arm runs the *same* sequence the whole-step graph captures, which is
         what keeps non-graph fused mode and CPU eager-persistent mode bit-identical to
         graph mode.
+
+        Scoped onto torch's current stream — these launches read state torch has just
+        written and their outputs are read by torch straight after. The scope goes *here*
+        rather than inside :meth:`launch_fused`, because the captured path
+        (:meth:`_launch_fused_step`) has to record on the capture stream and must stay raw.
         """
         if self.fused_active:
             self.prepare_fused()
-            self.launch_fused(STEP)
+            with torch_stream_scope(self.world.device):
+                self.launch_fused(STEP)
         else:
             self.post_step_torch()
+
+    def reset_mask_wp(self, env_mask: torch.Tensor | None):
+        """``(mask, use_mask)`` for a masked reset kernel: a uint8 ``[n_envs]`` Warp view
+        and the flag saying whether the kernel should consult it.
+
+        Every scenario's reset kernel takes the mask this way. When the fused spec is
+        active and declares a ``reset_mask`` buffer, this *is* the same device buffer
+        :meth:`finish_reset` later stamps for the fused obs/reward kernels
+        (``self.fb[self._fused_mask]``) — one upload, not two device buffers holding the
+        same value. Outside that (the torch-oracle path, or a scenario with no
+        ``reset_mask`` buffer) it falls back to a buffer owned by this method. Either way
+        the tensor is never reallocated for a given batch size, so the handle stays
+        pointer-stable — which is what lets a captured graph and the fused handle cache
+        keep working across resets.
+
+        ``env_mask=None`` (reset everything) leaves the buffer alone and returns
+        ``use_mask=0``: the kernel then skips the lookup instead of reading a buffer we
+        would otherwise have to fill with ones. (:meth:`finish_reset` still fills the
+        shared buffer with ones afterwards, for the fused kernels that read it
+        unconditionally.)
+        """
+        if self.fused_active:
+            self.ensure_fused()
+            if self._fused_mask is not None:
+                if env_mask is None:
+                    return self._wp[self._fused_mask], wp.int32(0)
+                self.fb[self._fused_mask].copy_(env_mask)  # bool -> uint8
+                self.mark_reset_mask_dirty()
+                return self._wp[self._fused_mask], wp.int32(1)
+
+        n_envs = self.world.n_envs
+        mask = getattr(self, "_reset_mask_t", None)
+        if mask is None or mask.shape != (n_envs,):
+            mask = torch.zeros(n_envs, dtype=torch.uint8, device=self.world.device)
+            self._reset_mask_t = mask
+            self._reset_mask_handle = wp.from_torch(mask)
+        if env_mask is None:
+            return self._reset_mask_handle, wp.int32(0)
+        mask.copy_(env_mask)  # bool -> uint8
+        return self._reset_mask_handle, wp.int32(1)
 
     def finish_reset(self, env_mask: torch.Tensor | None, *, obs_only: bool) -> None:
         """Close out ``reset_world``: the fused reset pass, or the torch refresh.
@@ -397,13 +512,15 @@ class FusedScenario(Scenario):
         if self.fused_active:
             self.ensure_fused()
             self.sync_fused_handles()  # this pass launches with the cached handles
-            if self._fused_mask is not None:
-                mask = self.fb[self._fused_mask]
-                if env_mask is None:
-                    mask.fill_(1)
-                else:
-                    mask.copy_(env_mask)  # bool -> uint8
-            self.launch_fused(FusedPass("reset", env_mask=env_mask, full=not obs_only))
+            if self._fused_mask is not None and env_mask is None:
+                # A masked reset already wrote this buffer from ``reset_mask_wp``; only
+                # the "reset everything" case needs the fill, since that call leaves the
+                # buffer untouched (the reset kernel doesn't need it when use_mask=0, but
+                # the fused kernels below read it unconditionally).
+                self.fb[self._fused_mask].fill_(1)
+                self.mark_reset_mask_dirty()
+            with torch_stream_scope(self.world.device):
+                self.launch_fused(FusedPass("reset", env_mask=env_mask, full=not obs_only))
         else:
             self.reset_torch(env_mask)
 

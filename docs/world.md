@@ -1,6 +1,6 @@
 # World, contacts and sensing
 
-`WorldConfig` (`swarp/core/config.py`) holds everything about the world that is not an agent: the contact law, the boundary, the neighbour search, and the integrator.
+`WorldConfig` (`swarp/core/config.py`) holds everything about the world that is not an agent: the contact law, the boundary, the neighbor search, and the integrator.
 A scenario builds one in its `make_world`.
 
 ```python
@@ -17,6 +17,28 @@ world_config = WorldConfig(
 )
 world = World(agent_configs, world_config, n_envs=n_envs, device=device, dt=dt, substeps=1, dtype=dtype)
 ```
+
+## Overriding a scenario's engine settings
+
+The built-in scenarios compute their own `WorldConfig` — `bounds` from `world_size`, `neighbor_radius` from the contact reach — and most of its fields are not scenario constructor arguments.
+Pass `world_config=` to `swarp.make` or `Environment` to override them without subclassing:
+
+```python
+import swarp
+from swarp import WorldConfig, Integrator
+
+env = swarp.make(
+    "navigation",
+    n_envs=4096,
+    n_agents=8,
+    world_config=WorldConfig(integrator=Integrator.RK4, bounds_mode="clamp", collision_k=50.0),
+)
+```
+
+Only the fields you set **away from the `WorldConfig()` defaults** are applied, so the scenario keeps everything it computed (`WorldConfig.override_with` is the merge).
+The one case this cannot express is forcing a field *back* to its default against a scenario that changed it — build the scenario's `World` yourself for that.
+
+`Scenario.make_world` takes the same argument, and all seven built-ins honour it (a test pins that).
 
 ## Soft contacts
 
@@ -38,7 +60,7 @@ It is also a smooth rational function of the state, which differentiates better 
 
 Contacts are **frictionless** everywhere in the engine: normal spring plus normal damping, no tangential term.
 
-Forces are **gather-based** — each thread sums the forces on its own agent from its own neighbour list, obstacles and walls. Symmetric pairs are computed twice, which buys a deterministic, race-free result with no atomics.
+Forces are **gather-based** — each thread sums the forces on its own agent from its own neighbor list, obstacles and walls. Symmetric pairs are computed twice, which buys a deterministic, race-free result with no atomics.
 
 ## Bounds
 
@@ -94,24 +116,29 @@ Two limits worth knowing:
 - **Box-box obstacle-obstacle contacts are not modelled.** Obstacles collide with each other for every pair in which at least one body is round; two boxes pass through one another, since that needs a polygon contact manifold rather than an SDF evaluated against a disc. Agent-vs-box is exact for every shape.
 - **Body integration is not taped** (`record_tape=False`), so no gradient flows through a body's motion. A scenario that needs one keeps its own torch-side copy — see [Differentiability](differentiability.md).
 
-## Neighbour search
+## Neighbor search
 
-Neighbour lists are padded to `max_neighbors` and built without a host sync. `neighbor_radius` defaults to the interaction reach `2·max_agent_radius + collision_margin`, and may not be set below it while collisions are on.
+Neighbor lists are padded to `max_neighbors` and built without a host sync. `neighbor_radius` defaults to the interaction reach `2·max_agent_radius + collision_margin`, and may not be set below it while collisions are on.
 
 `neighbor_method` picks the backend:
 
 | method | strategy | when |
 |---|---|---|
 | `"brute"` | per-env O(n_agents²) kernel | the usual multi-agent regime; linear in `n_envs` with a tiny constant |
-| `"uniform_grid"` | batched radix-sort grid, each env owning a disjoint block of cells, 3×3 neighbourhood query | large per-env populations across many envs |
+| `"uniform_grid"` | batched radix-sort grid, each env owning a disjoint block of cells, 3×3 neighborhood query | large per-env populations across many envs |
 | `"grid"` | one `wp.HashGrid` over all envs via a z-lift | very large per-env populations and few envs only |
 | `"auto"` (default) | `uniform_grid` above 512 agents per env, `brute` otherwise | |
 
 `wp.HashGrid` wraps cell *coordinates* modulo its dims, so the z-lifted envs alias into shared cells and query cost grows with `n_envs` — which is why `"grid"` is rarely the right answer here and is measured ~300× slower than brute force at 16k envs × 64 agents.
+`grid_dim` (default 128) is that backend's bucket dimension per axis.
+
+`uniform_bins` sets the cells per axis of the `"uniform_grid"` backend; `None` (the default) picks `~sqrt(n_agents)`, which keeps occupancy near one agent per cell.
+Raising it is usually a mistake: every query zeroes `n_envs · bins²` `int32` cell offsets before the sort, so an over-fine grid spends more clearing empty cells than searching occupied ones — 128 bins with 8 agents is 16384 cells per env for 8 points.
+A value that far above the heuristic warns.
 
 The backends are tested to agree exactly. `World.neighbor_overflow()` flags any agent whose true in-radius count exceeded `max_neighbors`, so truncation is never silent, and `World.edge_index()` turns the same lists into a COO radius graph.
 
-Neighbour construction is **not taped**: the neighbour *set* is a discrete structure, so gradients flow through contact geometry rather than through membership.
+Neighbor construction is **not taped**: the neighbor *set* is a discrete structure, so gradients flow through contact geometry rather than through membership.
 `neighbor_reuse` (on by default) lets the no-grad path reuse the list the previous step's post-step build already produced, turning two builds per step into one; the reused list is bit-identical to a fresh build on the same positions.
 
 ## Lidar
@@ -127,12 +154,13 @@ obs = torch.cat([base_obs, ranges], dim=-1)
 ```
 
 Geometry is analytic ray-circle intersection against other agents and circular obstacles; a ray that hits nothing returns `max_range`. Rays are spaced uniformly over 2π and rotate with each agent's heading when `body_frame=True`.
-Box and segment obstacles are invisible to the lidar for now, though they still act in the collision step.
+Box and segment obstacles are **excluded** from the scan — `Lidar.scan` filters on `ObstacleShape` before casting, because ray-circle is the only test implemented — so they are invisible to the sensor while still acting in the collision step.
+`Lidar.scan` reads the obstacle pose from `world.obstacle_state_views()`, so a *movable* obstacle is scanned where it currently is, not where it spawned.
 
 Two interchangeable backends:
 
 `"torch"` (default)
-: the pure-torch broadcast implementation. Differentiable, but materializes an `[E, A, R, T, 2]` intermediate, so memory grows with the target count.
+: the pure-torch broadcast implementation. Differentiable, but materializes a dense `[E, A, R, T]` family, so memory grows with the target count.
 
 `"warp"`
 : the Warp kernel — numerically equivalent with no dense intermediate, which keeps high ray counts affordable. Inference-only: when gradients are required the scan transparently falls back to the torch path.

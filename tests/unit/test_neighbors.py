@@ -40,7 +40,7 @@ def build_both(pos_np, radius, max_neighbors, device, dtype=wp.float32):
     return (g_idx, g_cnt), (b_idx, b_cnt)
 
 
-def build_uniform_and_brute(pos_np, radius, max_neighbors, device, dtype=wp.float32):
+def build_uniform_and_brute(pos_np, radius, max_neighbors, device, dtype=wp.float32, bounds=None):
     """Build the radix-sort uniform grid and the brute-force reference on one grid."""
     n_envs, n_agents, _ = pos_np.shape
     npdt = np.float64 if dtype == wp.float64 else np.float32
@@ -55,6 +55,7 @@ def build_uniform_and_brute(pos_np, radius, max_neighbors, device, dtype=wp.floa
         device=device,
         dtype=dtype,
         method="uniform_grid",
+        bounds=bounds,
     )
     grid.build_uniform(pos)
     u_idx, u_cnt = grid.neighbor_idx.numpy().copy(), grid.neighbor_count.numpy().copy()
@@ -91,6 +92,74 @@ def test_uniform_grid_matches_brute_force(device, n_envs, n_agents, radius):
     np.testing.assert_array_equal(u_true, b_true)
     assert not (b_true > 128).any(), "config truncated; widen max_neighbors"
     assert neighbor_sets(u_idx, u_cnt) == neighbor_sets(b_idx, b_cnt)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("n_envs,n_agents", [(1, 8), (4, 32), (2, 128), (2, 600)])
+@pytest.mark.parametrize("radius", [0.15, 0.5])
+def test_static_bounds_uniform_grid_matches_brute_force(device, n_envs, n_agents, radius):
+    """A grid pinned to a static world rectangle must still agree *exactly* with brute
+    force.
+
+    The pinned frame skips the per-build bounds reduction, so the origin no longer hugs
+    the batch and the cell size follows the declared rectangle instead of the measured
+    extent. Both are safe as long as ``cell_size >= radius``: the edge clamp can only
+    lose pairs that are further than ``radius`` apart anyway, and the exact distance
+    filter drops the extra same-cell candidates.
+    """
+    rng = np.random.default_rng(42)
+    pos_np = make_positions(rng, n_envs, n_agents)  # inside (x_min, x_max, y_min, y_max)
+    (u_idx, u_cnt, u_true), (b_idx, b_cnt, b_true) = build_uniform_and_brute(
+        pos_np, radius, 128, device, bounds=(-2.0, 2.0, -2.0, 2.0)
+    )
+    np.testing.assert_array_equal(u_cnt, b_cnt)
+    np.testing.assert_array_equal(u_true, b_true)
+    assert not (b_true > 128).any(), "config truncated; widen max_neighbors"
+    assert neighbor_sets(u_idx, u_cnt) == neighbor_sets(b_idx, b_cnt)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_static_bounds_grid_holds_for_points_outside_the_rectangle(device):
+    """Points beyond the declared rectangle clamp into the edge cells and still match.
+
+    A world with soft walls lets agents overshoot its bounds, so the pinned frame has to
+    stay correct for positions the rectangle does not contain.
+    """
+    rng = np.random.default_rng(11)
+    pos_np = make_positions(rng, 3, 64, extent=3.0)  # deliberately overflows the bounds
+    (u_idx, u_cnt, u_true), (b_idx, b_cnt, b_true) = build_uniform_and_brute(
+        pos_np, 0.3, 128, device, bounds=(-1.0, 1.0, -1.0, 1.0)
+    )
+    np.testing.assert_array_equal(u_cnt, b_cnt)
+    np.testing.assert_array_equal(u_true, b_true)
+    assert neighbor_sets(u_idx, u_cnt) == neighbor_sets(b_idx, b_cnt)
+
+
+def test_static_grid_flag_only_when_bounds_given():
+    """``bounds=None`` keeps the adaptive per-build reduction; ``bounds`` pins the frame.
+
+    The flag is also confined to ``uniform_grid`` — the other backends do not read the
+    origin at all.
+    """
+    kw = dict(device="cpu", method="uniform_grid")
+    assert not NeighborGrid(4, 600, radius=0.2, **kw)._static_grid
+
+    # bounds is (x_min, x_max, y_min, y_max): the origin is the min corner, the extent
+    # the larger side. 600 agents -> 25 bins, so 4.0 / 25 = 0.16 beats the 0.1 radius.
+    pinned = NeighborGrid(4, 600, radius=0.1, bounds=(-1.0, 1.0, -2.0, 2.0), **kw)
+    assert pinned._static_grid
+    assert pinned._u_origin.numpy().tolist() == [-1.0, -2.0]
+    assert pinned._u_cell_size.numpy()[0] == pytest.approx(4.0 / 25)
+
+    # The radius is a hard floor — a cell smaller than it would break the 3x3 query.
+    coarse = NeighborGrid(4, 600, radius=0.5, bounds=(-1.0, 1.0, -2.0, 2.0), **kw)
+    assert coarse._u_cell_size.numpy()[0] == pytest.approx(0.5)
+
+    # Only the uniform grid reads the origin, so the other backends never pin one.
+    brute = NeighborGrid(
+        4, 8, radius=0.2, device="cpu", method="brute", bounds=(-1.0, 1.0, -1.0, 1.0)
+    )
+    assert not brute._static_grid
 
 
 @pytest.mark.parametrize("device", DEVICES)
@@ -234,3 +303,63 @@ def test_edge_index(device):
     got = set(map(tuple, edges.T.cpu().numpy().tolist()))
     assert got == expected
     assert edges.device.type == ("cuda" if device.startswith("cuda") else "cpu")
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_lazy_hash_grid_honours_grid_dim(device, monkeypatch):
+    """``build_grid`` on a non-``"grid"`` backend must not fall back to a hardcoded 128.
+
+    The lazy allocation in ``_ensure_grid`` is the only way ``WorldConfig.grid_dim``
+    can be silently discarded, because it is reached from ``build_grid`` regardless of
+    the configured method.
+    """
+    dims = []
+    real = wp.HashGrid
+
+    def spy(dim_x, dim_y, dim_z, **kw):  # wp.HashGrid keeps no dim attributes
+        dims.append((dim_x, dim_y, dim_z))
+        return real(dim_x, dim_y, dim_z, **kw)
+
+    monkeypatch.setattr(wp, "HashGrid", spy)
+    rng = np.random.default_rng(0)
+    pos_np = make_positions(rng, 2, 6)
+    grid = NeighborGrid(2, 6, radius=0.5, device=device, method="brute", grid_dim=64)
+    assert grid._grid is None and not dims  # nothing allocated for the brute backend
+    pos = wp.array(pos_np.astype(np.float32), dtype=wp.vec2f, device=device)
+    grid.build_grid(pos)
+    assert dims == [(64, 64, 64)]
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_lazy_hash_grid_agrees_with_brute_force_at_a_small_grid_dim(device):
+    """...and the smaller grid still produces the same neighbor sets."""
+    rng = np.random.default_rng(1)
+    pos_np = make_positions(rng, 3, 12)
+    pos = wp.array(pos_np.astype(np.float32), dtype=wp.vec2f, device=device)
+    ref = NeighborGrid(3, 12, radius=0.6, device=device, method="brute")
+    ref.build_brute_force(pos)
+    small = NeighborGrid(3, 12, radius=0.6, device=device, method="brute", grid_dim=32)
+    small.build_grid(pos)
+    a = neighbor_sets(ref.neighbor_idx.numpy(), ref.neighbor_count.numpy())
+    b = neighbor_sets(small.neighbor_idx.numpy(), small.neighbor_count.numpy())
+    assert a == b
+
+
+def test_over_fine_uniform_grid_warns():
+    """``bins**2`` far above ``n_agents`` means each query memsets more cells than it searches."""
+    with pytest.warns(RuntimeWarning, match="cells per env"):
+        NeighborGrid(2, 8, radius=0.5, device="cpu", method="uniform_grid", uniform_bins=128)
+
+
+def test_default_uniform_bins_is_quiet():
+    """The ~sqrt(n_agents) heuristic is the shape the warning is calibrated against."""
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        NeighborGrid(2, 8, radius=0.5, device="cpu", method="uniform_grid")
+
+
+def test_uniform_bins_must_be_positive():
+    with pytest.raises(ValueError, match="uniform_bins"):
+        NeighborGrid(2, 8, radius=0.5, device="cpu", method="uniform_grid", uniform_bins=0)

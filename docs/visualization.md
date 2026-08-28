@@ -81,7 +81,7 @@ Overlays toggle by single key:
 | `g` | goals | ✓ |
 | `h` | heading | ✓ |
 | `l` | lidar (drawn once a sensor supplies rays) | ✓ |
-| `n` | neighbour graph | |
+| `n` | neighbor graph | |
 | `a` | applied action | |
 | `v` | velocity | |
 | `i` | agent ids | |

@@ -16,6 +16,14 @@ The package integration is plain torch, so gradients flow package->agent->action
 across a rollout (BPTT); the intra-step agent-avoids-package force is not taped
 (obstacles are constants inside a Warp step), a documented limitation of this
 first pass vs. a full in-tape rigid body.
+
+The three steps above describe the **torch reference path** — the parity oracle, and the
+only path that carries gradients. The no-grad hot path does the same physics in
+``transport_body_kernel`` (:mod:`swarp.scenarios.transport_kernels`) instead: the force
+gather, the integration and the pose write-back all happen on-device inside the fused
+whole-step hook, so nothing crosses back into torch per step and the whole step stays
+capturable as one CUDA graph. The two are tested against each other in
+``tests/scenarios/test_transport_fused.py``.
 """
 
 from __future__ import annotations
@@ -25,13 +33,18 @@ from typing import Any
 import torch
 import warp as wp
 
+from swarp._overloads import concrete
+from swarp.core.cached_launch import CachedLaunch, ptr_key
 from swarp.core.config import Obstacles, WorldConfig
+from swarp.core.state import VEC2
 from swarp.core.world import World
 from swarp.dynamics.base import AgentConfig, ControlMode, DynamicsModel
+from swarp.interop.autograd import torch_stream_scope
 from swarp.scenarios.fused import Buf, FusedPass, FusedScenario
 from swarp.scenarios.transport_kernels import (
     transport_body_kernel,
     transport_obs_kernel,
+    transport_reset_kernel,
     transport_reward_kernel,
 )
 
@@ -64,6 +77,11 @@ class TransportScenario(FusedScenario):
         self.package_inertia = 0.5 * package_mass * package_radius**2
         self.world_size = world_size
         self.max_speed = max_speed
+        # contact_k/contact_c ARE the engine's WorldConfig.collision_k/collision_c —
+        # the same spring-damper law, named for the agent<->package contact that dominates
+        # here. contact_margin is NOT the engine's collision_margin (which is derived
+        # from agent_radius in make_world): it is this scenario's own agent<->package
+        # activation gap, used by the torch reference path below.
         self.contact_k = contact_k
         self.contact_c = contact_c
         self.contact_margin = contact_margin
@@ -73,7 +91,7 @@ class TransportScenario(FusedScenario):
         self.goal_reward = goal_reward
         self.goal_tolerance = goal_tolerance if goal_tolerance is not None else package_radius
 
-    def make_world(self, n_envs, device, dt, substeps, dtype) -> World:
+    def make_world(self, n_envs, device, dt, substeps, dtype, world_config=None) -> World:
         cfgs = [
             AgentConfig(
                 model=DynamicsModel.HOLONOMIC,
@@ -96,7 +114,7 @@ class TransportScenario(FusedScenario):
             bounds_mode="soft",
             neighbor_radius=reach,
             max_neighbors=min(32, max(4, self.n_agents)),
-        )
+        ).override_with(world_config)
         self.dt = dt
         self.world = World(
             cfgs, cfg, n_envs=n_envs, device=device, dt=dt, substeps=substeps, dtype=dtype
@@ -118,6 +136,11 @@ class TransportScenario(FusedScenario):
         self._obstacles = Obstacles(self.pkg_pos.detach(), self._pkg_radius).resolve(device, dtype)
         self._prev_dist: torch.Tensor | None = None
         self._cache: dict[str, torch.Tensor] | None = None
+        # Cached, repack-once launches for the eager reset path — see
+        # swarp/core/cached_launch.py.
+        self._reset_launch = CachedLaunch()
+        self._obs_launch = CachedLaunch()
+        self._reward_launch = CachedLaunch()
         return self.world
 
     @property
@@ -129,35 +152,81 @@ class TransportScenario(FusedScenario):
     def reset_world(
         self, env_mask: torch.Tensor | None = None, *, obs_only: bool = False
     ) -> None:
+        """Masked reset in one Warp launch (see :mod:`swarp.scenarios.reset_kernels`).
+
+        The package buffers are written **in place** by the kernel, so the fused path's
+        cached Warp handles and the whole-step graph stay valid across resets; the grad
+        path's ``_refresh`` still reassigns them (fresh tensors for the tape), which the
+        framework's handle resync catches on the next no-grad step.
+        """
         w = self.world
-        n = w.n_envs
         lim = self.world_size - 2.0 * self.agent_radius
         plim = self.world_size - self.package_radius
-        spawn = w.sample_uniform((n, self.n_agents, 2), -lim, lim)
-        pkg = w.sample_uniform((n, self.n_packages, 2), -plim, plim)
-        goal = w.sample_uniform((n, self.n_packages, 2), -plim, plim)
-
-        # In-place package updates (copy_) so the fused path's cached wp handles
-        # and the whole-step graph stay valid across resets; the grad path's
-        # _refresh still reassigns them (fresh tensors for the tape), which the
-        # framework's handle resync catches on the next no-grad step.
-        w.write_state(env_mask, pos=spawn, vel=0.0)
-        if env_mask is None:
-            self.pkg_pos.copy_(pkg)
-            self.pkg_vel.zero_()
-            self.pkg_theta.zero_()
-            self.pkg_ang_vel.zero_()
-            self.goal.copy_(goal)
+        mask, use_mask = self.reset_mask_wp(env_mask)
+        st = w.state_wp()
+        scalar = w.wp_dtype
+        vec2 = VEC2[scalar]
+        if self.fused_active:
+            # Reuse the fused spec's cached, pointer-resynced handles instead of
+            # re-wrapping these watched tensors on every reset (see navigation's
+            # ``_launch_reset`` for the same fix and its rationale). ``sync_fused_
+            # handles`` must run first: it is what notices a grad-path reassignment
+            # and rebuilds the handle before this kernel writes through it.
+            self.ensure_fused()
+            self.sync_fused_handles()
+            pkg_pos = self._wp["pkg_pos"]
+            pkg_vel = self._wp["pkg_vel"]
+            pkg_theta = self._wp["pkg_theta"]
+            pkg_ang_vel = self._wp["pkg_ang_vel"]
+            goal = self._wp["goal"]
         else:
-            m3 = env_mask.view(-1, 1, 1)
-            m2 = env_mask.view(-1, 1)
-            zeros_p2 = torch.zeros_like(self.pkg_vel)
-            zeros_p = torch.zeros_like(self.pkg_theta)
-            self.pkg_pos.copy_(torch.where(m3, pkg, self.pkg_pos))
-            self.pkg_vel.copy_(torch.where(m3, zeros_p2, self.pkg_vel))
-            self.pkg_theta.copy_(torch.where(m2, zeros_p, self.pkg_theta))
-            self.pkg_ang_vel.copy_(torch.where(m2, zeros_p, self.pkg_ang_vel))
-            self.goal.copy_(torch.where(m3, goal, self.goal))
+            pkg_pos = wp.from_torch(self.pkg_pos.contiguous(), dtype=vec2)
+            pkg_vel = wp.from_torch(self.pkg_vel.contiguous(), dtype=vec2)
+            pkg_theta = wp.from_torch(self.pkg_theta.contiguous())
+            pkg_ang_vel = wp.from_torch(self.pkg_ang_vel.contiguous())
+            goal = wp.from_torch(self.goal.contiguous(), dtype=vec2)
+        seed = wp.int32(w.next_kernel_seed())
+        with torch_stream_scope(w.device):
+            launch = self._reset_launch.get(
+                concrete(transport_reset_kernel, scalar),
+                dim=w.n_envs,
+                inputs=[
+                    mask,
+                    use_mask,
+                    seed,
+                    scalar(lim),
+                    scalar(plim),
+                    wp.int32(self.n_agents),
+                    wp.int32(self.n_packages),
+                    st.pos,
+                    st.vel,
+                    pkg_pos,
+                    pkg_vel,
+                    pkg_theta,
+                    pkg_ang_vel,
+                    goal,
+                ],
+                device=w.device,
+                key=(
+                    w.n_envs,
+                    ptr_key(mask),
+                    lim,
+                    plim,
+                    self.n_agents,
+                    self.n_packages,
+                    ptr_key(st.pos),
+                    ptr_key(st.vel),
+                    ptr_key(pkg_pos),
+                    ptr_key(pkg_vel),
+                    ptr_key(pkg_theta),
+                    ptr_key(pkg_ang_vel),
+                    ptr_key(goal),
+                ),
+            )
+            launch.set_param_by_name("use_mask", use_mask)
+            launch.set_param_by_name("seed", seed)
+            launch.launch()
+        w.mark_pos_dirty()
 
         self._install_obstacles()
         if not self.fused_active:
@@ -235,20 +304,20 @@ class TransportScenario(FusedScenario):
         The ``_install_obstacles`` in the middle is an ordinary line here, running inside
         ``wp.ScopedCapture`` on a step — see its docstring for why that is legal.
         """
+        st = self.world.state_wp()  # one wrap for every launch in this pass
         if pass_.is_step:
-            self._launch_body()
+            self._launch_body(st)
             self._install_obstacles()  # updated package pose for the next step
-        self._launch_obs()
+        self._launch_obs(st)
         self._launch_reward(advance_prev=pass_.advance_prev, full_pass=pass_.full_pass)
 
-    def _launch_body(self) -> None:
+    def _launch_body(self, st) -> None:
         w = self.world
         scalar = w.wp_dtype
-        st = w.state_wp()
         pk = self._wp
         bound = self.world_size - self.package_radius
         wp.launch(
-            transport_body_kernel,
+            concrete(transport_body_kernel, self.world.wp_dtype),
             dim=(w.n_envs, self.n_packages),
             inputs=[
                 st.pos,
@@ -271,34 +340,47 @@ class TransportScenario(FusedScenario):
             record_tape=False,
         )
 
-    def _launch_obs(self) -> None:
+    def _launch_obs(self, st) -> None:
         w = self.world
-        st = w.state_wp()
-        wp.launch(
-            transport_obs_kernel,
+        pkg_pos, goal = self._wp["pkg_pos"], self._wp["goal"]
+        obs = self._wp["obs"]
+        # No per-call-varying argument at all: pointer-stable persistent-mode handles.
+        launch = self._obs_launch.get(
+            concrete(transport_obs_kernel, self.world.wp_dtype),
             dim=(w.n_envs, self.n_agents),
-            inputs=[
-                st.pos,
-                st.vel,
-                self._wp["pkg_pos"],
-                self._wp["goal"],
-                wp.int32(self.n_packages),
-            ],
-            outputs=[self._wp["obs"]],
+            inputs=[st.pos, st.vel, pkg_pos, goal, wp.int32(self.n_packages)],
+            outputs=[obs],
             device=w.device,
-            record_tape=False,
+            key=(
+                w.n_envs,
+                self.n_agents,
+                ptr_key(st.pos),
+                ptr_key(st.vel),
+                ptr_key(pkg_pos),
+                ptr_key(goal),
+                self.n_packages,
+                ptr_key(obs),
+            ),
         )
+        launch.launch()
 
     def _launch_reward(self, advance_prev: int, full_pass: int) -> None:
         w = self.world
         scalar = w.wp_dtype
-        wp.launch(
-            transport_reward_kernel,
+        pkg_pos, goal, resetmask = self._wp["pkg_pos"], self._wp["goal"], self._wp["resetmask"]
+        prev, reward, done, dist = (
+            self._wp["prev"],
+            self._wp["reward"],
+            self._wp["done"],
+            self._wp["dist"],
+        )
+        launch = self._reward_launch.get(
+            concrete(transport_reward_kernel, self.world.wp_dtype),
             dim=w.n_envs,
             inputs=[
-                self._wp["pkg_pos"],
-                self._wp["goal"],
-                self._wp["resetmask"],
+                pkg_pos,
+                goal,
+                resetmask,
                 wp.int32(self.n_agents),
                 wp.int32(self.n_packages),
                 scalar(self.pos_shaping_factor),
@@ -307,10 +389,27 @@ class TransportScenario(FusedScenario):
                 wp.int32(advance_prev),
                 wp.int32(full_pass),
             ],
-            outputs=[self._wp["prev"], self._wp["reward"], self._wp["done"], self._wp["dist"]],
+            outputs=[prev, reward, done, dist],
             device=w.device,
-            record_tape=False,
+            key=(
+                w.n_envs,
+                ptr_key(pkg_pos),
+                ptr_key(goal),
+                ptr_key(resetmask),
+                self.n_agents,
+                self.n_packages,
+                self.pos_shaping_factor,
+                self.goal_tolerance,
+                self.goal_reward,
+                ptr_key(prev),
+                ptr_key(reward),
+                ptr_key(done),
+                ptr_key(dist),
+            ),
         )
+        launch.set_param_by_name("advance_prev", wp.int32(advance_prev))
+        launch.set_param_by_name("full_pass", wp.int32(full_pass))
+        launch.launch()
 
     def _refresh(self, reset_mask: torch.Tensor | None = None, integrate: bool = True) -> None:
         w = self.world

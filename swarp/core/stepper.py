@@ -54,7 +54,25 @@ class StepBuffers:
 
 
 class Stepper:
-    """Owns per-agent parameters, interaction config, and the substep pipeline."""
+    """Owns per-agent parameters, interaction config, and the substep pipeline.
+
+    This is the **Warp-facing** layer, and its vocabulary reflects that rather than
+    :class:`~swarp.core.world.World`'s:
+
+    - ``world`` here is a :class:`~swarp.core.config.WorldConfig`, not a ``World``. The
+      stepper is what a ``World`` owns, so it holds the *config* it was built from —
+      hence the mirror-image ``world.stepper`` / ``stepper.world`` pair.
+    - ``dtype`` is a **Warp** dtype (``wp.float32`` / ``wp.float64``), where ``World``
+      takes a torch one. Kernels are instantiated per Warp dtype via ``wp.overload``, so
+      a Warp dtype is the honest type at this boundary; ``torch_dtype`` is the derived
+      torch view of it.
+
+    Several per-``n_envs`` caches hang off this object (``_cached_buffers``,
+    ``_out_states``, the neighbor grids). They are keyed by batch size and expected to
+    hold **one** entry in intended use — an ``Environment`` has a fixed ``n_envs`` for its
+    lifetime. Driving one stepper across many batch sizes therefore grows memory linearly
+    in the number of distinct sizes, which is the right trade for the common case.
+    """
 
     def __init__(
         self,
@@ -65,6 +83,9 @@ class Stepper:
         dtype=wp.float32,
         world: WorldConfig | None = None,
     ) -> None:
+        # Note the asymmetry with WorldConfig()'s own collisions=True default: a bare
+        # Stepper is the dynamics-only integrator the dynamics tests drive, so it stays
+        # collision-free unless a config asks otherwise. World always passes one through.
         world = world if world is not None else WorldConfig(collisions=False)
         if substeps < 1:
             raise ValueError("substeps must be >= 1")
@@ -172,6 +193,9 @@ class Stepper:
         # kernel would drop). ``enable_slim2d`` lets the ablation disable it.
         self.has_drone: bool = any(c.model == DynamicsModel.DRONE for c in configs)
         self.enable_slim2d: bool = True
+        # field name -> (identity key, Warp view, the tensor it views). Zero-copy wraps of
+        # the obstacle install's *source* tensors, kept across installs; see _src_handle.
+        self._src_handles: dict[str, tuple[tuple, wp.array, torch.Tensor]] = {}
 
     # ------------------------------------------------------------------ setup
 
@@ -206,6 +230,16 @@ class Stepper:
         captured whole-step graph. An install with movable bodies derives the body group in
         torch and reads ``any_movable`` back to the host, so it must stay outside a
         capture. Pinned by ``tests/unit/test_obstacles.py``.
+
+        **Streams.** The in-place ``wp.copy`` install runs on Warp's own stream, not
+        torch's — this is the one launch site in the engine that is not
+        :func:`~swarp.interop.autograd.torch_stream_scope`'d, and it cannot be: transport
+        calls it mid-capture, where opening a scope onto torch's legacy stream would break
+        the capture. It is safe under the default torch stream because Warp's stream is
+        created with the blocking flag (it synchronizes with the legacy stream), and safe
+        inside a capture because the copies then record on the capture stream. A caller
+        installing obstacles from inside its own ``torch.cuda.Stream`` is the uncovered
+        case: synchronize that stream, or install on the default one.
         """
         obs = obstacles.resolve(self.device, self.torch_dtype)
         n_envs, n_obs = obs.n_envs, obs.n_obstacles
@@ -215,6 +249,35 @@ class Stepper:
             n_obs > 0 and n_obs == self.n_obstacles and tuple(self.obs_pos.shape) == (n_envs, n_obs)
         )
         self._install(obs, in_place=in_place)
+
+    def _src_handle(self, name: str, src: torch.Tensor, wp_dtype) -> wp.array:
+        """A cached zero-copy Warp view of one install *source* tensor.
+
+        ``wp.from_torch`` is not free — it builds a fresh ``wp.array`` wrapper, re-derives
+        the strides and re-checks the dtype — and a scenario that re-samples obstacle
+        poses every reset pays it once per field on every step under ``auto_reset``. For
+        Push-T that was 22 wraps per reset and, with the copies they feed, 61% of the
+        reset. The sources are updated **in place** (that is what keeps the install
+        allocation-free and capture-legal), so the wrapper is valid for as long as the
+        tensor is.
+
+        Keyed by field name and validated against the tensor's data pointer, shape and
+        dtype, so the grad path's ``_refresh`` — which reassigns fresh tensors for the
+        tape — rebuilds instead of writing through a stale view. ``data_ptr()`` is a
+        host-side attribute read, not a device round-trip, so this stays legal on the
+        no-host-copy hot path.
+
+        The viewed tensor is retained deliberately: holding it alive is what stops the
+        allocator from recycling its address under a *different* tensor, which would make
+        a stale handle pass the pointer check.
+        """
+        key = (src.data_ptr(), tuple(src.shape), wp_dtype)
+        cached = self._src_handles.get(name)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        view = wp.from_torch(src, dtype=wp_dtype)
+        self._src_handles[name] = (key, view, src)
+        return view
 
     def _install(self, obs: Obstacles, *, in_place: bool) -> None:
         """Write a resolved obstacle set into the Warp arrays (the single install path)."""
@@ -238,10 +301,10 @@ class Stepper:
                     else:
                         arr.fill_(fill)
                 else:
-                    wp.copy(arr, wp.from_torch(src, dtype=wp_dtype))
+                    wp.copy(arr, self._src_handle(name, src, wp_dtype))
                 return
             if src is not None:
-                arr = wp.clone(wp.from_torch(src, dtype=wp_dtype))
+                arr = wp.clone(self._src_handle(name, src, wp_dtype))
             elif fill == 0.0:
                 arr = wp.zeros(shape, dtype=wp_dtype, device=dev)
             else:
@@ -328,6 +391,14 @@ class Stepper:
         re-randomize. Buffer shapes are unchanged, so no hot-path buffers are
         cleared.
 
+        The radius-vs-neighbor-reach check needs ``floats[..., P_RADIUS].max()`` on the
+        host, so it runs only on a **first install or a reallocation**. The in-place
+        refresh below — the per-reset re-randomization path, the one that runs inside a
+        graph-mode loop — is trusted against the bound validated then: a stall per reset
+        is exactly what that path exists to avoid. Widening the radius range past what the
+        first install validated therefore needs a reinstall (a differently shaped or typed
+        array, or a fresh Stepper) for it to be re-checked.
+
         Args:
             floats: ``[n_envs, n_agents, NUM_PARAMS]`` array (torch.Tensor or
                 np.ndarray); columns follow ``AgentConfig.to_row()`` order. See
@@ -341,7 +412,20 @@ class Stepper:
                 f"per-env params must have shape [n_envs, n_agents={self.n_agents}, "
                 f"NUM_PARAMS={NUM_PARAMS}]; got {shape}"
             )
-        if self.collisions:
+        torch_dt = self.torch_dtype
+        existing = self.params.floats_per_env
+        # In-place refresh (no numpy round-trip, no realloc, no version bump, and — see
+        # the docstring — no host read) when an on-device torch buffer of the matching
+        # shape/dtype is already installed: the per-reset re-randomization path in
+        # graph mode.
+        in_place = (
+            is_torch
+            and existing is not None
+            and tuple(existing.shape) == shape
+            and floats.dtype == torch_dt
+            and str(floats.device) == str(self.device)
+        )
+        if self.collisions and not in_place:
             if is_torch:
                 max_r = float(floats[..., P_RADIUS].max())
             else:
@@ -353,18 +437,7 @@ class Stepper:
                     f"(= 2 * max per-env radius + margin), but neighbor_radius="
                     f"{self.neighbor_radius}; set WorldConfig.neighbor_radius accordingly."
                 )
-        torch_dt = self.torch_dtype
-        existing = self.params.floats_per_env
-        # In-place refresh (no numpy round-trip, no realloc, no version bump) when
-        # an on-device torch buffer of the matching shape/dtype is already
-        # installed — the per-reset re-randomization path in graph mode.
-        if (
-            is_torch
-            and existing is not None
-            and tuple(existing.shape) == shape
-            and floats.dtype == torch_dt
-            and str(floats.device) == str(self.device)
-        ):
+        if in_place:
             wp.copy(existing, wp.from_torch(floats.contiguous(), dtype=self.dtype))
             return
         # (Re)allocate. Build on-device from torch when possible to avoid a host
@@ -425,6 +498,9 @@ class Stepper:
                 grid_dim=self.world.grid_dim,
                 method=self.world.neighbor_method,
                 uniform_bins=self.world.uniform_bins,
+                # A pinned world rectangle lets the uniform grid skip its per-build
+                # bounds reduction; None (no declared bounds) keeps the adaptive path.
+                bounds=self.world.bounds,
             )
             self._grids[n_envs] = g
         return g
@@ -478,7 +554,8 @@ class Stepper:
     def output_state(self, n_envs: int) -> WorldState:
         """Ping-pong output buffer for the tape-free hot path (two states cycled
         per batch size), so steady-state stepping allocates no output arrays —
-        also the fixed buffer a future CUDA-graph capture needs.
+        also the fixed buffer the whole-step CUDA-graph capture in
+        :class:`~swarp.interop.persistent.StepRuntime` replays into.
 
         The returned tensors stay valid until this method is called twice more
         for the same ``n_envs`` (the two-buffer cycle guarantees a step's input
@@ -532,8 +609,25 @@ class Stepper:
         *,
         reuse_neighbors: bool = False,
         skip_drone: bool = False,
+        write_in_place: bool = False,
     ) -> None:
-        """Advance one full env step. Functional: ``state_in`` is never written.
+        """Advance one full env step.
+
+        Functional by default: ``state_in`` is never written, and ``state_out``
+        (plus ``buffers.inter_states`` for substeps > 1) receives the result.
+
+        ``write_in_place=True`` is an opt-in for the no-grad persistent hot path:
+        every stage of the substep chain aliases ``state_in`` (which must then
+        also be ``state_out``), so the integrate kernel reads and writes the same
+        ``(e, a)`` slot. This is safe only because the elementwise slim-2D Euler
+        kernel reads its inputs into locals before writing outputs, and because
+        the force pass that reads cross-thread neighbour state is a separate,
+        fully-completed ``wp.launch`` before the integrate kernel that writes —
+        see ``docs/writing-a-scenario.md`` / the persistent-runtime module
+        docstring for the full argument. It is gated to require the ``slim``
+        Euler path (below); passing it when ``slim`` would be False raises,
+        since the full/RK4 ``integrate_kernel`` has not been cleared for aliased
+        in-place writes here.
 
         With ``reuse_neighbors=True`` (the no-grad hot path) substep 0 skips its
         neighbor rebuild and reads the grid's existing lists when they were built
@@ -544,7 +638,6 @@ class Stepper:
         get overwritten by the next build before then).
         """
         n_envs = state_in.pos.shape[0]
-        chain = [state_in, *buffers.inter_states, state_out]
         world = self.world
         slim = (
             self.enable_slim2d
@@ -552,6 +645,18 @@ class Stepper:
             and not buffers.taped
             and world.integrator == Integrator.EULER
         )
+        if write_in_place:
+            if not slim:
+                raise ValueError(
+                    "write_in_place=True requires the slim Euler 2D path "
+                    "(enable_slim2d, no drone agents, untaped, Integrator.EULER); "
+                    "the full/RK4 integrate_kernel is not cleared for in-place writes."
+                )
+            if state_out is not state_in:
+                raise ValueError("write_in_place=True requires state_out is state_in")
+            chain = [state_in] * (self.substeps + 1)
+        else:
+            chain = [state_in, *buffers.inter_states, state_out]
         grid = self.grid(n_envs) if self.collisions else None
         can_reuse = (
             reuse_neighbors

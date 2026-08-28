@@ -10,8 +10,10 @@ import pytest
 import warp as wp
 from conftest import DEVICES
 
+import swarp.dynamics.base as base
 from swarp.core.state import WorldState
 from swarp.dynamics.base import (
+    NUM_PARAMS,
     AgentConfig,
     ControlMode,
     DynamicsModel,
@@ -334,13 +336,65 @@ def test_float32_matches_float64_loosely():
 
 
 def test_drone_config_builds():
-    """The 6-DOF drone is a first-class model now (see tests/test_drone.py)."""
+    """The 6-DOF drone is a first-class model now (see tests/unit/test_drone.py)."""
     from swarp.dynamics.drone import drone_config
 
     cfg = drone_config()
     assert cfg.model == DynamicsModel.DRONE
     row = cfg.to_row()  # extended parameter matrix packs cleanly
-    assert len(row) == 16
+    assert len(row) == NUM_PARAMS
+
+
+# ------------------------------------------------------- parameter matrix layout
+
+#: What each ``P_*`` column constant is *supposed* to name, written out independently of
+#: ``PARAM_FIELDS`` on purpose: this dict is the oracle, and a test that derived it from
+#: the same tuple the code derives the constants from would assert nothing.
+COLUMN_FIELDS = {
+    "P_RADIUS": "radius",
+    "P_MASS": "mass",
+    "P_MAX_SPEED": "max_speed",
+    "P_MAX_ACCEL": "max_accel",
+    "P_MAX_ANG_VEL": "max_ang_vel",
+    "P_MAX_ANG_ACCEL": "max_ang_accel",
+    "P_LF": "l_f",
+    "P_LR": "l_r",
+    "P_MAX_STEER": "max_steer",
+    "P_THRUST_MAX": "thrust_max",
+    "P_ARM": "arm_length",
+    "P_IXX": "inertia_xx",
+    "P_IYY": "inertia_yy",
+    "P_IZZ": "inertia_zz",
+    "P_KAPPA": "torque_coeff",
+    "P_GRAVITY": "gravity",
+}
+
+
+def test_every_column_constant_points_at_the_field_to_row_packs_there():
+    """The assertion a ``len(row) == 16`` check cannot make: that column *k* holds the
+    parameter the kernels read out of column *k*.
+
+    Every field gets a distinct sentinel, so any transposition — in ``PARAM_FIELDS``, in
+    a ``P_*`` constant, or in ``to_row`` — lands a value in the wrong column and fails
+    here. Getting this wrong is otherwise silent: right shape, wrong physics.
+    """
+    assert len(COLUMN_FIELDS) == NUM_PARAMS
+    sentinels = {name: float(i + 1) for i, name in enumerate(COLUMN_FIELDS.values())}
+    cfg = AgentConfig(model=DynamicsModel.DRONE, **sentinels)
+    row = cfg.to_row()
+    assert len(row) == NUM_PARAMS
+    for const, field in COLUMN_FIELDS.items():
+        col = getattr(base, const)
+        assert row[col] == getattr(cfg, field), f"{const} does not name {field}"
+    # ...and the constants tile the row exactly once, so no column is unnamed or aliased.
+    assert sorted(getattr(base, c) for c in COLUMN_FIELDS) == list(range(NUM_PARAMS))
+
+
+def test_param_fields_are_all_agent_config_fields():
+    """A typo in ``PARAM_FIELDS`` must fail loudly, not pack a stale zero."""
+    cfg = AgentConfig()
+    for name in base.PARAM_FIELDS:
+        assert hasattr(cfg, name), f"PARAM_FIELDS names {name!r}, which AgentConfig lacks"
 
 
 # --------------------------------------------------------------------- RK4

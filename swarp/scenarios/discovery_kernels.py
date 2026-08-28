@@ -28,7 +28,9 @@ from typing import Any
 
 import warp as wp
 
+from swarp._overloads import register
 from swarp.core.state import VEC2
+from swarp.scenarios.reset_kernels import _as
 
 
 @wp.kernel
@@ -179,7 +181,66 @@ def _reward_signature(dtype) -> list:
     ]
 
 
+
+@wp.kernel
+def discovery_reset_kernel(
+    reset_mask: wp.array(dtype=wp.uint8),
+    use_mask: wp.int32,
+    seed: wp.int32,
+    lim: Any,
+    alim: Any,
+    n_agents: wp.int32,
+    n_aux: wp.int32,
+    n_flags: wp.int32,
+    pos: Any,
+    vel: Any,
+    targets: Any,
+    covered: wp.array2d(dtype=wp.uint8),
+):
+    """Masked episode reset: uniform spawns, zero velocity, fresh targets, cleared
+    ``covered``.
+
+    ``covered`` is the per-target discovery flag; a fresh episode starts with none found.
+    """
+    e = wp.tid()
+    if use_mask == 1 and reset_mask[e] == wp.uint8(0):
+        return
+    rng = wp.rand_init(seed, e)
+    zero = _as(0.0, lim)
+    two = _as(2.0, lim)
+    one = _as(1.0, lim)
+    for a in range(n_agents):
+        px = (_as(wp.randf(rng), lim) * two - one) * lim
+        py = (_as(wp.randf(rng), lim) * two - one) * lim
+        pos[e, a] = wp.vector(px, py)
+        vel[e, a] = wp.vector(zero, zero)
+    for i in range(n_aux):
+        tx = (_as(wp.randf(rng), alim) * two - one) * alim
+        ty = (_as(wp.randf(rng), alim) * two - one) * alim
+        targets[e, i] = wp.vector(tx, ty)
+    for i in range(n_flags):
+        covered[e, i] = wp.uint8(0)
+
+
+def _reset_signature(dtype) -> list:
+    a2v = wp.array2d(dtype=VEC2[dtype])
+    return [
+        wp.array(dtype=wp.uint8),  # reset_mask
+        wp.int32,  # use_mask
+        wp.int32,  # seed
+        dtype,  # lim
+        dtype,  # alim
+        wp.int32,  # n_agents
+        wp.int32,  # n_aux
+        wp.int32,  # n_flags
+        a2v,  # pos
+        a2v,  # vel
+        a2v,  # targets
+        wp.array2d(dtype=wp.uint8),  # covered
+    ]
+
 for _T in (wp.float32, wp.float64):
-    wp.overload(discovery_cover_kernel, _cover_signature(_T))
-    wp.overload(discovery_obs_kernel, _obs_signature(_T))
-    wp.overload(discovery_reward_kernel, _reward_signature(_T))
+    register(discovery_cover_kernel, _T, _cover_signature(_T))
+    register(discovery_obs_kernel, _T, _obs_signature(_T))
+    register(discovery_reward_kernel, _T, _reward_signature(_T))
+    register(discovery_reset_kernel, _T, _reset_signature(_T))

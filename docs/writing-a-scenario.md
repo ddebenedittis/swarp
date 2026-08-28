@@ -21,7 +21,7 @@ Four abstract members:
 
 | member | what it does |
 |---|---|
-| `make_world(n_envs, device, dt, substeps, dtype) -> World` | build the `World`, **and allocate all persistent state** |
+| `make_world(n_envs, device, dt, substeps, dtype, world_config=None) -> World` | build the `World`, **and allocate all persistent state** |
 | `reset_world(env_mask=None, *, obs_only=False)` | (re)randomize state, goals, obstacles |
 | `observations() -> [n_envs, n_agents, obs_dim]` | batched observations |
 | `obs_dim -> int` | per-agent observation width |
@@ -37,6 +37,27 @@ That matters more than it looks: `reset_world` runs on the per-step auto-reset p
 lazy allocation there is an undeclared ordering precondition — the fused path breaks if it
 runs before the first reset. `FusedScenario` turns that into a hard error rather than a
 subtle one.
+
+### `make_world` must honour `world_config`
+
+Compute your `WorldConfig` from your own scenario parameters as usual, then end with one
+call:
+
+```python
+cfg = WorldConfig(
+    collisions=True,
+    collision_margin=margin,
+    bounds=(-self.world_size, self.world_size, -self.world_size, self.world_size),
+    neighbor_radius=reach,
+).override_with(world_config)
+```
+
+That is the whole contract. It is what lets a caller reach engine settings your
+constructor does not expose (`integrator`, `bounds_mode`, `neighbor_reuse`, `grid_dim`,
+`uniform_bins`, the obstacle damping) via `swarp.make(..., world_config=...)` without
+subclassing, while your computed `bounds` and `neighbor_radius` survive — only the fields
+set away from the `WorldConfig()` defaults are taken. `tests/scenarios/test_scenarios.py`
+pins that all seven built-ins do this.
 
 ### `reset_world` must be host-sync-free
 
@@ -181,10 +202,10 @@ mapping reads as a rename. Where each scenario puts them differs, and all of it 
 expressible without touching a kernel signature:
 
 ```python
-# navigation / formation — flags on the obs kernel; no reward on a reset
+# navigation / formation — flags on the obs kernel; no reward on an obs-only auto-reset
 def launch_fused(self, pass_):
     self._launch_obs(advance_prev=pass_.advance_prev, full_pass=pass_.full_pass)
-    if pass_.is_step:
+    if pass_.full_pass:
         self._launch_reward()
 
 # transport / pusht — flags on the reward kernel; no body advance on a reset
@@ -199,13 +220,19 @@ def launch_fused(self, pass_):
 def launch_fused(self, pass_):
     self._launch(full_pass=pass_.full_pass)
 
-# discovery — neither flag: "a reset must not clobber the reward" by omitting the launch
+# discovery — neither flag reaches a kernel; full_pass only gates the reward launch
 def launch_fused(self, pass_):
     self._launch_cover()
     self._launch_obs()
-    if pass_.is_step:
+    if pass_.full_pass:
         self._launch_reward()
 ```
+
+Note which flag gates that reward launch: `full_pass`, not `is_step`. Only the *obs-only*
+auto-reset must preserve reward/done (they were already returned for the transition just
+taken). A standalone `reset()`/`reset_at()` is a full pass and has to recompute them, or
+the fused path reports the previous episode where the torch oracle reports the new one —
+which is exactly what `assert_reset_parity` in `tests/conftest.py` pins.
 
 ### Capture safety — the one rule that bites
 
@@ -255,7 +282,26 @@ than two tables that drift.
 
 ## Registering it
 
-Add the class to `SCENARIOS` in `swarp/scenarios/__init__.py`. That is the single registry:
-`swarp.make(name, ...)`, the benchmark CLIs and the tests all read it, and
-`fused_scenarios()` derives fused capability from `cls.fused_available` — which
+`SCENARIOS` in `swarp/scenarios/__init__.py` is the single registry: `swarp.make(name, ...)`,
+`make_scenario`, `scenario_class`, the benchmark CLIs' `--scenario` and the tests all read it,
+and `fused_scenarios()` derives fused capability from `cls.fused_available` — which
 `FusedScenario` sets — so there is no second list to keep in step.
+
+Your scenario almost certainly lives outside this package, so add it with
+`register_scenario` at import time of the module that defines it. No fork, no edit to the
+installed package:
+
+```python
+import swarp
+from swarp.scenarios import register_scenario
+
+register_scenario("my_task", MyTaskScenario)
+
+env = swarp.make("my_task", n_envs=4096, n_agents=8, device="cuda:0")
+```
+
+A name collision raises rather than silently swapping — pass `overwrite=True` if replacing a
+built-in is what you meant.
+
+For a scenario contributed *to* the package, add it to the `SCENARIOS` dict literal directly
+instead; the registry is the same object either way.

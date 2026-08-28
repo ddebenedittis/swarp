@@ -5,6 +5,16 @@ radius ``formation_radius`` centred at a per-env point. The reward is
 position-shaping toward the assigned slot (``(prev_dist - dist) * factor``, the
 same shaping NavigationScenario uses) plus a soft collision penalty, so the team
 converges onto — and holds — the shape.
+
+**Scaling.** The observation itself is only 6 wide (own pos, own vel, goal-relative
+vector) and costs O(1) per agent — nothing inter-agent goes into it. What is
+**O(n_agents^2)** is the *touching count* the obs pass computes alongside it, on both
+paths: an all-pairs scan rather than a walk of the neighbor list, feeding the collision
+term of the reward. That is deliberate: the fused path exists to match the torch parity
+oracle bit-for-bit, and the neighbor list is truncated at ``max_neighbors``, so reading it
+would make the two paths disagree by construction whenever the list overflowed. The
+quadratic term is the price of that guarantee — fine at the tens-of-agents this scenario is
+written for, and worth knowing about before pushing ``n_agents`` into the hundreds.
 """
 
 from __future__ import annotations
@@ -15,10 +25,18 @@ from typing import Any
 import torch
 import warp as wp
 
+from swarp._overloads import concrete
+from swarp.core.cached_launch import CachedLaunch, ptr_key
 from swarp.core.config import WorldConfig
+from swarp.core.state import VEC2
 from swarp.core.world import World
 from swarp.dynamics.base import AgentConfig, ControlMode, DynamicsModel
-from swarp.scenarios.formation_kernels import formation_obs_kernel, formation_reward_kernel
+from swarp.interop.autograd import torch_stream_scope
+from swarp.scenarios.formation_kernels import (
+    formation_obs_kernel,
+    formation_reset_kernel,
+    formation_reward_kernel,
+)
 from swarp.scenarios.fused import Buf, FusedPass, FusedScenario
 
 
@@ -43,7 +61,7 @@ class FormationScenario(FusedScenario):
         self.collision_penalty = collision_penalty
         self.goal_tolerance = goal_tolerance if goal_tolerance is not None else 2.0 * agent_radius
 
-    def make_world(self, n_envs, device, dt, substeps, dtype) -> World:
+    def make_world(self, n_envs, device, dt, substeps, dtype, world_config=None) -> World:
         cfgs = [
             AgentConfig(
                 model=DynamicsModel.HOLONOMIC,
@@ -63,7 +81,7 @@ class FormationScenario(FusedScenario):
             bounds_mode="soft",
             neighbor_radius=reach,
             max_neighbors=min(32, max(4, self.n_agents)),
-        )
+        ).override_with(world_config)
         self.world = World(
             cfgs, cfg, n_envs=n_envs, device=device, dt=dt, substeps=substeps, dtype=dtype
         )
@@ -74,6 +92,8 @@ class FormationScenario(FusedScenario):
         self._slot_offsets = self.formation_radius * torch.stack(
             [torch.cos(ang), torch.sin(ang)], dim=-1
         )  # [n_agents, 2]
+        # Warp view of the fixed slot offsets, built once for the reset kernel.
+        self._slot_offsets_wp = None
         # Left None so the first refresh seeds the shaping baseline from the spawn
         # distance (shaping 0) rather than from zeros; the fused spec adopts it with
         # alloc="if_none". The torch path reassigns it, which watch=True catches.
@@ -81,6 +101,10 @@ class FormationScenario(FusedScenario):
         self._cache: dict[str, torch.Tensor] | None = None
         # Allocated here, not in reset_world, so the fused spec can adopt the slots.
         self.world.goals = torch.zeros(n_envs, self.n_agents, 2, device=device, dtype=dtype)
+        # Cached, repack-once launches for the eager reset path — see
+        # swarp/core/cached_launch.py.
+        self._reset_launch = CachedLaunch()
+        self._obs_launch = CachedLaunch()
         return self.world
 
     @property
@@ -90,19 +114,61 @@ class FormationScenario(FusedScenario):
     def reset_world(
         self, env_mask: torch.Tensor | None = None, *, obs_only: bool = False
     ) -> None:
+        """Masked reset in one Warp launch (see :mod:`swarp.scenarios.reset_kernels`)."""
         w = self.world
-        n = w.n_envs
         lim = self.world_size - 2.0 * self.agent_radius
-        spawn = w.sample_uniform((n, self.n_agents, 2), -lim, lim)
         # Formation centre kept within bounds so all slots stay inside the world.
         clim = max(0.0, self.world_size - self.formation_radius - self.agent_radius)
-        center = w.sample_uniform((n, 1, 2), -clim, clim)
-        goals = center + self._slot_offsets.unsqueeze(0)  # [n_envs, n_agents, 2]
-        w.write_state(env_mask, pos=spawn, vel=0.0)
-        if env_mask is None:
-            w.goals.copy_(goals)
+        mask, use_mask = self.reset_mask_wp(env_mask)
+        if self._slot_offsets_wp is None:
+            self._slot_offsets_wp = wp.from_torch(
+                self._slot_offsets.contiguous(), dtype=VEC2[w.wp_dtype]
+            )
+        st = w.state_wp()
+        scalar = w.wp_dtype
+        if self.fused_active:
+            # Reuse the fused spec's cached, pointer-resynced handle instead of
+            # re-wrapping ``world.goals`` on every reset (see navigation's
+            # ``_launch_reset`` for the same fix and its rationale).
+            self.ensure_fused()
+            self.sync_fused_handles()
+            goals = self._wp["goals"]
         else:
-            w.goals.copy_(torch.where(env_mask.view(-1, 1, 1), goals, w.goals))
+            goals = wp.from_torch(w.goals.contiguous(), dtype=VEC2[scalar])
+        seed = wp.int32(w.next_kernel_seed())
+        with torch_stream_scope(w.device):
+            launch = self._reset_launch.get(
+                concrete(formation_reset_kernel, scalar),
+                dim=w.n_envs,
+                inputs=[
+                    mask,
+                    use_mask,
+                    seed,
+                    scalar(lim),
+                    scalar(clim),
+                    wp.int32(self.n_agents),
+                    self._slot_offsets_wp,
+                    st.pos,
+                    st.vel,
+                    goals,
+                ],
+                device=w.device,
+                key=(
+                    w.n_envs,
+                    ptr_key(mask),
+                    lim,
+                    clim,
+                    self.n_agents,
+                    ptr_key(self._slot_offsets_wp),
+                    ptr_key(st.pos),
+                    ptr_key(st.vel),
+                    ptr_key(goals),
+                ),
+            )
+            launch.set_param_by_name("use_mask", use_mask)
+            launch.set_param_by_name("seed", seed)
+            launch.launch()
+        w.mark_pos_dirty()
         self.finish_reset(env_mask, obs_only=obs_only)
 
     # ---------------------------------------- torch reference path (parity oracle)
@@ -133,23 +199,37 @@ class FormationScenario(FusedScenario):
         )
 
     def launch_fused(self, pass_: FusedPass) -> None:
-        """Obs, then reward — the reward only on a step (see NavigationScenario)."""
+        """Obs, then reward — the reward on every pass but an obs-only auto-reset.
+
+        Same rule as :meth:`~swarp.scenarios.navigation.NavigationScenario.launch_fused`:
+        ``full_pass=0`` (a mid-step auto-reset) keeps the reward/done already returned for
+        that transition, and a standalone reset recomputes them to match the torch oracle.
+        """
         self._launch_obs(advance_prev=pass_.advance_prev, full_pass=pass_.full_pass)
-        if pass_.is_step:
+        if pass_.full_pass:
             self._launch_reward()
 
     def _launch_obs(self, advance_prev: int, full_pass: int) -> None:
         w = self.world
         scalar = w.wp_dtype
         st = w.state_wp()
-        wp.launch(
-            formation_obs_kernel,
+        goals, resetmask = self._wp["goals"], self._wp["resetmask"]
+        obs, shaping, touch, dist, inform, prev = (
+            self._wp["obs"],
+            self._wp["shaping"],
+            self._wp["touch"],
+            self._wp["dist"],
+            self._wp["inform"],
+            self._wp["prev"],
+        )
+        launch = self._obs_launch.get(
+            concrete(formation_obs_kernel, self.world.wp_dtype),
             dim=(w.n_envs, self.n_agents),
             inputs=[
                 st.pos,
                 st.vel,
-                self._wp["goals"],
-                self._wp["resetmask"],
+                goals,
+                resetmask,
                 scalar((2.0 * self.agent_radius) ** 2),
                 scalar(self.goal_tolerance),
                 scalar(self.pos_shaping_factor),
@@ -157,23 +237,35 @@ class FormationScenario(FusedScenario):
                 wp.int32(advance_prev),
                 wp.int32(full_pass),
             ],
-            outputs=[
-                self._wp["obs"],
-                self._wp["shaping"],
-                self._wp["touch"],
-                self._wp["dist"],
-                self._wp["inform"],
-                self._wp["prev"],
-            ],
+            outputs=[obs, shaping, touch, dist, inform, prev],
             device=w.device,
-            record_tape=False,
+            key=(
+                w.n_envs,
+                self.n_agents,
+                ptr_key(st.pos),
+                ptr_key(st.vel),
+                ptr_key(goals),
+                ptr_key(resetmask),
+                self.agent_radius,
+                self.goal_tolerance,
+                self.pos_shaping_factor,
+                ptr_key(obs),
+                ptr_key(shaping),
+                ptr_key(touch),
+                ptr_key(dist),
+                ptr_key(inform),
+                ptr_key(prev),
+            ),
         )
+        launch.set_param_by_name("advance_prev", wp.int32(advance_prev))
+        launch.set_param_by_name("full_pass", wp.int32(full_pass))
+        launch.launch()
 
     def _launch_reward(self) -> None:
         w = self.world
         scalar = w.wp_dtype
         wp.launch(
-            formation_reward_kernel,
+            concrete(formation_reward_kernel, self.world.wp_dtype),
             dim=w.n_envs,
             inputs=[
                 self._wp["shaping"],

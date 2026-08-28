@@ -16,7 +16,13 @@ from swarp.render.overlays import DEFAULT_ENABLED, OVERLAYS
 from swarp.render.style import Style
 
 
-def _ensure_pygame():
+def ensure_pygame():
+    """Import pygame with the "install the viz extra" error, and init its font module.
+
+    Every render entry point has to go through this rather than importing pygame
+    directly — that is what keeps the core package free of a hard pygame dependency and
+    turns a missing extra into one actionable message.
+    """
     try:
         import pygame
     except ModuleNotFoundError as exc:  # pragma: no cover - exercised only without the extra
@@ -67,8 +73,13 @@ def draw_supersampled(pygame, target, factor: int, draw_fn) -> None:
         target.blit(pygame.transform.smoothscale(hi, (w, h)), (0, 0))
 
 
-def _bounds_from_geometry(g: RenderGeometry) -> tuple[float, float, float, float]:
-    """Fallback view box when the world has no bounds: fit all drawable points + a margin."""
+def bounds_from_geometry(g: RenderGeometry) -> tuple[float, float, float, float]:
+    """Fallback view box when the world has no bounds: fit all drawable points + a margin.
+
+    Callers pair it with the declared rectangle as
+    ``g.bounds or bounds_from_geometry(g)``, which is what a custom renderer or
+    :class:`~swarp.render.camera.Camera` construction needs for an unbounded world.
+    """
     pts = [g.pos]
     if g.goals is not None:
         pts.append(g.goals)
@@ -104,12 +115,12 @@ def render_frame(
     camera: Camera | None = None,
 ) -> np.ndarray:
     """Render one env to an ``(H, W, 3)`` uint8 RGB array, headless (no window)."""
-    pygame = _ensure_pygame()
+    pygame = ensure_pygame()
     width, height = size
     style = style or Style()
     enabled = DEFAULT_ENABLED if overlays is None else set(overlays)
     if camera is None:
-        bounds = geometry.bounds if geometry.bounds is not None else _bounds_from_geometry(geometry)
+        bounds = geometry.bounds if geometry.bounds is not None else bounds_from_geometry(geometry)
         camera = Camera(bounds, viewport=(0, 0, width, height))
 
     surface = pygame.Surface((width, height))

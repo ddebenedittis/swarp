@@ -12,7 +12,7 @@ import pygame
 from swarp.dynamics.base import DynamicsModel
 from swarp.render.geometry import RenderGeometry
 from swarp.render.input import ViewState
-from swarp.render.overlays import OVERLAYS, _get_font
+from swarp.render.overlays import OVERLAYS, get_font
 from swarp.render.style import Style
 
 
@@ -50,7 +50,7 @@ def draw_hud(
 ) -> None:
     """Top-left status: focus env, step, fps, pause flag, and active overlays."""
     clip = surface.get_clip()
-    font = _get_font(style.font_px(clip.height))
+    font = get_font(style.font_px(clip.height))
     header = f"env {state.focus_env}/{state.n_envs - 1}"
     if step is not None:
         header += f"   step {step}"
@@ -83,7 +83,7 @@ def draw_speed_badge(surface, state: ViewState, style: Style) -> int:
     if state.speed == 1.0:
         return 0
     clip = surface.get_clip()
-    font = _get_font(int(round(style.font_px(clip.height) * style.speed_badge_font_factor)))
+    font = get_font(int(round(style.font_px(clip.height) * style.speed_badge_font_factor)))
     text = format_speed(state.speed)
     pad = style.hover_pad
     width = font.size(text)[0] + 2 * pad
@@ -101,7 +101,7 @@ def draw_help(surface, state: ViewState, style: Style, *, top_offset: int = 0) -
     if not state.show_help:
         return
     clip = surface.get_clip()
-    font = _get_font(style.font_px(clip.height))
+    font = get_font(style.font_px(clip.height))
     overlay_lines = [f"{o.key}: {o.name}" for o in OVERLAYS if o.key]
     lines = [
         "Controls",
@@ -150,7 +150,7 @@ def draw_reward_hud(surface, rewards, geometry: RenderGeometry, style: Style) ->
     pad = style.hover_pad
     width, height = style.reward_hud_size
     clip = surface.get_clip()
-    font = _get_font(style.font_px(clip.height))
+    font = get_font(style.font_px(clip.height))
     x = clip.right - width - style.hud_margin
     y = clip.bottom - height - style.hud_margin
     _blit_panel(pygame, surface, (x, y, width, height), style.hover_panel_bg, style)
@@ -191,7 +191,7 @@ def draw_hover_panel(
     """Bottom-left inspector for the hovered agent (read-only state)."""
     if agent_idx is None or agent_idx >= geometry.n_agents:
         return
-    font = _get_font(style.font_px(surface.get_height()))
+    font = get_font(style.font_px(surface.get_height()))
     p = geometry.pos[agent_idx]
     v = geometry.vel[agent_idx]
     speed = float((v[0] ** 2 + v[1] ** 2) ** 0.5)

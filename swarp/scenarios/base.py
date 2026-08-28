@@ -21,6 +21,7 @@ from typing import Any
 
 import torch
 
+from swarp.core.config import WorldConfig
 from swarp.core.hooks import WholeStepHook
 from swarp.core.world import World
 
@@ -53,7 +54,7 @@ class Scenario(ABC):
     # How far this scenario's fused path may legitimately differ from its torch reference
     # path on the same seeded trajectory. It is the *scenario* that knows why its two
     # paths differ, so the number lives here and both readers take it from here: the
-    # per-scenario benchmark's parity gate (``swarp.benchmark.ablation._parity_ok``, via
+    # per-scenario benchmark's parity gate (``swarp.benchmark.ablation.parity_ok``, via
     # ``swarp.benchmark.scenarios.run_config``) and the shared test harness
     # (``tests/conftest.py``'s ``FusedSpec``). A second hardcoded table is what this
     # replaces — the CLI's flat 1e-5 reported push-t as a parity failure for a difference
@@ -85,6 +86,7 @@ class Scenario(ABC):
         dt: float,
         substeps: int,
         dtype: torch.dtype,
+        world_config: WorldConfig | None = None,
     ) -> World:
         """Build and return the World (agents, limits, interaction config).
 
@@ -92,6 +94,17 @@ class Scenario(ABC):
         sets, coverage latches, body state. ``n_envs`` is known here, so nothing needs
         a lazy ``if self.x is None`` branch inside ``reset_world`` (which runs on the
         per-step auto-reset path).
+
+        ``world_config`` is the caller's engine override, forwarded by
+        :class:`~swarp.core.environment.Environment` and :func:`swarp.make`. An
+        implementation computes its own :class:`~swarp.core.config.WorldConfig` from its
+        scenario parameters as usual and then ends with
+        ``.override_with(world_config)`` — that one call is the whole contract, and it
+        is what makes engine settings a scenario does not expose (``integrator``,
+        ``bounds_mode``, ``neighbor_reuse``, ``grid_dim``, ``uniform_bins``, the
+        obstacle damping) reachable without subclassing. See
+        :meth:`~swarp.core.config.WorldConfig.override_with` for the merge rule; a test
+        pins that all seven built-ins honour it.
         """
 
     @abstractmethod

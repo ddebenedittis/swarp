@@ -1,4 +1,4 @@
-"""VMAS adapter: reuses the ``_make_vmas`` navigation builder from ``compare_vmas``.
+"""VMAS adapter: reuses the ``make_vmas`` navigation builder from ``compare_vmas``.
 
 ``collisions`` toggles VMAS's coupled collisions+lidar:
 
@@ -14,7 +14,7 @@
 from __future__ import annotations
 
 from swarp.benchmark._adapters import Runner, make_torch_runner
-from swarp.benchmark.compare_vmas import _make_vmas
+from swarp.benchmark.compare_vmas import make_vmas
 
 
 def build(
@@ -22,5 +22,5 @@ def build(
 ) -> Runner:
     if scenario != "navigation":
         raise ValueError(f"vmas adapter only implements 'navigation', got {scenario!r}")
-    env, step = _make_vmas(n_envs, n_agents, device, collisions=collisions)
+    env, step = make_vmas(n_envs, n_agents, device, collisions=collisions)
     return make_torch_runner(env, step, n_envs, len(env.agents), device)

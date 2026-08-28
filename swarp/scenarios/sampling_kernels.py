@@ -22,7 +22,9 @@ from typing import Any
 
 import warp as wp
 
+from swarp._overloads import register
 from swarp.core.state import VEC2
+from swarp.scenarios.reset_kernels import _as
 
 
 @wp.func
@@ -160,6 +162,65 @@ def _scatter_signature(dtype) -> list:
     ]
 
 
+
+@wp.kernel
+def sampling_reset_kernel(
+    reset_mask: wp.array(dtype=wp.uint8),
+    use_mask: wp.int32,
+    seed: wp.int32,
+    lim: Any,
+    alim: Any,
+    n_agents: wp.int32,
+    n_aux: wp.int32,
+    n_flags: wp.int32,
+    pos: Any,
+    vel: Any,
+    centers: Any,
+    consumed: wp.array2d(dtype=wp.uint8),
+):
+    """Masked episode reset: uniform spawns, zero velocity, fresh centers, cleared
+    ``consumed``.
+
+    ``consumed`` is the sampled-cell grid; a fresh episode starts with nothing consumed.
+    """
+    e = wp.tid()
+    if use_mask == 1 and reset_mask[e] == wp.uint8(0):
+        return
+    rng = wp.rand_init(seed, e)
+    zero = _as(0.0, lim)
+    two = _as(2.0, lim)
+    one = _as(1.0, lim)
+    for a in range(n_agents):
+        px = (_as(wp.randf(rng), lim) * two - one) * lim
+        py = (_as(wp.randf(rng), lim) * two - one) * lim
+        pos[e, a] = wp.vector(px, py)
+        vel[e, a] = wp.vector(zero, zero)
+    for i in range(n_aux):
+        tx = (_as(wp.randf(rng), alim) * two - one) * alim
+        ty = (_as(wp.randf(rng), alim) * two - one) * alim
+        centers[e, i] = wp.vector(tx, ty)
+    for i in range(n_flags):
+        consumed[e, i] = wp.uint8(0)
+
+
+def _reset_signature(dtype) -> list:
+    a2v = wp.array2d(dtype=VEC2[dtype])
+    return [
+        wp.array(dtype=wp.uint8),  # reset_mask
+        wp.int32,  # use_mask
+        wp.int32,  # seed
+        dtype,  # lim
+        dtype,  # alim
+        wp.int32,  # n_agents
+        wp.int32,  # n_aux
+        wp.int32,  # n_flags
+        a2v,  # pos
+        a2v,  # vel
+        a2v,  # centers
+        wp.array2d(dtype=wp.uint8),  # consumed
+    ]
+
 for _T in (wp.float32, wp.float64):
-    wp.overload(sampling_obs_reward_kernel, _obs_reward_signature(_T))
-    wp.overload(sampling_scatter_kernel, _scatter_signature(_T))
+    register(sampling_obs_reward_kernel, _T, _obs_reward_signature(_T))
+    register(sampling_scatter_kernel, _T, _scatter_signature(_T))
+    register(sampling_reset_kernel, _T, _reset_signature(_T))

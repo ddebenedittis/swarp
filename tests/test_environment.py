@@ -1,10 +1,12 @@
 """Environment + NavigationScenario API behavior."""
 
+import warnings
+
 import pytest
 import torch
 from conftest import DEVICES
 
-from swarp import DynamicsModel, Environment, NavigationScenario
+from swarp import DynamicsModel, Environment, NavigationScenario, WorldConfig
 
 
 def make_env(device, n_envs=8, n_agents=3, **kw):
@@ -34,10 +36,12 @@ def test_api_shapes_and_devices(device):
     assert obs.dtype == torch.float32
 
     actions = torch.zeros(8, 3, 2, device=device)
-    obs, rew, done, info = env.step(actions)
+    obs, rew, term, trunc, info = env.step(actions)
     assert obs.shape[:2] == (8, 3)
     assert rew.shape == (8, 3) and rew.device.type == expected_dev
-    assert done.shape == (8,) and done.dtype == torch.bool and done.device.type == expected_dev
+    for flag in (term, trunc):
+        assert flag.shape == (8,) and flag.dtype == torch.bool
+        assert flag.device.type == expected_dev
     assert info["dist_to_goal"].shape == (8, 3)
     # obs layout: pos(2) vel(2) cos/sin/angvel(3) goal_rel(2) + 5*neighbor_obs
     assert obs.shape[2] == 9 + 5 * env.scenario.neighbor_obs
@@ -61,7 +65,7 @@ def test_reward_sign_toward_goal():
     pos = env.world.state.pos
     goal_dir = env.world.goals - pos
     actions = torch.nn.functional.normalize(goal_dir, dim=-1) * 0.5
-    _, rew, _, info = env.step(actions)
+    _, rew, *_, info = env.step(actions)
     # spawn separation is 3 radii, one 0.05-step can't create contact,
     # so reward = shaping only, and it must be positive for every agent
     assert (info["collisions"] == 0).all()
@@ -78,37 +82,56 @@ def test_collision_penalty_applied():
         env.scenario._prev_dist = (env.world.state.pos - env.world.goals).norm(dim=-1)
     actions = torch.tensor([[[0.5, 0.0], [-0.5, 0.0]]])
     # post-step distance = 0.16 - 2*0.05 = 0.06 < 2*radius = 0.1 -> touching
-    _, rew, _, info = env.step(actions)
+    _, rew, *_, info = env.step(actions)
     assert (info["collisions"][0] >= 1).all()
     # collision penalty (-1 each) dominates the small shaping term
     assert (rew[0] < -0.5).all()
 
 
-def test_done_on_goals_and_truncation():
+def test_terminated_on_goal_reach():
+    """Reaching the goals sets ``terminated`` and leaves ``truncated`` false."""
     env = make_env("cpu", n_envs=4, n_agents=2, world_size=1.0, max_steps=200)
     env.reset(seed=3)
-    done = None
+    term = trunc = None
     for _ in range(200):
         goal_dir = env.world.goals - env.world.state.pos
         actions = goal_dir.clamp(-1.0, 1.0) * 5.0  # P-controller, saturates at max_speed
-        _, _, done, _ = env.step(actions)
-        if bool(done.all()):
+        _, _, term, trunc, _ = env.step(actions)
+        if bool(term.all()):
             break
-    assert bool(done.all())
-    assert bool((env._step_count < 200).all())  # reached goals, not truncated
+    assert bool(term.all())
+    assert not bool(trunc.any())  # the task condition fired, not the time limit
+    assert bool((env._step_count < 200).all())
 
-    env2 = make_env("cpu", n_envs=2, n_agents=2, max_steps=5)
-    env2.reset(seed=1)
+
+def test_truncated_at_max_steps():
+    """A parked fleet never reaches its goals, so only ``truncated`` fires."""
+    env = make_env("cpu", n_envs=2, n_agents=2, max_steps=5)
+    env.reset(seed=1)
+    term = trunc = None
     for _ in range(5):
-        _, _, done, _ = env2.step(torch.zeros(2, 2, 2))
-    assert bool(done.all())
+        _, _, term, trunc, _ = env.step(torch.zeros(2, 2, 2))
+    assert bool(trunc.all())
+    assert not bool(term.any())  # the time limit is not a terminal state
+
+
+def test_truncated_all_false_without_max_steps():
+    """``max_steps=None`` reports a stable all-false ``truncated`` buffer."""
+    env = make_env("cpu", n_envs=3, n_agents=2)
+    env.reset(seed=0)
+    seen = set()
+    for _ in range(3):
+        _, _, _, trunc, _ = env.step(torch.zeros(3, 2, 2))
+        assert not bool(trunc.any()) and trunc.shape == (3,)
+        seen.add(id(trunc))
+    assert len(seen) == 1  # cached, not reallocated per step
 
 
 def test_differentiable_through_env():
     env = make_env("cpu", n_envs=2, n_agents=2)
     env.reset(seed=0)
     actions = torch.zeros(2, 2, 2, requires_grad=True)
-    obs, rew, done, _ = env.step(actions * 1.0)
+    obs, rew, *_ = env.step(actions * 1.0)
     loss = obs.square().sum() + rew.sum()
     loss.backward()
     assert actions.grad is not None
@@ -121,7 +144,7 @@ def test_nonholonomic_navigation_smoke(model):
     env = make_env("cpu", n_envs=4, n_agents=3, model=model)
     env.reset(seed=0)
     for _ in range(10):
-        obs, rew, done, _ = env.step(0.3 * torch.randn(4, 3, 2))
+        obs, rew, *_ = env.step(0.3 * torch.randn(4, 3, 2))
     assert torch.isfinite(obs).all() and torch.isfinite(rew).all()
 
 
@@ -154,13 +177,13 @@ def test_auto_reset_on_truncation(device):
     """auto_reset=True resets done envs in-place; step_count returns to zero."""
     env = make_env(device, n_envs=3, n_agents=2, max_steps=3, auto_reset=True)
     env.reset(seed=0)
-    done = None
+    trunc = None
     for _ in range(3):
-        _, _, done, _ = env.step(torch.zeros(3, 2, 2, device=device))
-    assert bool(done.all())  # truncated at max_steps
+        _, _, _, trunc, _ = env.step(torch.zeros(3, 2, 2, device=device))
+    assert bool(trunc.all())  # truncated at max_steps
     assert (env._step_count == 0).all()  # and auto-reset back to zero
     # keeps running afterwards
-    _, _, done2, _ = env.step(torch.zeros(3, 2, 2, device=device))
+    env.step(torch.zeros(3, 2, 2, device=device))
     assert (env._step_count == 1).all()
 
 
@@ -220,6 +243,33 @@ def test_default_step_outputs_alias_and_clone_outputs_snapshots(device):
 
 
 @pytest.mark.parametrize("device", DEVICES)
+def test_clone_outputs_also_clones_info(device):
+    """``info`` values are views into the scenario's fused buffers, exactly like obs and
+    reward, and the docs list them among the zero-copy returns the flag remedies. So the
+    flag has to cover them — it used to hand back the scenario's live dict."""
+    cloned = make_env(device, n_envs=4, n_agents=2, clone_outputs=True)
+    cloned.reset(seed=0)
+    act = torch.full((4, 2, cloned.act_dim), 0.5, device=device)
+    with torch.no_grad():
+        info = cloned.step(act)[4]
+        tensors = {k: v for k, v in info.items() if torch.is_tensor(v)}
+        assert tensors, "navigation reports info tensors; the check is vacuous without them"
+        snapshot = {k: v.clone() for k, v in tensors.items()}
+        cloned.step(act * -1.0)  # a different action, so the buffers really do move
+    for k, before in snapshot.items():
+        assert torch.equal(tensors[k], before), f"info[{k!r}] was not cloned"
+
+    # ...and without the flag they alias, which is the documented default.
+    aliased = make_env(device, n_envs=4, n_agents=2)
+    aliased.reset(seed=0)
+    with torch.no_grad():
+        live = {k: v for k, v in aliased.step(act)[4].items() if torch.is_tensor(v)}
+        snap = {k: v.clone() for k, v in live.items()}
+        aliased.step(act * -1.0)
+    assert any(not torch.equal(live[k], snap[k]) for k in snap)
+
+
+@pytest.mark.parametrize("device", DEVICES)
 def test_env_forwards_obs_dim_and_act_dim(device):
     env = make_env(device, n_envs=4, n_agents=3, neighbor_obs=2)
     assert env.obs_dim == env.scenario.obs_dim
@@ -247,3 +297,78 @@ def test_use_graph_auto_is_on_for_a_capturable_fused_scenario():
     # graph is not what the 2.5-5x in docs/benchmarks.md measures.
     plain = make_env("cuda:0", n_envs=4, n_agents=2, fused=False)
     assert plain.world.runtime is None
+
+
+@pytest.mark.gpu(reason="the capture-eligibility gate only exists on CUDA")
+def test_auto_use_graph_does_not_warn_about_a_capture_nobody_asked_for():
+    """``"auto"`` gates on a hook and a CUDA device but *not* on the neighbor backend, so
+    the ``"grid"`` backend lands in eager persistent execution. That is the intended
+    outcome — eager persistent still beats the functional step — and warning about it
+    would scold the user for a default they never chose."""
+    cfg = WorldConfig(neighbor_method="grid")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        auto = make_env("cuda:0", n_envs=8, n_agents=2, world_config=cfg)
+    assert auto.world.runtime is not None  # persistent...
+    assert not auto.graph_mode  # ...but not captured
+
+    # An explicit request still warns: that caller demanded capture and did not get it.
+    with pytest.warns(UserWarning, match="CUDA-graph capture unavailable"):
+        asked = make_env("cuda:0", n_envs=8, n_agents=2, use_graph=True, world_config=cfg)
+    assert asked.world.runtime is not None and not asked.graph_mode
+
+
+def test_public_exports_are_importable_and_sorted():
+    """Every name in ``swarp.__all__`` resolves, and the list stays alphabetized.
+
+    The extension points in particular: ``Obstacles`` annotates the already-exported
+    ``ObstacleKind``/``ObstacleShape``, ``register_scenario`` is how an out-of-tree
+    scenario reaches ``swarp.make``, ``GradRing`` is documented in
+    ``docs/differentiability.md``, and ``drone_config`` builds the quadrotor's
+    ``AgentConfig``.
+    """
+    import swarp
+
+    for name in swarp.__all__:
+        assert hasattr(swarp, name), name
+    for name in ("Obstacles", "GradRing", "drone_config", "register_scenario"):
+        assert name in swarp.__all__
+    # Alphabetized in plain ASCII order (so the CONSTANTS precede the CamelCase names,
+    # which precede the lowercase functions) with __version__ pinned last.
+    names = [n for n in swarp.__all__ if n != "__version__"]
+    assert names == sorted(names)
+    assert swarp.__all__[-1] == "__version__"
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_close_is_idempotent_and_env_stays_usable(device):
+    """``close()`` releases the viewer and the captured graph, and is not a destructor."""
+    env = make_env(device, n_envs=4, n_agents=2)
+    env.reset(seed=0)
+    actions = torch.zeros(4, 2, 2, device=device)
+    env.step(actions)
+
+    env.close()
+    env.close()  # idempotent
+    assert env._viewer is None
+    if env.world.runtime is not None:
+        assert env.world.runtime._graph is None
+
+    # Still usable: the state and the buffers survived, so this just recaptures.
+    obs, rew, term, trunc, _ = env.step(actions)
+    assert torch.isfinite(obs).all() and torch.isfinite(rew).all()
+    assert term.shape == (4,) and trunc.shape == (4,)
+
+
+def test_cuda_device_without_cuda_fails_with_a_useful_message(monkeypatch):
+    """Asking for CUDA on a CPU-only install must say so at construction.
+
+    Without the check the failure surfaced much later and much deeper — inside Warp
+    device resolution or a torch allocation — with nothing pointing at the ``device=``
+    argument that caused it.
+    """
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    with pytest.raises(RuntimeError, match="CUDA is not available"):
+        Environment(NavigationScenario(n_agents=2), n_envs=2, device="cuda:0")
+    # ...and the CPU advice in that message is real.
+    Environment(NavigationScenario(n_agents=2), n_envs=2, device="cpu")
