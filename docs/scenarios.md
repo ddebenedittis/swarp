@@ -3,7 +3,7 @@
 A scenario defines the task: what the world is made of, how it resets, and what the agents observe and are rewarded for.
 The engine knows nothing about tasks — every built-in scenario is written against the same public `Scenario` ABC you would use for your own.
 
-## The seven built-ins
+## The ten built-ins
 
 | name | task | agents | `obs_dim` | notable |
 |---|---|---|---|---|
@@ -14,15 +14,55 @@ The engine knows nothing about tasks — every built-in scenario is written agai
 | `sampling` | collect an unknown scalar field, consuming cells | 4 | 13 | batched sum-of-Gaussians density on a grid; obs is the 3×3 cell neighborhood |
 | `transport` | push a movable circular package to a goal | 4 | 8 | package integrated in torch, staggered by one step, so BPTT flows package→agent→action |
 | `pusht` | push a T-shaped rigid body to a target **pose** | 4 | 18 | movable compound body with rotation; needs `substeps >= 8` |
+| `giveway` | cross a one-lane intersection without deadlocking | 4 | 16 | the only **non-monotone** task: solving it needs an agent to move *away* from its goal. Rigid contact (`contact_k=200000`, **`substeps >= 16`**) — softer and the walls stop being walls |
+| `caging` | surround a drifting disc so it cannot escape | 4 | 10 | reward is the largest **angular gap** around the disc, not a distance, plus a dense per-agent even-spacing term |
+| `shepherding` | drive fleeing sheep into a pen | 3 | 26 | 5 sheep, each running its own flee policy, so the environment pushes back |
 
 Defaults shown; every scenario takes constructor keywords (`n_agents`, `world_size`, shaping factors, penalties, tolerances).
-`navigation` and `flocking` size their observation from `neighbor_obs`, so their `obs_dim` moves with it.
+`navigation`, `flocking` and `giveway` size their observation from `neighbor_obs`, so their `obs_dim` moves with it;
+`shepherding`'s moves with `n_sheep`.
 
 ```{image} _static/flocking.png
 :alt: Flocking — 24 agents with the within-radius neighbor graph drawn
 :width: 75%
 :align: center
 ```
+
+## The three that are not monotone
+
+The first seven scenarios are all solved by closing a distance, which means a greedy policy that
+always reduces its own distance-to-goal does well on every one of them.
+`giveway`, `caging` and `shepherding` each break that in a different way, and each one needed a
+physics correction that only *training* exposed — the test suite was green either way.
+
+<video src="_static/giveway.webm" autoplay loop muted playsinline width="100%"
+       title="Give-way — four robots deadlocked at the junction of a plus-shaped one-lane corridor"></video>
+
+Give-way is the picture of the problem: four robots, each headed for the arm opposite its own,
+jammed at a junction one robot wide.
+Getting out requires one of them to *reverse into a side arm* and let another past, which is the
+one thing distance shaping actively punishes.
+The contact has to be rigid for any of that to be true — at Push-T's `contact_k=8000` a robot
+sinks a third of the way into a corner block, the corridor stops being one lane, and a greedy
+policy solves 100% of episodes by squeezing through walls.
+Stiffness alone is not enough either: a velocity-mode agent covers `max_speed * sub_dt` in the
+substep before contact can answer, which at `substeps=8` is half a radius and is why this
+scenario asks for **16**. At 16 the overlap measured over a crowded jam is exactly zero.
+
+<video src="_static/caging.webm" autoplay loop muted playsinline width="100%"
+       title="Caging — six agents closing a ring around a drifting disc, one gap still open"></video>
+
+Caging scores the *largest angular gap* in the ring of agents seen from the disc, so the objective
+is a shape rather than a distance, and the disc drifts out through whatever gap is left open.
+Note the gap still open at the upper right of the shot: that is the whole reward.
+
+<video src="_static/shepherding.webm" autoplay loop muted playsinline width="100%"
+       title="Shepherding — three shepherds driving fleeing sheep toward the pen marker"></video>
+
+Shepherding is the only scenario whose environment pushes back.
+The sheep are not agents and not cargo — they run their own flee policy, so a shepherd that
+charges straight in scatters the flock, and the sheep have to be slower than the shepherds or the
+task is quietly impossible.
 
 ## The registry
 

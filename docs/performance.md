@@ -85,7 +85,9 @@ Pass an explicit scalar pair (`action_low=-1.0, action_high=1.0`) if you want a 
 Downstream code written against `VmasEnv` needs the flat path here.
 :::
 
-[`examples/pusht_torchrl.py`](https://github.com/ddebenedittis/swarp/blob/main/examples/pusht_torchrl.py) is a full MAPPO training loop on top of it.
+[`examples/marl_train.py`](https://github.com/ddebenedittis/swarp/blob/main/examples/marl_train.py) is a full MAPPO training loop on top of it, scenario-generic: `--scenario <name>` off the registry, with episode length, substeps and the success metric held in one `Task` record per scenario.
+[`examples/marl_eval.py`](https://github.com/ddebenedittis/swarp/blob/main/examples/marl_eval.py) scores a checkpoint against a random baseline on the same seed and can render the rollout.
+[`examples/pusht_torchrl.py`](https://github.com/ddebenedittis/swarp/blob/main/examples/pusht_torchrl.py) is the older, heavily annotated Push-T-specific version of the same loop, kept as the worked example.
 
 ## Choosing a batch shape
 

@@ -88,7 +88,7 @@ The [quickstart](https://ddebenedittis.github.io/swarp/quickstart.html) walks th
 | [Environment](https://ddebenedittis.github.io/swarp/environment.html) | actions, returns, reset semantics, determinism |
 | [Dynamics models](https://ddebenedittis.github.io/swarp/dynamics.html) | the four models, heterogeneous fleets, domain randomization |
 | [World and contacts](https://ddebenedittis.github.io/swarp/world.html) | the contact law, obstacles, rigid bodies, neighbors, lidar |
-| [Scenarios](https://ddebenedittis.github.io/swarp/scenarios.html) | the seven built-in tasks |
+| [Scenarios](https://ddebenedittis.github.io/swarp/scenarios.html) | the ten built-in tasks |
 | [Writing a scenario](https://ddebenedittis.github.io/swarp/writing-a-scenario.html) | your own task, in torch and fused Warp kernels |
 | [Differentiability](https://ddebenedittis.github.io/swarp/differentiability.html) | gradients through the physics, and where they stop |
 | [Visualization](https://ddebenedittis.github.io/swarp/visualization.html) | viewer, overlays, video, notebooks |

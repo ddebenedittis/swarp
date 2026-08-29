@@ -5,6 +5,118 @@ All notable changes to `swarp`. Newest first. Nothing has been released yet — 
 
 ## Unreleased
 
+### Added
+
+- **Three scenarios that are not solved by monotone progress toward a goal.** All seven
+  existing scenarios reward closing a distance, so a greedy policy does well on every one of
+  them and none of them tests credit assignment, deadlock, or a non-metric objective. The
+  registry is now ten:
+
+  - `giveway` — four robots cross a one-lane intersection formed by four immovable corner
+    blocks. The corridor fits one robot, not two abreast, so the only feasible solution has a
+    robot back into a perpendicular arm and *give way* — it has to move away from its goal.
+    This is the repo's first negative-shaping task, and the first where deadlock is a real
+    outcome rather than something the geometry rules out. `shared_reward` defaults to `True`
+    here (navigation defaults it `False`): under per-agent shaping the yielding robot pays the
+    whole cost of a manoeuvre only the team benefits from. Needs the stiff contact
+    (`contact_k` 8000, `substeps >= 8`) — at the engine's default `collision_k=100` a
+    velocity-mode agent settles at a penetration several times its own radius and the corridor
+    walls stop being walls.
+  - `caging` — surround a disc that drifts away from the agents' mean bearing, so a cage that
+    is merely nearby does not hold it. The reward is topological rather than metric: the
+    largest angular gap in the ring of agents seen from the disc. Warp has no dynamically
+    sized register array, so the kernel computes the gap in the storage-free O(A^2) form
+    (`max_i min_j (b_j - b_i) mod 2*pi`) rather than sorting; wrap-around is then structural,
+    and one and two agents need no special case.
+  - `shepherding` — drive sheep into a pen. The sheep are not agents and not passive cargo:
+    they run their own flee policy, so this is the first scenario whose environment pushes
+    back, and a shepherd that charges straight in scatters the flock.
+
+  All three needed a physics or reward correction that only *training* surfaced, which is
+  worth recording because in each case the test suite was perfectly green either way:
+
+  - `giveway` inherited Push-T's `contact_k=8000`, at which a velocity-mode robot settles
+    **0.033 deep** into a corner block — two thirds of its own radius. Blocks that soft are
+    not one-lane geometry, and the symptom was that a greedy "drive straight at the goal"
+    policy solved **100%** of episodes by squeezing through robots and walls. At
+    `contact_k=50000` a robot stops short of the wall and the same greedy policy solves
+    **0%**. Pinned by `test_the_corridor_is_solid_and_one_lane`. Note penetration gets
+    *worse* with more substeps (the settling depth is `max_speed / (k * sub_dt)`), so
+    holding force has to come from `k`.
+  - `shepherding`'s per-shepherd flee forces summed without a bound, so three converging
+    shepherds accelerated a sheep to a measured **2.30** against their own top speed of
+    1.0 — the flock could never be cornered, and MAPPO plateaued at 7% penned. The summed
+    flee force is now capped, and sheep carry a top speed of `0.75 * max_speed`. Pinned by
+    `test_sheep_cannot_outrun_the_shepherds`.
+  - `caging`'s reward was `max_gap` alone, which is a *max*: only the two agents bordering
+    the widest gap get any gradient, so the policy optimized the easy radial term and
+    clumped. Training moved steadily *away* from a solve. A dense per-agent gap-variance
+    term now shapes toward the evenly spaced ring, which is the same configuration that
+    minimizes `max_gap`; `spacing_factor=0.0` recovers the old reward exactly.
+
+  Caging and shepherding own and integrate their bodies the way `transport` does, rather than
+  tagging them `ObstacleKind.MOVABLE`: the engine integrates a movable obstacle from contact
+  reaction alone, with no hook for an escape or flee force, it is skipped entirely on a taped
+  step, and an install carrying `kind=MOVABLE` reads `any_movable` back to the host, which is
+  not capture-safe. Sheep in particular are scenario-owned bodies rather than agents with
+  overridden actions, because nothing in the engine can intercept an action — `world.action`
+  is written after the only pre-physics hook fires.
+
+  Each is verified learnable by an actual MAPPO run, scored against a random policy on the
+  **same seed** (512 envs, `examples/marl_eval.py`). "solved" is the fraction of episodes that
+  ever reach the scenario's own termination condition.
+
+  :::{note}
+  These numbers were measured *before* give-way's contact was hardened
+  (`contact_k` 50k -> 200k, `substeps` 8 -> 16) and before `shepherding`'s default flock grew
+  from 2 sheep to 5. Both change the task, so both numbers will move — give-way's walls are
+  now genuinely solid, and shepherding with five sheep is harder than with two. They are kept
+  as the record of the runs that found the physics defects below; re-measure before quoting.
+  :::
+
+  | scenario | metric | policy | random |
+  |---|---|---|---|
+  | `caging` | episodes that close the cage | **0.994** | 0.125 |
+  | | max angular gap, start -> end | 2.81 -> **1.92** | 2.81 -> 5.30 |
+  | `shepherding` | sheep penned at episode end | **0.508** | 0.105 |
+  | | episodes penning the whole flock | **0.133** | 0.033 |
+  | `giveway` | distance to goal, start -> end | 1.77 -> **1.06** | 1.77 -> 1.45 |
+
+  Caging is solved and shepherding is clearly learned. Give-way is only *partially* learned:
+  the policy closes distance more than twice as fast as random but rarely completes the
+  crossing, which is unsurprising for the one task in the registry whose solution requires
+  moving away from the goal. It does solve during training at full corridor difficulty
+  (episode solve rate ~1.0 between iterations 400 and 2400 of one run) but PPO collapses
+  from there and does not recover, so it is honest to call it unfinished rather than solved.
+
+- **`examples/marl_train.py` / `examples/marl_eval.py` — MAPPO for any scenario.**
+  `--scenario <name>` off the registry; everything task-specific is one `Task` record
+  (episode length, substeps, scenario kwargs, which `info()` key is the headline success
+  metric, an optional gated curriculum). Logged metrics are discovered from the scenario's
+  own `info()` rather than hardcoded per scenario, so they cannot go stale. The eval script
+  scores a checkpoint against a random baseline **on the same seed** and can render the
+  rollout to a window or a video file. `examples/pusht_torchrl.py` and `pusht_eval.py` are
+  unchanged — they remain the worked, heavily annotated Push-T recipe.
+
+  Three defaults in it are load-bearing and were each paid for by a wasted run:
+
+  - **`normalize_advantage=True`.** Per-step rewards across the registry span two orders of
+    magnitude (shepherding ~0.06, caging ~7.5). Unnormalized, caging drove **~85% of
+    minibatches to a non-finite gradient** — the run skipped almost every update and looked
+    like a reward-design problem for a long time. With normalization its max angular gap
+    went 3.06 -> 1.50 in 300 iterations.
+  - **`policy_best.pt`, gated on full curriculum difficulty.** PPO collapses late and does
+    not recover: give-way held an episode solve rate near 1.0 from iteration 400 to 2400,
+    then fell to zero by 2800 and stayed there. Interval checkpointing saved the wreckage,
+    and that policy evaluated *worse than random*. The gate matters too — success peaks
+    while the curriculum is still easy, so an ungated tracker crowns an easy-stage policy
+    that solves nothing on the real task.
+  - **The curriculum gates on the fraction of finished episodes that ended in success**, not
+    on `terminated.mean()`. The latter is a per-*step* hazard rate: a task that always solves
+    on step 40 of a 300-step budget reports 0.025, which reads as a 2.5% success rate and is
+    really 100%. Give-way's curriculum consequently never left its easiest setting for an
+    entire 4000-iteration run.
+
 ### Performance
 
 - **Kernel overloads are resolved once, not per launch.** Every generic kernel was already

@@ -16,28 +16,34 @@ import inspect
 import warnings
 
 from swarp.scenarios.base import Scenario
+from swarp.scenarios.caging import CagingScenario
 from swarp.scenarios.discovery import DiscoveryScenario
 from swarp.scenarios.flocking import FlockingScenario
 from swarp.scenarios.formation import FormationScenario
 from swarp.scenarios.fused import Buf, FusedPass, FusedScenario
+from swarp.scenarios.giveway import GiveWayScenario
 from swarp.scenarios.navigation import NavigationScenario
 from swarp.scenarios.pusht import PushTScenario
 from swarp.scenarios.sampling import SamplingScenario
+from swarp.scenarios.shepherding import ShepherdingScenario
 from swarp.scenarios.transport import TransportScenario
 
 __all__ = [
     "SCENARIOS",
     # The two base classes a scenario author subclasses, and the fused vocabulary.
     "Buf",
+    "CagingScenario",
     "DiscoveryScenario",
     "FlockingScenario",
     "FormationScenario",
     "FusedPass",
     "FusedScenario",
+    "GiveWayScenario",
     "NavigationScenario",
     "PushTScenario",
     "SamplingScenario",
     "Scenario",
+    "ShepherdingScenario",
     "TransportScenario",
     "fused_scenarios",
     "make_scenario",
@@ -56,6 +62,9 @@ SCENARIOS: dict[str, type[Scenario]] = {
     "sampling": SamplingScenario,
     "transport": TransportScenario,
     "pusht": PushTScenario,
+    "giveway": GiveWayScenario,
+    "caging": CagingScenario,
+    "shepherding": ShepherdingScenario,
 }
 
 

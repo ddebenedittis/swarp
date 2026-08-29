@@ -34,6 +34,9 @@ SCENARIO_KWARGS = {
     "discovery": {"n_agents": 5, "n_targets": 4},
     "flocking": {"n_agents": 8},
     "formation": {"n_agents": 5},
+    "giveway": {"n_agents": 4},
+    "caging": {"n_agents": 4},
+    "shepherding": {"n_agents": 3, "n_sheep": 2},
 }
 
 
