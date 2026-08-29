@@ -91,6 +91,28 @@ All notable changes to `swarp`. Newest first. Nothing has been released yet — 
   shaping points the yielder the wrong way, but shaping telescopes to `d_spawn - d_final`, so
   a detour into a bay is fully refunded and the real cost of yielding is ~0.017 of discounting.
 
+- **The give-way priority token does not earn its place — the observation rebuild alone
+  solves the task.** Ablated over three seeds each way, `use_priority=False` against the
+  default, on a controlled A/B (the flag zeroes the token but keeps `obs_dim` at 40, so both
+  arms train an identically shaped network):
+
+  | | max difficulty | first iter at 1.0 | mean `episode_solve` at 1.0 | worst iter |
+  |---|---|---|---|---|
+  | token, seeds 0 / 1 / 7 | 1.000 / 1.000 / 1.000 | 265 / 263 / 255 | 0.9998 / 0.9995 / 0.9989 | 0.994 / 0.982 / 0.798 |
+  | **no token**, seeds 0 / 1 / 2 | 1.000 / 1.000 / 1.000 | 272 / 257 / 256 | 0.9996 / 0.9996 / 0.9990 | 0.985 / 0.974 / 0.990 |
+
+  Indistinguishable on every axis, and all three no-token policies evaluate at **1.000
+  solved against 0.000 random** on the held-out seed. So the symmetry argument that motivated
+  the token is real — a head-on pair's observations genuinely are a 180-degree rotation of
+  each other — but the travel-frame observation already breaks it, because the world-frame
+  travel axis carried in the row differs between the two robots. The token was solving a
+  problem the frame change had already solved.
+
+  Two things follow. `use_priority` stays but is now a documented no-op on the default 4-agent
+  task rather than a load-bearing mechanism, and the six runs incidentally settle the
+  reliability question: **6/6 reach full difficulty and hold `episode_solve` above 0.998**, so
+  give-way is not a lucky seed.
+
 - **The MAPPO harness was discarding 79% of its gradient updates.** `runs/giveway.log` ends
   with `skipped 50852` out of 64000, and still printed a plausible reward curve for 2000
   iterations — so the run read as a reward-design problem for its entire length. The cause was
