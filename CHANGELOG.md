@@ -5,6 +5,130 @@ All notable changes to `swarp`. Newest first. Nothing has been released yet — 
 
 ## Unreleased
 
+### Fixed
+
+- **Give-way and shepherding now train. Both were unlearnable for reasons a green test suite
+  could not see, and one of the two was not a tuning problem at all.**
+
+  Before: give-way's `all_on_goal` was **0.0000 for an entire 2000-iteration run** and
+  shepherding's `sheep_penned` crawled to 0.29 with `terminated` at 0.0016.
+
+  After, on `marl_eval`'s held-out seed 123, both against a random baseline on the same seed:
+
+  | scenario | metric | policy | random |
+  |---|---|---|---|
+  | `giveway` | episodes solved (all four on goal) | **1.000** | 0.000 |
+  | | distance to goal, start -> end | 1.775 -> **0.256** | 1.775 -> 1.450 |
+  | `shepherding` | episodes penning the whole flock | **1.000** | 0.002 |
+  | | sheep penned, start -> end | 0.071 -> **0.990** | 0.071 -> 0.057 |
+  | | whole flock penned, end | **0.955** | 0.002 |
+  | | flock radius, start -> end | 0.189 -> **0.107** | 0.189 -> 0.127 |
+  | | sheep distance to pen, start -> end | 0.539 -> **0.130** | 0.539 -> 0.547 |
+
+  Both halves of shepherding work rather than one: the flock radius falls (collect) *and*
+  the distance to the pen falls (drive). During training, once the curriculum reaches full
+  difficulty, give-way holds a mean `episode_solve` of **0.9989** over 1745 iterations and
+  shepherding **0.9929** over 2586, neither with a late collapse. These are two independent
+  runs at different seeds from the ones the design work was done on.
+
+  **Shepherding was geometrically impossible, not badly shaped.** The sheep's own
+  separation/cohesion equilibrium settles at a maximum radius of **0.198** — against a
+  `pen_radius` of **0.2**. Satisfying `all_penned` therefore meant placing the flock centroid
+  within **3 mm** in a world of half-extent 1.0, which is exactly the measured `terminated` of
+  0.0016. It is worse than that: the flee force is capped at 1.0 while cohesion is only
+  `0.5 * R ≈ 0.1`, so *any* shepherd inside `flee_radius` inflates the flock past the pen
+  **diameter** (three shepherds at radius 0.25 blow it out to 0.405). A scripted Strömbom
+  collect/drive controller solves **0%** of episodes at the shipped parameters. No reward
+  function can fix that. The geometry is now `pen_radius` 0.3, `sep_radius` 0.15 (which drops
+  the free-flock equilibrium to 0.150), 200-step episodes, and `done` requires the flock to
+  hold for 5 consecutive steps rather than pass through.
+
+  The spawn law was separately degenerate. Drawing each sheep at an independent angle on a
+  ring about the pen puts the flock *centroid on the pen* by symmetry, so once the pen was
+  enlarged **doing nothing solved 23%** — shepherding had accidentally become a gathering
+  task rather than a herding one. It now draws a flock centre at a distance from the pen and
+  scatters the sheep about that; do-nothing and random both drop to 0.00.
+
+  **Give-way's collision penalty was multiplying a structurally zero quantity.** `touching`
+  counts pairs closer than `2 * agent_radius`, but the contact spring activates at
+  `2r + margin` and `test_no_interpenetration_in_a_crowded_junction` asserts *exactly zero*
+  overlap at the shipped stiffness — so the `-1.0` coefficient could never fire, and
+  `collisions` logged 0.000000 for the whole run. What the policy actually felt was the
+  **wall** penalty: `-0.1 x 0.64 x 300 = -19.2` per agent per episode against a total
+  available shaping of 1.774, as a step function with no gradient, through a wall-free band
+  one sixth of the corridor wide. The policy was being taxed for existing in a corridor, and
+  it responded by learning to avoid the junction. Both penalties are now continuous ramps
+  over the contact-activation band; the discrete count and the binary flag survive as
+  `info()` metrics, where they are diagnostics rather than gradients.
+
+  Give-way's observation is rebuilt around the fact that **a head-on pair's observations are
+  an exact 180-degree rotation of each other**, so a shared-weight policy maps them to
+  rotated actions and both robots accelerate or both retreat. Observations are now in each
+  robot's own travel frame (which collapses the plus-shape's 4-fold symmetry the shared actor
+  was learning four times over, and makes distance-to-junction and lateral offset fall out
+  for free), plus the world-frame travel axis, corner-block clearance and analytic SDF normal,
+  the current corridor half-width, each neighbour's travel direction, and a per-episode
+  **priority token** drawn as a uniform random permutation. A permutation rather than i.i.d.
+  draws because a near-tie *is* the deadlock case, so i.i.d. tokens put a ceiling on the solve
+  rate that no amount of training removes. `obs_dim` 16 -> 40, and sensing is all-pairs: the
+  physics neighbour grid has left the observation path, since its radius (0.1125) meant a
+  robot could not see an opponent until they were almost touching.
+
+  Shepherding's observation gains what the Strömbom heuristic actually needs — flock centroid
+  and velocity, mean and max flock radius, the stray furthest from the centroid, and the
+  drive and collect points — plus, for the first time, the other shepherds. Three shepherds
+  that cannot see each other cannot form the arc the multi-shepherd literature is unanimous
+  about. `obs_dim` 26 -> 38.
+
+  Two reward-shape corrections worth recording. Shepherding paid `0.5 x penned_count` **every
+  step**, worth up to 375 per episode against a telescoped shaping total of 2.5 — a factor of
+  150, whose optimum is "park two sheep near the pen and stop", which is precisely the
+  observed signature of `sheep_penned` rising while `sheep_dist_to_pen` stayed flat. It is now
+  a potential on the count, bounded at 5 per episode, alongside a gather potential on the mean
+  flock radius (the "collect" half of Strömbom, previously absent) and a genuine terminal
+  bonus, which `done` had never carried. Give-way's `shared_reward: bool` becomes
+  `shaping_share: float` defaulting to 0.0: the docstring's argument for sharing was that
+  shaping points the yielder the wrong way, but shaping telescopes to `d_spawn - d_final`, so
+  a detour into a bay is fully refunded and the real cost of yielding is ~0.017 of discounting.
+
+- **The MAPPO harness was discarding 79% of its gradient updates.** `runs/giveway.log` ends
+  with `skipped 50852` out of 64000, and still printed a plausible reward curve for 2000
+  iterations — so the run read as a reward-design problem for its entire length. The cause was
+  an unbounded policy head: nothing clamped `loc`, so it saturated the `TanhNormal`, where a
+  boundary sample's log-prob diverges and its gradient vanishes. `_ClampScale` now bounds both
+  `loc` and `scale`, and the skip ratio is a first-class `metrics.csv` column that prints a
+  warning above 5%. Measured after: **0.000000 every iteration** on all four scenarios tried.
+
+  Also in the trainer, each paid for by one of the two dead runs:
+
+  - **Observation and value normalization** (`ObsNorm`, `ReturnScaler`). Observations mix
+    metres, radians and unit flags in one row and per-step rewards span two orders of
+    magnitude across the registry, under one shared `lr`. `ObsNorm` is the first layer of both
+    actor and critic, so its statistics ride in `state_dict` and `marl_eval` cannot evaluate
+    through a different transform than training used.
+  - **A curriculum that can go down.** The monotone ratchet stranded give-way at difficulty
+    0.472 for 1700 iterations and shepherding at 0.404, both reporting zero success
+    throughout, because a policy that regressed after one lucky early batch had no way back.
+  - **LR annealing and a KL cut-off on the epoch loop**, against the documented late collapse
+    (a give-way run held ~1.0 from iteration 400 to 2400, then fell to zero by 2800). `lr`
+    drops 1e-3 -> 3e-4.
+  - **Action bounds read from `Environment.action_bounds`** rather than a hardcoded +/-1,
+    which was correct only by coincidence of every task using `max_speed=1.0`.
+  - `marl_eval` was **executing a different policy than it trained**: `_greedy` returned
+    `loc.clamp(-1, 1)`, but the mode of a `TanhNormal` is `tanh(loc)`. Every eval number in
+    this file below predates that fix.
+
+  On the two scenarios that already worked, the new trainer is not a regression but a large
+  improvement: caging reaches `caged` **0.266 and holds** after 400 iterations on 256 envs,
+  against **0.0013** after 3000 iterations on 512 envs before.
+
+- **A scripted-expert feasibility test now runs in CI for both scenarios**, and this is the
+  process lesson rather than a code change. `test_a_scripted_shepherd_solves_most_episodes`
+  asserts a Strömbom controller clears 60% *and* that a do-nothing policy solves exactly 0;
+  give-way has the equivalent for a token-scheduled controller. Either would have reported, in
+  thirty seconds, what two multi-thousand-iteration runs took hours to fail to say — and in
+  shepherding's case would have caught a task that was impossible at any reward.
+
 ### Added
 
 - **Three scenarios that are not solved by monotone progress toward a goal.** All seven
@@ -82,12 +206,16 @@ All notable changes to `swarp`. Newest first. Nothing has been released yet — 
   | | episodes penning the whole flock | **0.133** | 0.033 |
   | `giveway` | distance to goal, start -> end | 1.77 -> **1.06** | 1.77 -> 1.45 |
 
-  Caging is solved and shepherding is clearly learned. Give-way is only *partially* learned:
-  the policy closes distance more than twice as fast as random but rarely completes the
-  crossing, which is unsurprising for the one task in the registry whose solution requires
-  moving away from the goal. It does solve during training at full corridor difficulty
-  (episode solve rate ~1.0 between iterations 400 and 2400 of one run) but PPO collapses
-  from there and does not recover, so it is honest to call it unfinished rather than solved.
+  Caging is solved and shepherding looks learned. Give-way is only *partially* learned: the
+  policy closes distance more than twice as fast as random but rarely completes the crossing.
+
+  **All three readings above are now known to be wrong**, and the "Fixed" section at the top
+  of this file has the corrected ones. The give-way conclusion blamed the task ("the one task
+  whose solution requires moving away from the goal") for what was an unbounded policy head
+  discarding 79% of its updates; shepherding's 0.508 was measured on a task whose terminal
+  condition was geometrically unreachable; and every number in this table was produced by an
+  eval that executed `loc.clamp(-1, 1)` where the policy's actual mode is `tanh(loc)`. The
+  table is left in place as the record of what the runs reported at the time.
 
 - **`examples/marl_train.py` / `examples/marl_eval.py` — MAPPO for any scenario.**
   `--scenario <name>` off the registry; everything task-specific is one `Task` record
