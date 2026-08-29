@@ -35,31 +35,53 @@ import torch
 
 # Same directory: Python puts the script's dir on sys.path, so this resolves when invoked as
 # `python examples/marl_eval.py` (the convention used across examples/).
-from marl_train import TASKS, Task, build_env, build_policy, info_keys
+from marl_train import TASKS, ObsNorm, Task, build_env, build_policy, info_keys
 from tensordict import TensorDict
 
 from swarp import Environment
 
 
 def _load(path: str, device: str):
+    """Rebuild the *exact* module the checkpoint was trained with.
+
+    Every field read here beyond the weights is load-bearing. The observation statistics
+    ride inside ``policy`` as ``ObsNorm`` buffers, but the module has to be built with an
+    ``ObsNorm`` in it for those keys to have anywhere to land -- and evaluating a policy
+    through a different observation transform than it trained under is evaluating a
+    different policy. Same for the action bounds: they set where the ``TanhNormal``'s
+    squash saturates, so they change what the greedy action *is*, not just its clipping.
+    """
     ckpt = torch.load(path, map_location=device, weights_only=True)
+    obs_dim = ckpt["obs_dim"]
+    low = float(ckpt.get("action_low", -1.0))
+    high = float(ckpt.get("action_high", 1.0))
     policy = build_policy(
-        ckpt["obs_dim"], ckpt["act_dim"], ckpt["n_agents"], device,
+        obs_dim, ckpt["act_dim"], ckpt["n_agents"], device,
         num_cells=ckpt.get("num_cells", 256),
+        action_low=low, action_high=high,
+        obs_norm=ObsNorm(obs_dim, device, enabled=ckpt.get("norm_obs", False)),
     )
     policy.load_state_dict(ckpt["policy"])
     policy.eval()
     return policy, ckpt
 
 
-def _greedy(policy, n_envs: int, device: str):
-    """``action_fn(obs) -> action`` using the distribution mean (no exploration noise)."""
+def _greedy(policy, n_envs: int, device: str, low: float = -1.0, high: float = 1.0):
+    """``action_fn(obs) -> action`` using the distribution's mode (no exploration noise).
+
+    The mode of a ``TanhNormal(loc, scale, low, high)`` is ``tanh(loc)`` mapped onto
+    ``[low, high]`` -- **not** ``loc``. Clamping the raw ``loc`` instead, which is what this
+    did, silently evaluates a different and systematically larger-magnitude policy than the
+    one that was trained: at ``loc = 0.5`` the trained mode is ``tanh(0.5) = 0.462`` and the
+    clamp hands the simulator ``0.5``. Every eval number in the CHANGELOG predates this fix.
+    """
+    mid, half = 0.5 * (high + low), 0.5 * (high - low)
 
     def action_fn(obs: torch.Tensor) -> torch.Tensor:
         td = TensorDict({"observation": obs}, batch_size=[n_envs], device=device)
         with torch.no_grad():
             policy(td)
-            return td.get("loc").clamp(-1.0, 1.0)
+            return mid + half * torch.tanh(td.get("loc"))
 
     return action_fn
 
@@ -72,7 +94,11 @@ def score(policy, name: str, task: Task, n_agents: int, n_envs: int, steps: int,
         sim = build_env(name, task, n_agents=n_agents, n_envs=n_envs, device=device, seed=seed)
         sim.reset(seed=seed)
         keys = info_keys(sim)
-        act = _greedy(policy, n_envs, device)
+        # Take the bounds off the env rather than a literal, so the greedy mode and the
+        # random baseline both live in the action space the kernels actually clamp to.
+        a_low, a_high = sim.action_bounds
+        low, high = float(a_low.min()), float(a_high.max())
+        act = _greedy(policy, n_envs, device, low, high)
         gen = torch.Generator(device=device).manual_seed(seed)
 
         solved = torch.zeros(n_envs, dtype=torch.bool, device=device)
@@ -86,7 +112,7 @@ def score(policy, name: str, task: Task, n_agents: int, n_envs: int, steps: int,
                 else:
                     a = torch.empty(
                         n_envs, n_agents, sim.act_dim, device=device
-                    ).uniform_(-1, 1, generator=gen)
+                    ).uniform_(low, high, generator=gen)
                 _, _, term, _, info = sim.step(a)
                 # Termination semantics: the episode would end at the first step the
                 # scenario reports success, so count envs that ever get there.
@@ -174,7 +200,8 @@ def main() -> None:
             seed=args.seed, max_steps=task.max_steps, auto_reset=True,
         )
         env.reset(seed=args.seed)
-        act = _greedy(policy, 1, args.device)
+        r_low, r_high = env.action_bounds
+        act = _greedy(policy, 1, args.device, float(r_low.min()), float(r_high.max()))
         n = args.render_steps
         step_rate = args.speed / task.dt  # sim steps per second of wall clock
         print(
