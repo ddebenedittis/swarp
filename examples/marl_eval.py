@@ -29,6 +29,7 @@ once while paused, ``r`` resets, ``?`` lists the rest.
 from __future__ import annotations
 
 import argparse
+import ast
 import csv
 
 import torch
@@ -162,6 +163,15 @@ def main() -> None:
     parser.add_argument("--speed", type=float, default=1.0, help="playback speed vs real time")
     parser.add_argument("--fps", type=int, default=60, help="frame rate of the window/video")
     parser.add_argument("--curve", help="metrics.csv to plot as ASCII curves")
+    parser.add_argument(
+        "--set", action="append", default=[], metavar="KEY=VALUE",
+        help="override a scenario constructor kwarg, mirroring marl_train's --set; "
+             "repeatable. Values are parsed as Python literals. A checkpoint trained under "
+             "an override MUST be evaluated under the same one -- the scenario is otherwise "
+             "a different task, and for a same-width override like give-way's "
+             "use_priority=False the policy still loads and silently scores against inputs "
+             "it never saw.",
+    )
     args = parser.parse_args()
 
     if args.curve:
@@ -177,6 +187,18 @@ def main() -> None:
     if name is None:
         parser.error("checkpoint has no 'scenario' field; pass --scenario explicitly")
     task = TASKS[name]
+    if args.set:
+        overrides = dict(task.scenario_kwargs)
+        for item in args.set:
+            key, _, raw = item.partition("=")
+            if not _:
+                parser.error(f"--set expects KEY=VALUE, got {item!r}")
+            overrides[key.strip()] = ast.literal_eval(raw)
+        task = Task(
+            n_agents=task.n_agents, max_steps=task.max_steps, substeps=task.substeps,
+            dt=task.dt, scenario_kwargs=overrides, success=task.success,
+            success_desc=task.success_desc, curriculum=task.curriculum,
+        )
     n_agents = ckpt["n_agents"]
     steps = args.steps or task.max_steps
 
