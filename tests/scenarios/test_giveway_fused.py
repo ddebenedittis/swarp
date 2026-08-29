@@ -29,6 +29,7 @@ SPEC = FusedSpec(
         "rew",
         "done",
         "info:collisions",
+        "info:proximity",
         "info:wall_contacts",
         "info:dist_to_goal",
         "info:on_goal",
@@ -40,6 +41,18 @@ SPEC = FusedSpec(
     action_seed=17,
 )
 
+
+#: Observation columns that are constant *by construction* and so are exempt from the
+#: non-vacuity sweep in :func:`test_fused_matches_torch`. Index 9 is ``c/r``, which only
+#: moves when the curriculum moves the corridor; the ``valid`` flag of every neighbour
+#: slot is always 1, because slots are chosen all-pairs and ``k_obs <= n_agents - 1``, so
+#: a slot can never go unfilled. Everything else has to actually vary over a rollout —
+#: with 40 columns and two independently written paths, a block silently zeroed in *both*
+#: would sail through ``assert_close``.
+def _constant_obs_cols(k_obs: int) -> set[int]:
+    return {9} | {13 + 9 * j + 8 for j in range(k_obs)}
+
+
 # Five agents in a small arena: two of them share an arm (ranks 0 and 1), which is what
 # puts agents within contact range of each other inside a five-step episode. A larger
 # world simply cannot be crossed at ``max_speed`` before the harness's auto-reset fires,
@@ -48,14 +61,17 @@ N_AGENTS = 5
 WORLD = 0.6
 
 
-def _env(device, fused, *, n_agents=N_AGENTS, shared_reward=True, neighbor_obs=2,
-         world_size=WORLD):
+def _env(
+    device, fused, *, n_agents=N_AGENTS, shaping_share=0.0, neighbor_obs=None, world_size=WORLD
+):
     scen = GiveWayScenario(
         n_agents=n_agents,
         world_size=world_size,
-        shared_reward=shared_reward,
+        shaping_share=shaping_share,
         neighbor_obs=neighbor_obs,
-        neighbor_method="brute",  # pin the backend so both paths see identical lists
+        # Physics only: the observation is all-pairs, so this no longer selects what the
+        # two paths see. Pinned anyway so the *contact* lists stay backend-independent.
+        neighbor_method="brute",
     )
     return fused_env(scen, device, fused, spec=SPEC)
 
@@ -65,19 +81,21 @@ def _run(env, n_steps, device, n_agents=N_AGENTS):
 
 
 @pytest.mark.parametrize("device", DEVICES)
-@pytest.mark.parametrize("shared_reward", [True, False])
-@pytest.mark.parametrize("neighbor_obs", [1, 3])
-def test_fused_matches_torch(device, shared_reward, neighbor_obs):
-    kw = dict(device=device, shared_reward=shared_reward, neighbor_obs=neighbor_obs)
+@pytest.mark.parametrize("shaping_share", [0.0, 0.5, 1.0])
+@pytest.mark.parametrize("neighbor_obs", [1, 3, 4])
+def test_fused_matches_torch(device, shaping_share, neighbor_obs):
+    kw = dict(device=device, shaping_share=shaping_share, neighbor_obs=neighbor_obs)
     fused = _run(_env(fused=True, **kw), 20, device)
     torchp = _run(_env(fused=False, **kw), 20, device)
     # The corridor must actually be felt, and the agents must actually meet — otherwise
-    # the box SDF and the neighbor loop are both untested by this rollout.
-    assert any(step[4].sum().item() > 0 for step in torchp), "no agent ever touched a block"
-    assert any(step[3].sum().item() > 0 for step in torchp), "no agent-agent contact"
+    # the box SDF and the contact ramps are both untested by this rollout. ``collisions``
+    # is the *discrete* pair count, which this stiff contact makes rare; ``proximity`` is
+    # the ramp the reward charges, and both have to fire for the rollout to mean anything.
+    assert any(step[5].sum().item() > 0 for step in torchp), "no agent ever touched a block"
+    assert any(step[4].sum().item() > 0 for step in torchp), "no agent-agent proximity"
     for t, (f, r) in enumerate(zip(fused, torchp, strict=True)):
-        of, rf, df, cf, wf, gf, ogf, fgf = f
-        ot, rt, dt_, ct, wt, gt, ogt, fgt = r
+        of, rf, df, cf, pf, wf, gf, ogf, fgf = f
+        ot, rt, dt_, ct, pt, wt, gt, ogt, fgt = r
         torch.testing.assert_close(of, ot, rtol=SPEC.rtol, atol=SPEC.atol, msg=f"obs@{t}")
         torch.testing.assert_close(rf, rt, rtol=SPEC.rtol, atol=SPEC.atol, msg=f"reward@{t}")
         assert torch.equal(df, dt_), f"done@{t}"
@@ -85,8 +103,21 @@ def test_fused_matches_torch(device, shared_reward, neighbor_obs):
         assert torch.equal(cf, ct), f"collisions@{t}"
         assert torch.equal(wf, wt), f"wall_contacts@{t}"
         assert torch.equal(ogf, ogt), f"on_goal@{t}"
+        torch.testing.assert_close(pf, pt, rtol=SPEC.rtol, atol=SPEC.atol, msg=f"prox@{t}")
         torch.testing.assert_close(gf, gt, rtol=SPEC.rtol, atol=SPEC.atol, msg=f"dist@{t}")
         torch.testing.assert_close(fgf, fgt, rtol=SPEC.rtol, atol=SPEC.atol, msg=f"frac@{t}")
+
+    # Non-vacuity: a column that is identically zero on *both* paths compares equal for
+    # free. With 40 columns and a hand-written kernel mirroring a hand-written oracle,
+    # that is the failure mode ``assert_close`` cannot see.
+    rows = torch.stack([step[0] for step in torchp])  # [T, n_envs, n_agents, obs_dim]
+    spread = rows.reshape(-1, rows.shape[-1]).std(dim=0)
+    k_obs = min(neighbor_obs, N_AGENTS - 1)
+    const = _constant_obs_cols(k_obs)
+    dead = [i for i in range(rows.shape[-1]) if i not in const and spread[i].item() == 0.0]
+    assert not dead, f"observation columns never varied over the rollout: {dead}"
+    for i in sorted(const):
+        assert spread[i].item() == 0.0, f"column {i} was expected to be constant"
 
 
 @pytest.mark.parametrize("device", DEVICES)
@@ -173,9 +204,7 @@ def test_the_corridor_is_solid_and_one_lane(device):
     because that is what the shipped defaults actually achieve.
     """
     scen = GiveWayScenario(n_agents=2)
-    env = Environment(
-        scen, n_envs=1, device=device, dt=0.05, substeps=16, seed=0, max_steps=None
-    )
+    env = Environment(scen, n_envs=1, device=device, dt=0.05, substeps=16, seed=0, max_steps=None)
     env.reset(seed=0)
     r, c = scen.agent_radius, scen.corridor_half_width
 
@@ -212,8 +241,7 @@ def test_the_corridor_is_solid_and_one_lane(device):
     y = env.world.state.pos[0, :, 1].abs()
     assert torch.isfinite(y).all()
     assert (y <= c - r + 1e-3).all(), (
-        f"robot sank into a corner block: |y|={y.tolist()} exceeds the wall at "
-        f"c - r = {c - r:.4f}"
+        f"robot sank into a corner block: |y|={y.tolist()} exceeds the wall at c - r = {c - r:.4f}"
     )
 
 
@@ -227,18 +255,16 @@ def test_no_interpenetration_in_a_crowded_junction(device):
     the floor there is the one-substep overshoot rather than the spring.
     """
     scen = GiveWayScenario(n_agents=8)
-    env = Environment(
-        scen, n_envs=16, device=device, dt=0.05, substeps=16, seed=0, max_steps=None
-    )
+    env = Environment(scen, n_envs=16, device=device, dt=0.05, substeps=16, seed=0, max_steps=None)
     env.reset(seed=0)
     r = scen.agent_radius
     gen = torch.Generator(device=device).manual_seed(3)
     worst_pair = worst_block = 0.0
     with torch.no_grad():
         for _ in range(200):
-            act = torch.empty(
-                16, 8, env.act_dim, device=device, dtype=env.dtype
-            ).uniform_(-1, 1, generator=gen)
+            act = torch.empty(16, 8, env.act_dim, device=device, dtype=env.dtype).uniform_(
+                -1, 1, generator=gen
+            )
             env.step(act)
             p = env.world.state.pos
             for i in range(8):
