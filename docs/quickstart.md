@@ -100,7 +100,7 @@ It reuses the neighbor lists `step` already built, so there is no rebuild — ju
 ## Where to go next
 
 - [Environment](environment.md) — the loop in detail: reset semantics, determinism, action layout.
-- [Scenarios](scenarios.md) — the seven built-in tasks and how to pick between them.
+- [Scenarios](scenarios.md) — the ten built-in tasks and how to pick between them.
 - [Writing a scenario](writing-a-scenario.md) — your own task, in torch and (optionally) fused Warp kernels.
 - [Differentiability](differentiability.md) — gradients through the physics.
 - [Visualization](visualization.md) — see what your agents are doing.

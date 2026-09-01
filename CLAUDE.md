@@ -80,15 +80,15 @@ TorchRL `EnvBase` wrapper).
 - `swarp/core/neighbors.py` — `NeighborGrid` with three backends (per-env brute force, a batched
   radix-sort `uniform_grid`, and one `wp.HashGrid` over all envs), selected via
   `WorldConfig.neighbor_method`; tested to agree exactly.
-- `swarp/scenarios/` — 7 scenarios: navigation, flocking, formation, discovery, sampling,
-  transport, pusht. Each pairs a torch implementation of obs/reward/done with fused Warp
-  `*_kernels.py` for the no-grad hot path. The torch path is the **parity oracle** the fused
+- `swarp/scenarios/` — 10 scenarios: navigation, flocking, formation, discovery, sampling,
+  transport, pusht, giveway, caging, shepherding. Each pairs a torch implementation of
+  obs/reward/done with fused Warp `*_kernels.py` for the no-grad hot path. The torch path is the **parity oracle** the fused
   kernels are tested against — keep them independent rather than sharing code.
-- `swarp/scenarios/fused.py` — `FusedScenario`, which all 7 subclass. A scenario declares its
+- `swarp/scenarios/fused.py` — `FusedScenario`, which all 10 subclass. A scenario declares its
   persistent buffers as a tuple of `Buf` from `fused_spec(n_envs)` and its launch sequence
   as `launch_fused(FusedPass)`; the framework owns lazy allocation, uint8→bool reinterpret
   views, Warp handle caching, pointer-move resync, the recapture token, the warm-up carry
-  list and the reset-mask stamp. **Zero opt-outs** — a test asserts all 7 implement the same
+  list and the reset-mask stamp. **Zero opt-outs** — a test asserts all 10 implement the same
   four members and override none of the framework's. `swarp/core/hooks.py` holds
   `WholeStepHook`, the declared form of what the scenario hands `StepRuntime`. Contract and
   capture-safety rules: `docs/writing-a-scenario.md`.

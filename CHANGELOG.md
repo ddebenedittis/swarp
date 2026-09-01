@@ -5,6 +5,268 @@ All notable changes to `swarp`. Newest first. Nothing has been released yet — 
 
 ## Unreleased
 
+### Fixed
+
+- **Give-way and shepherding now train. Both were unlearnable for reasons a green test suite
+  could not see, and one of the two was not a tuning problem at all.**
+
+  Before: give-way's `all_on_goal` was **0.0000 for an entire 2000-iteration run** and
+  shepherding's `sheep_penned` crawled to 0.29 with `terminated` at 0.0016.
+
+  After, on `marl_eval`'s held-out seed 123, both against a random baseline on the same seed:
+
+  | scenario | metric | policy | random |
+  |---|---|---|---|
+  | `giveway` | episodes solved (all four on goal) | **1.000** | 0.000 |
+  | | distance to goal, start -> end | 1.775 -> **0.256** | 1.775 -> 1.450 |
+  | `shepherding` | episodes penning the whole flock | **1.000** | 0.002 |
+  | | sheep penned, start -> end | 0.071 -> **0.990** | 0.071 -> 0.057 |
+  | | whole flock penned, end | **0.955** | 0.002 |
+  | | flock radius, start -> end | 0.189 -> **0.107** | 0.189 -> 0.127 |
+  | | sheep distance to pen, start -> end | 0.539 -> **0.130** | 0.539 -> 0.547 |
+
+  Both halves of shepherding work rather than one: the flock radius falls (collect) *and*
+  the distance to the pen falls (drive). During training, once the curriculum reaches full
+  difficulty, give-way holds a mean `episode_solve` of **0.9989** over 1745 iterations and
+  shepherding **0.9929** over 2586, neither with a late collapse. These are two independent
+  runs at different seeds from the ones the design work was done on.
+
+  **Shepherding was geometrically impossible, not badly shaped.** The sheep's own
+  separation/cohesion equilibrium settles at a maximum radius of **0.198** — against a
+  `pen_radius` of **0.2**. Satisfying `all_penned` therefore meant placing the flock centroid
+  within **3 mm** in a world of half-extent 1.0, which is exactly the measured `terminated` of
+  0.0016. It is worse than that: the flee force is capped at 1.0 while cohesion is only
+  `0.5 * R ≈ 0.1`, so *any* shepherd inside `flee_radius` inflates the flock past the pen
+  **diameter** (three shepherds at radius 0.25 blow it out to 0.405). A scripted Strömbom
+  collect/drive controller solves **0%** of episodes at the shipped parameters. No reward
+  function can fix that. The geometry is now `pen_radius` 0.3, `sep_radius` 0.15 (which drops
+  the free-flock equilibrium to 0.150), 200-step episodes, and `done` requires the flock to
+  hold for 5 consecutive steps rather than pass through.
+
+  The spawn law was separately degenerate. Drawing each sheep at an independent angle on a
+  ring about the pen puts the flock *centroid on the pen* by symmetry, so once the pen was
+  enlarged **doing nothing solved 23%** — shepherding had accidentally become a gathering
+  task rather than a herding one. It now draws a flock centre at a distance from the pen and
+  scatters the sheep about that; do-nothing and random both drop to 0.00.
+
+  **Give-way's collision penalty was multiplying a structurally zero quantity.** `touching`
+  counts pairs closer than `2 * agent_radius`, but the contact spring activates at
+  `2r + margin` and `test_no_interpenetration_in_a_crowded_junction` asserts *exactly zero*
+  overlap at the shipped stiffness — so the `-1.0` coefficient could never fire, and
+  `collisions` logged 0.000000 for the whole run. What the policy actually felt was the
+  **wall** penalty: `-0.1 x 0.64 x 300 = -19.2` per agent per episode against a total
+  available shaping of 1.774, as a step function with no gradient, through a wall-free band
+  one sixth of the corridor wide. The policy was being taxed for existing in a corridor, and
+  it responded by learning to avoid the junction. Both penalties are now continuous ramps
+  over the contact-activation band; the discrete count and the binary flag survive as
+  `info()` metrics, where they are diagnostics rather than gradients.
+
+  Give-way's observation is rebuilt around the fact that **a head-on pair's observations are
+  an exact 180-degree rotation of each other**, so a shared-weight policy maps them to
+  rotated actions and both robots accelerate or both retreat. Observations are now in each
+  robot's own travel frame (which collapses the plus-shape's 4-fold symmetry the shared actor
+  was learning four times over, and makes distance-to-junction and lateral offset fall out
+  for free), plus the world-frame travel axis, corner-block clearance and analytic SDF normal,
+  the current corridor half-width, each neighbour's travel direction, and a per-episode
+  **priority token** drawn as a uniform random permutation. A permutation rather than i.i.d.
+  draws because a near-tie *is* the deadlock case, so i.i.d. tokens put a ceiling on the solve
+  rate that no amount of training removes. `obs_dim` 16 -> 40, and sensing is all-pairs: the
+  physics neighbour grid has left the observation path, since its radius (0.1125) meant a
+  robot could not see an opponent until they were almost touching.
+
+  Shepherding's observation gains what the Strömbom heuristic actually needs — flock centroid
+  and velocity, mean and max flock radius, the stray furthest from the centroid, and the
+  drive and collect points — plus, for the first time, the other shepherds. Three shepherds
+  that cannot see each other cannot form the arc the multi-shepherd literature is unanimous
+  about. `obs_dim` 26 -> 38.
+
+  Two reward-shape corrections worth recording. Shepherding paid `0.5 x penned_count` **every
+  step**, worth up to 375 per episode against a telescoped shaping total of 2.5 — a factor of
+  150, whose optimum is "park two sheep near the pen and stop", which is precisely the
+  observed signature of `sheep_penned` rising while `sheep_dist_to_pen` stayed flat. It is now
+  a potential on the count, bounded at 5 per episode, alongside a gather potential on the mean
+  flock radius (the "collect" half of Strömbom, previously absent) and a genuine terminal
+  bonus, which `done` had never carried. Give-way's `shared_reward: bool` becomes
+  `shaping_share: float` defaulting to 0.0: the docstring's argument for sharing was that
+  shaping points the yielder the wrong way, but shaping telescopes to `d_spawn - d_final`, so
+  a detour into a bay is fully refunded and the real cost of yielding is ~0.017 of discounting.
+
+- **The give-way priority token does not earn its place — the observation rebuild alone
+  solves the task.** Ablated over three seeds each way, `use_priority=False` against the
+  default, on a controlled A/B (the flag zeroes the token but keeps `obs_dim` at 40, so both
+  arms train an identically shaped network):
+
+  | | max difficulty | first iter at 1.0 | mean `episode_solve` at 1.0 | worst iter |
+  |---|---|---|---|---|
+  | token, seeds 0 / 1 / 7 | 1.000 / 1.000 / 1.000 | 265 / 263 / 255 | 0.9998 / 0.9995 / 0.9989 | 0.994 / 0.982 / 0.798 |
+  | **no token**, seeds 0 / 1 / 2 | 1.000 / 1.000 / 1.000 | 272 / 257 / 256 | 0.9996 / 0.9996 / 0.9990 | 0.985 / 0.974 / 0.990 |
+
+  Indistinguishable on every axis, and all three no-token policies evaluate at **1.000
+  solved against 0.000 random** on the held-out seed. So the symmetry argument that motivated
+  the token is real — a head-on pair's observations genuinely are a 180-degree rotation of
+  each other — but the travel-frame observation already breaks it, because the world-frame
+  travel axis carried in the row differs between the two robots. The token was solving a
+  problem the frame change had already solved.
+
+  Two things follow. `use_priority` stays but is now a documented no-op on the default 4-agent
+  task rather than a load-bearing mechanism, and the six runs incidentally settle the
+  reliability question: **6/6 reach full difficulty and hold `episode_solve` above 0.998**, so
+  give-way is not a lucky seed.
+
+- **The MAPPO harness was discarding 79% of its gradient updates.** `runs/giveway.log` ends
+  with `skipped 50852` out of 64000, and still printed a plausible reward curve for 2000
+  iterations — so the run read as a reward-design problem for its entire length. The cause was
+  an unbounded policy head: nothing clamped `loc`, so it saturated the `TanhNormal`, where a
+  boundary sample's log-prob diverges and its gradient vanishes. `_ClampScale` now bounds both
+  `loc` and `scale`, and the skip ratio is a first-class `metrics.csv` column that prints a
+  warning above 5%. Measured after: **0.000000 every iteration** on all four scenarios tried.
+
+  Also in the trainer, each paid for by one of the two dead runs:
+
+  - **Observation and value normalization** (`ObsNorm`, `ReturnScaler`). Observations mix
+    metres, radians and unit flags in one row and per-step rewards span two orders of
+    magnitude across the registry, under one shared `lr`. `ObsNorm` is the first layer of both
+    actor and critic, so its statistics ride in `state_dict` and `marl_eval` cannot evaluate
+    through a different transform than training used.
+  - **A curriculum that can go down.** The monotone ratchet stranded give-way at difficulty
+    0.472 for 1700 iterations and shepherding at 0.404, both reporting zero success
+    throughout, because a policy that regressed after one lucky early batch had no way back.
+  - **LR annealing and a KL cut-off on the epoch loop**, against the documented late collapse
+    (a give-way run held ~1.0 from iteration 400 to 2400, then fell to zero by 2800). `lr`
+    drops 1e-3 -> 3e-4.
+  - **Action bounds read from `Environment.action_bounds`** rather than a hardcoded +/-1,
+    which was correct only by coincidence of every task using `max_speed=1.0`.
+  - `marl_eval` was **executing a different policy than it trained**: `_greedy` returned
+    `loc.clamp(-1, 1)`, but the mode of a `TanhNormal` is `tanh(loc)`. Every eval number in
+    this file below predates that fix.
+
+  On the two scenarios that already worked, the new trainer is not a regression but a large
+  improvement: caging reaches `caged` **0.266 and holds** after 400 iterations on 256 envs,
+  against **0.0013** after 3000 iterations on 512 envs before.
+
+- **A scripted-expert feasibility test now runs in CI for both scenarios**, and this is the
+  process lesson rather than a code change. `test_a_scripted_shepherd_solves_most_episodes`
+  asserts a Strömbom controller clears 60% *and* that a do-nothing policy solves exactly 0;
+  give-way has the equivalent for a token-scheduled controller. Either would have reported, in
+  thirty seconds, what two multi-thousand-iteration runs took hours to fail to say — and in
+  shepherding's case would have caught a task that was impossible at any reward.
+
+### Added
+
+- **Three scenarios that are not solved by monotone progress toward a goal.** All seven
+  existing scenarios reward closing a distance, so a greedy policy does well on every one of
+  them and none of them tests credit assignment, deadlock, or a non-metric objective. The
+  registry is now ten:
+
+  - `giveway` — four robots cross a one-lane intersection formed by four immovable corner
+    blocks. The corridor fits one robot, not two abreast, so the only feasible solution has a
+    robot back into a perpendicular arm and *give way* — it has to move away from its goal.
+    This is the repo's first negative-shaping task, and the first where deadlock is a real
+    outcome rather than something the geometry rules out. `shared_reward` defaults to `True`
+    here (navigation defaults it `False`): under per-agent shaping the yielding robot pays the
+    whole cost of a manoeuvre only the team benefits from. Needs the stiff contact
+    (`contact_k` 8000, `substeps >= 8`) — at the engine's default `collision_k=100` a
+    velocity-mode agent settles at a penetration several times its own radius and the corridor
+    walls stop being walls.
+  - `caging` — surround a disc that drifts away from the agents' mean bearing, so a cage that
+    is merely nearby does not hold it. The reward is topological rather than metric: the
+    largest angular gap in the ring of agents seen from the disc. Warp has no dynamically
+    sized register array, so the kernel computes the gap in the storage-free O(A^2) form
+    (`max_i min_j (b_j - b_i) mod 2*pi`) rather than sorting; wrap-around is then structural,
+    and one and two agents need no special case.
+  - `shepherding` — drive sheep into a pen. The sheep are not agents and not passive cargo:
+    they run their own flee policy, so this is the first scenario whose environment pushes
+    back, and a shepherd that charges straight in scatters the flock.
+
+  All three needed a physics or reward correction that only *training* surfaced, which is
+  worth recording because in each case the test suite was perfectly green either way:
+
+  - `giveway` inherited Push-T's `contact_k=8000`, at which a velocity-mode robot settles
+    **0.033 deep** into a corner block — two thirds of its own radius. Blocks that soft are
+    not one-lane geometry, and the symptom was that a greedy "drive straight at the goal"
+    policy solved **100%** of episodes by squeezing through robots and walls. At
+    `contact_k=50000` a robot stops short of the wall and the same greedy policy solves
+    **0%**. Pinned by `test_the_corridor_is_solid_and_one_lane`. Note penetration gets
+    *worse* with more substeps (the settling depth is `max_speed / (k * sub_dt)`), so
+    holding force has to come from `k`.
+  - `shepherding`'s per-shepherd flee forces summed without a bound, so three converging
+    shepherds accelerated a sheep to a measured **2.30** against their own top speed of
+    1.0 — the flock could never be cornered, and MAPPO plateaued at 7% penned. The summed
+    flee force is now capped, and sheep carry a top speed of `0.75 * max_speed`. Pinned by
+    `test_sheep_cannot_outrun_the_shepherds`.
+  - `caging`'s reward was `max_gap` alone, which is a *max*: only the two agents bordering
+    the widest gap get any gradient, so the policy optimized the easy radial term and
+    clumped. Training moved steadily *away* from a solve. A dense per-agent gap-variance
+    term now shapes toward the evenly spaced ring, which is the same configuration that
+    minimizes `max_gap`; `spacing_factor=0.0` recovers the old reward exactly.
+
+  Caging and shepherding own and integrate their bodies the way `transport` does, rather than
+  tagging them `ObstacleKind.MOVABLE`: the engine integrates a movable obstacle from contact
+  reaction alone, with no hook for an escape or flee force, it is skipped entirely on a taped
+  step, and an install carrying `kind=MOVABLE` reads `any_movable` back to the host, which is
+  not capture-safe. Sheep in particular are scenario-owned bodies rather than agents with
+  overridden actions, because nothing in the engine can intercept an action — `world.action`
+  is written after the only pre-physics hook fires.
+
+  Each is verified learnable by an actual MAPPO run, scored against a random policy on the
+  **same seed** (512 envs, `examples/marl_eval.py`). "solved" is the fraction of episodes that
+  ever reach the scenario's own termination condition.
+
+  :::{note}
+  These numbers were measured *before* give-way's contact was hardened
+  (`contact_k` 50k -> 200k, `substeps` 8 -> 16) and before `shepherding`'s default flock grew
+  from 2 sheep to 5. Both change the task, so both numbers will move — give-way's walls are
+  now genuinely solid, and shepherding with five sheep is harder than with two. They are kept
+  as the record of the runs that found the physics defects below; re-measure before quoting.
+  :::
+
+  | scenario | metric | policy | random |
+  |---|---|---|---|
+  | `caging` | episodes that close the cage | **0.994** | 0.125 |
+  | | max angular gap, start -> end | 2.81 -> **1.92** | 2.81 -> 5.30 |
+  | `shepherding` | sheep penned at episode end | **0.508** | 0.105 |
+  | | episodes penning the whole flock | **0.133** | 0.033 |
+  | `giveway` | distance to goal, start -> end | 1.77 -> **1.06** | 1.77 -> 1.45 |
+
+  Caging is solved and shepherding looks learned. Give-way is only *partially* learned: the
+  policy closes distance more than twice as fast as random but rarely completes the crossing.
+
+  **All three readings above are now known to be wrong**, and the "Fixed" section at the top
+  of this file has the corrected ones. The give-way conclusion blamed the task ("the one task
+  whose solution requires moving away from the goal") for what was an unbounded policy head
+  discarding 79% of its updates; shepherding's 0.508 was measured on a task whose terminal
+  condition was geometrically unreachable; and every number in this table was produced by an
+  eval that executed `loc.clamp(-1, 1)` where the policy's actual mode is `tanh(loc)`. The
+  table is left in place as the record of what the runs reported at the time.
+
+- **`examples/marl_train.py` / `examples/marl_eval.py` — MAPPO for any scenario.**
+  `--scenario <name>` off the registry; everything task-specific is one `Task` record
+  (episode length, substeps, scenario kwargs, which `info()` key is the headline success
+  metric, an optional gated curriculum). Logged metrics are discovered from the scenario's
+  own `info()` rather than hardcoded per scenario, so they cannot go stale. The eval script
+  scores a checkpoint against a random baseline **on the same seed** and can render the
+  rollout to a window or a video file. `examples/pusht_torchrl.py` and `pusht_eval.py` are
+  unchanged — they remain the worked, heavily annotated Push-T recipe.
+
+  Three defaults in it are load-bearing and were each paid for by a wasted run:
+
+  - **`normalize_advantage=True`.** Per-step rewards across the registry span two orders of
+    magnitude (shepherding ~0.06, caging ~7.5). Unnormalized, caging drove **~85% of
+    minibatches to a non-finite gradient** — the run skipped almost every update and looked
+    like a reward-design problem for a long time. With normalization its max angular gap
+    went 3.06 -> 1.50 in 300 iterations.
+  - **`policy_best.pt`, gated on full curriculum difficulty.** PPO collapses late and does
+    not recover: give-way held an episode solve rate near 1.0 from iteration 400 to 2400,
+    then fell to zero by 2800 and stayed there. Interval checkpointing saved the wreckage,
+    and that policy evaluated *worse than random*. The gate matters too — success peaks
+    while the curriculum is still easy, so an ungated tracker crowns an easy-stage policy
+    that solves nothing on the real task.
+  - **The curriculum gates on the fraction of finished episodes that ended in success**, not
+    on `terminated.mean()`. The latter is a per-*step* hazard rate: a task that always solves
+    on step 40 of a 300-step budget reports 0.025, which reads as a 2.5% success rate and is
+    really 100%. Give-way's curriculum consequently never left its easiest setting for an
+    entire 4000-iteration run.
+
 ### Performance
 
 - **Kernel overloads are resolved once, not per launch.** Every generic kernel was already

@@ -24,6 +24,9 @@ def test_registry_has_all_scenarios():
         "sampling",
         "transport",
         "pusht",
+        "giveway",
+        "caging",
+        "shepherding",
     }
 
 
