@@ -211,7 +211,7 @@ class FusedSpec:
 
 
 def fused_env(scenario, device, fused, *, spec, dtype=torch.float32):
-    """The ``Environment`` settings the seven ``*_fused`` parity suites share.
+    """The ``Environment`` settings the ``*_fused`` parity suites share.
 
     ``auto_reset=True`` with ``max_steps=5`` is deliberate and must stay: the parity
     rollouts are 10-20 steps long, so they cross several auto-resets and thereby pin

@@ -1,8 +1,8 @@
 """``FusedScenario``: the fused / CUDA-graph bookkeeping, owned once.
 
 A scenario with fused Warp obs/reward kernels needs the same six things, and before
-this module each of the seven built-ins hand-wrote all six (~200 lines apiece, plus a
-seventh hand-copied out of tree into ``render/demo.py``):
+this module every built-in hand-wrote all six (~200 lines apiece, plus one more
+hand-copied out of tree into ``render/demo.py``):
 
 1. lazy allocation of the persistent output buffers, once, at the real ``n_envs``;
 2. zero-copy ``uint8 -> bool`` reinterpret views, because a Warp kernel writes ``0/1``
@@ -24,7 +24,7 @@ signatures; a launch DSL would be a worse ``wp.launch`` with none of Warp's type
 checking), :meth:`~swarp.scenarios.base.Scenario.info` (the keys differ per scenario and
 half the entries are not buffers), and the torch reference paths — those are the
 **parity oracle** the fused kernels are tested against, so sharing code with them would
-weaken the exact property the seven parity suites exist to test.
+weaken the exact property the per-scenario parity suites exist to test.
 """
 
 from __future__ import annotations
@@ -106,7 +106,7 @@ class Buf:
 class FusedPass:
     """Which fused pass to launch — a step, or one of the two flavours of reset.
 
-    The three kernel flags the seven scenarios actually need are all derivable from
+    The three kernel flags the built-in scenarios actually need are all derivable from
     ``(kind, full)``, but *where* each puts them differs: navigation and formation carry
     them on the obs kernel, transport and pusht on the reward kernel, flocking and
     sampling only take ``full_pass``, and discovery takes neither — it reads ``full_pass``

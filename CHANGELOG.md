@@ -5,6 +5,90 @@ All notable changes to `swarp`. Newest first. Nothing has been released yet — 
 
 ## Unreleased
 
+### Added
+
+- **Three scenarios that break the assumptions the first seven share** — `giveway`,
+  `shepherding` and `caging`, bringing the registry to ten. Every one of the original seven
+  rewards monotone progress toward a goal, so a greedy "reduce the distance" controller does
+  well on all of them. These do not:
+
+  - **`giveway`** — four agents cross a one-lane intersection formed by four `IMMOVABLE`
+    `BOX` obstacles, each heading for the opposite arm. The corridor fits one agent, not two
+    abreast, so the passing bay is the *perpendicular arm* and the only feasible solution
+    requires an agent to move **away** from its own goal. Deadlock is a first-class outcome;
+    nothing in the repo could previously deadlock. Two details are load-bearing: the four
+    blocks are mirror-symmetric, so the wall gap is one box SDF at `(|x|, |y|)` rather than a
+    four-shape loop; and each agent observes a per-episode `politeness` scalar, without which
+    shared actor weights make two agents in mirror-image situations emit identical actions —
+    which in a one-lane corridor *is* deadlock. The blocks never move, so unlike
+    `navigation` this scenario also supports the in-graph reset.
+  - **`shepherding`** — dog agents drive non-cooperative sheep into a scored pen. The sheep
+    are scenario-owned obstacles with a flee/cohere/separate force, not agents, so the action
+    space stays dogs-only; the environment reacts to what the agents do, which no other
+    scenario does. `pen_walls=True` is reserved and raises.
+  - **`caging`** — a team surrounds an evasive disc. "Caged" is a *topological* condition —
+    the maximum angular gap between the agents' bearings, computed by an O(N^2) circular-min
+    identity rather than a sort (there is no per-thread local array in Warp without a
+    compile-time team-size cap), shaped through a log-sum-exp surrogate so every agent gets
+    gradient. Enclosure is also conjoined with a distance-from-wall predicate, because a disc
+    clamped into a corner is otherwise caged for free by two arena walls.
+
+  All three ship fused Warp obs/reward kernels parity-tested against an independently written
+  torch oracle, and all three emit `info()["multiobj_reward"]` so a shaping imbalance shows
+  up on the first training iteration. That check earned its keep immediately: `giveway`'s
+  first-cut wall penalty outweighed its position shaping 22x (wall contact is unavoidable in
+  a 1.5-diameter corridor, firing on 55% of agent-steps), which would have trained a policy
+  that stands still rather than crossing.
+
+- **A scenario-generic MAPPO trainer and evaluator**, `examples/train_mappo.py` and
+  `examples/eval_mappo.py`, over a shared `examples/mappo.py`. Replaces the Push-T-only
+  scripts (`git mv`, so the history explaining the non-obvious defaults survives);
+  `--scenario pusht` reproduces the published recipe, pinned by a test. Per-scenario
+  recipes live in one `SPECS` table, and `--scen-kwarg k=v` reaches any scenario constructor
+  keyword. `examples/` had no test coverage at all; it now has 39 tests including a
+  two-iteration end-to-end smoke run per scenario.
+
+### Fixed
+
+- **The training solve rate was not a solve rate.** The old trainer logged
+  `terminated.float().mean()` — a per-*step* termination fraction, smaller than the episode
+  solve rate by a factor of the episode length. It is replaced by a windowed
+  `sum(terminated) / sum(done)`, which is an unbiased estimate of the fraction of episode
+  *starts* that get solved (each env is a renewal process; differing episode lengths change
+  how many ends you observe, not the proportion marked). Reported blank during the warm-up
+  in which every env is still in its first episode.
+
+- **The Push-T curriculum was effectively ungated.** Its gate compared
+  `solved * max_steps > 0.35`; with the per-step fraction at 0.012 and `max_steps=400` the
+  left side was 4.8, so difficulty ramped 0 -> 1 on a fixed schedule regardless of
+  performance. The gate now reads the episode solve rate, which makes `curriculum_iters` a
+  floor on the ramp rather than a schedule — a stalled run holds its difficulty and shows a
+  flat `difficulty` column, which is the diagnostic. Note this means `--scenario pusht`
+  reproduces the published *recipe* but not the published *trajectory*.
+
+- **Advantages were unnormalized, and would have been pooled across agents.** torchrl's
+  `ClipPPOLoss` defaults `normalize_advantage` to `False`, and the old script left it there;
+  with a large sparse terminal bonus over small dense shaping this swings the effective step
+  size by orders of magnitude between iterations. Now on, with
+  `normalize_advantage_exclude_dims=(-2,)` so each agent's statistics stay independent
+  rather than being pooled over the team.
+
+- **A non-finite-gradient run no longer continues indefinitely.** The existing per-minibatch
+  NaN skip is kept, but skips are now reported per iteration, and a run that exceeds
+  `--max-skip-frac` for `--max-skip-iters` consecutive iterations saves a `_nan.pt` and
+  aborts nonzero instead of collecting nan reward for as long as it is left running.
+
+- **The random-action baseline sampled the wrong action box.** `pusht_eval.py` hardcoded a
+  `[-1, 1]^2` box; swarp actions are physical and the box differs per dynamics model (a
+  quadrotor under `[-1, 1]` cannot even reach hover). The evaluator now takes the box from
+  `env.action_bounds`, and the trainer asserts the actor's fixed `TanhNormal` range matches
+  it rather than silently throttling the policy.
+
+- **`giveway` agents spawned flush against the arena wall.** The outermost queue slot sat one
+  radius from the edge, so the agent's disc touched the boundary at t=0 — a spawn-time
+  contact under stiff contact and `bounds_mode="clamp"`. Now a full diameter.
+
+
 ### Performance
 
 - **Kernel overloads are resolved once, not per launch.** Every generic kernel was already

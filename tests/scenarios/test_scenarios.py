@@ -209,7 +209,7 @@ UNREACHABLE_OVERRIDE = WorldConfig(
 
 @pytest.mark.parametrize("name", sorted(REGISTRY))
 def test_every_scenario_honours_the_world_config_override(name):
-    """All seven must end make_world with ``.override_with(world_config)``.
+    """All ten must end make_world with ``.override_with(world_config)``.
 
     Nothing in the type system enforces that, and a scenario that quietly dropped the
     argument would leave its users back where they started: subclass or nothing.

@@ -42,11 +42,11 @@ Holonomic, differential drive, kinematic bicycle and a 6-DOF quadrotor — mixab
 Soft agent-agent contacts, circle/box/segment obstacles, and movable compound rigid bodies pushed by agent reaction forces.
 :::
 
-:::{grid-item-card} Seven scenarios
+:::{grid-item-card} Ten scenarios
 :link: scenarios
 :link-type: doc
 
-Navigation, flocking, formation, discovery, sampling, transport and Push-T — each with fused Warp obs/reward kernels.
+Navigation, flocking, formation, discovery, sampling, transport, Push-T, give-way, shepherding and caging — each with fused Warp obs/reward kernels.
 :::
 
 :::{grid-item-card} 24 M env-steps/s

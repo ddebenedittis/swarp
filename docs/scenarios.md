@@ -3,7 +3,7 @@
 A scenario defines the task: what the world is made of, how it resets, and what the agents observe and are rewarded for.
 The engine knows nothing about tasks — every built-in scenario is written against the same public `Scenario` ABC you would use for your own.
 
-## The seven built-ins
+## The ten built-ins
 
 | name | task | agents | `obs_dim` | notable |
 |---|---|---|---|---|
@@ -14,9 +14,17 @@ The engine knows nothing about tasks — every built-in scenario is written agai
 | `sampling` | collect an unknown scalar field, consuming cells | 4 | 13 | batched sum-of-Gaussians density on a grid; obs is the 3×3 cell neighborhood |
 | `transport` | push a movable circular package to a goal | 4 | 8 | package integrated in torch, staggered by one step, so BPTT flows package→agent→action |
 | `pusht` | push a T-shaped rigid body to a target **pose** | 4 | 18 | movable compound body with rotation; needs `substeps >= 8` |
+| `giveway` | cross a one-lane intersection without deadlocking | 4 | 25 | the only task whose solution requires moving *away* from your goal; a per-episode `politeness` scalar breaks the mirror symmetry that would otherwise force deadlock |
+| `shepherding` | drive non-cooperative sheep into a pen | 3 dogs + 5 sheep | 34 | the environment pushes back: sheep flee the dogs and cohere, so a dog must herd rather than chase |
+| `caging` | surround an evasive disc so it cannot escape | 5 | 23 | a *topological* objective — the maximum angular gap between agents, not any distance |
 
 Defaults shown; every scenario takes constructor keywords (`n_agents`, `world_size`, shaping factors, penalties, tolerances).
-`navigation` and `flocking` size their observation from `neighbor_obs`, so their `obs_dim` moves with it.
+`navigation`, `flocking` and `giveway` size their observation from `neighbor_obs`, so their `obs_dim` moves with it;
+`caging` and `shepherding` size theirs from the team (and, for `shepherding`, the flock), so theirs moves with `n_agents`/`n_sheep`.
+
+The last three are newer and break assumptions the first seven share.
+Every one of the original seven rewards monotone progress toward a goal, so a greedy "reduce the distance" controller does well on all of them;
+`giveway` cannot be solved that way (the greedy policy deadlocks nose-to-nose in the corridor), `caging` scores an angular property rather than a distance, and `shepherding` is the only one whose environment reacts to what the agents do.
 
 ```{image} _static/flocking.png
 :alt: Flocking — 24 agents with the within-radius neighbor graph drawn

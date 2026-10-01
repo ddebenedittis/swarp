@@ -6,13 +6,16 @@ import warp as wp
 from conftest import DEVICES
 
 from swarp import (
+    CagingScenario,
     DiscoveryScenario,
     Environment,
     FlockingScenario,
     FormationScenario,
+    GiveWayScenario,
     NavigationScenario,
     PushTScenario,
     SamplingScenario,
+    ShepherdingScenario,
     TransportScenario,
 )
 from swarp.core.config import WorldConfig
@@ -123,8 +126,14 @@ def test_matches_under_a_user_created_stream(use_graph):
         lambda n: SamplingScenario(n_agents=n),
         lambda n: TransportScenario(n_agents=n),
         lambda n: PushTScenario(n_agents=n),
+        lambda n: GiveWayScenario(n_agents=n),
+        lambda n: ShepherdingScenario(n_agents=n),
+        lambda n: CagingScenario(n_agents=n),
     ],
-    ids=["navigation", "flocking", "formation", "discovery", "sampling", "transport", "pusht"],
+    ids=[
+        "navigation", "flocking", "formation", "discovery", "sampling", "transport",
+        "pusht", "giveway", "shepherding", "caging",
+    ],
 )
 def test_graph_matches_eager_all_scenarios(scen_factory):
     # Regression: the physics graph may only bake in neighbor reuse when the

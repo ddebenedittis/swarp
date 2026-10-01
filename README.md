@@ -39,7 +39,7 @@ The whole step — dynamics, soft collisions, walls — also runs under Warp's a
 - **Four dynamics models** — holonomic point, differential drive, kinematic bicycle and a 6-DOF quadrotor, mixable per agent in one world. [→](https://ddebenedittis.github.io/swarp/dynamics.html)
 - **Soft contacts and rigid bodies** — spring-damper interactions against agents, circle/box/segment obstacles and walls, plus movable compound rigid bodies pushed by the reaction of those same contacts. [→](https://ddebenedittis.github.io/swarp/world.html)
 - **Neighbor search without a sync** — padded within-radius lists, an explicit overflow flag, a COO radius graph for GNN policies, and three interchangeable backends tested to agree exactly. [→](https://ddebenedittis.github.io/swarp/world.html#neighbor-search)
-- **Seven scenarios** — navigation, flocking, formation, discovery, sampling, transport and Push-T, each with fused Warp obs/reward kernels alongside the torch reference they are parity-tested against. [→](https://ddebenedittis.github.io/swarp/scenarios.html)
+- **Ten scenarios** — navigation, flocking, formation, discovery, sampling, transport, Push-T, give-way, shepherding and caging, each with fused Warp obs/reward kernels alongside the torch reference they are parity-tested against. [→](https://ddebenedittis.github.io/swarp/scenarios.html)
 - **Fast by default** — **24.1 M env-steps/s** at 16,000 envs × 16 agents on one RTX 3070 Laptop GPU from the fused Warp obs/reward kernels alone, with whole-step CUDA-graph capture (on by default) taking 16,384 × 16 to 35.6 M. [→](https://ddebenedittis.github.io/swarp/performance.html)
 - **Interactive viewer** — an optional pygame renderer with headless frames, mp4/webm export, notebook embedding, a batch mosaic and live overlay toggles. [→](https://ddebenedittis.github.io/swarp/visualization.html)
 
@@ -88,7 +88,7 @@ The [quickstart](https://ddebenedittis.github.io/swarp/quickstart.html) walks th
 | [Environment](https://ddebenedittis.github.io/swarp/environment.html) | actions, returns, reset semantics, determinism |
 | [Dynamics models](https://ddebenedittis.github.io/swarp/dynamics.html) | the four models, heterogeneous fleets, domain randomization |
 | [World and contacts](https://ddebenedittis.github.io/swarp/world.html) | the contact law, obstacles, rigid bodies, neighbors, lidar |
-| [Scenarios](https://ddebenedittis.github.io/swarp/scenarios.html) | the seven built-in tasks |
+| [Scenarios](https://ddebenedittis.github.io/swarp/scenarios.html) | the ten built-in tasks |
 | [Writing a scenario](https://ddebenedittis.github.io/swarp/writing-a-scenario.html) | your own task, in torch and fused Warp kernels |
 | [Differentiability](https://ddebenedittis.github.io/swarp/differentiability.html) | gradients through the physics, and where they stop |
 | [Visualization](https://ddebenedittis.github.io/swarp/visualization.html) | viewer, overlays, video, notebooks |

@@ -38,7 +38,7 @@ env = swarp.make(
 Only the fields you set **away from the `WorldConfig()` defaults** are applied, so the scenario keeps everything it computed (`WorldConfig.override_with` is the merge).
 The one case this cannot express is forcing a field *back* to its default against a scenario that changed it — build the scenario's `World` yourself for that.
 
-`Scenario.make_world` takes the same argument, and all seven built-ins honour it (a test pins that).
+`Scenario.make_world` takes the same argument, and all ten built-ins honour it (a test pins that).
 
 ## Soft contacts
 
