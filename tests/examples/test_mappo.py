@@ -134,7 +134,9 @@ def test_pusht_spec_reproduces_published_recipe():
     assert (s.n_envs, s.steps_per_batch, s.epochs, s.minibatches) == (512, 32, 8, 4)
     assert (s.lr, s.gamma, s.lmbda) == (5e-4, 0.99, 0.95)
     assert (s.entropy_coeff, s.num_cells, s.normalize_advantage) == (3e-3, 256, False)
-    assert dict(s.scen_kwargs) == {"pos_shaping_factor": 5.0, "rot_shaping_factor": 0.5}
+    assert dict(s.scen_kwargs) == {
+        "pos_shaping_factor": 5.0, "rot_shaping_factor": 0.5, "rot_away_penalty": 1.0,
+    }
     assert (s.curriculum_iters, s.curriculum_gate, s.iters) == (250, 0.0, 4000)
     assert s.metrics == ("tee_dist_to_goal", "tee_angle_error")
 

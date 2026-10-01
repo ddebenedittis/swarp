@@ -50,6 +50,22 @@ All notable changes to `swarp`. Newest first. Nothing has been released yet — 
 
 ### Fixed
 
+- **MAPPO training raced when two runs shared the GPU.** torchrl's `Collector` stepped
+  the env on a side CUDA stream of its own, while swarp orders its Warp launches against
+  torch's default stream. Alone a run was fine; with a second training on the GPU, a
+  solved Push-T policy fell from 0.98 to 0.05 training solve within 20 iterations. The
+  collector now gets `no_cuda_sync=True`, so the env and the training loop run on the
+  default stream, and the in-training eval's stream workaround is gone.
+
+- **Push-T teams spun the T and caught the goal heading on a later lap.** The wrapped
+  heading error refunds every full turn, so extra turns cost nothing, and four agents
+  sharing one policy torqued the T the same way from all sides: solved episodes turned
+  it 8-9 rad against the 1.6 needed. A new `rot_away_penalty` (off by default) charges
+  each radian the heading error grows, and the `pusht` recipe sets it to 1.0: both
+  training seeds now solve 0.99+ greedy at median step 44, turning the T ~2.6 rad. An
+  angular-speed penalty was tried first and does not work: it also charges the rotation
+  the task needs, and policies learned to stop pushing.
+
 - **The training solve rate was not a solve rate.** The old trainer logged
   `terminated.float().mean()` — a per-*step* termination fraction, smaller than the episode
   solve rate by a factor of the episode length. It is replaced by a windowed

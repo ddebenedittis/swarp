@@ -268,9 +268,16 @@ SPECS: dict[str, TrainSpec] = {
     # difficulty the position shaping carries the signal and both seeds climb, to a final
     # greedy 0.875 (seed 0) and 0.981 (seed 1). 2100 iters is too short for that: at iter
     # 2000 the two seeds were at 0.62 and 0.90 greedy.
+    #
+    # rot_away_penalty=1.0: the team learned to spin the T and catch the goal heading on
+    # a later lap (all agents torquing it the same way), since the wrapped heading error
+    # refunds every full turn. Solved episodes turned it 8-9 rad against 1.6 needed. With
+    # the cost, both seeds solve 0.99+ greedy at median step 44 and turn it ~2.6 rad.
     "pusht": TrainSpec(
         dt=0.05, substeps=8, max_steps=400, n_agents=4,
-        scen_kwargs={"pos_shaping_factor": 5.0, "rot_shaping_factor": 0.5},
+        scen_kwargs={
+            "pos_shaping_factor": 5.0, "rot_shaping_factor": 0.5, "rot_away_penalty": 1.0,
+        },
         iters=4000, n_envs=512, steps_per_batch=32, epochs=8, minibatches=4,
         lr=5e-4, entropy_coeff=3e-3, num_cells=256, normalize_advantage=False,
         curriculum=(

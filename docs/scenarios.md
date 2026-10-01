@@ -13,7 +13,7 @@ The engine knows nothing about tasks — every built-in scenario is written agai
 | `discovery` | cover scattered targets, each needing several agents nearby | 5 | 19 | one-off shared reward the step a target is first covered, plus optional per-agent closing speed on the nearest uncovered target (off by default) |
 | `sampling` | collect an unknown scalar field, consuming cells | 4 | 13 | batched sum-of-Gaussians density on a grid; obs is the 3×3 cell neighborhood |
 | `transport` | push a movable circular package to a goal | 4 | 8 | package integrated in torch, staggered by one step, so BPTT flows package→agent→action |
-| `pusht` | push a T-shaped rigid body to a target **pose** | 4 | 18 | movable compound body with rotation; needs `substeps >= 8` |
+| `pusht` | push a T-shaped rigid body to a target **pose** | 4 | 18 | movable compound body with rotation; needs `substeps >= 8`; optional cost on heading-error growth, so extra turns are not free (off by default) |
 | `giveway` | cross a one-lane intersection without deadlocking | 4 | 25 | the only task whose solution requires moving *away* from your goal; a per-episode `politeness` scalar breaks the mirror symmetry that would otherwise force deadlock |
 | `shepherding` | drive non-cooperative sheep into a pen | 3 dogs + 5 sheep | 34 | the environment pushes back: sheep flee the dogs and cohere, so a dog must herd rather than chase |
 | `caging` | surround an evasive disc so it cannot escape | 5 | 23 | a *topological* objective — the maximum angular gap between agents, not any distance |

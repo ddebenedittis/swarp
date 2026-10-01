@@ -267,6 +267,14 @@ def train(cfg: TrainConfig) -> Path:
         total_frames=frames_per_batch * spec.iters,
         device=device,
         auto_register_policy_transforms=True,
+        # Without this the collector steps the env, and runs the training-loop body, on a
+        # side CUDA stream of its own. swarp orders its Warp launches against torch's
+        # default stream, not a user-created one, so under GPU contention (two trainings
+        # sharing the GPU) the env raced: a solved Push-T policy fell from 0.98 to 0.05
+        # training solve within 20 iterations, and the in-training greedy eval misread
+        # solved checkpoints as 0.000. Everything here is on one device, so the syncs
+        # this also skips are no-ops.
+        no_cuda_sync=True,
     )
     buffer = ReplayBuffer(
         storage=LazyTensorStorage(frames_per_batch, device=device),
@@ -493,26 +501,12 @@ def train(cfg: TrainConfig) -> Path:
                 info_vals.append(f"{v.float().mean().item():.6f}")
 
         if cfg.eval_every and (it + 1) % cfg.eval_every == 0:
-            # The collector runs this loop body on its own CUDA stream, and a swarp env
-            # built and reset under a user-created stream races: the greedy eval came out
-            # 0.000 or 0.500 on checkpoints that eval_mappo.py (default stream) scores
-            # 1.000. So evaluate on the default stream, ordered against the side stream in
-            # both directions. (The training env is built before the collector exists, on
-            # the default stream, and stepping it on the side stream measured clean.)
-            on_cuda = device.startswith("cuda")
-            side = torch.cuda.current_stream(device) if on_cuda else None
-            default = torch.cuda.default_stream(device) if on_cuda else None
-            if on_cuda:
-                default.wait_stream(side)
-            with torch.cuda.stream(default):  # a no-op off CUDA (stream None)
-                res = score(
-                    cfg.scenario, policy=policy, n_agents=n_agents, n_envs=cfg.eval_envs,
-                    steps=spec.max_steps, device=device, seed=cfg.seed + 1_000,
-                    dt=spec.dt, substeps=spec.substeps, scen_kwargs=cfg.scen_kwargs,
-                    arms=("policy",),
-                )["policy"]
-            if on_cuda:
-                side.wait_stream(default)
+            res = score(
+                cfg.scenario, policy=policy, n_agents=n_agents, n_envs=cfg.eval_envs,
+                steps=spec.max_steps, device=device, seed=cfg.seed + 1_000,
+                dt=spec.dt, substeps=spec.substeps, scen_kwargs=cfg.scen_kwargs,
+                arms=("policy",),
+            )["policy"]
             eval_rate, (eval_lo, eval_hi) = res.solve_rate, res.ci
             print(
                 f"  eval @ iter {it + 1}: greedy solve {eval_rate:.3f} "
