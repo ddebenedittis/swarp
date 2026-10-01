@@ -217,36 +217,67 @@ UNTRAINABLE: dict[str, str] = {
 
 SPECS: dict[str, TrainSpec] = {
     "navigation": TrainSpec(
+        # 600 iters overtrained: greedy solve was 1.000 at iters 100-300, then the run
+        # collapsed at ~330 (stochastic solve 1.00 -> 0.26) and the final greedy policy
+        # fell to 0.69, with unsolved envs stuck at ~2 of 4 agents on goal and the rest
+        # ~1.3 away (a standoff only exploration noise breaks, not a near miss).
         dt=0.05, substeps=4, max_steps=200, n_agents=4,
-        iters=600, metrics=("dist_to_goal", "on_goal", "collisions"),
+        iters=250, metrics=("dist_to_goal", "on_goal", "collisions"),
     ),
     "formation": TrainSpec(
         dt=0.05, substeps=4, max_steps=200, n_agents=4,
         iters=800, metrics=("formation_error", "multiobj_reward"),
     ),
+    # The covering reward alone is too sparse: a random policy covers 0.45 of 5 targets
+    # per episode against a -3 time-penalty return, and spec-only runs plateaued at ~0.27
+    # solve. Progress shaping toward the nearest uncovered target supplies the gradient;
+    # the lighter collision penalty (-0.02, from run r1) is what those runs used.
     "discovery": TrainSpec(
         dt=0.05, substeps=4, max_steps=300, n_agents=4,
-        iters=1000, metrics=("covered_frac",),
+        scen_kwargs={"pos_shaping_factor": 1.0, "collision_penalty": -0.02},
+        iters=1000, n_envs=1024, metrics=("covered_frac",),
     ),
+    # A single agent can move the package (a scripted "get behind it and push" controller
+    # solves 93% with one agent), so this is not a physics problem. At the default
+    # shaping factor 1.0 a whole episode's shaping sums to ~0.9 (the mean spawn distance)
+    # against a 5.0 terminal bonus; 10.0 makes package progress the dominant signal.
     "transport": TrainSpec(
         dt=0.05, substeps=8, max_steps=300, n_agents=4,
+        scen_kwargs={"pos_shaping_factor": 10.0},
         iters=1500, metrics=("package_dist_to_goal",),
     ),
-    # Reproduces the published Push-T recipe exactly; pinned by
+    # The published Push-T recipe, with the changes below; pinned by
     # tests/examples/test_mappo.py::test_pusht_spec_reproduces_published_recipe.
     # The two shaping weights are not the scenario's defaults: per-step |dt angle| runs
     # ~8.7x |dt distance| under a random policy, so the raw 1.0/0.5 weights make the
     # (easier) rotation term dominate and the policy ignores position entirely.
+    #
+    # normalize_advantage=False is what the published script ran (torchrl's default). With
+    # the now-real curriculum gate, normalizing held difficulty at 0.000 for 1400+ iters
+    # (solve ~0.13-0.33 against a 0.35 gate); unnormalized, the gate opened and difficulty
+    # reached 1.0 by iter ~560. lr 5e-4, not 1e-3: at 1e-3 the run reached 0.64 greedy at
+    # full difficulty and then one update at iter 1079 blew the policy up (entropy
+    # -2.6 -> -0.4, solve 0.59 -> 0.06) with no recovery. At 5e-4 the ramp takes ~1200
+    # iters and the run ends at 0.71-0.75 greedy.
+    #
+    # curriculum_gate=0.0 (a fixed ramp to full difficulty by iter 250) and iters=4000.
+    # Difficulty 0 is not an easy version of the task: it is only the final precise
+    # placement, which a finished policy solves at 0.85 against 0.73 at full difficulty.
+    # Its shaping is tiny (goals within 0.25), so seeds settled at a stochastic solve of
+    # 0.13-0.30, under the 0.35 gate, and held difficulty at 0 for all 2100 iters. At full
+    # difficulty the position shaping carries the signal and both seeds climb, to a final
+    # greedy 0.875 (seed 0) and 0.981 (seed 1). 2100 iters is too short for that: at iter
+    # 2000 the two seeds were at 0.62 and 0.90 greedy.
     "pusht": TrainSpec(
         dt=0.05, substeps=8, max_steps=400, n_agents=4,
         scen_kwargs={"pos_shaping_factor": 5.0, "rot_shaping_factor": 0.5},
-        iters=2100, n_envs=512, steps_per_batch=32, epochs=8, minibatches=4,
-        lr=1e-3, entropy_coeff=3e-3, num_cells=256,
+        iters=4000, n_envs=512, steps_per_batch=32, epochs=8, minibatches=4,
+        lr=5e-4, entropy_coeff=3e-3, num_cells=256, normalize_advantage=False,
         curriculum=(
             CurriculumKnob("goal_spawn_radius", 0.25, 0.25 + 1.9),
             CurriculumKnob("goal_spawn_angle", 0.4, math.pi),
         ),
-        curriculum_iters=250, curriculum_gate=0.35,
+        curriculum_iters=250, curriculum_gate=0.0,
         metrics=("tee_dist_to_goal", "tee_angle_error"),
     ),
     # Give-way. Four agents, one per arm, crossing to the opposite arm through a junction
@@ -255,16 +286,28 @@ SPECS: dict[str, TrainSpec] = {
     # from. substeps=8 is the contact law's floor at dt=0.05, not a preference.
     #
     # The curriculum knob is the arrival stagger: at difficulty 0 the agents reach the
-    # junction one at a time and there is no conflict to resolve at all, so the terminal
-    # bonus is reachable by a novice policy; at 1 they arrive together. Ramping the
-    # *conflict density* rather than the geometry keeps the success criterion fixed.
+    # junction at random, spread-out times, so conflicts are fewer and milder (the opposing
+    # pair on each axis still has to pass, so it is not conflict-free: at penalty -1.0 the
+    # scripted arm pays -6.4 collision per agent there, -24.0 at difficulty 1); at 1 they
+    # arrive together. Ramping the *conflict density* rather than the geometry keeps the
+    # success criterion fixed.
     "giveway": TrainSpec(
         dt=0.05, substeps=8, max_steps=200, n_agents=4,
         # Measured under a random policy: raw shaping averages +0.012/step against a
         # -0.017 collision term and a -0.010 time penalty, so at factor 1.0 the objective
         # is the smallest term in its own reward. 5.0 puts it clearly on top, the same
         # rebalance and the same reason as Push-T's pos_shaping_factor.
-        scen_kwargs={"pos_shaping_factor": 5.0},
+        #
+        # collision_penalty -1.0 -> -0.25. At -1.0 the crossing is barely worth making:
+        # measured per agent over one episode at difficulty 1.0, the scripted P controller
+        # (which solves 100%) nets +15.5 -- shaping +35.1, collisions -24.0 -- against +12.0
+        # for stopping at the junction mouth and never touching anyone. A novice policy's
+        # first crossings collide more than the scripted one's, so stalling won: the 5e-3
+        # run sat at difficulty 0, dist_to_goal ~1.08, on_goal 0 for all 3000 iterations.
+        # At -0.25 the scripted crossing nets +33.5 against the same +12.0, and training
+        # solves difficulty 0 within 100 iterations and full difficulty by ~450 -- with
+        # collisions falling to ~4e-4/agent-step, so the policy still learns to avoid them.
+        scen_kwargs={"pos_shaping_factor": 5.0, "collision_penalty": -0.25},
         iters=3000, n_envs=1024, steps_per_batch=32, minibatches=8,
         # Floored at 5e-3 rather than 1e-3. The 1e-3 schedule solved the task by iter 1250
         # and then destroyed it: entropy fell -4.48 -> -8.31 and `ep_solve_rate` went
@@ -309,23 +352,35 @@ SPECS: dict[str, TrainSpec] = {
     # The curriculum is verified reachable at its easy end: at difficulty 0 the agents spawn
     # on the cage ring with an inert disc, and a zero-action policy holds the cage for 100%
     # of steps and terminates in 100% of envs -- so the dwell bonus and the terminal are
-    # both experienced from iteration 1. The ramp is steep (a zero-action cage survives at
-    # difficulty 0.3 in only ~3% of envs), so expect the gate to hold difficulty low for a
-    # long time; a flat `difficulty` column here is the curriculum working, not stalling.
+    # both experienced from iteration 1. The hard end is verified reachable too: a scripted
+    # ring-follower (P control to evenly spaced slots on the cage radius, plus the observed
+    # disc velocity as feedforward) solves 0.95 of envs at difficulty 1, median step 22.
     "caging": TrainSpec(
         dt=0.05, substeps=8, max_steps=300, n_agents=5,
-        scen_kwargs={"gap_shaping_factor": 2.0},
-        iters=4000, n_envs=1024, steps_per_batch=32, minibatches=8,
+        # cage_reward/time_penalty: the scenario's 0.5/-0.01 make a caged step worth +0.49,
+        # so terminating forfeits a positive stream and the policy learns to *avoid* done.
+        # Measured on the old iter-500 checkpoint at difficulty 0: caged on 87.5% of steps,
+        # never 10 in a row, ~37 deliberate cage breaks per episode, solve rate 0.000.
+        # Net -0.05 while caged (vs -0.15 uncaged) keeps the dwell signal but makes the
+        # terminal the best thing that can happen.
+        scen_kwargs={"gap_shaping_factor": 2.0, "cage_reward": 0.1, "time_penalty": -0.15},
+        iters=1500, n_envs=1024, steps_per_batch=32, minibatches=8,
         # Both knobs moved after the 0.35/1e-2 run died at iter 2454 with non-finite
         # gradients. The gate never opened -- `difficulty` held 0.053 for 2400 iterations
         # against an `ep_solve_rate` of ~0.07 -- so `loss_objective` stayed at ~0.003 while
         # the entropy bonus grew to ~0.05 (coeff 4.6e-3 x entropy 11.3), i.e. ~20x the
         # objective. With no upper bound on `scale`, maximising entropy was free reward:
         # the std ran away, TanhNormal log-probs went non-finite, and 47/64 minibatches
-        # produced NaN gradients. 0.15 is a gate the policy can actually clear; 3e-3 stops
-        # the bonus out-weighing a weak objective. (giveway collapsed the *opposite* way,
-        # for the same missing-std-bound reason -- see its spec above.)
-        entropy_coeff=3e-3, entropy_coeff_final=1e-3,
+        # produced NaN gradients. 3e-3 stops the bonus out-weighing a weak objective.
+        # (giveway collapsed the *opposite* way, for the same missing-std-bound reason --
+        # see its spec above.) The gate itself was never the problem: solve sat at ~0.07
+        # because the policy was farming the dwell bonus (see cage_reward above), and with
+        # that fixed ep_solve_rate is 1.0 through difficulty 0.5, so it stays at 0.35.
+        # Constant, not decayed to 1e-3: with the decay the run solved (greedy 0.978 at
+        # iter ~1270) and then collapsed as the coefficient fell past ~2.3e-3 -- entropy
+        # -1.3 -> -4.4, ep_solve_rate 0.96 -> 0.51 by iter 1750. Held at 3e-3 for 1500
+        # iterations it ends solved (greedy 0.944) with entropy steady around -1.6.
+        entropy_coeff=3e-3,
         # exponent 3.0, not linear. The measured cliff sits between difficulty 0.073
         # (`caged` 0.861) and 0.192 (`caged` 0.070), so a linear ramp spends ~19% of its
         # iterations below the cliff and the rest at a difficulty the policy cannot touch.
@@ -334,7 +389,7 @@ SPECS: dict[str, TrainSpec] = {
         curriculum=(
             CurriculumKnob("difficulty", 0.0, 1.0, none_at_full=False, exponent=3.0),
         ),
-        curriculum_iters=600, curriculum_gate=0.15,
+        curriculum_iters=600, curriculum_gate=0.35,
         metrics=("gap_max", "band_error", "caged", "multiobj_reward"),
     ),
 }
@@ -606,9 +661,10 @@ def goal_p_controller(gain: float = 4.0) -> Callable[[Environment], ActionFn]:
 # goal" is a meaningful controller; a scenario with no per-agent goal has no entry.
 BASELINES: dict[str, Callable[[Environment], ActionFn]] = {
     "navigation": goal_p_controller(),
-    # Expected to *fail* here, and that is the point: driving straight at the goal is what
-    # produces the head-on deadlock the task exists to test. The gap between this arm and
-    # the policy arm is the evidence that something non-greedy was learnt.
+    # Measured, this does *not* deadlock: under the stiff contact the head-on pairs shove
+    # each other into the perpendicular arms and it solves 100% at difficulty 1.0 (median
+    # step 48), paying heavily in collisions. So on giveway this arm is a ceiling on the
+    # solve rate, not a floor; compare collisions and solve step instead.
     "giveway": goal_p_controller(),
 }
 

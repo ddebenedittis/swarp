@@ -255,6 +255,7 @@ def obstacle_dynamics_kernel(
     fy = zero
     tau = zero
     denom_self = one + c * sub_dt / obs_mass[o]
+    ext = zero  # bounding radius of the whole body about its origin, for the bounds clamp
     for s in range(n_obstacles):
         if obs_body[s] != o:
             continue
@@ -267,6 +268,16 @@ def obstacle_dynamics_kernel(
         st = obs_type[s]
         obs_r = obs_radius[s]
         half = obs_half[s]
+        # Farthest point of the shape from the body origin (shapes are axis-aligned in
+        # the body frame), so a T's ext equals the spawn's farthest-corner radius.
+        ax = wp.abs(off[0])
+        ay = wp.abs(off[1])
+        reach = wp.sqrt(ax * ax + ay * ay) + obs_r  # circle
+        if st == SHAPE_BOX:
+            reach = wp.sqrt((ax + half[0]) * (ax + half[0]) + (ay + half[1]) * (ay + half[1]))
+        elif st == SHAPE_SEGMENT:
+            reach = wp.sqrt((ax + half[0]) * (ax + half[0]) + ay * ay) + obs_r
+        ext = wp.max(ext, reach)
 
         for a in range(n_agents):
             f, r = _reaction(
@@ -304,8 +315,25 @@ def obstacle_dynamics_kernel(
     new_x = q[0] + new_vx * sub_dt
     new_y = q[1] + new_vy * sub_dt
     if clamp_bounds == 1:
-        new_x = wp.clamp(new_x, bounds_min[0], bounds_max[0])
-        new_y = wp.clamp(new_y, bounds_min[1], bounds_max[1])
+        # The whole body stays inside, not just its origin: with only the origin clamped
+        # half a body can leave the arena, and agents pinned between the soft wall and
+        # the part still inside get crushed. Shrunk by the bounding radius, clamped to the
+        # middle if the body is wider than the arena. A clamped axis also loses its
+        # velocity, or a body held at the bound keeps integrating contact force into a
+        # velocity it can never move at, which the contact damping then reads and uses to
+        # fling the pushing agents off at many times their max speed.
+        lo_x = wp.min(bounds_min[0] + ext, (bounds_min[0] + bounds_max[0]) * type(th)(0.5))
+        hi_x = wp.max(bounds_max[0] - ext, lo_x)
+        lo_y = wp.min(bounds_min[1] + ext, (bounds_min[1] + bounds_max[1]) * type(th)(0.5))
+        hi_y = wp.max(bounds_max[1] - ext, lo_y)
+        cx = wp.clamp(new_x, lo_x, hi_x)
+        cy = wp.clamp(new_y, lo_y, hi_y)
+        if cx != new_x:
+            new_vx = zero
+        if cy != new_y:
+            new_vy = zero
+        new_x = cx
+        new_y = cy
     new_th = th + new_om * sub_dt
     body_vel[e, o] = type(tv)(new_vx, new_vy)
     body_ang_vel[e, o] = new_om

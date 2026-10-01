@@ -10,7 +10,7 @@ The engine knows nothing about tasks — every built-in scenario is written agai
 | `navigation` | reach a per-agent goal while avoiding collisions | 4 | 19 | optional obstacles; `shared_reward` switches per-agent shaping to a team term |
 | `flocking` | Reynolds-style cohesion + alignment, penalized for crowding | 8 | 24 | pure neighbor-feature reward, no goals |
 | `formation` | hold assigned slots of a regular polygon | 5 | 6 | slot `i` is assigned to agent `i`, so the shape is ordered |
-| `discovery` | cover scattered targets, each needing several agents nearby | 5 | 19 | one-off shared reward the step a target is first covered |
+| `discovery` | cover scattered targets, each needing several agents nearby | 5 | 19 | one-off shared reward the step a target is first covered, plus optional per-agent closing speed on the nearest uncovered target (off by default) |
 | `sampling` | collect an unknown scalar field, consuming cells | 4 | 13 | batched sum-of-Gaussians density on a grid; obs is the 3×3 cell neighborhood |
 | `transport` | push a movable circular package to a goal | 4 | 8 | package integrated in torch, staggered by one step, so BPTT flows package→agent→action |
 | `pusht` | push a T-shaped rigid body to a target **pose** | 4 | 18 | movable compound body with rotation; needs `substeps >= 8` |

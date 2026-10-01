@@ -767,7 +767,12 @@ class PushTScenario(FusedScenario):
                 self.tee_ang_vel = (self.tee_ang_vel + tau / self.tee_inertia * sub_dt) * (
                     1.0 - self.angular_damping * sub_dt
                 )
-                self.tee_pos = (self.tee_pos + self.tee_vel * sub_dt).clamp(-b, b)
+                new_pos = self.tee_pos + self.tee_vel * sub_dt
+                self.tee_pos = new_pos.clamp(-b, b)
+                # A clamped axis loses its velocity, as in the engine kernel.
+                self.tee_vel = torch.where(
+                    self.tee_pos != new_pos, torch.zeros_like(self.tee_vel), self.tee_vel
+                )
                 self.tee_theta = self.tee_theta + self.tee_ang_vel * sub_dt
             self._install_obstacles()  # for the next step
 

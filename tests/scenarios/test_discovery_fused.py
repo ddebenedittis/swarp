@@ -38,6 +38,7 @@ def _env(device, fused, *, n_agents=6, n_targets=3, world_size=0.5, covering_ran
         world_size=world_size,
         covering_range=covering_range,
         agents_per_target=2,
+        pos_shaping_factor=1.0,  # exercise the shaping term on both paths
     )
     return fused_env(scen, device, fused, spec=SPEC)
 

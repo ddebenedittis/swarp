@@ -6,11 +6,12 @@ Three launches, ordered ``cover -> {obs, reward}``:
   covering range, latches ``covered`` monotonically **in place**, and records
   ``newly`` from the *pre-update* latch. Each ``(env, target)`` entry is owned by
   exactly one thread, so the read-old/write-new is race-free without a snapshot.
-* ``discovery_obs_kernel`` (thread per env,agent) builds the obs row and the
-  all-pairs touching count, reading the *post-update* ``covered`` as the
-  broadcast flag.
+* ``discovery_obs_kernel`` (thread per env,agent) builds the obs row, the
+  all-pairs touching count and the progress shaping (closing speed on the nearest
+  uncovered target), reading the *post-update* ``covered`` for both the broadcast
+  flag and "uncovered".
 * ``discovery_reward_kernel`` (thread per env) folds the per-agent term
-  (collision + time penalty) and the shared covering reward, and reduces
+  (collision + time penalty + shaping) and the shared covering reward, and reduces
   ``done``.
 
 The torch implementation in :mod:`swarp.scenarios.discovery` stays the reference
@@ -73,10 +74,12 @@ def discovery_obs_kernel(
     n_agents: wp.int32,
     n_targets: wp.int32,
     col_dist_sq: Any,
+    shaping_scale: Any,
     obs: wp.array3d(dtype=Any),
     touching: wp.array2d(dtype=Any),
+    shaping: wp.array2d(dtype=Any),
 ):
-    """Thread per (env, agent): obs row (rel targets + covered flag) + touching."""
+    """Thread per (env, agent): obs row (rel targets + covered flag), touching, shaping."""
     e, a = wp.tid()
     p = pos[e, a]
     v = vel[e, a]
@@ -88,15 +91,28 @@ def discovery_obs_kernel(
     obs[e, a, 1] = py
     obs[e, a, 2] = v[0]
     obs[e, a, 3] = v[1]
+    # One pass over the targets: rel-target obs, covered flag, and the nearest uncovered
+    # target the progress shaping closes on.
+    cflag_base = wp.int32(4) + wp.int32(2) * n_targets
+    best = zero
+    bx = zero
+    by = zero
+    found = wp.int32(0)
     for t in range(n_targets):
         tg = targets[e, t]
-        obs[e, a, wp.int32(4) + wp.int32(2) * t] = tg[0] - px
-        obs[e, a, wp.int32(4) + wp.int32(2) * t + 1] = tg[1] - py
-    cflag_base = wp.int32(4) + wp.int32(2) * n_targets
-    for t in range(n_targets):
-        cv = zero
-        if covered[e, t] == wp.uint8(1):
-            cv = one
+        dx = tg[0] - px
+        dy = tg[1] - py
+        obs[e, a, wp.int32(4) + wp.int32(2) * t] = dx
+        obs[e, a, wp.int32(4) + wp.int32(2) * t + 1] = dy
+        cv = one
+        if covered[e, t] == wp.uint8(0):
+            cv = zero
+            d2 = dx * dx + dy * dy
+            if found == 0 or d2 < best:
+                best = d2
+                bx = dx
+                by = dy
+                found = wp.int32(1)
         obs[e, a, cflag_base + t] = cv
 
     # All-pairs touching (squared distance, minus self), matches navigation-style.
@@ -108,10 +124,18 @@ def discovery_obs_kernel(
             cnt += one
     touching[e, a] = cnt - one
 
+    # Closing speed on the nearest uncovered target (0 once every target is covered).
+    s = zero
+    if found == 1:
+        dist = wp.max(wp.sqrt(bx * bx + by * by), type(px)(1e-9))
+        s = shaping_scale * ((v[0] * bx + v[1] * by) / dist)
+    shaping[e, a] = s
+
 
 @wp.kernel
 def discovery_reward_kernel(
     touching: wp.array2d(dtype=Any),
+    shaping: wp.array2d(dtype=Any),
     newly: wp.array(dtype=wp.uint8, ndim=2),
     covered: wp.array(dtype=wp.uint8, ndim=2),
     n_agents: wp.int32,
@@ -133,7 +157,7 @@ def discovery_reward_kernel(
             all_cov = wp.uint8(0)
     global_r = covering_reward * n_new
     for a in range(n_agents):
-        reward[e, a] = collision_penalty * touching[e, a] + time_penalty + global_r
+        reward[e, a] = collision_penalty * touching[e, a] + time_penalty + shaping[e, a] + global_r
     done[e] = all_cov
 
 
@@ -160,8 +184,10 @@ def _obs_signature(dtype) -> list:
         wp.int32,  # n_agents
         wp.int32,  # n_targets
         dtype,  # col_dist_sq
+        dtype,  # shaping_scale
         wp.array3d(dtype=dtype),  # obs
         wp.array2d(dtype=dtype),  # touching
+        wp.array2d(dtype=dtype),  # shaping
     ]
 
 
@@ -169,6 +195,7 @@ def _reward_signature(dtype) -> list:
     a2s = wp.array2d(dtype=dtype)
     return [
         a2s,  # touching
+        a2s,  # shaping
         wp.array(dtype=wp.uint8, ndim=2),  # newly
         wp.array(dtype=wp.uint8, ndim=2),  # covered
         wp.int32,  # n_agents

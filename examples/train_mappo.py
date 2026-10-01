@@ -493,12 +493,26 @@ def train(cfg: TrainConfig) -> Path:
                 info_vals.append(f"{v.float().mean().item():.6f}")
 
         if cfg.eval_every and (it + 1) % cfg.eval_every == 0:
-            res = score(
-                cfg.scenario, policy=policy, n_agents=n_agents, n_envs=cfg.eval_envs,
-                steps=spec.max_steps, device=device, seed=cfg.seed + 1_000,
-                dt=spec.dt, substeps=spec.substeps, scen_kwargs=cfg.scen_kwargs,
-                arms=("policy",),
-            )["policy"]
+            # The collector runs this loop body on its own CUDA stream, and a swarp env
+            # built and reset under a user-created stream races: the greedy eval came out
+            # 0.000 or 0.500 on checkpoints that eval_mappo.py (default stream) scores
+            # 1.000. So evaluate on the default stream, ordered against the side stream in
+            # both directions. (The training env is built before the collector exists, on
+            # the default stream, and stepping it on the side stream measured clean.)
+            on_cuda = device.startswith("cuda")
+            side = torch.cuda.current_stream(device) if on_cuda else None
+            default = torch.cuda.default_stream(device) if on_cuda else None
+            if on_cuda:
+                default.wait_stream(side)
+            with torch.cuda.stream(default):  # a no-op off CUDA (stream None)
+                res = score(
+                    cfg.scenario, policy=policy, n_agents=n_agents, n_envs=cfg.eval_envs,
+                    steps=spec.max_steps, device=device, seed=cfg.seed + 1_000,
+                    dt=spec.dt, substeps=spec.substeps, scen_kwargs=cfg.scen_kwargs,
+                    arms=("policy",),
+                )["policy"]
+            if on_cuda:
+                side.wait_stream(default)
             eval_rate, (eval_lo, eval_hi) = res.solve_rate, res.ci
             print(
                 f"  eval @ iter {it + 1}: greedy solve {eval_rate:.3f} "

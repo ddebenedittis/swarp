@@ -132,10 +132,10 @@ def test_pusht_spec_reproduces_published_recipe():
     s = SPECS["pusht"]
     assert (s.dt, s.substeps, s.max_steps, s.n_agents) == (0.05, 8, 400, 4)
     assert (s.n_envs, s.steps_per_batch, s.epochs, s.minibatches) == (512, 32, 8, 4)
-    assert (s.lr, s.gamma, s.lmbda) == (1e-3, 0.99, 0.95)
-    assert (s.entropy_coeff, s.num_cells) == (3e-3, 256)
+    assert (s.lr, s.gamma, s.lmbda) == (5e-4, 0.99, 0.95)
+    assert (s.entropy_coeff, s.num_cells, s.normalize_advantage) == (3e-3, 256, False)
     assert dict(s.scen_kwargs) == {"pos_shaping_factor": 5.0, "rot_shaping_factor": 0.5}
-    assert (s.curriculum_iters, s.curriculum_gate) == (250, 0.35)
+    assert (s.curriculum_iters, s.curriculum_gate, s.iters) == (250, 0.0, 4000)
     assert s.metrics == ("tee_dist_to_goal", "tee_angle_error")
 
     radius, angle = s.curriculum
@@ -266,7 +266,7 @@ def test_cli_overrides_beat_the_spec(tmp_path):
     cfg = parse_args(_smoke_argv("pusht", tmp_path, max_steps=7, substeps=2, iters=3))
     assert cfg.spec.max_steps == 7 and cfg.spec.substeps == 2 and cfg.spec.iters == 3
     # The smoke argv also sets num_cells, so check fields it does *not* touch.
-    assert cfg.spec.dt == 0.05 and cfg.spec.lr == 1e-3
+    assert cfg.spec.dt == 0.05 and cfg.spec.lr == 5e-4
     assert cfg.spec.curriculum_iters == 250 and cfg.spec.n_agents == 4
 
 
