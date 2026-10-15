@@ -22,7 +22,7 @@ uv run pytest -m "not gpu"                 # what CI runs (no CUDA device on the
 python -m swarp.benchmark.throughput        # NavigationScenario hot-path env-steps/s
 python -m swarp.benchmark.compare_vmas      # vs VMAS; needs `.[bench]` (pulls in vmas, numpy<2)
 python -m swarp.rl --scenario navigation    # CUDA-graph MAPPO trainer (add --compile --tf32 for max speed)
-python -m swarp.benchmark.train_throughput  # end-to-end training speed: torchrl trainer vs swarp.rl
+python -m swarp.benchmark.train_throughput  # end-to-end training speed: swarp.rl vs torchrl (plain/tuned), BenchMARL, rsl_rl
 uv pip install --group docs                # docs toolchain (no torch/warp needed)
 uv run --no-sync sphinx-build -b html -W docs docs/_build/html   # build the docs site
 ```

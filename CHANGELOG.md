@@ -12,10 +12,19 @@ All notable changes to `swarp`. Newest first. Nothing has been released yet — 
   Per env step it replays a small *act* graph, calls `Environment.step` and replays a *store* graph; per iteration it replays a *prepare* graph (critic, GAE, permutations) and one *minibatch* graph per minibatch (forward, loss, backward, clipping, fused Adam), with one host sync for every logged statistic.
   A minibatch with a non-finite gradient is skipped on device through Adam's `found_inf`, leaving the weights and Adam state untouched.
   Same algorithm, recipes and `metrics.csv` columns as `examples/train_mappo.py`, which stays as the reference; timeouts bootstrap from `V(s_t)` because the env runs with `auto_reset=True`.
-  End to end it is 2.4–2.5× faster than the TorchRL trainer at the recipes' batch sizes, and 3.1–3.4× with `--compile --tf32`; on `giveway` both reach full difficulty at the same iteration, 83 s vs 208 s of wall-clock.
-  Run it as `python -m swarp.rl --scenario <name>`; `python -m swarp.benchmark.train_throughput` measures both trainers.
+  End to end it is 2.4–2.5× faster than the TorchRL trainer at the recipes' batch sizes, and 3.2× with `--compile --tf32`; on `giveway` both reach full difficulty at the same iteration, 83 s vs 208 s of wall-clock.
+  Run it as `python -m swarp.rl --scenario <name>`; `python -m swarp.benchmark.train_throughput` measures it against the baselines below.
   The torchrl-free half of `examples/mappo.py` (`TrainSpec`, `SPECS`, `SolveRateWindow`, `score`, ...) moved to `swarp.rl.recipes`, and `examples/mappo.py` re-exports it.
   `examples/eval_mappo.py` reads both trainers' checkpoints.
+
+- **Training baselines for the throughput comparison**, each running the same `TrainSpec` recipes, curriculum gate and `metrics.csv` timing through its library's own loop:
+  `examples/train_mappo_tuned.py` (the TorchRL trainer with TorchRL's own speed features: `cudagraph_policy`, the update step in `CudaGraphModule`, fused capturable Adam with an on-device skip, optional `--compile --tf32`),
+  `examples/train_benchmarl.py` (BenchMARL's `Experiment` and `MappoConfig`, swarp registered as a task; new `benchmarl` extra, in its own venv because BenchMARL pins `torchrl < 0.12`) and
+  `examples/train_rsl_rl.py` (rsl_rl's `OnPolicyRunner` with one rsl_rl env per agent; new `rsl-rl` extra).
+  Each script's docstring lists how its algorithm differs from `swarp.rl`, and `examples/eval_mappo.py` reads all their checkpoints.
+  At the recipes' sizes `swarp.rl` is 1.2–1.3× faster than the tuned TorchRL trainer (1.3–1.4× with `--compile --tf32` on both), 1.7× faster than rsl_rl and 2.5–2.6× faster than BenchMARL.
+  The tuned trainer works around a TorchRL 0.13.3 bug in which `cudagraph_policy` fills every step of a batch with the last step's action, so training silently never learns.
+  `train_throughput` keeps its trainers in a registry and takes `--python CONFIG=PATH` to run one from another venv.
 
 - **Three scenarios that break the assumptions the first seven share** — `giveway`,
   `shepherding` and `caging`, bringing the registry to ten. Every one of the original seven
@@ -188,6 +197,7 @@ All notable changes to `swarp`. Newest first. Nothing has been released yet — 
 - **`examples/train_mappo.py` times the whole iteration.**
   Its `wall_s`/`env_sps` columns used to start the clock after the collector yielded, so they reported frames per update-phase second and left the rollout out.
   They now cover collection and update, which is what the training-throughput comparison needs.
+  Its update, loss and CLI are now importable pieces (`build_parser`, `build_loss`, `EagerUpdate`) so the tuned trainer reuses them; a seeded run produces the same metrics and weights as before.
 
 - **Seeded trajectories differ from previous versions.** No scenario's reset draws from
   `world.generator` any more, so every downstream torch draw sits at a different point in
