@@ -21,6 +21,9 @@ Configurations (``--configs``):
     ``python -m swarp.rl``: rollout and update CUDA-graph captured (the default).
 ``fast``
     ``graphs`` plus ``--compile --tf32``: the fastest configuration.
+``rsl_rl``
+    ``examples/train_rsl_rl.py``: rsl_rl's PPO and ``OnPolicyRunner`` with one rsl_rl env
+    per agent (needs the ``rsl-rl`` extra; skipped otherwise).
 
 ``sim`` is the simulator alone over the same rollout (``steps_per_batch`` steps of random
 actions at the same ``n_envs``, ``auto_reset=True``): the ceiling no trainer can beat, and
@@ -70,6 +73,7 @@ TRAINERS: dict[str, Trainer] = {
     "eager": Trainer(("-m", "swarp.rl", "--no-graphs")),
     "graphs": Trainer(("-m", "swarp.rl")),
     "fast": Trainer(("-m", "swarp.rl", "--compile", "--tf32")),
+    "rsl_rl": Trainer((str(REPO / "examples" / "train_rsl_rl.py"),), "rsl_rl"),
 }
 CONFIGS = tuple(TRAINERS)
 

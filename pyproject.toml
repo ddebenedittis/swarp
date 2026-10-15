@@ -48,6 +48,10 @@ torchrl = [
     "torchrl>=0.5",
     "tensordict>=0.5",
 ]
+# rsl_rl MAPPO baseline (examples/train_rsl_rl.py) for the training-throughput benchmark.
+rsl-rl = [
+    "rsl-rl-lib>=5.5",
+]
 # VMAS comparison benchmark (swarp/benchmark/compare_vmas.py). VMAS pulls in gym,
 # which requires numpy < 2. Falls back to an optional (gitignored) local
 # ./VectorizedMultiAgentSimulator clone if `vmas` is not importable.

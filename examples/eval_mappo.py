@@ -100,6 +100,11 @@ def _load_arm(path: str, device: str) -> tuple[PolicyArm, dict]:
     if ckpt.get("format") == CHECKPOINT_FORMAT:
         actor, _, ckpt = load_checkpoint(path, device)
         return greedy_arm(actor), ckpt
+    if ckpt.get("format") == "rsl_rl/1":  # examples/train_rsl_rl.py: acts with clamp(mean)
+        import train_rsl_rl
+
+        actor, ckpt = train_rsl_rl.load_checkpoint(path, device)
+        return train_rsl_rl.greedy_arm(actor), ckpt
     policy, ckpt = _load(path, device)
     return partial(greedy_actions, policy), ckpt
 
