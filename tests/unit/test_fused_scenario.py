@@ -1,6 +1,6 @@
 """The ``FusedScenario`` framework's own guarantees.
 
-The seven ``tests/scenarios/test_*_fused.py`` suites check that each scenario's fused
+The per-scenario ``tests/scenarios/test_*_fused.py`` suites check that each scenario's fused
 kernels agree with its torch reference. This file checks the layer *underneath* them: that
 the declarative :class:`~swarp.scenarios.fused.Buf` spec does what it says, and that the
 mistakes it exists to prevent are now errors rather than silent corruption.
@@ -37,12 +37,12 @@ def test_step_pass_is_a_shared_constant():
     assert STEP.kind == "step" and STEP.env_mask is None
 
 
-# ------------------------------------------------------ the spec, across all 7
+# -------------------------------------------- the spec, across every scenario
 
 
 @pytest.mark.parametrize("cls", FUSED, ids=IDS)
 def test_every_registered_scenario_implements_the_same_member_set(cls):
-    """Zero opt-outs: the point of the abstraction is that all seven use all of it."""
+    """Zero opt-outs: the point of the abstraction is that every scenario uses all of it."""
     assert issubclass(cls, FusedScenario)
     assert cls.fused_available is True
     for name in ("fused_spec", "launch_fused", "post_step_torch", "reset_torch"):

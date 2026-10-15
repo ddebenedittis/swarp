@@ -229,6 +229,26 @@ RESET_STATE = {
         ("tee_vel", "clear"),
         ("tee_ang_vel", "clear"),
     ],
+    # Give-way's layout *is* the task, so unlike the others its reset draws no goal
+    # position -- goals are the fixed point reflections of the nominal arm slots. What it
+    # must redraw is the per-agent politeness scalar, which is the only thing breaking the
+    # mirror symmetry between two agents meeting head-on in a one-lane corridor.
+    "giveway": [("politeness", "draw")],
+    # The sheep are scenario-owned obstacles, not agents, so their pose is episode state
+    # the reset has to redraw; ``drift`` is the per-episode evasion heading that replaces
+    # in-kernel per-step noise (which a CUDA graph would freeze at capture).
+    "shepherding": [
+        ("sheep_pos", "draw"),
+        ("drift", "draw"),
+        ("sheep_vel", "clear"),
+    ],
+    # Same shape as shepherding: the disc is scenario-owned, so its pose is episode state,
+    # and ``drift`` is the per-episode escape heading that replaces per-step in-kernel noise.
+    "caging": [
+        ("disc_pos", "draw"),
+        ("drift", "draw"),
+        ("disc_vel", "clear"),
+    ],
 }
 
 

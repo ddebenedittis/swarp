@@ -85,9 +85,7 @@ Pass an explicit scalar pair (`action_low=-1.0, action_high=1.0`) if you want a 
 Downstream code written against `VmasEnv` needs the flat path here.
 :::
 
-[`examples/marl_train.py`](https://github.com/ddebenedittis/swarp/blob/main/examples/marl_train.py) is a full MAPPO training loop on top of it, scenario-generic: `--scenario <name>` off the registry, with episode length, substeps and the success metric held in one `Task` record per scenario.
-[`examples/marl_eval.py`](https://github.com/ddebenedittis/swarp/blob/main/examples/marl_eval.py) scores a checkpoint against a random baseline on the same seed and can render the rollout.
-[`examples/pusht_torchrl.py`](https://github.com/ddebenedittis/swarp/blob/main/examples/pusht_torchrl.py) is the older, heavily annotated Push-T-specific version of the same loop, kept as the worked example.
+[`examples/train_mappo.py`](https://github.com/ddebenedittis/swarp/blob/main/examples/train_mappo.py) is a full MAPPO training loop on top of it.
 
 ## Choosing a batch shape
 
@@ -129,7 +127,7 @@ Two things follow for anyone writing a scenario:
 ```bash
 python -m swarp.benchmark.throughput      # the full (n_envs, n_agents) grid
 python -m swarp.benchmark.ablation        # cumulative optimization ablation, parity-gated
-python -m swarp.benchmark.scenarios       # all 7 scenarios x model x lidar rays
+python -m swarp.benchmark.scenarios       # all 10 scenarios x model x lidar rays
 python -m swarp.benchmark.compare_vmas    # vs VMAS: --metric {throughput,memory,both}
 python -m swarp.benchmark.compare_sims    # vs VMAS, JaxMARL and CAMAR
 ```

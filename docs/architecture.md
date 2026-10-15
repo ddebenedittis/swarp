@@ -29,14 +29,13 @@ swarp/core       state (SoA), stepper (THE substep pipeline), neighbors, collisi
 swarp/dynamics   model tags/configs, unified integrate kernel (2D vehicles + drone)
 swarp/interop    torch.autograd bridge + BPTT rollout, torch.compile custom op,
                  CUDA-graph capture, TorchRL EnvBase wrapper
-swarp/scenarios  Scenario ABC + 7 scenarios, each with its fused *_kernels.py
+swarp/scenarios  Scenario ABC + 10 scenarios, each with its fused *_kernels.py
 swarp/sensors    opt-in differentiable observation sensors (lidar: torch + Warp backends)
 swarp/render     optional pygame viewer: renderer, overlays, camera, HUD, input handling,
                  mosaic layout, video export, notebook embed, demo entry point
 swarp/benchmark  throughput, optimization ablation, per-scenario sweep, and two
                  cross-simulator comparisons (+ _adapters/ for swarp/vmas/jaxmarl/camar)
-examples/        standalone scripts: action optimization, MAPPO train/eval for any
-                 scenario, and the Push-T-specific TorchRL pair
+examples/        standalone scripts: action optimization, Push-T eval, Push-T + TorchRL
 docs/            this site
 tests/           pytest suite
 ```
@@ -56,7 +55,7 @@ Key modules:
 : the torch↔Warp bridge — `_WarpStepFn` (a `torch.autograd.Function` replaying Warp adjoints in `backward`), `warp_step`, and `rollout`.
 
 `swarp/scenarios/fused.py`
-: `FusedScenario`, which all ten built-ins subclass. A scenario declares its persistent buffers and its launch sequence; the framework owns lazy allocation, uint8→bool reinterpret views, Warp handle caching, pointer-move resync, the recapture token, the warm-up carry list and the reset-mask stamp. There are **zero opt-outs** — a test asserts all ten implement the same four members and override none of the framework's.
+: `FusedScenario`, which all ten built-ins subclass. A scenario declares its persistent buffers and its launch sequence; the framework owns lazy allocation, uint8→bool reinterpret views, Warp handle caching, pointer-move resync, the recapture token, the warm-up carry list and the reset-mask stamp. There are **zero opt-outs** — a test asserts all seven implement the same four members and override none of the framework's.
 
 ## Design invariants
 

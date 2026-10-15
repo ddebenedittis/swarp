@@ -36,7 +36,8 @@ SPEC = FusedSpec(
 
 
 def _env(device, fused, *, n_agents=4, world_size=0.5):
-    scen = PushTScenario(n_agents=n_agents, world_size=world_size)
+    # rot_away_penalty on, so parity covers the turn-away cost (it defaults to 0).
+    scen = PushTScenario(n_agents=n_agents, world_size=world_size, rot_away_penalty=1.0)
     return fused_env(scen, device, fused, spec=SPEC)
 
 

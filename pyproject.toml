@@ -40,7 +40,7 @@ viz = [
     "pillow>=10",
 ]
 # TorchRL EnvBase wrapper (swarp/interop/torchrl.py) and the MAPPO training
-# examples (examples/pusht_torchrl.py). Optional: the core install stays lean
+# examples (examples/train_mappo.py). Optional: the core install stays lean
 # and only depends on warp + torch + numpy. torchrl pulls in tensordict itself,
 # but it's pinned explicitly here so `pip install -e '.[torchrl]'` resolves a
 # version compatible with the rest of the stack in one shot.

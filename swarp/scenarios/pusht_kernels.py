@@ -7,9 +7,9 @@ at most one substep old. These kernels only read the body state the engine produ
 
 * ``pusht_obs_kernel`` (thread per (env, agent)) builds the obs row.
 * ``pusht_reward_kernel`` (thread per env) reduces position **and** orientation shaping,
-  the joint pose "crater", the per-agent approach term and the pose bonus, using the
-  navigation ``prev_dist`` / ``reset_hit`` / ``advance_prev`` / ``full_pass`` machinery
-  extended to the angular and per-agent carries. No atomics.
+  the joint pose "crater", the turn-away cost, the per-agent approach term and the pose
+  bonus, using the navigation ``prev_dist`` / ``reset_hit`` / ``advance_prev`` /
+  ``full_pass`` machinery extended to the angular and per-agent carries. No atomics.
 
 The torch implementation in :mod:`swarp.scenarios.pusht` remains the differentiable
 reference: on a taped step the engine leaves movable bodies alone and the scenario
@@ -88,6 +88,7 @@ def pusht_reward_kernel(
     agent_dist_shaping: Any,
     push_point_offset: Any,
     joint_shaping: Any,
+    rot_away_penalty: Any,
     goal_tolerance: Any,
     angle_tolerance: Any,
     goal_reward: Any,
@@ -128,6 +129,9 @@ def pusht_reward_kernel(
         wp.exp(-(d / sd) * (d / sd) - (ang / sa) * (ang / sa))
         - wp.exp(-(pd / sd) * (pd / sd) - (pa / sa) * (pa / sa))
     )
+    # The wrapped heading potential refunds turning away from the goal once the error
+    # passes pi, so an extra full turn nets zero; this charges for the away half of it.
+    ps -= rot_away_penalty * wp.max(ang - pa, zero)
     if reset_hit == 1:
         prev_dist[e] = d
         prev_ang[e] = ang
@@ -202,6 +206,7 @@ def _reward_signature(dtype) -> list:
         dtype,  # agent_dist_shaping
         dtype,  # push_point_offset
         dtype,  # joint_shaping
+        dtype,  # rot_away_penalty
         dtype,  # goal_tolerance
         dtype,  # angle_tolerance
         dtype,  # goal_reward

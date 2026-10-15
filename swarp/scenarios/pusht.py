@@ -77,6 +77,7 @@ class PushTScenario(FusedScenario):
         rot_shaping_factor: float = 0.5,
         agent_dist_shaping: float = 1.0,
         joint_shaping: float = 2.0,
+        rot_away_penalty: float = 0.0,
         goal_reward: float = 5.0,
         goal_tolerance: float = 0.1,
         angle_tolerance: float = 0.25,
@@ -120,6 +121,10 @@ class PushTScenario(FusedScenario):
         # each error independently — this is the only term that rewards closing the
         # last stretch of both at once, which is what the solved condition needs.
         self.joint_shaping = joint_shaping
+        # Extra cost per radian the heading error *grows*. The wrapped error refunds a
+        # turn away from the goal once it passes pi, so without this an extra full turn
+        # (or going the long way round) costs nothing. 0 keeps the default reward.
+        self.rot_away_penalty = rot_away_penalty
         self.goal_reward = goal_reward
         self.goal_tolerance = goal_tolerance
         self.angle_tolerance = angle_tolerance
@@ -639,6 +644,7 @@ class PushTScenario(FusedScenario):
                 scalar(self.agent_dist_shaping),
                 scalar(self.push_point_offset),
                 scalar(self.joint_shaping),
+                scalar(self.rot_away_penalty),
                 scalar(self.goal_tolerance),
                 scalar(self.angle_tolerance),
                 scalar(self.goal_reward),
@@ -661,6 +667,7 @@ class PushTScenario(FusedScenario):
                 self.agent_dist_shaping,
                 self.push_point_offset,
                 self.joint_shaping,
+                self.rot_away_penalty,
                 self.goal_tolerance,
                 self.angle_tolerance,
                 self.goal_reward,
@@ -767,7 +774,12 @@ class PushTScenario(FusedScenario):
                 self.tee_ang_vel = (self.tee_ang_vel + tau / self.tee_inertia * sub_dt) * (
                     1.0 - self.angular_damping * sub_dt
                 )
-                self.tee_pos = (self.tee_pos + self.tee_vel * sub_dt).clamp(-b, b)
+                new_pos = self.tee_pos + self.tee_vel * sub_dt
+                self.tee_pos = new_pos.clamp(-b, b)
+                # A clamped axis loses its velocity, as in the engine kernel.
+                self.tee_vel = torch.where(
+                    self.tee_pos != new_pos, torch.zeros_like(self.tee_vel), self.tee_vel
+                )
                 self.tee_theta = self.tee_theta + self.tee_ang_vel * sub_dt
             self._install_obstacles()  # for the next step
 
@@ -797,6 +809,7 @@ class PushTScenario(FusedScenario):
         shaping = shaping + self.joint_shaping * (
             crater(dist_to_goal, angle_error) - crater(self._prev_dist, self._prev_ang)
         )
+        shaping = shaping - self.rot_away_penalty * (angle_error - self._prev_ang).clamp(min=0)
         agent_shaping = (self._prev_adist - agent_dist) * self.agent_dist_shaping  # [E, A]
         if reset_mask is None:
             self._prev_dist = dist_to_goal.detach().clone()

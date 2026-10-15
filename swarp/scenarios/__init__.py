@@ -63,8 +63,8 @@ SCENARIOS: dict[str, type[Scenario]] = {
     "transport": TransportScenario,
     "pusht": PushTScenario,
     "giveway": GiveWayScenario,
-    "caging": CagingScenario,
     "shepherding": ShepherdingScenario,
+    "caging": CagingScenario,
 }
 
 

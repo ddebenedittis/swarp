@@ -12,7 +12,7 @@ The benchmark entry points (`swarp/benchmark/`):
 | `python -m swarp.benchmark.compare_vmas` | swarp vs VMAS (throughput and/or peak device memory) |
 | `python -m swarp.benchmark.compare_sims` | swarp vs VMAS vs JaxMARL vs CAMAR, one subprocess per simulator |
 | `python -m swarp.benchmark.ablation` | cumulative optimization ablation of the same hot path, one feature per row, parity-gated |
-| `python -m swarp.benchmark.scenarios` | all 7 scenarios × robot model × lidar rays: baseline vs optimized, parity-gated |
+| `python -m swarp.benchmark.scenarios` | all 10 scenarios × robot model × lidar rays: baseline vs optimized, parity-gated |
 
 ## Throughput
 

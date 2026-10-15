@@ -6,6 +6,15 @@ earns a one-off shared reward the step a target is first covered. Agents also pa
 a small per-step time penalty and a per-contact collision penalty. Coverage is
 computed with ``torch.cdist`` over agent/target positions.
 
+**Progress shaping.** Each agent also earns ``pos_shaping_factor * dt * (v . u)``, where
+``u`` is the unit vector to its nearest still-uncovered target: the rate at which it is
+closing on that target, i.e. the per-step decrease of that distance to first order. It is
+the dense signal the one-off covering reward lacks (a random policy covers under half a
+target per episode), and it is stateless -- a velocity projection rather than a
+``prev - cur`` distance difference -- so the nearest target switching when one is covered
+causes no jump, and no shaping baseline has to be carried across steps or resets.
+It defaults to 0 (off), so the default reward is unchanged; the MAPPO recipe turns it on.
+
 **Scaling.** That ``cdist`` — and the matching loop in the fused kernels — is
 **O(n_agents * n_targets)** all-pairs work, and the inter-agent observation is
 **O(n_agents^2)**; neither consults the neighbor list. Deliberate: the fused path is
@@ -50,6 +59,7 @@ class DiscoveryScenario(FusedScenario):
         time_penalty: float = -0.01,
         collision_penalty: float = -0.1,
         max_speed: float = 1.0,
+        pos_shaping_factor: float = 0.0,
     ) -> None:
         self.n_agents = n_agents
         self.n_targets = n_targets
@@ -61,6 +71,7 @@ class DiscoveryScenario(FusedScenario):
         self.time_penalty = time_penalty
         self.collision_penalty = collision_penalty
         self.max_speed = max_speed
+        self.pos_shaping_factor = pos_shaping_factor
 
     def make_world(self, n_envs, device, dt, substeps, dtype, world_config=None) -> World:
         cfgs = [
@@ -84,6 +95,7 @@ class DiscoveryScenario(FusedScenario):
         self.world = World(
             cfgs, cfg, n_envs=n_envs, device=device, dt=dt, substeps=substeps, dtype=dtype
         )
+        self.dt = dt
         # Task state, allocated here (n_envs is known) and only ever written in place, so
         # the fused spec can adopt it with alloc="never". Allocating it on first reset
         # instead made the fused path silently depend on reset running first.
@@ -190,10 +202,19 @@ class DiscoveryScenario(FusedScenario):
         dd2 = (diff * diff).sum(-1)
         touch = (dd2 < (2.0 * self.agent_radius) ** 2).sum(dim=-1).to(w.dtype) - 1.0  # minus self
 
+        # Closing speed on the nearest target still uncovered after this step's latch.
+        unc = ~self.covered.unsqueeze(1)  # [n_envs, 1, n_targets]
+        near = torch.where(unc, dt2, torch.full_like(dt2, float("inf"))).argmin(dim=-1)
+        to_t = -torch.gather(diff_t, 2, near[..., None, None].expand(-1, -1, 1, 2)).squeeze(2)
+        dist = (to_t * to_t).sum(-1).sqrt()
+        closing = (w.state.vel * to_t).sum(-1) / dist.clamp_min(1e-9)
+        shaping = torch.where(unc.any(-1), closing, torch.zeros_like(closing))
+
         self._cache = {
             "newly": newly,
             "count": count,
             "touch": touch,
+            "shaping": self.pos_shaping_factor * self.dt * shaping,
             "rel_targets": (self.targets.unsqueeze(1) - pos.unsqueeze(2)).reshape(
                 w.n_envs, w.n_agents, self.n_targets * 2
             ),
@@ -206,6 +227,7 @@ class DiscoveryScenario(FusedScenario):
         return (
             Buf("obs", (ne, na, self.obs_dim)),
             Buf("touch", (ne, na)),
+            Buf("shaping", (ne, na)),
             Buf("reward", (ne, na)),
             Buf("newly", (ne, self.n_targets), "uint8"),
             Buf("done", (ne,), "uint8", bool_view=True),
@@ -266,7 +288,7 @@ class DiscoveryScenario(FusedScenario):
         w = self.world
         scalar = w.wp_dtype
         targets, covered = self._wp["targets"], self._wp["covered"]
-        obs, touch = self._wp["obs"], self._wp["touch"]
+        obs, touch, shaping = self._wp["obs"], self._wp["touch"], self._wp["shaping"]
         launch = self._obs_launch.get(
             concrete(discovery_obs_kernel, self.world.wp_dtype),
             dim=(w.n_envs, self.n_agents),
@@ -278,8 +300,9 @@ class DiscoveryScenario(FusedScenario):
                 wp.int32(self.n_agents),
                 wp.int32(self.n_targets),
                 scalar((2.0 * self.agent_radius) ** 2),
+                scalar(self.pos_shaping_factor * self.dt),
             ],
-            outputs=[obs, touch],
+            outputs=[obs, touch, shaping],
             device=w.device,
             key=(
                 w.n_envs,
@@ -290,8 +313,10 @@ class DiscoveryScenario(FusedScenario):
                 ptr_key(targets),
                 ptr_key(covered),
                 self.agent_radius,
+                self.pos_shaping_factor * self.dt,
                 ptr_key(obs),
                 ptr_key(touch),
+                ptr_key(shaping),
             ),
         )
         launch.launch()
@@ -304,6 +329,7 @@ class DiscoveryScenario(FusedScenario):
             dim=w.n_envs,
             inputs=[
                 self._wp["touch"],
+                self._wp["shaping"],
                 self._wp["newly"],
                 self._wp["covered"],
                 wp.int32(self.n_agents),
@@ -329,9 +355,11 @@ class DiscoveryScenario(FusedScenario):
 
     def agent_reward(self, agent_idx: int) -> torch.Tensor:
         c = self._cache
-        return self.collision_penalty * c["touch"][
-            :, agent_idx
-        ] + self.time_penalty * torch.ones_like(c["touch"][:, agent_idx])
+        return (
+            self.collision_penalty * c["touch"][:, agent_idx]
+            + self.time_penalty * torch.ones_like(c["touch"][:, agent_idx])
+            + c["shaping"][:, agent_idx]
+        )
 
     def global_reward(self) -> torch.Tensor:
         return self.covering_reward * self._cache["newly"].sum(dim=-1).to(self.world.dtype)

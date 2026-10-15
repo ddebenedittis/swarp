@@ -589,7 +589,7 @@ class NeighborGrid:
         This is the whole point of ``bounds``: with the grid frame fixed, every build
         skips ``_bounds_init``/``_bounds_reduce``/``_finalize_grid`` — a global-atomic
         reduction over all ``n_envs * n_agents`` positions that was costing 10-17% of the
-        build. All seven built-in scenarios pin a static world rectangle, so the batch
+        build. All ten built-in scenarios pin a static world rectangle, so the batch
         extent the dynamic path measures is bounded by it anyway.
 
         **Why this stays exact.** The clamp that maps out-of-range positions into the edge

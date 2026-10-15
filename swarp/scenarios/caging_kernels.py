@@ -1,43 +1,76 @@
-"""Fused Warp kernels for the CagingScenario obs/reward + escaping-disc body layer.
+"""Fused Warp kernels for the CagingScenario obs/reward layer and its evasive disc.
 
-Four launches, ordered ``body -> {obs, reward}`` (with ``set_obstacles`` between ``body``
-and the next physics step, on the host), plus the masked reset:
+Four launches per step, in this order (see
+:meth:`~swarp.scenarios.caging.CagingScenario.launch_fused`):
 
-* ``caging_body_kernel`` (thread per env) sums the spring-damper reaction force the
-  disc receives from every agent (Newton's third law of the same soft contact the agent
-  step applies) *and* the escape acceleration — ``-escape_accel`` times the mean of the
-  unit vectors pointing from the disc to each agent — then integrates the disc position
-  in place (semi-implicit Euler + damping + a ``max_disc_speed`` cap). One disc per env,
-  one thread per disc: no cross-thread races, and the per-agent reduction loops
-  ``0..A-1``.
-* ``caging_obs_kernel`` (thread per (env, agent)) builds the obs row, including the
-  agent's own two *local* angular gaps — the bearing distance to the next agent
-  counter-clockwise and clockwise around the disc. Those are what make the topological
-  objective observable from a single agent's row.
-* ``caging_reward_kernel`` (thread per env) computes the largest circular gap between
-  agent bearings, the capture latch, and the per-agent reward.
-* ``caging_reset_kernel`` (thread per env) draws the disc pose and an annulus of agents
-  around it in one masked launch.
+* ``caging_disc_kernel`` (thread per ``(env, 1)``) — the scenario-owned disc. Drift +
+  flee + agent contact reaction, one semi-implicit Euler step, clamped to the arena.
+  The disc is **not** an engine ``MOVABLE`` body: it is installed as an ordinary
+  ``IMMOVABLE`` circle so the agents feel it through ``_static_forces``, and integrated
+  here, because the engine's obstacle integrator derives force only from agent reaction
+  and has no slot for an external one (a flee potential that reaches beyond contact
+  cannot be expressed as a contact law).
+* ``caging_obs_kernel`` (thread per ``(env, agent)``) — the O(N^2) bearing work. Every
+  per-agent reward input (``gap``, ``band``, ``touch``, ``inband``) and every per-agent
+  observation column.
+* ``caging_reward_kernel`` (thread per env) — O(N) reductions only: ``gap_max``, the
+  soft-max surrogate, the band error, the ``caged`` predicate, the hold counter, the
+  reward and the objective vector. It also writes the two **broadcast** observation
+  columns (``gap_max``, ``caged``), which is why it runs on every pass rather than only
+  on a full one: those columns are per-env reductions that the per-agent obs kernel
+  cannot see, and folding them in here keeps the scenario at four kernels instead of
+  splitting the observation across two per-agent launches.
+* ``caging_reset_kernel`` (thread per env) — masked episode reset, including the
+  **per-episode** drift force and evade gain (see the scenario docstring for why those
+  cannot be per-step draws).
 
-**The largest circular gap, two ways.** The torch reference
-(:mod:`swarp.scenarios.caging`) sorts the bearings and differences them, wrap-around
-included. The kernel cannot: Warp has no dynamically sized register array, so an
-insertion sort over a runtime ``n_agents`` has nowhere to live. It uses the equivalent
-"nearest neighbour ahead" formulation instead — for every agent ``i``, the gap that
-*starts* at ``i`` is ``min_j (b_j - b_i) mod 2*pi`` over the other agents, and the
-largest circular gap is the max of those over ``i``. That is O(A^2) with zero storage,
-and it makes the wrap-around structural rather than a special case: the modulo is what
-carries a bearing past ``+pi`` back round to ``-pi``. The two paths being independent
-implementations of the same quantity is the point — that is what
-``tests/scenarios/test_caging_fused.py`` tests.
+Max angular gap, without a sort
+-------------------------------
+With ``theta_i = atan2(p_i - q)`` in ``(-pi, pi]``::
 
-Degenerate agent counts fall out of the same formula. With ``n_agents == 1`` the inner
-loop never runs and the gap stays at its ``2*pi`` initializer; with ``n_agents == 2`` the
-two gaps sum to ``2*pi`` and the larger one wins. Nothing special-cases them.
+    gap_i   = min over j != i of wrap(theta_j - theta_i),  wrap(x) = x + 2pi if x < 0
+    gap_max = max over i of gap_i
 
-Observation cat order (``obs_dim = 10``)::
+The CCW successor of ``i`` is exactly the ``j`` that minimizes the wrapped difference, so
+``{gap_i}`` are precisely the N arcs of the circular order and they sum to ``2*pi``. The
+alternative — sort the bearings and difference them — is avoided for three reasons: there
+is no precedent in this repo for a per-thread local array and Warp has no good one (a
+``wp.types.vector(length=N)`` needs a module-scope declaration per ``(N, dtype)`` pair,
+i.e. a compile-time cap on ``n_agents``); O(N^2) at the tens of agents this scenario is
+written for is nothing, and it is the same trade
+:mod:`swarp.scenarios.formation` already makes *for parity*; and a sort-based torch
+oracle agrees with this form almost everywhere but **differs exactly at bearing ties and
+the 2pi wrap**, which would surface as a parity failure that looks like a kernel bug and
+is not one. The torch reference computes the identical min-of-wrapped-differences
+expression.
 
-    [ pos(2), vel(2), disc_rel(2), disc_vel(2), gap_ccw(1), gap_cw(1) ]
+Because ``theta`` is in ``(-pi, pi]`` the raw difference lies in ``(-2pi, 2pi)``, so the
+**single conditional add** below is exact and bit-identical to ``torch.where(d < 0, d +
+2pi, d)``. Do not "simplify" it to ``fmod``/``remainder``/``floor`` — those round
+differently and ``gap_max`` feeds a threshold that ``done`` is compared on exactly.
+
+``best`` is seeded at ``2*pi`` rather than at ``+inf``, which is also how the
+``n_agents == 1`` case is defined (an empty loop leaves ``gap = 2*pi``) — the torch
+oracle reproduces it by masking the diagonal with ``2*pi`` instead of ``inf``.
+
+The "arcs sum to 2*pi" identity holds for *distinct* bearings. At an exact tie both
+duplicates get a zero arc and this form under-reports (a sort would collapse them and
+report the real arc). Exact ties have measure zero in floating point, both paths use the
+same form so parity is unaffected, and ``tests/scenarios/test_caging_fused.py::
+test_gap_matches_sort_oracle`` pins the divergence explicitly so that a future "fix" of
+one side to the sort form is caught there rather than as a mystery parity failure.
+
+Observation row (``obs_dim = 13 + 2 * (n_agents - 1)``)::
+
+    [ pos(2), vel(2), disc_pos - pos(2), disc_vel(2), r - cage_radius,
+      cos(gap_a), sin(gap_a), gap_max, caged, other agents' rel pos(2*(N-1)) ]
+
+``gap_max`` and ``caged`` are broadcast to every agent on purpose: "caged" is a
+*topological* property of the whole team, and without those two columns no agent in a
+decentralised policy can tell whether the cage is closed. ``cos/sin(gap_a)`` rather than
+"my CCW successor's relative position" because the successor needs an **argmin**, and
+torch does not guarantee a lowest-index tie-break on CUDA, so oracle and kernel could
+pick different successors at a bearing tie.
 """
 
 from __future__ import annotations
@@ -50,101 +83,115 @@ from swarp._overloads import register
 from swarp.core.state import VEC2
 from swarp.scenarios.reset_kernels import _as
 
-#: 2*pi, as a Python float; cast to the kernel's dtype at use (``type(x)(TWO_PI)``).
-TWO_PI = 6.283185307179586
+#: Objective columns of ``info()["multiobj_reward"]``, in order. Kept next to the kernel
+#: that writes them so the two cannot drift apart.
+OBJ_GAP = 0
+OBJ_BAND = 1
+OBJ_CAGE = 2
+OBJ_TIME = 3
+OBJ_COLLISION = 4
+N_OBJ = 5
+
+#: The two observation columns the *reward* kernel fills (per-env reductions broadcast to
+#: every agent), and where the other-agent block starts. The per-agent obs kernel owns
+#: columns 0..10; keeping the split as named constants is what stops the two kernels from
+#: silently writing the same slot.
+C_GAP_MAX = 11
+C_CAGED = 12
+C_OTHERS = 13
 
 
 @wp.kernel
-def caging_body_kernel(
+def caging_disc_kernel(
     pos: wp.array2d(dtype=Any),
     vel: wp.array2d(dtype=Any),
+    drift: wp.array2d(dtype=Any),
+    evade: wp.array(dtype=Any),
     n_agents: wp.int32,
-    inv_agents: Any,
     agent_radius: Any,
     disc_radius: Any,
     contact_margin: Any,
+    flee_radius: Any,
+    flee_k: Any,
     contact_k: Any,
     contact_c: Any,
     disc_mass: Any,
     linear_damping: Any,
-    escape_accel: Any,
-    max_disc_speed: Any,
     dt: Any,
     bound: Any,
     disc_pos: wp.array2d(dtype=Any),
     disc_vel: wp.array2d(dtype=Any),
 ):
-    """Thread per env: contact reaction + escape drift, then integrate the disc.
+    """Thread per ``(env, 1)``: accumulate the disc's force, integrate, clamp.
 
-    Position only. A circle under frictionless normal contact has zero lever arm about
-    its own centre (``swarp/core/bodies.py``), so there is no orientation to track and
-    none is allocated.
+    Force terms, in the order the torch oracle sums them:
+
+    1. ``drift[e, 0]`` — a per-episode constant wander, written by the reset kernel.
+    2. a **flee** push away from every agent within ``flee_radius``, profile
+       ``(1 - d / flee_radius)^2``. Quadratic, not exponential: it is C^1 at the cutoff,
+       so an agent crossing the flee boundary does not step the disc's acceleration.
+    3. the agent **contact reaction**, the same spring-damper the engine applies to the
+       agents (Newton's third law of it), which is what makes "caged" a dynamical fact
+       rather than a reward label — without it the disc slides through the ring and the
+       task degenerates into ``formation``.
+
+    Term 3 is the plain explicit spring-damper, whereas the agent side of the same
+    contact goes through :func:`swarp.core.collisions.pair_force`'s linearly-implicit,
+    depth-saturated law. So the pair is not third-law-exact; the same one-sided
+    simplification :mod:`swarp.scenarios.transport` makes, and it is bounded by the same
+    damping. ``agent_radius`` is a scenario scalar rather than ``params[a, P_RADIUS]``:
+    the cage geometry is derived from the scenario's single agent radius, so a per-agent
+    radius would describe a ring that does not exist.
+
+    The clamp is the scenario's own responsibility: nothing in the engine bounds a
+    scenario-owned obstacle (``Stepper`` feeds the arena clamp to
+    :mod:`swarp.core.bodies`, inside a kernel that early-returns for a non-``MOVABLE``
+    obstacle).
     """
-    e = wp.tid()
-    q = disc_pos[e, 0]
-    pv = disc_vel[e, 0]
-    qx = q[0]
-    qy = q[1]
-    zero = type(qx)(0.0)
-    one = type(qx)(1.0)
-    eps = type(qx)(1.0e-9)
+    e, k = wp.tid()
+    q = disc_pos[e, k]
+    dv = disc_vel[e, k]
+    zero = type(q[0])(0.0)
+    one = type(q[0])(1.0)
+    eps = type(q[0])(1.0e-9)
     reach = agent_radius + disc_radius + contact_margin
+    ev = evade[e]
 
-    fx = zero
-    fy = zero
-    # Sum of the unit vectors disc -> agent. Its mean is the "where the crowd is"
-    # direction; the disc accelerates the other way (see the escape law below).
-    sx = zero
-    sy = zero
+    d0 = drift[e, k]
+    fx = d0[0]
+    fy = d0[1]
     for a in range(n_agents):
-        relx = qx - pos[e, a][0]  # agent -> disc
-        rely = qy - pos[e, a][1]
+        relx = q[0] - pos[e, a][0]
+        rely = q[1] - pos[e, a][1]
         dist = wp.sqrt(relx * relx + rely * rely)
         if dist < eps:
             dist = eps
         nhx = relx / dist
         nhy = rely / dist
-        overlap = reach - dist
-        active = zero
-        if overlap > zero:
-            active = one
-        ov = overlap
-        if ov < zero:
-            ov = zero
-        fmag = contact_k * ov
-        rvx = pv[0] - vel[e, a][0]
-        rvy = pv[1] - vel[e, a][1]
-        vn = rvx * nhx + rvy * nhy
-        coeff = (fmag - contact_c * vn) * active
-        fx += coeff * nhx
-        fy += coeff * nhy
-        sx -= nhx  # disc -> agent is -n_hat
-        sy -= nhy
 
-    # Escape law: a = -escape_accel * mean_a(unit(disc -> agent)). A ring that closes
-    # around the disc cancels the sum and the drift vanishes; a ring with a hole leaves
-    # a residual pointing *into* the hole, at up to ``escape_accel``. Smooth in the
-    # agent positions, so no argmax and no discontinuity when the widest gap changes
-    # hands.
-    ex = -escape_accel * sx * inv_agents
-    ey = -escape_accel * sy * inv_agents
+        if dist < flee_radius:
+            w = one - dist / flee_radius
+            coeff = ev * flee_k * w * w
+            fx += coeff * nhx
+            fy += coeff * nhy
+
+        overlap = reach - dist
+        if overlap > zero:
+            vnx = dv[0] - vel[e, a][0]
+            vny = dv[1] - vel[e, a][1]
+            vn = vnx * nhx + vny * nhy
+            cc = contact_k * overlap - contact_c * vn
+            fx += cc * nhx
+            fy += cc * nhy
 
     decay = one - linear_damping * dt
-    new_vx = (pv[0] + (fx / disc_mass + ex) * dt) * decay
-    new_vy = (pv[1] + (fy / disc_mass + ey) * dt) * decay
-    # Speed cap, applied to the integrated velocity *before* it moves the position, so
-    # the clamped velocity is what the state carries and what the next step's damping
-    # acts on — the same order the torch reference uses, and the same formulation as
-    # shepherding's ``max_sheep_speed``.
-    speed = wp.sqrt(new_vx * new_vx + new_vy * new_vy)
-    if speed > max_disc_speed:
-        vscale = max_disc_speed / speed
-        new_vx = new_vx * vscale
-        new_vy = new_vy * vscale
-    new_px = wp.clamp(qx + new_vx * dt, -bound, bound)
-    new_py = wp.clamp(qy + new_vy * dt, -bound, bound)
-    disc_vel[e, 0] = type(pv)(new_vx, new_vy)
-    disc_pos[e, 0] = type(q)(new_px, new_py)
+    nvx = (dv[0] + fx / disc_mass * dt) * decay
+    nvy = (dv[1] + fy / disc_mass * dt) * decay
+    disc_vel[e, k] = type(dv)(nvx, nvy)
+    disc_pos[e, k] = type(q)(
+        wp.clamp(q[0] + nvx * dt, -bound, bound),
+        wp.clamp(q[1] + nvy * dt, -bound, bound),
+    )
 
 
 @wp.kernel
@@ -153,157 +200,230 @@ def caging_obs_kernel(
     vel: wp.array2d(dtype=Any),
     disc_pos: wp.array2d(dtype=Any),
     disc_vel: wp.array2d(dtype=Any),
+    reset_mask: wp.array(dtype=wp.uint8),
     n_agents: wp.int32,
+    col_dist_sq: Any,
+    cage_radius: Any,
+    band_half: Any,
+    two_pi: Any,
+    full_pass: wp.int32,
     obs: wp.array3d(dtype=Any),
+    gap: wp.array2d(dtype=Any),
+    band: wp.array2d(dtype=Any),
+    touching: wp.array2d(dtype=Any),
+    inband: wp.array(dtype=wp.uint8, ndim=2),
 ):
-    """Thread per (env, agent): pose, disc-relative pose, and the agent's two local gaps.
+    """Thread per ``(env, agent)``: bearings, angular gap, radial band, contacts, obs row.
 
-    ``gap_ccw`` is the bearing distance from this agent to the next one counter-clockwise
-    around the disc, ``gap_cw`` the same clockwise. Both are computed as their own
-    modulo, rather than one as ``2*pi - other``: the latter cancels catastrophically for
-    a bearing pair that wrapped, and the torch oracle takes two independent remainders.
+    One pass over the other agents does all three O(N) jobs — the wrapped-difference
+    minimum, the all-pairs contact count, and the other-agent observation block — so the
+    quadratic term is walked once rather than three times.
+
+    The contact count is an all-pairs scan against the static ``2 * agent_radius``
+    distance rather than a walk of the neighbor list, for formation's reason: the list is
+    truncated at ``max_neighbors``, so reading it would make the two paths disagree by
+    construction whenever it overflowed. Squared comparison (no ``sqrt``) so it matches
+    the torch oracle's squared broadcast distance bit-for-bit at the boundary.
     """
     e, a = wp.tid()
+    if full_pass == 0 and reset_mask[e] == wp.uint8(0):
+        # Obs-only auto-reset pass: an env this mask did not select has state identical to
+        # what the step pass wrote into every buffer below moments earlier.
+        return
     p = pos[e, a]
     v = vel[e, a]
     q = disc_pos[e, 0]
     dv = disc_vel[e, 0]
-    px = p[0]
-    py = p[1]
-    zero = type(px)(0.0)
-    two_pi = type(px)(TWO_PI)
-    obs[e, a, 0] = px
-    obs[e, a, 1] = py
+    zero = type(q[0])(0.0)
+    one = type(q[0])(1.0)
+
+    dx = p[0] - q[0]
+    dy = p[1] - q[1]
+    r = wp.sqrt(dx * dx + dy * dy)
+    th = wp.atan2(dy, dx)
+
+    obs[e, a, 0] = p[0]
+    obs[e, a, 1] = p[1]
     obs[e, a, 2] = v[0]
     obs[e, a, 3] = v[1]
-    obs[e, a, 4] = q[0] - px
-    obs[e, a, 5] = q[1] - py
+    obs[e, a, 4] = -dx  # disc_pos - own pos
+    obs[e, a, 5] = -dy
     obs[e, a, 6] = dv[0]
     obs[e, a, 7] = dv[1]
+    obs[e, a, 8] = r - cage_radius
 
-    bi = wp.atan2(py - q[1], px - q[0])
-    ccw = two_pi
-    cw = two_pi
-    for j in range(n_agents):
-        if j != a:
-            bj = wp.atan2(pos[e, j][1] - q[1], pos[e, j][0] - q[0])
-            d = bj - bi
-            if d < zero:
-                d += two_pi
-            if d < ccw:
-                ccw = d
-            dc = bi - bj
-            if dc < zero:
-                dc += two_pi
-            if dc < cw:
-                cw = dc
-    obs[e, a, 8] = ccw
-    obs[e, a, 9] = cw
+    best = two_pi
+    cnt = zero
+    slot = wp.int32(0)
+    for b in range(n_agents):
+        bx = pos[e, b][0] - p[0]
+        by = pos[e, b][1] - p[1]
+        if bx * bx + by * by < col_dist_sq:
+            cnt += one
+        if b != a:
+            dd = wp.atan2(pos[e, b][1] - q[1], pos[e, b][0] - q[0]) - th
+            # Exact: th, and every other bearing, lie in (-pi, pi], so dd is in
+            # (-2pi, 2pi) and one conditional add is the whole wrap.
+            if dd < zero:
+                dd += two_pi
+            if dd < best:
+                best = dd
+            obs[e, a, C_OTHERS + wp.int32(2) * slot] = bx
+            obs[e, a, C_OTHERS + wp.int32(2) * slot + 1] = by
+            slot += wp.int32(1)
+
+    obs[e, a, 9] = wp.cos(best)
+    obs[e, a, 10] = wp.sin(best)
+
+    gap[e, a] = best
+    err = wp.abs(r - cage_radius) - band_half
+    band[e, a] = wp.max(err, zero)
+    if err <= zero:
+        inband[e, a] = wp.uint8(1)
+    else:
+        inband[e, a] = wp.uint8(0)
+    touching[e, a] = cnt - one
 
 
 @wp.kernel
 def caging_reward_kernel(
-    pos: wp.array2d(dtype=Any),
+    gap: wp.array2d(dtype=Any),
+    band: wp.array2d(dtype=Any),
+    touching: wp.array2d(dtype=Any),
+    inband: wp.array(dtype=wp.uint8, ndim=2),
     disc_pos: wp.array2d(dtype=Any),
+    reset_mask: wp.array(dtype=wp.uint8),
     n_agents: wp.int32,
-    agent_radius: Any,
-    disc_radius: Any,
-    cage_radius: Any,
-    capture_radius: Any,
+    inv_n_agents: Any,
+    two_pi: Any,
+    beta: Any,
+    inv_beta: Any,
     gap_threshold: Any,
-    gap_reward: Any,
-    radius_factor: Any,
-    contact_penalty: Any,
-    caged_reward: Any,
-    spacing_factor: Any,
-    even_gap: Any,
-    gap_out: wp.array(dtype=Any),
-    reward: wp.array2d(dtype=Any),
+    wall_free_radius: Any,
+    hold_steps: wp.int32,
+    gap_shaping_factor: Any,
+    band_shaping_factor: Any,
+    cage_reward: Any,
+    time_penalty: Any,
+    collision_penalty: Any,
+    advance_prev: wp.int32,
+    full_pass: wp.int32,
+    prev_gap: wp.array(dtype=Any),
+    prev_band: wp.array(dtype=Any),
+    obs: wp.array3d(dtype=Any),
+    gap_max_out: wp.array(dtype=Any),
+    gap_soft_out: wp.array(dtype=Any),
+    band_err_out: wp.array(dtype=Any),
     caged: wp.array(dtype=wp.uint8),
+    hold: wp.array(dtype=wp.uint8),
+    done: wp.array(dtype=wp.uint8),
+    reward: wp.array2d(dtype=Any),
+    multiobj: wp.array3d(dtype=Any),
 ):
-    """Thread per env: largest circular gap, the capture latch, and the reward row.
+    """Thread per env; sequential agent loops (deterministic, no atomics).
 
-    Three ``0..A-1`` sweeps, deterministic and atomic-free: the O(A^2) gap reduction
-    (see the module docstring for why it is not a sort), the capture check — which needs
-    every agent's radius before the bonus is known — and then the per-agent write.
+    ``gap_soft = 2pi + (1/beta) * log(sum_i exp(beta * (gap_i - 2pi)))`` is the *shaped*
+    signal, and ``gap_max`` only the success criterion. That split is the point:
+    ``gap_max``'s gradient is supported on one pair of agents at a time, so a team of six
+    with one big gap would give signal to two agents and zero to four. Every exponent
+    here is ``<= 0`` (because ``gap_i <= 2pi``), so the sum needs no max-subtraction for
+    stability and stays exp/log only — no hidden ``max`` reintroducing the sparse
+    gradient.
 
-    The dense per-agent spacing shaping rides along in the *first* sweep for free: the
-    inner loop's ``gi`` is already this agent's counter-clockwise local gap, so tracking
-    the clockwise one alongside it costs two more comparisons and no extra pass. It is
-    parked straight into ``reward[e, i]`` because a thread has nowhere else to keep one
-    value per agent — Warp has no dynamically sized register array — and the third sweep
-    then folds the shared and radial terms on top.
+    ``caged`` is a **conjunction**, and ``|q| < wall_free_radius`` is one of its
+    conjuncts rather than a penalty term, because once the disc is clamped to the arena
+    the trivial optimum is to shove it into a corner where two walls close most escape
+    directions for free and ``gap_max`` never has to shrink. A penalty is one more weight
+    to tune and can be traded off against; a predicate cannot.
+
+    ``cage_reward`` is paid on **every** caged step, not once at ``done``: ``hold_steps``
+    asks the policy to *maintain* the cage, and a terminal-only bonus gives zero signal
+    during the hold.
+
+    The hold counter advances on ``advance_prev`` (i.e. on a step) rather than on
+    ``full_pass``: a standalone ``reset()`` is a full pass, and advancing there would
+    count the spawn instant as a held step, which the torch oracle — whose ``reset_torch``
+    does not advance — would not.
     """
     e = wp.tid()
-    q = disc_pos[e, 0]
-    qx = q[0]
-    qy = q[1]
-    zero = type(qx)(0.0)
-    two_pi = type(qx)(TWO_PI)
+    if full_pass == 0 and reset_mask[e] == wp.uint8(0):
+        return
+    zero = type(two_pi)(0.0)
+    one = type(two_pi)(1.0)
 
-    # Largest circular gap = max over i of the smallest bearing step counter-clockwise
-    # from i to any other agent. ``gi`` starts at a full turn, which is exactly the right
-    # answer when there is no other agent (n_agents == 1).
     gmax = zero
-    for i in range(n_agents):
-        bi = wp.atan2(pos[e, i][1] - qy, pos[e, i][0] - qx)
-        gi = two_pi
-        ci = two_pi
-        for j in range(n_agents):
-            if j != i:
-                bj = wp.atan2(pos[e, j][1] - qy, pos[e, j][0] - qx)
-                d = bj - bi
-                if d < zero:
-                    d += two_pi
-                if d < gi:
-                    gi = d
-                dc = bi - bj
-                if dc < zero:
-                    dc += two_pi
-                if dc < ci:
-                    ci = dc
-        if gi > gmax:
-            gmax = gi
-        # Dense per-agent spacing shaping: pull each agent's own two local gaps towards
-        # an even share of the circle. Its optimum *is* the evenly spaced ring, i.e. the
-        # configuration that minimizes ``gmax`` — so it agrees with the topological
-        # objective rather than competing with it, and unlike a max it hands every agent
-        # a gradient every step. Squared, not absolute: see the scenario module docstring
-        # for why an L1 deviation goes flat for a third of the agents.
-        d_ccw = gi - even_gap
-        d_cw = ci - even_gap
-        reward[e, i] = -spacing_factor * (d_ccw * d_ccw + d_cw * d_cw)
-    gap_out[e] = gmax
-
-    # Caged: the ring is closed *and* it is a ring around this disc rather than a
-    # coincidental bearing spread from far away.
-    flag = wp.uint8(0)
-    if gmax < gap_threshold:
-        flag = wp.uint8(1)
+    esum = zero
+    bsum = zero
+    n_in = wp.int32(0)
     for a in range(n_agents):
-        dx = pos[e, a][0] - qx
-        dy = pos[e, a][1] - qy
-        if wp.sqrt(dx * dx + dy * dy) > capture_radius:
-            flag = wp.uint8(0)
-    bonus = zero
-    if flag == wp.uint8(1):
-        bonus = caged_reward
-    shared = gap_reward * (gap_threshold - gmax) + bonus
+        g = gap[e, a]
+        if g > gmax:
+            gmax = g
+        esum += wp.exp(beta * (g - two_pi))
+        bsum += band[e, a]
+        if inband[e, a] == wp.uint8(1):
+            n_in += wp.int32(1)
+    gsoft = two_pi + inv_beta * wp.log(esum)
+    berr = bsum * inv_n_agents
 
-    contact_reach = agent_radius + disc_radius
+    q = disc_pos[e, 0]
+    qn = wp.sqrt(q[0] * q[0] + q[1] * q[1])
+    cg = wp.int32(0)
+    if gmax < gap_threshold and n_in == n_agents and qn < wall_free_radius:
+        cg = wp.int32(1)
+    cgf = zero
+    if cg == 1:
+        cgf = one
+
+    if full_pass == 1:
+        # Gated, like every other reward/info buffer: the obs-only auto-reset pass must
+        # leave the diagnostics already returned for the transition just taken alone. The
+        # two *observation* columns below are the exception — an obs-only pass exists
+        # precisely to refresh the observation — and they read ``gmax``/``cgf`` from this
+        # thread's locals, not from the buffers.
+        caged[e] = wp.uint8(cg)
+        gap_max_out[e] = gmax
+        gap_soft_out[e] = gsoft
+        band_err_out[e] = berr
     for a in range(n_agents):
-        dx = pos[e, a][0] - qx
-        dy = pos[e, a][1] - qy
-        d = wp.sqrt(dx * dx + dy * dy)
-        ring = wp.abs(d - cage_radius)
-        pen = contact_reach - d
-        if pen < zero:
-            pen = zero
-        # ``reward[e, a]`` already holds the spacing term from the first sweep. The
-        # parenthesisation mirrors the torch oracle's ``agent_reward + global_reward``
-        # split exactly, so the two paths associate these four terms the same way.
-        reward[e, a] = (reward[e, a] - radius_factor * ring - contact_penalty * pen) + shared
-    caged[e] = flag
+        obs[e, a, C_GAP_MAX] = gmax
+        obs[e, a, C_CAGED] = cgf
+
+    sg = (prev_gap[e] - gsoft) * gap_shaping_factor
+    sb = (prev_band[e] - berr) * band_shaping_factor
+    if reset_mask[e] == wp.uint8(1):
+        prev_gap[e] = gsoft
+        prev_band[e] = berr
+        sg = zero
+        sb = zero
+    elif advance_prev == 1:
+        prev_gap[e] = gsoft
+        prev_band[e] = berr
+
+    h = wp.int32(hold[e])
+    if advance_prev == 1:
+        if cg == 1:
+            if h < 255:
+                h += wp.int32(1)
+        else:
+            h = wp.int32(0)
+        hold[e] = wp.uint8(h)
+
+    if full_pass == 1:
+        if h >= hold_steps:
+            done[e] = wp.uint8(1)
+        else:
+            done[e] = wp.uint8(0)
+        cage_term = cage_reward * cgf
+        glob = sg + sb + cage_term + time_penalty
+        for a in range(n_agents):
+            col = collision_penalty * touching[e, a]
+            multiobj[e, a, OBJ_GAP] = sg
+            multiobj[e, a, OBJ_BAND] = sb
+            multiobj[e, a, OBJ_CAGE] = cage_term
+            multiobj[e, a, OBJ_TIME] = time_penalty
+            multiobj[e, a, OBJ_COLLISION] = col
+            reward[e, a] = glob + col
 
 
 @wp.kernel
@@ -311,129 +431,216 @@ def caging_reset_kernel(
     reset_mask: wp.array(dtype=wp.uint8),
     use_mask: wp.int32,
     seed: wp.int32,
-    alim: Any,
-    dlim: Any,
-    spawn_min: Any,
-    spawn_max: Any,
+    difficulty: wp.array(dtype=Any),
     n_agents: wp.int32,
+    agent_lim: Any,
+    disc_lim: Any,
+    cage_radius: Any,
+    ring_ang_jitter: Any,
+    ring_rad_jitter: Any,
+    drift_mag: Any,
     pos: Any,
+    theta: Any,
     vel: Any,
+    speed: Any,
+    ang_vel: Any,
     disc_pos: Any,
     disc_vel: Any,
+    drift: Any,
+    evade: wp.array(dtype=Any),
+    hold: wp.array(dtype=wp.uint8),
 ):
-    """Masked episode reset: a disc pose, then an annulus of agents around it.
+    """Masked episode reset: the disc, the per-episode drift/evade draw, and the spawns.
 
-    Agents spawn on a random bearing at a random radius in
-    ``[spawn_min, spawn_max]`` about the disc rather than uniformly over the world:
-    caging is about *where on the ring* they sit, and a uniform spawn spends most of an
-    episode just closing the distance. ``dlim`` is shrunk so the annulus fits inside the
-    world, and the final clamp only bites for a world too small to hold it.
+    ``difficulty`` is a one-element **array**, read by pointer, not a scalar. This
+    scenario's reset is not folded into the whole-step graph (its seed is drawn
+    host-side), but the same discipline giveway documents applies the moment it were: a
+    scalar kernel argument is baked into a capture *by value*, so a trainer moving the
+    curriculum between batches would silently keep getting the value captured first.
+    Reading it out of device memory costs nothing and cannot go stale.
 
-    Every ``wp.randf`` is drawn inline — a ``@wp.func`` helper would take the RNG state
-    by value and hand back the same point every call (see
-    :mod:`swarp.scenarios.reset_kernels`).
+    At ``f = 0`` the disc is inert (no drift, no evade) at the origin and the agents
+    spawn **on the cage ring** with small jitter, i.e. already caged on step 1 — so the
+    dwell bonus and the terminal are experienced immediately, which is the single reason
+    Push-T's curriculum works. At ``f = 1`` the spawn is uniform and the disc drifts and
+    flees at full strength. Spawn positions are the linear blend of the two, so the
+    curriculum is continuous in ``f``.
+
+    ``drift`` is a per-episode **force vector**, not a per-step draw, and that is
+    load-bearing rather than a simplification. A per-step draw inside the fused step
+    kernel would have to come either from a scalar seed argument — which a CUDA graph
+    bakes in by value, so the "noise" freezes at replay, silently — or from
+    ``World.seed_state``, which the torch oracle cannot reproduce, destroying parity by
+    construction. Written once here, both paths read the identical numbers.
+
+    ``hold`` is zeroed here rather than in the reward kernel, so it is cleared on every
+    flavour of reset including the obs-only auto-reset pass (which does not write the
+    reward outputs at all).
     """
     e = wp.tid()
     if use_mask == 1 and reset_mask[e] == wp.uint8(0):
         return
     rng = wp.rand_init(seed, e)
-    zero = _as(0.0, alim)
-    one = _as(1.0, alim)
-    two = _as(2.0, alim)
-    two_pi = _as(TWO_PI, alim)
+    zero = _as(0.0, agent_lim)
+    one = _as(1.0, agent_lim)
+    two = _as(2.0, agent_lim)
+    two_pi = _as(6.28318530717959, agent_lim)
 
-    qx = (_as(wp.randf(rng), dlim) * two - one) * dlim
-    qy = (_as(wp.randf(rng), dlim) * two - one) * dlim
+    f = difficulty[0]
+
+    # ---- the disc: at the origin when inert, uniform inside the wall-free zone at f = 1
+    qx = (_as(wp.randf(rng), agent_lim) * two - one) * disc_lim * f
+    qy = (_as(wp.randf(rng), agent_lim) * two - one) * disc_lim * f
     disc_pos[e, 0] = wp.vector(qx, qy)
     disc_vel[e, 0] = wp.vector(zero, zero)
 
+    # ---- per-episode wander: a constant force, so under (1 - lambda*dt) decay the disc
+    # settles at drift_mag / (mass * lambda) — which is how the caller sizes drift_mag.
+    phi = _as(wp.randf(rng), agent_lim) * two_pi
+    mag = drift_mag * f
+    drift[e, 0] = wp.vector(mag * wp.cos(phi), mag * wp.sin(phi))
+    evade[e] = f
+    hold[e] = wp.uint8(0)
+
+    inv_n = one / _as(wp.float32(n_agents), agent_lim)
     for a in range(n_agents):
-        phi = _as(wp.randf(rng), alim) * two_pi
-        r = spawn_min + _as(wp.randf(rng), alim) * (spawn_max - spawn_min)
-        px = wp.clamp(qx + r * wp.cos(phi), -alim, alim)
-        py = wp.clamp(qy + r * wp.sin(phi), -alim, alim)
-        pos[e, a] = wp.vector(px, py)
+        # Draw inline, never through a @wp.func: Warp passes the RNG state by value, so a
+        # helper would advance a local copy and hand back the same number every call.
+        ang = _as(wp.float32(a), agent_lim) * two_pi * inv_n + (
+            _as(wp.randf(rng), agent_lim) * two - one
+        ) * ring_ang_jitter
+        rad = cage_radius + (_as(wp.randf(rng), agent_lim) * two - one) * ring_rad_jitter
+        rx = qx + rad * wp.cos(ang)
+        ry = qy + rad * wp.sin(ang)
+        ux = (_as(wp.randf(rng), agent_lim) * two - one) * agent_lim
+        uy = (_as(wp.randf(rng), agent_lim) * two - one) * agent_lim
+        px = (one - f) * rx + f * ux
+        py = (one - f) * ry + f * uy
+        pos[e, a] = wp.vector(
+            wp.clamp(px, -agent_lim, agent_lim), wp.clamp(py, -agent_lim, agent_lim)
+        )
+        theta[e, a] = zero
         vel[e, a] = wp.vector(zero, zero)
+        speed[e, a] = zero
+        ang_vel[e, a] = zero
 
 
-def _body_signature(dtype) -> list:
+def _disc_signature(dtype) -> list:
     a2v = wp.array2d(dtype=VEC2[dtype])
     return [
-        a2v,        # pos
-        a2v,        # vel
-        wp.int32,   # n_agents
-        dtype,      # inv_agents
-        dtype,      # agent_radius
-        dtype,      # disc_radius
-        dtype,      # contact_margin
-        dtype,      # contact_k
-        dtype,      # contact_c
-        dtype,      # disc_mass
-        dtype,      # linear_damping
-        dtype,      # escape_accel
-        dtype,      # max_disc_speed
-        dtype,      # dt
-        dtype,      # bound
-        a2v,        # disc_pos
-        a2v,        # disc_vel
+        a2v,  # pos
+        a2v,  # vel
+        a2v,  # drift
+        wp.array(dtype=dtype),  # evade
+        wp.int32,  # n_agents
+        dtype,  # agent_radius
+        dtype,  # disc_radius
+        dtype,  # contact_margin
+        dtype,  # flee_radius
+        dtype,  # flee_k
+        dtype,  # contact_k
+        dtype,  # contact_c
+        dtype,  # disc_mass
+        dtype,  # linear_damping
+        dtype,  # dt
+        dtype,  # bound
+        a2v,  # disc_pos
+        a2v,  # disc_vel
     ]
 
 
 def _obs_signature(dtype) -> list:
     a2v = wp.array2d(dtype=VEC2[dtype])
+    a2s = wp.array2d(dtype=dtype)
     return [
-        a2v,                      # pos
-        a2v,                      # vel
-        a2v,                      # disc_pos
-        a2v,                      # disc_vel
-        wp.int32,                 # n_agents
+        a2v,  # pos
+        a2v,  # vel
+        a2v,  # disc_pos
+        a2v,  # disc_vel
+        wp.array(dtype=wp.uint8),  # reset_mask
+        wp.int32,  # n_agents
+        dtype,  # col_dist_sq
+        dtype,  # cage_radius
+        dtype,  # band_half
+        dtype,  # two_pi
+        wp.int32,  # full_pass
         wp.array3d(dtype=dtype),  # obs
+        a2s,  # gap
+        a2s,  # band
+        a2s,  # touching
+        wp.array(dtype=wp.uint8, ndim=2),  # inband
     ]
 
 
 def _reward_signature(dtype) -> list:
-    a2v = wp.array2d(dtype=VEC2[dtype])
+    a1s = wp.array(dtype=dtype)
+    a2s = wp.array2d(dtype=dtype)
     return [
-        a2v,                         # pos
-        a2v,                         # disc_pos
-        wp.int32,                    # n_agents
-        dtype,                       # agent_radius
-        dtype,                       # disc_radius
-        dtype,                       # cage_radius
-        dtype,                       # capture_radius
-        dtype,                       # gap_threshold
-        dtype,                       # gap_reward
-        dtype,                       # radius_factor
-        dtype,                       # contact_penalty
-        dtype,                       # caged_reward
-        dtype,                       # spacing_factor
-        dtype,                       # even_gap
-        wp.array(dtype=dtype),       # gap_out
-        wp.array2d(dtype=dtype),     # reward
-        wp.array(dtype=wp.uint8),    # caged
+        a2s,  # gap
+        a2s,  # band
+        a2s,  # touching
+        wp.array(dtype=wp.uint8, ndim=2),  # inband
+        wp.array2d(dtype=VEC2[dtype]),  # disc_pos
+        wp.array(dtype=wp.uint8),  # reset_mask
+        wp.int32,  # n_agents
+        dtype,  # inv_n_agents
+        dtype,  # two_pi
+        dtype,  # beta
+        dtype,  # inv_beta
+        dtype,  # gap_threshold
+        dtype,  # wall_free_radius
+        wp.int32,  # hold_steps
+        dtype,  # gap_shaping_factor
+        dtype,  # band_shaping_factor
+        dtype,  # cage_reward
+        dtype,  # time_penalty
+        dtype,  # collision_penalty
+        wp.int32,  # advance_prev
+        wp.int32,  # full_pass
+        a1s,  # prev_gap
+        a1s,  # prev_band
+        wp.array3d(dtype=dtype),  # obs
+        a1s,  # gap_max_out
+        a1s,  # gap_soft_out
+        a1s,  # band_err_out
+        wp.array(dtype=wp.uint8),  # caged
+        wp.array(dtype=wp.uint8),  # hold
+        wp.array(dtype=wp.uint8),  # done
+        a2s,  # reward
+        wp.array3d(dtype=dtype),  # multiobj
     ]
 
 
 def _reset_signature(dtype) -> list:
     a2v = wp.array2d(dtype=VEC2[dtype])
+    a2s = wp.array2d(dtype=dtype)
     return [
         wp.array(dtype=wp.uint8),  # reset_mask
-        wp.int32,                  # use_mask
-        wp.int32,                  # seed
-        dtype,                     # alim
-        dtype,                     # dlim
-        dtype,                     # spawn_min
-        dtype,                     # spawn_max
-        wp.int32,                  # n_agents
-        a2v,                       # pos
-        a2v,                       # vel
-        a2v,                       # disc_pos
-        a2v,                       # disc_vel
+        wp.int32,  # use_mask
+        wp.int32,  # seed
+        wp.array(dtype=dtype),  # difficulty (by pointer, never a baked scalar)
+        wp.int32,  # n_agents
+        dtype,  # agent_lim
+        dtype,  # disc_lim
+        dtype,  # cage_radius
+        dtype,  # ring_ang_jitter
+        dtype,  # ring_rad_jitter
+        dtype,  # drift_mag
+        a2v,  # pos
+        a2s,  # theta
+        a2v,  # vel
+        a2s,  # speed
+        a2s,  # ang_vel
+        a2v,  # disc_pos
+        a2v,  # disc_vel
+        a2v,  # drift
+        wp.array(dtype=dtype),  # evade
+        wp.array(dtype=wp.uint8),  # hold
     ]
 
 
 for _T in (wp.float32, wp.float64):
-    register(caging_body_kernel, _T, _body_signature(_T))
+    register(caging_disc_kernel, _T, _disc_signature(_T))
     register(caging_obs_kernel, _T, _obs_signature(_T))
     register(caging_reward_kernel, _T, _reward_signature(_T))
     register(caging_reset_kernel, _T, _reset_signature(_T))

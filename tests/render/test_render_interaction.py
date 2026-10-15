@@ -421,7 +421,7 @@ def test_viewer_run_loop_paused_does_not_advance_the_sim(monkeypatch):
     ``_steps_this_frame`` is only consulted by :meth:`Viewer.run`, so a caller that drives its
     own ``env.step`` loop and calls ``render(mode="human")`` steps regardless of the flag —
     the agents keep moving with the HUD claiming "paused". Examples therefore hand the loop
-    to the viewer (see ``examples/pusht_eval.py --window``), and this pins the behaviour.
+    to the viewer (see ``examples/eval_mappo.py --window``), and this pins the behaviour.
     """
     monkeypatch.setenv("SDL_VIDEODRIVER", "dummy")
     env, _ = make_env(n_agents=3, n_envs=2)
