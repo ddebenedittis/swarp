@@ -1,4 +1,4 @@
-"""End-to-end training throughput: the torchrl reference trainer vs ``swarp.rl``.
+"""End-to-end training throughput: the torchrl trainers vs ``swarp.rl``.
 
 Run with::
 
@@ -15,6 +15,12 @@ Configurations (``--configs``):
 
 ``torchrl``
     ``examples/train_mappo.py`` (needs the ``torchrl`` extra; skipped otherwise).
+``torchrl-tuned``
+    ``examples/train_mappo_tuned.py``: the same MAPPO with TorchRL's speed features (a
+    CUDA-graphed collector policy and update, fused capturable Adam, one host read per
+    iteration). fp32, no compile: the counterpart of ``graphs``.
+``torchrl-tuned-fast``
+    ``torchrl-tuned`` plus ``--compile --tf32``: the counterpart of ``fast``.
 ``eager``
     ``python -m swarp.rl --no-graphs``: the lean loop, no CUDA graphs.
 ``graphs``
@@ -74,6 +80,10 @@ class Trainer:
 
 TRAINERS: dict[str, Trainer] = {
     "torchrl": Trainer((str(REPO / "examples" / "train_mappo.py"),), "torchrl"),
+    "torchrl-tuned": Trainer((str(REPO / "examples" / "train_mappo_tuned.py"),), "torchrl"),
+    "torchrl-tuned-fast": Trainer(
+        (str(REPO / "examples" / "train_mappo_tuned.py"), "--compile", "--tf32"), "torchrl"
+    ),
     "eager": Trainer(("-m", "swarp.rl", "--no-graphs")),
     "graphs": Trainer(("-m", "swarp.rl")),
     "fast": Trainer(("-m", "swarp.rl", "--compile", "--tf32")),
@@ -170,7 +180,7 @@ def main(argv: list[str] | None = None) -> None:
             continue
         configs.append(config)
 
-    header = f"{'scenario':12s} {'n_envs':>7s} {'mb':>4s} {'config':>8s} " \
+    header = f"{'scenario':12s} {'n_envs':>7s} {'mb':>4s} {'config':>18s} " \
              f"{'ms/iter':>9s} {'env-steps/s':>13s} {'vs torchrl':>10s} {'sim share':>9s}"
     print(header)
     print("-" * len(header))
@@ -190,19 +200,19 @@ def main(argv: list[str] | None = None) -> None:
                     pythons.get(config, sys.executable),
                 )
                 if wall is None:
-                    print(f"{scenario:12s} {n_envs:7d} {mb:4d} {config:>8s} {'OOM':>9s}",
+                    print(f"{scenario:12s} {n_envs:7d} {mb:4d} {config:>18s} {'OOM':>9s}",
                           flush=True)
                     continue
                 if config == "torchrl":
                     base = wall
                 ratio = "" if base is None else f"{base / wall:9.2f}x"
                 print(
-                    f"{scenario:12s} {n_envs:7d} {mb:4d} {config:>8s} {wall * 1e3:9.1f} "
+                    f"{scenario:12s} {n_envs:7d} {mb:4d} {config:>18s} {wall * 1e3:9.1f} "
                     f"{frames / wall:13,.0f} {ratio:>10s} {sim / wall:9.1%}",
                     flush=True,
                 )
             print(
-                f"{scenario:12s} {n_envs:7d} {'':4s} {'sim':>8s} {sim * 1e3:9.1f} "
+                f"{scenario:12s} {n_envs:7d} {'':4s} {'sim':>18s} {sim * 1e3:9.1f} "
                 f"{frames / sim:13,.0f}",
                 flush=True,
             )
