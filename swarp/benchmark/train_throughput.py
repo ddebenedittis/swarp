@@ -24,6 +24,10 @@ Configurations (``--configs``):
 ``rsl_rl``
     ``examples/train_rsl_rl.py``: rsl_rl's PPO and ``OnPolicyRunner`` with one rsl_rl env
     per agent (needs the ``rsl-rl`` extra; skipped otherwise).
+``benchmarl``
+    ``examples/train_benchmarl.py``: MAPPO through BenchMARL's ``Experiment``. BenchMARL
+    pins ``torchrl < 0.12``, so it runs from its own venv:
+    ``--python benchmarl=.venv-benchmarl/bin/python``.
 
 ``sim`` is the simulator alone over the same rollout (``steps_per_batch`` steps of random
 actions at the same ``n_envs``, ``auto_reset=True``): the ceiling no trainer can beat, and
@@ -74,6 +78,7 @@ TRAINERS: dict[str, Trainer] = {
     "graphs": Trainer(("-m", "swarp.rl")),
     "fast": Trainer(("-m", "swarp.rl", "--compile", "--tf32")),
     "rsl_rl": Trainer((str(REPO / "examples" / "train_rsl_rl.py"),), "rsl_rl"),
+    "benchmarl": Trainer((str(REPO / "examples" / "train_benchmarl.py"),), "benchmarl"),
 }
 CONFIGS = tuple(TRAINERS)
 

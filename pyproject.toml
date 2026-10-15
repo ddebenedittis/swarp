@@ -70,6 +70,18 @@ bench-jaxmarl = [
 bench-camar = [
     "camar[cuda12]",
 ]
+# BenchMARL MAPPO baseline (examples/train_benchmarl.py). BenchMARL pins torchrl < 0.12, so
+# it gets its own venv (.venv-benchmarl) and train_throughput drives it with
+# `--python benchmarl=.venv-benchmarl/bin/python`; the conflict below keeps the lock's
+# torchrl extra on the newer torchrl.
+benchmarl = [
+    "benchmarl>=1.5.2",
+]
+
+[tool.uv]
+conflicts = [
+    [{ extra = "benchmarl" }, { extra = "torchrl" }],
+]
 
 [dependency-groups]
 dev = [
