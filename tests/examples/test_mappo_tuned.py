@@ -23,7 +23,14 @@ if str(EXAMPLES) not in sys.path:
     sys.path.insert(0, str(EXAMPLES))
 
 import torch  # noqa: E402
-from mappo import DONE_KEY, TERM_KEY, build_critic, build_env, build_policy, expand_flag  # noqa: E402
+from mappo import (  # noqa: E402
+    DONE_KEY,
+    TERM_KEY,
+    build_critic,
+    build_env,
+    build_policy,
+    expand_flag,
+)
 from torchrl.collectors import Collector  # noqa: E402
 from train_mappo import EagerUpdate, build_loss, parse_args  # noqa: E402
 from train_mappo_tuned import TunedConfig, TunedUpdate  # noqa: E402
