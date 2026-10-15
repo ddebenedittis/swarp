@@ -100,6 +100,14 @@ def _load_arm(path: str, device: str) -> tuple[PolicyArm, dict]:
     if ckpt.get("format") == CHECKPOINT_FORMAT:
         actor, _, ckpt = load_checkpoint(path, device)
         return greedy_arm(actor), ckpt
+    if ckpt.get("format") == "benchmarl/1":
+        # train_benchmarl.py saves its actor in swarp.rl's layout; tanh(loc) is BenchMARL's
+        # deterministic action too. No benchmarl import needed.
+        from swarp.rl.networks import Actor
+
+        actor = Actor(ckpt["obs_dim"], ckpt["act_dim"], ckpt["num_cells"]).to(device)
+        actor.load_state_dict(ckpt["actor"])
+        return greedy_arm(actor.eval()), ckpt
     policy, ckpt = _load(path, device)
     return partial(greedy_actions, policy), ckpt
 

@@ -21,6 +21,10 @@ Configurations (``--configs``):
     ``python -m swarp.rl``: rollout and update CUDA-graph captured (the default).
 ``fast``
     ``graphs`` plus ``--compile --tf32``: the fastest configuration.
+``benchmarl``
+    ``examples/train_benchmarl.py``: MAPPO through BenchMARL's ``Experiment``. BenchMARL
+    pins ``torchrl < 0.12``, so it runs from its own venv:
+    ``--python benchmarl=.venv-benchmarl/bin/python``.
 
 ``sim`` is the simulator alone over the same rollout (``steps_per_batch`` steps of random
 actions at the same ``n_envs``, ``auto_reset=True``): the ceiling no trainer can beat, and
@@ -70,6 +74,7 @@ TRAINERS: dict[str, Trainer] = {
     "eager": Trainer(("-m", "swarp.rl", "--no-graphs")),
     "graphs": Trainer(("-m", "swarp.rl")),
     "fast": Trainer(("-m", "swarp.rl", "--compile", "--tf32")),
+    "benchmarl": Trainer((str(REPO / "examples" / "train_benchmarl.py"),), "benchmarl"),
 }
 CONFIGS = tuple(TRAINERS)
 
