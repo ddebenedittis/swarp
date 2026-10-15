@@ -7,6 +7,16 @@ All notable changes to `swarp`. Newest first. Nothing has been released yet — 
 
 ### Added
 
+- **`swarp.rl`, a MAPPO trainer with the rollout and the update CUDA-graph captured.**
+  Torch only, no torchrl.
+  Per env step it replays a small *act* graph, calls `Environment.step` and replays a *store* graph; per iteration it replays a *prepare* graph (critic, GAE, permutations) and one *minibatch* graph per minibatch (forward, loss, backward, clipping, fused Adam), with one host sync for every logged statistic.
+  A minibatch with a non-finite gradient is skipped on device through Adam's `found_inf`, leaving the weights and Adam state untouched.
+  Same algorithm, recipes and `metrics.csv` columns as `examples/train_mappo.py`, which stays as the reference; timeouts bootstrap from `V(s_t)` because the env runs with `auto_reset=True`.
+  End to end it is 2.4–2.5× faster than the TorchRL trainer at the recipes' batch sizes, and 3.1–3.4× with `--compile --tf32`; on `giveway` both reach full difficulty at the same iteration, 83 s vs 208 s of wall-clock.
+  Run it as `python -m swarp.rl --scenario <name>`; `python -m swarp.benchmark.train_throughput` measures both trainers.
+  The torchrl-free half of `examples/mappo.py` (`TrainSpec`, `SPECS`, `SolveRateWindow`, `score`, ...) moved to `swarp.rl.recipes`, and `examples/mappo.py` re-exports it.
+  `examples/eval_mappo.py` reads both trainers' checkpoints.
+
 - **Three scenarios that break the assumptions the first seven share** — `giveway`,
   `shepherding` and `caging`, bringing the registry to ten. Every one of the original seven
   rewards monotone progress toward a goal, so a greedy "reduce the distance" controller does
@@ -174,6 +184,10 @@ All notable changes to `swarp`. Newest first. Nothing has been released yet — 
   oracles.
 
 ### Changed
+
+- **`examples/train_mappo.py` times the whole iteration.**
+  Its `wall_s`/`env_sps` columns used to start the clock after the collector yielded, so they reported frames per update-phase second and left the rollout out.
+  They now cover collection and update, which is what the training-throughput comparison needs.
 
 - **Seeded trajectories differ from previous versions.** No scenario's reset draws from
   `world.generator` any more, so every downstream torch draw sits at a different point in

@@ -403,8 +403,12 @@ def train(cfg: TrainConfig) -> Path:
     if cfg.scen_kwargs:
         print(f"  scenario kwargs: {cfg.scen_kwargs}")
 
+    # Wall time covers collection *and* update: the clock restarts at the end of each
+    # iteration, before the collector rolls out the next batch. (It used to start after the
+    # collector yielded, so `env_sps` read frames per update-phase second.) Logging, eval
+    # and checkpointing stay outside it.
+    t0 = time.perf_counter()
     for it, batch in enumerate(collector):
-        t0 = time.perf_counter()
         # Entropy schedule: broad early exploration, committed late behaviour. Watched via
         # the `entropy` column -- an early collapse is the signature of a policy that has
         # locked into a local optimum.
@@ -546,6 +550,7 @@ def train(cfg: TrainConfig) -> Path:
         if rate is not None and (f, rate) > best_key:
             best_key = (f, rate)
             save("best")
+        t0 = time.perf_counter()
 
     final = save("final")
     csv_file.close()

@@ -86,6 +86,7 @@ Downstream code written against `VmasEnv` needs the flat path here.
 :::
 
 [`examples/train_mappo.py`](https://github.com/ddebenedittis/swarp/blob/main/examples/train_mappo.py) is a full MAPPO training loop on top of it.
+It is kept as the reference implementation; [`swarp.rl`](training.md) trains the same recipes 2–3× faster without TorchRL.
 
 ## Choosing a batch shape
 

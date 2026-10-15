@@ -13,6 +13,7 @@ The benchmark entry points (`swarp/benchmark/`):
 | `python -m swarp.benchmark.compare_sims` | swarp vs VMAS vs JaxMARL vs CAMAR, one subprocess per simulator |
 | `python -m swarp.benchmark.ablation` | cumulative optimization ablation of the same hot path, one feature per row, parity-gated |
 | `python -m swarp.benchmark.scenarios` | all 10 scenarios × robot model × lidar rays: baseline vs optimized, parity-gated |
+| `python -m swarp.benchmark.train_throughput` | end-to-end MAPPO training: the TorchRL trainer vs [`swarp.rl`](training.md) |
 
 ## Throughput
 
@@ -71,6 +72,61 @@ GPU-bound configs where launch overhead was never the constraint.
 Raising `n_agents` at fixed `n_envs` is close to free until that point, which is the
 structural difference from per-entity simulators: the step is a fixed handful of Warp
 kernels whose thread count grows with agents, not a Python loop whose *length* does.
+
+## Training throughput
+
+`python -m swarp.benchmark.train_throughput` measures what a training run pays per iteration: rollout plus PPO update, logging and eval excluded.
+Each configuration runs its trainer's real CLI in a subprocess, and the number is the median `wall_s` from the `metrics.csv` it writes, after the warm-up iterations.
+`torchrl` is `examples/train_mappo.py`; `graphs` is `python -m swarp.rl` (rollout and update CUDA-graph captured); `fast` adds `--compile --tf32`.
+`sim` is the simulator alone over the same rollout, and *sim share* is that time over the trainer's.
+RTX 3070 Laptop GPU, float32, nothing else on the GPU.
+
+At the recipes' own batch sizes:
+
+```
+scenario      n_envs   mb   config   ms/iter   env-steps/s vs torchrl sim share
+-------------------------------------------------------------------------------
+navigation       512    4  torchrl     244.0        67,148      1.00x      0.9%
+navigation       512    4    eager     108.0       151,704      2.26x      2.1%
+navigation       512    4   graphs      97.0       168,907      2.52x      2.4%
+navigation       512    4     fast      72.5       225,986      3.37x      3.2%
+navigation       512           sim       2.3     7,103,006
+giveway         1024    8  torchrl     442.5        74,052      1.00x      0.9%
+giveway         1024    8    eager     201.0       163,025      2.20x      1.9%
+giveway         1024    8   graphs     188.0       174,298      2.35x      2.0%
+giveway         1024    8     fast     145.0       225,986      3.05x      2.6%
+giveway         1024           sim       3.8     8,567,931
+```
+
+Scaling `n_envs` on navigation with the minibatch held at 4096 env-steps (`--minibatch-samples 4096`, so the minibatch count grows with the batch):
+
+```
+scenario      n_envs   mb   config   ms/iter   env-steps/s vs torchrl sim share
+-------------------------------------------------------------------------------
+navigation      1024    8  torchrl     419.5        78,112      1.00x      0.6%
+navigation      1024    8   graphs     191.0       171,560      2.20x      1.2%
+navigation      1024    8     fast     140.5       233,224      2.99x      1.7%
+navigation      1024           sim       2.3    13,997,258
+navigation      4096   32  torchrl    1583.5        82,774      1.00x      0.2%
+navigation      4096   32   graphs     754.0       173,836      2.10x      0.3%
+navigation      4096   32     fast     552.0       237,449      2.87x      0.4%
+navigation      4096           sim       2.4    54,031,437
+navigation     16384  128  torchrl    6685.5        78,422      1.00x      0.1%
+navigation     16384  128   graphs    3058.0       171,448      2.19x      0.2%
+navigation     16384  128     fast    2224.5       235,688      3.01x      0.2%
+navigation     16384           sim       5.5    94,467,702
+```
+
+Reading it:
+
+- **Removing the framework overhead is worth ~2.2× and the CUDA graphs a further ~5–10%.** `eager` is the same lean loop without graphs; most of the gain over TorchRL is the per-step TensorDict work and host syncs it no longer does.
+- **The update is the cost, not the physics.** The simulator is 0.2–3.2% of an iteration, so a trainer over swarp is bounded by its PPO update: here 8 epochs through two 256-wide MLPs, GPU-bound at ~170 k env-steps/s in fp32 and ~235 k with TF32 matmuls and Inductor-fused elementwise ops. That ceiling is flat in `n_envs`; a smaller network, fewer epochs or a larger GPU moves it, the simulator does not.
+- **The ratio is roughly constant in `n_envs`** (2.1–2.5× for `graphs`, 2.9–3.4× for `fast`): TorchRL's overhead grows with the work, since it is per step and per minibatch.
+- **TorchRL is the one that suffers under CPU contention.** With two Isaac Sim processes busy on the same laptop, TorchRL ran 1.3–1.4× slower (navigation at 512 envs: 328 ms per iteration instead of 244 ms) and ran out of GPU memory at 16,384 envs, while `swarp.rl` moved by under 5%. Its loop is host-bound; the captured one is not.
+
+Learning is unchanged by the speedup.
+On `giveway` (1024 envs, 3000 iterations, seed 0) both trainers reach full curriculum difficulty with a ≥ 0.7 episode solve rate at the same iteration (414 vs 415), and both final checkpoints score a greedy solve rate of 1.000 [0.998, 1.000] over 2048 envs with a median solve step of 39 (the scripted controller: 1.000 at step 48).
+`swarp.rl` got there in 83 s of training wall-clock against 208 s, and finished the run in 604 s against 1845 s.
 
 ## vs. VMAS
 
