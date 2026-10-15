@@ -26,6 +26,11 @@ Configurations (``--configs``):
 actions at the same ``n_envs``, ``auto_reset=True``): the ceiling no trainer can beat, and
 the share of an iteration that is physics.
 
+Every trainer is a CLI that takes the shared flags below and writes ``wall_s`` per
+iteration to ``<checkpoint-dir>/metrics.csv``; ``TRAINERS`` maps a config name to its
+command. A trainer whose library cannot share this venv runs under its own interpreter
+via ``--python CONFIG=PATH``.
+
 ``--n-envs`` overrides the spec's batch; ``--minibatch-samples`` then keeps the minibatch
 size fixed (so the update stays within memory and the number of minibatches grows with the
 batch) instead of the spec's fixed number of minibatches.
@@ -41,6 +46,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
@@ -48,23 +54,43 @@ import torch
 from swarp.rl.recipes import SPECS, build_env
 
 REPO = Path(__file__).resolve().parents[2]
-CONFIGS = ("torchrl", "eager", "graphs", "fast")
-_SWARP_RL_FLAGS = {"eager": ["--no-graphs"], "graphs": [], "fast": ["--compile", "--tf32"]}
 
 
-def _trainer_cmd(config: str) -> list[str]:
-    if config == "torchrl":
-        return [sys.executable, str(REPO / "examples" / "train_mappo.py")]
-    return [sys.executable, "-m", "swarp.rl", *_SWARP_RL_FLAGS[config]]
+@dataclass(frozen=True)
+class Trainer:
+    """A trainer CLI: ``args`` follow the interpreter; ``requires`` is the module whose
+    absence skips the config when it runs under the current interpreter."""
+
+    args: tuple[str, ...]
+    requires: str | None = None
+
+
+TRAINERS: dict[str, Trainer] = {
+    "torchrl": Trainer((str(REPO / "examples" / "train_mappo.py"),), "torchrl"),
+    "eager": Trainer(("-m", "swarp.rl", "--no-graphs")),
+    "graphs": Trainer(("-m", "swarp.rl")),
+    "fast": Trainer(("-m", "swarp.rl", "--compile", "--tf32")),
+}
+CONFIGS = tuple(TRAINERS)
+
+
+def _config_path(s: str) -> tuple[str, str]:
+    if "=" not in s:
+        raise argparse.ArgumentTypeError(f"expected CONFIG=PATH, got {s!r}")
+    config, path = s.split("=", 1)
+    if config not in TRAINERS:
+        raise argparse.ArgumentTypeError(f"unknown config {config!r}; choose from {CONFIGS}")
+    return config, path
 
 
 def run_trainer(
     config: str, scenario: str, n_envs: int | None, minibatches: int | None, iters: int,
-    warmup: int, device: str,
+    warmup: int, device: str, python: str = sys.executable,
 ) -> float | None:
     """Median seconds per iteration after ``warmup`` iterations; ``None`` on CUDA OOM."""
     with tempfile.TemporaryDirectory() as tmp:
-        cmd = _trainer_cmd(config) + [
+        cmd = [
+            python, *TRAINERS[config].args,
             "--scenario", scenario, "--device", device, "--iters", str(iters),
             "--eval-every", "0", "--checkpoint-every", "0", "--checkpoint-dir", tmp,
         ]
@@ -119,12 +145,21 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--configs", nargs="+", default=list(CONFIGS), choices=CONFIGS)
     p.add_argument("--iters", type=int, default=25)
     p.add_argument("--warmup", type=int, default=5)
+    p.add_argument(
+        "--python", action="append", type=_config_path, metavar="CONFIG=PATH", default=[],
+        help="run a config under another venv's interpreter, e.g. "
+             "--python benchmarl=.venv-benchmarl/bin/python",
+    )
     a = p.parse_args(argv)
 
-    configs = list(a.configs)
-    if "torchrl" in configs and importlib.util.find_spec("torchrl") is None:
-        print("torchrl not installed: skipping the torchrl config")
-        configs.remove("torchrl")
+    pythons = dict(a.python)
+    configs = []
+    for config in a.configs:
+        req = TRAINERS[config].requires
+        if config not in pythons and req and importlib.util.find_spec(req) is None:
+            print(f"{req} not installed: skipping the {config} config")
+            continue
+        configs.append(config)
 
     header = f"{'scenario':12s} {'n_envs':>7s} {'mb':>4s} {'config':>8s} " \
              f"{'ms/iter':>9s} {'env-steps/s':>13s} {'vs torchrl':>10s} {'sim share':>9s}"
@@ -142,7 +177,8 @@ def main(argv: list[str] | None = None) -> None:
             base = None
             for config in configs:
                 wall = run_trainer(
-                    config, scenario, n_envs, minibatches, a.iters, a.warmup, a.device
+                    config, scenario, n_envs, minibatches, a.iters, a.warmup, a.device,
+                    pythons.get(config, sys.executable),
                 )
                 if wall is None:
                     print(f"{scenario:12s} {n_envs:7d} {mb:4d} {config:>8s} {'OOM':>9s}",
