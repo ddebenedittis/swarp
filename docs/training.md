@@ -48,7 +48,7 @@ At the recipes' batch sizes, on an RTX 3070 Laptop GPU, in ms per iteration:
 With the overhead gone the iteration is GPU-bound in the PPO update: 8 epochs over the batch through two 256-wide MLPs.
 The physics is 2–3% of an iteration even in the fastest configuration, which is why `--tf32` (faster matmuls) and `--compile` (Inductor fuses the elementwise work between them) are the knobs that still move the number.
 TorchRL with its own CUDA-graph and compile options gets within 1.1–1.4× of `swarp.rl`; the rest is its per-step env machinery, which a TorchRL user cannot take over.
-The speedup carries through to time-to-solve: on `giveway` `swarp.rl` and the TorchRL trainer reach full curriculum difficulty at the same iteration, `swarp.rl` in 83 s of wall-clock and TorchRL in 208 s, and both final policies solve 1.000 of 2048 evaluation envs.
+The speedup carries through to time-to-solve: on `giveway`, over three seeds, every trainer reaches full curriculum difficulty at iteration 413–417, `swarp.rl` in 79 s of wall-clock against 102 s for tuned TorchRL, 133 s for rsl_rl, 187 s for TorchRL as usually written and 208 s for BenchMARL, and every final policy solves all 2048 evaluation envs.
 [Benchmarks](benchmarks.md#training-throughput) has the scaling sweep over `n_envs`, what each baseline differs in, and the learning comparison.
 
 ## Flags

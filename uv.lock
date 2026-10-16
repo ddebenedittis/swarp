@@ -2543,7 +2543,7 @@ dependencies = [
     { name = "onnxscript" },
     { name = "tensorboard" },
     { name = "tensordict", version = "0.11.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-5-swarp-benchmarl'" },
-    { name = "tensordict", version = "0.13.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-5-swarp-torchrl' or extra != 'extra-5-swarp-benchmarl'" },
+    { name = "tensordict", version = "0.14.3", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-5-swarp-torchrl' or extra != 'extra-5-swarp-benchmarl'" },
     { name = "torch" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/97/0e/142a31e8124255ec9276516c49c6fbe1497f2146ea384a92b81d23e3c525/rsl_rl_lib-5.5.1.tar.gz", hash = "sha256:50129065b35c69735ea197343321145a400af8c1b5fe9a28116fdaf1890fab43", size = 68077, upload-time = "2026-09-09T11:28:51.656Z" }
@@ -2926,8 +2926,8 @@ rsl-rl = [
     { name = "rsl-rl-lib" },
 ]
 torchrl = [
-    { name = "tensordict", version = "0.13.0", source = { registry = "https://pypi.org/simple" } },
-    { name = "torchrl", version = "0.13.3", source = { registry = "https://pypi.org/simple" } },
+    { name = "tensordict", version = "0.14.3", source = { registry = "https://pypi.org/simple" } },
+    { name = "torchrl", version = "0.14.1", source = { registry = "https://pypi.org/simple" } },
 ]
 viz = [
     { name = "imageio", extra = ["ffmpeg"] },
@@ -3084,7 +3084,7 @@ wheels = [
 
 [[package]]
 name = "tensordict"
-version = "0.13.0"
+version = "0.14.3"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'win32'",
@@ -3107,26 +3107,22 @@ dependencies = [
     { name = "torch", marker = "extra == 'extra-5-swarp-torchrl' or extra != 'extra-5-swarp-benchmarl'" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/b8/77/6edc42425c4cc3755e52df25478f9b2ab7f67063e0bdc6c472a3db783f0a/tensordict-0.13.0-cp312-cp312-macosx_14_0_arm64.whl", hash = "sha256:023d19f36b0aef990668033ca9dd721bace95266d0b9650626bdb4e3f2192f13", size = 911682, upload-time = "2026-06-04T14:46:58.304Z" },
-    { url = "https://files.pythonhosted.org/packages/a8/b5/0c3889dabb6d92373036b9c2cc8269aa2fa5c3089f4ef1c04ae34d82b494/tensordict-0.13.0-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:25dbc418dbfe2733b34467c478f70c1d83870c76029397f00b5c45832d47929a", size = 555486, upload-time = "2026-06-04T14:46:59.802Z" },
-    { url = "https://files.pythonhosted.org/packages/89/6c/92da62aefa186e2ab0e307dceccfbcdcb8769ec812a00676cb164ef6f47e/tensordict-0.13.0-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:343cf19838f6cb6be9db28d164338a399c269171854a6d688cb42f82be796e1c", size = 559537, upload-time = "2026-06-04T14:47:01.096Z" },
-    { url = "https://files.pythonhosted.org/packages/48/33/fdbc52ec5069d64910c8efbf64a67fe399134ec9f602d4a3cfa5dd8e5362/tensordict-0.13.0-cp312-cp312-win_amd64.whl", hash = "sha256:53f60f72554b49d2143768c92396b8af020ab920d6068a46c115b11669444e9b", size = 608643, upload-time = "2026-06-04T14:47:02.466Z" },
-    { url = "https://files.pythonhosted.org/packages/2a/66/f787025fa49f842ec9c60229cb093b31e7071b406e428f831b58266b71ef/tensordict-0.13.0-cp313-cp313-macosx_14_0_arm64.whl", hash = "sha256:9eddecc4b500f7f93c52815266afd295c081a2fb0e7847e387bee4398a841518", size = 911688, upload-time = "2026-06-04T14:47:03.949Z" },
-    { url = "https://files.pythonhosted.org/packages/f1/b7/08776521a01c0f90b509f1475b152ecfcae3355ac97373c2d6c7a9f8d1d2/tensordict-0.13.0-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:faac41677a13c442733483459564cf16668b9d01c33af36dbee5142a34100ca3", size = 555747, upload-time = "2026-06-04T14:47:05.632Z" },
-    { url = "https://files.pythonhosted.org/packages/23/25/d86e45b85c2f92a84efa0d10cb5b889d457f7a780dc05ebedda21931d551/tensordict-0.13.0-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:f0f9130ae72c53a174cc7ea77d1bc51c573f3aa51e3ebb1f0ec1568cc92c0e05", size = 559520, upload-time = "2026-06-04T14:47:06.933Z" },
-    { url = "https://files.pythonhosted.org/packages/06/e0/2d0934dc0edcf8823f1732cde7afb7e796121f1b33099d7f27047c2c9993/tensordict-0.13.0-cp313-cp313-win_amd64.whl", hash = "sha256:1ba477fae50bb6edf7ba1c67ff448fd778cece249eb6aceaff669e58e9ad07c8", size = 608618, upload-time = "2026-06-04T14:47:08.359Z" },
-    { url = "https://files.pythonhosted.org/packages/05/93/7b65ea5352c02d0c6b10c818b45af40636fc7069079c9ff87b7ff5d73980/tensordict-0.13.0-cp313-cp313t-macosx_14_0_arm64.whl", hash = "sha256:d161f1aed655f6ad8909d15bb1acf84f378b571ac2052f2760bff3f8aeb11a58", size = 917114, upload-time = "2026-06-04T14:47:09.95Z" },
-    { url = "https://files.pythonhosted.org/packages/0c/26/f29d7543db47c21eddf87c95ccfeb059e508250d8a8689e7c8842bcd31a4/tensordict-0.13.0-cp313-cp313t-manylinux_2_28_aarch64.whl", hash = "sha256:731215d5a4e63fe834cc082de7555e1d5207b7be26d83f53906963ec36bf8a62", size = 557189, upload-time = "2026-06-04T14:47:11.588Z" },
-    { url = "https://files.pythonhosted.org/packages/d2/91/8847964100950bee174f4a6dd5839fa985a95b8e9eb96a3f012b1c6bee66/tensordict-0.13.0-cp313-cp313t-manylinux_2_28_x86_64.whl", hash = "sha256:6121b672ae021739f56a5e03193b2650155667f97c5121b7948a3b1ff047ec2d", size = 561063, upload-time = "2026-06-04T14:47:13.049Z" },
-    { url = "https://files.pythonhosted.org/packages/81/51/d9053993fc45b613522dc6425a04bed7947fecd65fed8f0a35a884e2f4af/tensordict-0.13.0-cp313-cp313t-win_amd64.whl", hash = "sha256:fd2f54af8293bd8d0472fe49c6940740a96366c02b4dba7d9838dde9ccc2e654", size = 619464, upload-time = "2026-06-04T14:47:14.457Z" },
-    { url = "https://files.pythonhosted.org/packages/d8/1f/f38135b42d857ec85e611c281e134ef459d9558a915763e5f821124cad4c/tensordict-0.13.0-cp314-cp314-macosx_14_0_arm64.whl", hash = "sha256:780863fb9e98ded974e8d82b15b259cd2c220e8d5d4913837fb64ea9486ca87e", size = 911803, upload-time = "2026-06-04T14:47:15.772Z" },
-    { url = "https://files.pythonhosted.org/packages/20/e1/c5e9acdedfdcb3f77b2753485e42512e596236335dc5c77c66cd8476610e/tensordict-0.13.0-cp314-cp314-manylinux_2_28_aarch64.whl", hash = "sha256:78118e1b203ca5fcbb5f0f538478e7482723ef9af1055ea6da15fcb52172681c", size = 556447, upload-time = "2026-06-04T14:47:17.121Z" },
-    { url = "https://files.pythonhosted.org/packages/17/a4/c58a434c6fec06c9319ac9174f447c66f0226751b0f2b2b51e1ff42c7908/tensordict-0.13.0-cp314-cp314-manylinux_2_28_x86_64.whl", hash = "sha256:04989d48ca28f58c48a6a1ad909b08ef384371838ee01de8a9c35152851168ea", size = 559760, upload-time = "2026-06-04T14:47:18.916Z" },
-    { url = "https://files.pythonhosted.org/packages/c2/96/4de0e7062cc80b87f0dd97f6bbf770acd4c86ceda5a5affc549370b8e337/tensordict-0.13.0-cp314-cp314-win_amd64.whl", hash = "sha256:889d52919c309b4fd00f7cbe5df3304ff8085168b41a3470ff5c3e3ba45e6686", size = 608845, upload-time = "2026-06-04T14:47:20.339Z" },
-    { url = "https://files.pythonhosted.org/packages/c9/fe/754f557861670a3af173929ac871956cb40a61aec82cbd0a696d6270c1b8/tensordict-0.13.0-cp314-cp314t-macosx_14_0_arm64.whl", hash = "sha256:25c696da1b161209f4ae6c4b855e0be403a365123e6ddcb57bf35a5d7a1e6b9c", size = 916229, upload-time = "2026-06-04T14:47:21.746Z" },
-    { url = "https://files.pythonhosted.org/packages/a4/f9/e80dd7d6c52f2954180d56f2de739e1b29038f193ed1595bba675a9adaf6/tensordict-0.13.0-cp314-cp314t-manylinux_2_28_aarch64.whl", hash = "sha256:d7fe2aee71b258614f9528b96c0af98174a2f8522aa0171428316724dd03f7de", size = 556778, upload-time = "2026-06-04T14:47:23.396Z" },
-    { url = "https://files.pythonhosted.org/packages/09/7a/b7d84a2047b8f0c65980d3d47cba00d4765c64bde0f5e1039f8e2ce35779/tensordict-0.13.0-cp314-cp314t-manylinux_2_28_x86_64.whl", hash = "sha256:c75f80dd1501ae9791b5e632a47f8d6584fa6835f9ce404f9d0602b4419c46ed", size = 560487, upload-time = "2026-06-04T14:47:24.703Z" },
-    { url = "https://files.pythonhosted.org/packages/dd/c0/5dbee7743baeb79ae72ced0f157b7ceb2388b879a750c3292eae814b12cb/tensordict-0.13.0-cp314-cp314t-win_amd64.whl", hash = "sha256:4fdf7a60ae416d1790358e372ad55178edbdc25ea29bf28aeefee4d7a87fa8ae", size = 619462, upload-time = "2026-06-04T14:47:26.302Z" },
+    { url = "https://files.pythonhosted.org/packages/99/27/b34d0992b95bf61876d9600ed40c80c1aa4ec01e3611e9e38ac5c0c00e47/tensordict-0.14.3-cp312-cp312-macosx_14_0_arm64.whl", hash = "sha256:36e081a32d2c5a97eb7e785b0b3f4ed0a40c9a4f4aec5ee266059d40d6514063", size = 953100, upload-time = "2026-10-08T13:29:21.374Z" },
+    { url = "https://files.pythonhosted.org/packages/07/4a/f3ef1ef8432693994e86465ccd0de2b67cafd20d50b24a1166a28a95e189/tensordict-0.14.3-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:f08ee3ff1c8ef02261d609b734734a29e69bc4c890286478182704b8d354d424", size = 596124, upload-time = "2026-10-08T13:29:22.676Z" },
+    { url = "https://files.pythonhosted.org/packages/73/7c/f8d6570ef5b0a859316e38329993ef540fe53ea711234647d2f38d33af5b/tensordict-0.14.3-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:b5c48a21ee84b83e69f1ff6ac06e371bdc20b01aa2c05af76c7e5020144cb71a", size = 601662, upload-time = "2026-10-08T13:29:23.945Z" },
+    { url = "https://files.pythonhosted.org/packages/b7/07/ebfd04ed0c73db371a51e135d083498b92e342a5452898855853377aac86/tensordict-0.14.3-cp312-cp312-win_amd64.whl", hash = "sha256:46536999c0970d98e11eaf4bbcf238a612617f01d6c2aa407fe354cd920fac99", size = 651362, upload-time = "2026-10-08T13:29:25.62Z" },
+    { url = "https://files.pythonhosted.org/packages/59/d7/6229ce78187e865b908d1e524de6994670f455e4da71f168b8fdb6878761/tensordict-0.14.3-cp313-cp313-macosx_14_0_arm64.whl", hash = "sha256:e66ce92ff53f3f5c32e91203c02e4cec51b72aa73335a4a27c266b1916d9aa06", size = 953134, upload-time = "2026-10-08T13:29:26.985Z" },
+    { url = "https://files.pythonhosted.org/packages/99/28/1cdc70e3766e52aae8440cfa2f6708e44a532bdddab6195c93ee45f0574b/tensordict-0.14.3-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:4e67f71cfd64e44041d7a4aab9f7cd35ea3b3c8ef090a8b02edb1f3eb1ee1613", size = 596338, upload-time = "2026-10-08T13:29:28.259Z" },
+    { url = "https://files.pythonhosted.org/packages/ac/35/b844bac04ebb5cc653c9762bcbdecf5da95b147478ab77973d8bf0aa5b65/tensordict-0.14.3-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:20d224c73e3fe81f6b27440ab54a0d3bfef4a75f1fcc64ead901f1ce61ab1fe2", size = 601694, upload-time = "2026-10-08T13:29:29.68Z" },
+    { url = "https://files.pythonhosted.org/packages/8b/49/16ca821dd68f83f72c269262048d5c6f85fc5bdae0ed12697d1a1ae3322c/tensordict-0.14.3-cp313-cp313-win_amd64.whl", hash = "sha256:f41a16c5e60dca5352507ed4d55b298ac09e16cf8bb080f4c17e462ae680eab2", size = 651490, upload-time = "2026-10-08T13:29:31.04Z" },
+    { url = "https://files.pythonhosted.org/packages/42/a0/3f46b26b4ecf2d667c5c6ef812bd7f435f70f5838ce8597f827f3e6a96c0/tensordict-0.14.3-cp314-cp314-macosx_14_0_arm64.whl", hash = "sha256:30ea0a416274352c3ed9f1cb51d2d17c122d592158a331d959926239c309d479", size = 953284, upload-time = "2026-10-08T13:29:32.716Z" },
+    { url = "https://files.pythonhosted.org/packages/a7/b4/36f8b3597916978968da82c6b7e4734aa848cb51250cff77c9b565f72abd/tensordict-0.14.3-cp314-cp314-manylinux_2_28_aarch64.whl", hash = "sha256:e963f28fd4b560a2b4bbfb905302b47a412a5a8819a12318eec5a63a7f60b85a", size = 597148, upload-time = "2026-10-08T13:29:34.052Z" },
+    { url = "https://files.pythonhosted.org/packages/68/37/3bd8e684b2bc596f980a86220863a53fe9061227c3e122879b03f6d0f8b3/tensordict-0.14.3-cp314-cp314-manylinux_2_28_x86_64.whl", hash = "sha256:9a0bf18065cb4c8fd19a9c58f179f22544c6e05dbafed304ac7704993a735dc4", size = 602168, upload-time = "2026-10-08T13:29:35.336Z" },
+    { url = "https://files.pythonhosted.org/packages/7a/11/aeb42f3345c55934c0db71b7674f10d6dd42c7b1374f4ae23c89288f6d4c/tensordict-0.14.3-cp314-cp314-win_amd64.whl", hash = "sha256:0d65cdb5b9fb04b279ef4624e5cb9509f9aa6894c46a8c0237fc157ed2c38adc", size = 651177, upload-time = "2026-10-08T13:29:36.78Z" },
+    { url = "https://files.pythonhosted.org/packages/f2/d1/a1c061a594b9d14da9690e7a77272c52c52efaba4ac96d896115aac88dd5/tensordict-0.14.3-cp314-cp314t-macosx_14_0_arm64.whl", hash = "sha256:03a67039f4dcc4d5956c7485acfd5dea4fad7cb72c39d1594a87a251f99eece9", size = 957946, upload-time = "2026-10-08T13:29:38.422Z" },
+    { url = "https://files.pythonhosted.org/packages/ce/ed/b83a73413b5675683c1669be1bbcbfb29c77fc3c0fb6dea47fc6c109ac36/tensordict-0.14.3-cp314-cp314t-manylinux_2_28_aarch64.whl", hash = "sha256:0041e5dfdab4737b173e044d916f9d42709d2302771feaa91ce74272edef4d6f", size = 598306, upload-time = "2026-10-08T13:29:40.292Z" },
+    { url = "https://files.pythonhosted.org/packages/56/b8/3193e5bcb6bc90d5b85ab4c697e97cf593caa13a8dfaad3a9167abd1b7e2/tensordict-0.14.3-cp314-cp314t-manylinux_2_28_x86_64.whl", hash = "sha256:87886522b3e52bb77d00ad77dfe0595eb13bdc466978a9af9562fcd524d54fa0", size = 602053, upload-time = "2026-10-08T13:29:41.669Z" },
+    { url = "https://files.pythonhosted.org/packages/63/d5/73ab98430e72cc60f37b8239e144603f9188dc3bff26012e56d788f44f9d/tensordict-0.14.3-cp314-cp314t-win_amd64.whl", hash = "sha256:2013539f00bfbdc6e8298fee2972d946db155b4b07f28e6f4b0074106601c243", size = 662013, upload-time = "2026-10-08T13:29:42.963Z" },
 ]
 
 [[package]]
@@ -3273,7 +3269,7 @@ wheels = [
 
 [[package]]
 name = "torchrl"
-version = "0.13.3"
+version = "0.14.1"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'win32'",
@@ -3292,22 +3288,22 @@ dependencies = [
     { name = "numpy" },
     { name = "packaging" },
     { name = "pyvers" },
-    { name = "tensordict", version = "0.13.0", source = { registry = "https://pypi.org/simple" } },
+    { name = "tensordict", version = "0.14.3", source = { registry = "https://pypi.org/simple" } },
     { name = "torch" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/d2/a4/0020b5c9ba708e923eea7cf9e7bcb93ec5dc973e793d6a7076afda1f5501/torchrl-0.13.3-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:ced579163ed09502c93c846ec71143498cc2a4632adf4f92715dfec697069182", size = 2857408, upload-time = "2026-07-14T17:50:53.747Z" },
-    { url = "https://files.pythonhosted.org/packages/15/75/af20f583756f03c1d387dcbc0941cd91ebbf8c46a1ad5c62cef279a8fc63/torchrl-0.13.3-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:0f2f43d60f29f6329ecbcd70702491941660e2381f3e527858b2d9ae2c8e87d0", size = 2523860, upload-time = "2026-07-14T17:50:55.559Z" },
-    { url = "https://files.pythonhosted.org/packages/37/40/704bbc51863d5aad82604f3f62e87fd33ba8dbfe1e95e8a5c3ed862e0a82/torchrl-0.13.3-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:2af6826ee7739172ace06df68382f6cb6a4e5ebec7c74ca9894b4da039a0bad7", size = 2538579, upload-time = "2026-07-14T17:50:57.476Z" },
-    { url = "https://files.pythonhosted.org/packages/2a/75/a3b61ac47fd8379080458daf655c5c8db9229a8634e2465c5e61ba6de884/torchrl-0.13.3-cp312-cp312-win_amd64.whl", hash = "sha256:6261c94bb790dfc53623f43262f8005f1856bcb71aa5607ea8488dda5dd8aae5", size = 2512425, upload-time = "2026-07-14T17:50:59.33Z" },
-    { url = "https://files.pythonhosted.org/packages/48/97/82c8075daddf96c7a692d79dc70e49729420159cf0d5b00ec5237fb3b205/torchrl-0.13.3-cp313-cp313-macosx_12_0_arm64.whl", hash = "sha256:bf60c4dbd675ae82bdba1574c6cfc0c8c891ac3817d3bb688da507361085942e", size = 2857396, upload-time = "2026-07-14T17:51:01.16Z" },
-    { url = "https://files.pythonhosted.org/packages/a6/b9/f606bb60f8ebfd4a20ddb4df75b3c8dd7ec0c937a8fc445949eebc450532/torchrl-0.13.3-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:33903e62a98feb5ddac9088dbd3c451f9008d6300cc3a3a1a735ad2d45891339", size = 2524304, upload-time = "2026-07-14T17:51:02.709Z" },
-    { url = "https://files.pythonhosted.org/packages/31/84/a15ffa216b371e76fdc00c7c2c8726801da61ad1fd6232e696e5ff518038/torchrl-0.13.3-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:0ad57cc990104e1eeb1b9797e604056c098b4f9e53913203d23374fdaa25f4e8", size = 2538656, upload-time = "2026-07-14T17:51:04.354Z" },
-    { url = "https://files.pythonhosted.org/packages/f4/34/455f03bc5003ef8c504b412ded8baa9d06466b18666963256afa50662b00/torchrl-0.13.3-cp313-cp313-win_amd64.whl", hash = "sha256:1a22be0666af154927aaaa2319f106835c8b545bcf987936d84c4ab76392ef44", size = 2512472, upload-time = "2026-07-14T17:51:06.095Z" },
-    { url = "https://files.pythonhosted.org/packages/3f/d4/32ebe4b29be49a3c204f46e0623485e6d17692ad7a7c63900897697421d7/torchrl-0.13.3-cp314-cp314-macosx_12_0_arm64.whl", hash = "sha256:3cbcac363bf396343d292debe3db3bfddf48371138b8d9006f4c23da9db665e7", size = 2857632, upload-time = "2026-07-14T17:51:07.868Z" },
-    { url = "https://files.pythonhosted.org/packages/ea/42/177b4762085b7e6aa521d19169d988dc6d508ea34e179b94b35bc67d5dcb/torchrl-0.13.3-cp314-cp314-manylinux_2_28_aarch64.whl", hash = "sha256:afbaf7bd4cc4fb53bbe435d273d1fb30469dcc7611c6190426a173a3e116c805", size = 2524980, upload-time = "2026-07-14T17:51:09.658Z" },
-    { url = "https://files.pythonhosted.org/packages/94/33/fcfa9f4b2c2a7b25a960647b80fe13288dfc0a0d304d06d6fedfce976175/torchrl-0.13.3-cp314-cp314-manylinux_2_28_x86_64.whl", hash = "sha256:00ebb75f9a49945c00a5f51c96d421f3d162e41faa63567c3ae9768c36d4c12b", size = 2538920, upload-time = "2026-07-14T17:51:11.196Z" },
-    { url = "https://files.pythonhosted.org/packages/13/5e/3ec448dc29153253cfb81434ee9d03a217a5dd46c0db32c59191ecf7edd8/torchrl-0.13.3-cp314-cp314-win_amd64.whl", hash = "sha256:39ba41c5e47d593a7b391eafe2bc653818a95e7003105aa6abad2691bd63404e", size = 2512607, upload-time = "2026-07-14T17:51:12.793Z" },
+    { url = "https://files.pythonhosted.org/packages/c5/c0/505ee76d5bde046ef7e48e6997235ad73559efef56bb11cfa5497b8dd396/torchrl-0.14.1-cp312-cp312-macosx_14_0_arm64.whl", hash = "sha256:4cb24d8d8c211a2c9a75c3bd901db90c19781ba29ae543b1d110b4c101de301e", size = 3683096, upload-time = "2026-10-10T12:15:55.605Z" },
+    { url = "https://files.pythonhosted.org/packages/ac/f6/64f558315192f2fabb86bfff6601e7433ca69fa51f6088fa168449f4257b/torchrl-0.14.1-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:0f583d56ec07b32a6c80b7ab5c387fef96a8b7b22e15cc92affb2cc8b3c312ac", size = 3361512, upload-time = "2026-10-10T12:15:57.789Z" },
+    { url = "https://files.pythonhosted.org/packages/33/d6/5c91e919c4261e1bfe13c833a356b26c5d79102d018930f85444cf0117b4/torchrl-0.14.1-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:d2bea667dee3abb76dd7cc2e5c064f3012c125adad06af36603c3c79e63618b2", size = 3375139, upload-time = "2026-10-10T12:16:00.152Z" },
+    { url = "https://files.pythonhosted.org/packages/7d/85/037d5fc6b28143405774f4dcd45aa604834ff820fd6f5696f488a11ec595/torchrl-0.14.1-cp312-cp312-win_amd64.whl", hash = "sha256:8cb425027e24af82c9c66c669e5eaaae1b9c0446e4041479a6c69c29bf8f38b1", size = 3341145, upload-time = "2026-10-10T12:16:02.515Z" },
+    { url = "https://files.pythonhosted.org/packages/2a/83/9fb415adaca716d721b025387482a499349c6ad2086440446d0893381d4e/torchrl-0.14.1-cp313-cp313-macosx_14_0_arm64.whl", hash = "sha256:862b92e623be338f3b40b06f71245800d5c8323805e2585a623e89b65bc77c00", size = 3683379, upload-time = "2026-10-10T12:16:04.498Z" },
+    { url = "https://files.pythonhosted.org/packages/40/e3/55fbca05d97c221dee9db2360e7ba03aba0bfd9d4a56588b25bf3dca35c1/torchrl-0.14.1-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:bc7c05dfa53f49a2fe330517dcfc7f039642649c66eaa8069a0ad2cc5bbd1eb2", size = 3362453, upload-time = "2026-10-10T12:16:06.879Z" },
+    { url = "https://files.pythonhosted.org/packages/eb/e3/ff2509737698be1812de240500587a5b702e150d9b206f99468ce475bb15/torchrl-0.14.1-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:ae644e278c6922cbc8a7c8165fd1a053ccb7e5104fe284afd1b901165b971a9c", size = 3375146, upload-time = "2026-10-10T12:16:08.923Z" },
+    { url = "https://files.pythonhosted.org/packages/5c/1b/a8c25b5f9d463e56e125ece54261902112f52381941912b7a07bd5ff798c/torchrl-0.14.1-cp313-cp313-win_amd64.whl", hash = "sha256:33c65744b3b2a30dc33e4809ce6be2248f2d7552cd35c8e2bfd3ec8ac3fa9a20", size = 3341132, upload-time = "2026-10-10T12:16:11.491Z" },
+    { url = "https://files.pythonhosted.org/packages/96/9d/f5f111270ce43cf212458e29995361c93d8e04f78452ffd6965cee754e69/torchrl-0.14.1-cp314-cp314-macosx_14_0_arm64.whl", hash = "sha256:3f64f1e7a4998a1933efe3634c396dfb43c268acd408418c3ac82fc33cae1f55", size = 3683942, upload-time = "2026-10-10T12:16:14.209Z" },
+    { url = "https://files.pythonhosted.org/packages/3d/d7/3286a2b31884d82361e656e982f0d94ad60033a1b5b12acd4ff236a2ce54/torchrl-0.14.1-cp314-cp314-manylinux_2_28_aarch64.whl", hash = "sha256:49ae69df2aea9aacff2b122558834856f19f3019cc1c5f25cb5c14d88b530ae9", size = 3364174, upload-time = "2026-10-10T12:16:16.656Z" },
+    { url = "https://files.pythonhosted.org/packages/f0/c6/5064610a7ca3f189fc7bd44d8fcaa8c124c975d01be2c02cb40b6e3fc184/torchrl-0.14.1-cp314-cp314-manylinux_2_28_x86_64.whl", hash = "sha256:10fd58488b2cf236d20656afa94eee36886f038de6feabce719c8717fc601815", size = 3375630, upload-time = "2026-10-10T12:16:18.788Z" },
+    { url = "https://files.pythonhosted.org/packages/82/ce/2c138349f1a6be0cf61ba424cc27785da352ebbf932ad614ff61f8cf95c9/torchrl-0.14.1-cp314-cp314-win_amd64.whl", hash = "sha256:0e0f8a6788dfb69d39c4709ed202158ee0ec396a62533704939267c0144c5327", size = 3341841, upload-time = "2026-10-10T12:16:21.082Z" },
 ]
 
 [[package]]

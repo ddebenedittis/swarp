@@ -13,9 +13,10 @@ RTX 3070 Laptop) next to the reference trainer's ~240:
   check; the losses come back as device tensors, read once per iteration rather than with
   ``.item()`` per minibatch. Those last two without the graph are worth ~10%.
 * **Collector** (~140 -> ~120): ``cudagraph_policy``, the actor forward and its sampling
-  replayed as one graph per env step. That needs two fixes, see :class:`FreshOutputs` and
-  :meth:`TunedUpdate.collector_kwargs`. ``auto_register_policy_transforms=False`` (~7 ms):
-  the policy is not recurrent, and the empty ``InitTracker`` the collector otherwise adds
+  replayed as one graph per env step. On TorchRL 0.13 that needs two fixes, see
+  :class:`FreshOutputs` and :meth:`TunedUpdate.collector_kwargs`; on 0.14 only the second.
+  ``auto_register_policy_transforms=False`` (~7 ms): the policy is not recurrent, and the
+  empty ``InitTracker`` the collector otherwise adds
   wraps the env in a ``TransformedEnv`` with unlocked specs, so ``step_mdp`` rebuilt its
   key plan every env step. ``track_traj_ids=False`` and ``return_same_td=True``: nothing
   reads trajectory ids or keeps a batch past its iteration (no measurable gain).
@@ -25,7 +26,7 @@ RTX 3070 Laptop) next to the reference trainer's ~240:
   the collector. ``--tf32``: TF32 matmuls (~5%).
 
 Tried and dropped: ``Distribution.set_default_validate_args(False)`` (no measurable change;
-captured code runs no validation anyway) and capturing GAE: TorchRL 0.13's value
+captured code runs no validation anyway) and capturing GAE: TorchRL 0.13-0.14's value
 estimators branch on ``nan_mask.any()`` (a sanitizer for ``compact_obs`` collectors'
 NaN next-observations) before calling the critic, which a graph cannot capture. GAE stays
 eager, ~3 ms.
@@ -105,6 +106,11 @@ class FreshOutputs(TensorDictModuleBase):
     step: under ``cudagraph_policy`` every step of a batch then carried the *last* step's
     action and log-prob, and nothing learnt (TorchRL 0.13.3, tensordict 0.13.0). For a
     module that returns a new TensorDict, ``CudaGraphModule`` clones the outputs.
+
+    Fixed upstream in TorchRL 0.14.0, whose collector clones a cudagraphed policy's
+    outputs (pytorch/rl#4143, the report is pytorch/rl#3002), and in tensordict 0.15.0
+    (pytorch/tensordict#1999). Kept so the script stays correct on 0.13; on 0.14 it learns
+    with or without it, at the same ms/iteration.
     """
 
     def __init__(self, policy: TensorDictModuleBase) -> None:
