@@ -99,7 +99,7 @@ from tqdm import tqdm
 import swarp
 from swarp.benchmark.ablation import sync_device
 from swarp.interop.torchrl import SwarpEnv
-from swarp.rl.ppo import _check_action_box
+from swarp.rl.ppo import check_action_box
 from swarp.rl.recipes import (
     SPECS,
     UNTRAINABLE,
@@ -431,7 +431,7 @@ class SwarpCallback(Callback):
         self.scen = scen = env._env.scenario
         # The checkpoint's actor is evaluated as tanh(loc) on [-1, 1]; BenchMARL itself
         # trains on any box, but eval_mappo would then act on the wrong one.
-        _check_action_box(env._env, cfg.scenario)
+        check_action_box(env._env, cfg.scenario)
 
         info0 = scen.info()
         missing = [k for k in spec.metrics if k not in info0]

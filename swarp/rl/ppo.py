@@ -561,8 +561,12 @@ def parse_args(argv: list[str] | None = None) -> TrainConfig:
 # --------------------------------------------------------------------------- training
 
 
-def _check_action_box(env: Environment, scenario: str) -> None:
-    """The actor's tanh box is ``[-1, 1]``; refuse a scenario whose limits differ."""
+def check_action_box(env: Environment, scenario: str) -> None:
+    """Raise unless ``env``'s action box is ``[-1, 1]``, the range of :class:`Actor`'s tanh.
+
+    Zero-width slots (past an agent's model arity in a mixed fleet) are ignored. Call it
+    before training an :class:`Actor` on an env from outside :func:`train`, which runs it.
+    """
     lo, hi = env.action_bounds
     nonzero = hi > lo  # zero-width slots exist for mixed fleets and are legitimately 0
     if not (
@@ -590,7 +594,7 @@ def train(cfg: TrainConfig) -> Path:
     )
     scen = env.scenario
     obs_dim, act_dim = env.obs_dim, env.act_dim
-    _check_action_box(env, cfg.scenario)
+    check_action_box(env, cfg.scenario)
 
     env.reset()  # a probe: info() needs a reset world; the real reset follows the knobs
     info0 = scen.info()

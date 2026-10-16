@@ -160,7 +160,7 @@ class SwarpVecEnv(VecEnv):
 
     @property
     def episode_length_buf(self) -> torch.Tensor:
-        return self.env._step_count.repeat_interleave(self.A)
+        return self.env.step_count.repeat_interleave(self.A)
 
     def _write_obs(self, obs: torch.Tensor) -> TensorDict:
         E, A, Ob = self.E, self.A, self.Ob

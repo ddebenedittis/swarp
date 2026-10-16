@@ -437,6 +437,17 @@ class Environment:
         self.world.set_kernel_seed(int(seed))
 
     @property
+    def step_count(self) -> torch.Tensor:
+        """Steps since each env's last reset, ``[n_envs]`` int32: the counter ``max_steps``
+        truncates on.
+
+        The live buffer, updated in place by ``step``, ``reset`` and ``reset_at`` (inside
+        the CUDA graph when one is active), so clone it to keep a value. Read-only: write
+        through ``reset_at``.
+        """
+        return self._step_count
+
+    @property
     def graph_mode(self) -> bool:
         """True when a CUDA graph is actively backing the no-grad step."""
         return self.world.runtime is not None and self.world.runtime.graph_active

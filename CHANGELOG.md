@@ -26,6 +26,8 @@ All notable changes to `swarp`. Newest first. Nothing has been released yet — 
   The tuned trainer works around a TorchRL 0.13.3 bug in which `cudagraph_policy` fills every step of a batch with the last step's action, so training silently never learns.
   `train_throughput` keeps its trainers in a registry and takes `--python CONFIG=PATH` to run one from another venv.
 
+- **`Environment.step_count`**, the per-env step counter `max_steps` truncates on, as a public read-only accessor (the live `[n_envs]` buffer), and **`swarp.rl.check_action_box`**, the `[-1, 1]` action-box check `train` runs, public for loops built on `Actor` outside it.
+
 - **Three scenarios that break the assumptions the first seven share** — `giveway`,
   `shepherding` and `caging`, bringing the registry to ten. Every one of the original seven
   rewards monotone progress toward a goal, so a greedy "reduce the distance" controller does

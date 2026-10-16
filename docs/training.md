@@ -88,6 +88,7 @@ for it in range(spec.iters):
 ```
 
 The environment must be built with `auto_reset=True` and `clone_outputs=False` (the default): the graphs read its output buffers by address.
+`Actor` acts in a fixed `[-1, 1]` tanh box; `swarp.rl.check_action_box(env, name)` raises if the env's `action_bounds` differ, and `train` runs it for you.
 
 ## What differs from the TorchRL trainer
 

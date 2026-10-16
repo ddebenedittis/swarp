@@ -101,7 +101,7 @@ def test_terminated_on_goal_reach():
             break
     assert bool(term.all())
     assert not bool(trunc.any())  # the task condition fired, not the time limit
-    assert bool((env._step_count < 200).all())
+    assert bool((env.step_count < 200).all())
 
 
 def test_truncated_at_max_steps():
@@ -156,14 +156,14 @@ def test_reset_at_masked(device):
     for _ in range(3):
         env.step(0.2 * torch.ones(4, 3, 2, device=device))
     pos_before = env.world.state.pos.clone()
-    count_before = env._step_count.clone()
+    count_before = env.step_count.clone()
     assert (count_before == 3).all()
 
     mask = torch.tensor([True, False, True, False], device=device)
     env.reset_at(mask)
 
     torch.testing.assert_close(
-        env._step_count, torch.tensor([0, 3, 0, 3], dtype=torch.int32, device=device)
+        env.step_count, torch.tensor([0, 3, 0, 3], dtype=torch.int32, device=device)
     )
     # unreset envs untouched; reset envs moved
     torch.testing.assert_close(env.world.state.pos[1], pos_before[1])
@@ -181,10 +181,10 @@ def test_auto_reset_on_truncation(device):
     for _ in range(3):
         _, _, _, trunc, _ = env.step(torch.zeros(3, 2, 2, device=device))
     assert bool(trunc.all())  # truncated at max_steps
-    assert (env._step_count == 0).all()  # and auto-reset back to zero
+    assert (env.step_count == 0).all()  # and auto-reset back to zero
     # keeps running afterwards
     env.step(torch.zeros(3, 2, 2, device=device))
-    assert (env._step_count == 1).all()
+    assert (env.step_count == 1).all()
 
 
 def test_partial_reset_preserves_other_envs_shaping_baseline():
