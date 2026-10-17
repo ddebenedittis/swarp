@@ -107,22 +107,24 @@ TorchRL `EnvBase` wrapper).
 - `swarp/core/neighbors.py` — `NeighborGrid` with three backends (per-env brute force, a batched
   radix-sort `uniform_grid`, and one `wp.HashGrid` over all envs), selected via
   `WorldConfig.neighbor_method`; tested to agree exactly.
-- `swarp/scenarios/` — 10 scenarios: navigation, flocking, formation, discovery, sampling,
-  transport, pusht, giveway, shepherding, caging. Each pairs a torch implementation of
+- `swarp/scenarios/` — 11 scenarios: navigation, flocking, formation, discovery, sampling,
+  transport, pusht, giveway, shepherding, caging, ringroad. Each pairs a torch implementation of
   obs/reward/done with fused Warp `*_kernels.py` for the no-grad hot path. The torch path is
   the **parity oracle** the fused kernels are tested against — keep them independent rather
   than sharing code. The first seven all reward monotone progress toward a goal; the last
-  three deliberately do not (giveway requires moving *away* from your goal, caging scores an
-  angular property rather than a distance, and shepherding's environment reacts).
-  `giveway`/`shepherding`/`caging` each emit `info()["multiobj_reward"]`
+  four deliberately do not (giveway requires moving *away* from your goal, caging scores an
+  angular property rather than a distance, shepherding's environment reacts, and ringroad's
+  stop-and-go wave only exists on a ring of about 11+ cars at its density, so it is the one
+  task whose phenomenon needs many vehicles; its IDM humans are scenario-owned 1-D state).
+  `giveway`/`shepherding`/`caging`/`ringroad` each emit `info()["multiobj_reward"]`
   `[n_envs, n_agents, n_obj]` summing to the scalar reward, so a shaping imbalance is visible
   on the first training iteration rather than after an hour — that check has already caught
   one 22x imbalance.
-- `swarp/scenarios/fused.py` — `FusedScenario`, which all 10 subclass. A scenario declares its
+- `swarp/scenarios/fused.py` — `FusedScenario`, which all 11 subclass. A scenario declares its
   persistent buffers as a tuple of `Buf` from `fused_spec(n_envs)` and its launch sequence
   as `launch_fused(FusedPass)`; the framework owns lazy allocation, uint8→bool reinterpret
   views, Warp handle caching, pointer-move resync, the recapture token, the warm-up carry
-  list and the reset-mask stamp. **Zero opt-outs** — a test asserts all 10 implement the same
+  list and the reset-mask stamp. **Zero opt-outs** — a test asserts all 11 implement the same
   four members and override none of the framework's. `swarp/core/hooks.py` holds
   `WholeStepHook`, the declared form of what the scenario hands `StepRuntime`. Contract and
   capture-safety rules: `docs/writing-a-scenario.md`.

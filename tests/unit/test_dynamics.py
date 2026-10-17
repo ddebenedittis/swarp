@@ -5,6 +5,8 @@ specified to use (semi-implicit Euler: velocity-level state updated from the
 action first, pose then integrated with the new velocities), in float64.
 """
 
+from dataclasses import replace
+
 import numpy as np
 import pytest
 import warp as wp
@@ -69,7 +71,8 @@ def ref_bicycle(pos, theta, speed, actions, cfg: AgentConfig, dt: float):
     for a in actions:
         acc = np.clip(a[0], -cfg.max_accel, cfg.max_accel)
         delta = np.clip(a[1], -cfg.max_steer, cfg.max_steer)
-        s_new = np.clip(speed + acc * dt, -cfg.max_speed, cfg.max_speed)
+        lo = -cfg.max_speed if cfg.min_speed is None else cfg.min_speed
+        s_new = np.clip(speed + acc * dt, lo, cfg.max_speed)
         beta = np.arctan2(np.tan(delta) * cfg.l_r / wheelbase, 1.0)
         v_trans = s_new * np.array([np.cos(theta + beta), np.sin(theta + beta)])
         w_new = s_new / wheelbase * np.cos(beta) * np.tan(delta)
@@ -244,6 +247,49 @@ def test_bicycle_straight_line_analytic():
 
 
 @pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("integrator", [Integrator.EULER, Integrator.RK4])
+def test_bicycle_min_speed_brakes_to_a_stop(device, integrator):
+    """``min_speed=0`` is a car: full braking stops it and it stays stopped, never reversing."""
+    cfg = AgentConfig(
+        model=DynamicsModel.KINEMATIC_BICYCLE,
+        max_speed=5.0,
+        max_accel=1.0,
+        l_f=1.25,
+        l_r=1.25,
+        max_steer=0.6,
+        min_speed=0.0,
+    )
+    T, dt = 30, 0.1
+    actions = np.tile(np.array([-1.0, 0.3]), (T, 1, 1))
+    init = {
+        "pos": np.zeros((1, 2)),
+        "theta": np.zeros(1),
+        "vel": np.array([[0.5, 0.0]]),
+        "speed": np.array([0.5]),
+        "ang_vel": np.zeros(1),
+    }
+    traj = rollout_warp([cfg], init, actions, dt, device, integrator=integrator)
+    speeds = np.array([step["speed"][0] for step in traj])
+    assert speeds.min() == 0.0 and speeds[-1] == 0.0
+    if integrator == Integrator.EULER:
+        # RK4 enforces limits on the combined result only, so its pose integrates the
+        # unclamped stage speeds and a stopped car creeps; that is its rule for every limit.
+        stopped = int(np.argmax(speeds == 0.0))
+        np.testing.assert_array_equal(traj[stopped]["pos"], traj[-1]["pos"])
+    # The default still lets the same car reverse.
+    reversing = replace(cfg, min_speed=None)
+    rev = rollout_warp([reversing], init, actions, dt, device, integrator=integrator)
+    assert rev[-1]["speed"][0] < 0.0
+
+
+def test_min_speed_must_lie_within_max_speed():
+    with pytest.raises(ValueError, match="min_speed"):
+        AgentConfig(model=DynamicsModel.KINEMATIC_BICYCLE, max_speed=2.0, min_speed=-3.0)
+    row = AgentConfig(model=DynamicsModel.KINEMATIC_BICYCLE, max_speed=2.0).to_row()
+    assert row[base.P_MIN_SPEED] == -2.0
+
+
+@pytest.mark.parametrize("device", DEVICES)
 def test_clamping(device):
     """Huge commands saturate at the configured limits."""
     dt = 0.1
@@ -367,6 +413,7 @@ COLUMN_FIELDS = {
     "P_IZZ": "inertia_zz",
     "P_KAPPA": "torque_coeff",
     "P_GRAVITY": "gravity",
+    "P_MIN_SPEED": "min_speed",
 }
 
 
@@ -380,6 +427,8 @@ def test_every_column_constant_points_at_the_field_to_row_packs_there():
     """
     assert len(COLUMN_FIELDS) == NUM_PARAMS
     sentinels = {name: float(i + 1) for i, name in enumerate(COLUMN_FIELDS.values())}
+    # min_speed is validated against max_speed, so its sentinel is the one negative value.
+    sentinels["min_speed"] = -0.5 * sentinels["max_speed"]
     cfg = AgentConfig(model=DynamicsModel.DRONE, **sentinels)
     row = cfg.to_row()
     assert len(row) == NUM_PARAMS

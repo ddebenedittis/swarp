@@ -249,6 +249,9 @@ RESET_STATE = {
         ("drift", "draw"),
         ("disc_vel", "clear"),
     ],
+    # The humans are scenario-owned 1-D state; the reset draws the wave's phase and the
+    # ring offset, so both their arc positions and speeds are fresh each episode.
+    "ringroad": [("idm_s", "draw"), ("idm_v", "draw")],
 }
 
 

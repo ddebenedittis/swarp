@@ -88,7 +88,7 @@ With inertia ~1e-2 kg·m² a 10 Hz control step diverges — substep the physics
 | `radius`, `mass` | 0.05, 1.0 | all (contacts, and the drone's rigid body) |
 | `max_speed`, `max_accel` | 1.0, 1.0 | all 2D models |
 | `max_ang_vel`, `max_ang_accel` | π, 2π | diff-drive |
-| `l_f`, `l_r`, `max_steer` | 0.1, 0.1, π/4 | kinematic bicycle |
+| `l_f`, `l_r`, `max_steer`, `min_speed` | 0.1, 0.1, π/4, `None` (= `-max_speed`) | kinematic bicycle |
 | `thrust_max`, `arm_length`, `inertia_xx/yy/zz`, `torque_coeff`, `gravity` | see `drone_config` | drone |
 
 ## Heterogeneous fleets

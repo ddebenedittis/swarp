@@ -128,7 +128,7 @@ Two things follow for anyone writing a scenario:
 ```bash
 python -m swarp.benchmark.throughput      # the full (n_envs, n_agents) grid
 python -m swarp.benchmark.ablation        # cumulative optimization ablation, parity-gated
-python -m swarp.benchmark.scenarios       # all 10 scenarios x model x lidar rays
+python -m swarp.benchmark.scenarios       # all 11 scenarios x model x lidar rays
 python -m swarp.benchmark.compare_vmas    # vs VMAS: --metric {throughput,memory,both}
 python -m swarp.benchmark.compare_sims    # vs VMAS, JaxMARL and CAMAR
 ```

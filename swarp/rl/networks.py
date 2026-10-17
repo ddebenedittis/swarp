@@ -40,24 +40,47 @@ class Actor(nn.Module):
     """Decentralised actor with shared weights: ``[*, n_agents, obs_dim]`` -> (loc, scale).
 
     The action is ``tanh(u)`` with ``u ~ N(loc, scale)``, i.e. torchrl's ``TanhNormal`` on
-    ``[-1, 1]``. The trainer stores ``u`` rather than the action, so the log-prob never
-    goes through ``atanh``.
+    ``[-1, 1]``, mapped affinely onto ``[low, high]`` per action slot when a box is given
+    (ring road's accel and steering angle are not unit-ranged). The trainer stores ``u``
+    rather than the action, so the log-prob never goes through ``atanh``, and the affine
+    map's constant Jacobian cancels in PPO's ratio: the loss is the unit-box loss.
+
+    The box is held in non-persistent buffers, so it moves with ``.to()`` but stays out of
+    the state dict and checkpoints from before it existed still load.
     """
 
-    def __init__(self, obs_dim: int, act_dim: int, num_cells: int = 256) -> None:
+    def __init__(
+        self,
+        obs_dim: int,
+        act_dim: int,
+        num_cells: int = 256,
+        low: torch.Tensor | None = None,
+        high: torch.Tensor | None = None,
+    ) -> None:
         super().__init__()
         self.obs_dim, self.act_dim, self.num_cells = obs_dim, act_dim, num_cells
         self.net = mlp(obs_dim, 2 * act_dim, num_cells)
+        low = -torch.ones(act_dim) if low is None else torch.as_tensor(low, dtype=torch.float32)
+        high = torch.ones(act_dim) if high is None else torch.as_tensor(high, dtype=torch.float32)
+        # A Python flag, read when a graph is captured: the unit box costs nothing extra.
+        self.unit_box = bool((low == -1.0).all() and (high == 1.0).all())
+        self.register_buffer("act_mid", 0.5 * (high + low), persistent=False)
+        self.register_buffer("act_half", 0.5 * (high - low), persistent=False)
 
     def forward(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         loc, raw = self.net(obs).chunk(2, dim=-1)
         scale = (F.softplus(raw + _SCALE_BIAS) + _SCALE_MIN).clamp_min(_SCALE_LB)
         return loc, scale
 
+    def squash(self, u: torch.Tensor) -> torch.Tensor:
+        """The env action for a pre-tanh sample ``u``."""
+        t = torch.tanh(u)
+        return t if self.unit_box else torch.addcmul(self.act_mid, self.act_half, t)
+
     @torch.no_grad()
     def greedy(self, obs: torch.Tensor) -> torch.Tensor:
-        """The deterministic action ``tanh(loc)``: consumes no RNG."""
-        return torch.tanh(self(obs)[0])
+        """The deterministic action ``squash(loc)``: consumes no RNG."""
+        return self.squash(self(obs)[0])
 
 
 class Critic(nn.Module):

@@ -27,6 +27,7 @@ def test_registry_has_all_scenarios():
         "giveway",
         "shepherding",
         "caging",
+        "ringroad",
     }
 
 
@@ -58,7 +59,7 @@ def test_only_navigation_supports_model():
     assert supports_model(SCENARIOS["navigation"])
     for name in (
         "flocking", "formation", "discovery", "sampling", "transport", "pusht", "giveway",
-        "shepherding", "caging",
+        "shepherding", "caging", "ringroad",
     ):  # every scenario but navigation is single-model by design
         assert not supports_model(SCENARIOS[name])
 

@@ -58,6 +58,31 @@ def test_actor_scale_is_one_at_zero_output():
     assert torch.allclose(scale, torch.ones_like(scale))
 
 
+def test_actor_maps_onto_a_non_unit_action_box():
+    """Ring road's box is accel +/-2, steer +/-0.6: the greedy action spans it exactly, and
+    the unit box stays the plain tanh (no extra op, same numbers as before boxes existed)."""
+    low, high = torch.tensor([-2.0, -0.6]), torch.tensor([2.0, 0.6])
+    actor = Actor(obs_dim=3, act_dim=2, num_cells=4, low=low, high=high)
+    big = torch.tensor([[50.0, -50.0], [-50.0, 50.0]]).view(2, 1, 2)
+    expect = torch.tensor([[2.0, -0.6], [-2.0, 0.6]]).view(2, 1, 2)
+    assert torch.allclose(actor.squash(big), expect, atol=1e-6)
+    assert torch.equal(actor.squash(torch.zeros(1, 1, 2)), torch.zeros(1, 1, 2))
+    unit = Actor(obs_dim=3, act_dim=2, num_cells=4)
+    assert unit.unit_box
+    u = torch.randn(4, 2, 2)
+    assert torch.equal(unit.squash(u), torch.tanh(u))
+    assert "act_mid" not in actor.state_dict()  # checkpoints from before boxes still load
+
+
+def test_train_smoke_on_a_non_unit_box_stores_the_box(tmp_path):
+    cfg = parse_args(["--scenario", "ringroad", *SMOKE, "--checkpoint-dir", str(tmp_path)])
+    actor, _, meta = load_checkpoint(train(cfg))
+    assert meta["act_low"] == pytest.approx([-2.0, -0.6])
+    assert meta["act_high"] == pytest.approx([2.0, 0.6])
+    act = actor.greedy(torch.randn(5, 1, actor.obs_dim))
+    assert (act.abs() <= torch.tensor([2.0, 0.6]) + 1e-6).all()
+
+
 def test_train_smoke_writes_metrics_and_a_loadable_checkpoint(tmp_path):
     cfg = parse_args(["--scenario", "navigation", *SMOKE, "--checkpoint-dir", str(tmp_path)])
     path = train(cfg)

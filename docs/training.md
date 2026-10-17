@@ -88,7 +88,8 @@ for it in range(spec.iters):
 ```
 
 The environment must be built with `auto_reset=True` and `clone_outputs=False` (the default): the graphs read its output buffers by address.
-`Actor` acts in a fixed `[-1, 1]` tanh box; `swarp.rl.check_action_box(env, name)` raises if the env's `action_bounds` differ, and `train` runs it for you.
+`Actor` samples in a `[-1, 1]` tanh box and maps it affinely onto the env's per-slot action box, which `swarp.rl.check_action_box(env, name)` returns (it raises if agents' boxes disagree, since the weights are shared); `train` runs it for you and stores the box in the checkpoint.
+The map's Jacobian is constant, so it cancels in the PPO ratio and the loss is the unit-box loss.
 
 ## What differs from the TorchRL trainer
 

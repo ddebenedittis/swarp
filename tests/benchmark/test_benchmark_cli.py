@@ -9,6 +9,7 @@ would find.
 """
 
 import argparse
+import sys
 
 import pytest
 import torch
@@ -92,3 +93,12 @@ def test_compare_vmas_hidden_child_flag_still_parses():
     """The memory probe re-execs itself with this; a rename would break it silently."""
     args = compare_vmas.build_parser().parse_args(["--_mem_child", "swarp", "8", "2", "5"])
     assert args._mem_child == ["swarp", "8", "2", "5"]
+
+
+def test_compare_sims_vehicles_is_ringroad_only(monkeypatch):
+    """``--vehicles`` sizes the ring road; on navigation it would be silently ignored."""
+    args = compare_sims.build_parser().parse_args(["--scenarios", "ringroad", "--vehicles", "64"])
+    assert args.vehicles == [64]
+    monkeypatch.setattr(sys, "argv", ["compare_sims", "--vehicles", "64"])
+    with pytest.raises(SystemExit):
+        compare_sims.main()

@@ -12,7 +12,7 @@ The benchmark entry points (`swarp/benchmark/`):
 | `python -m swarp.benchmark.compare_vmas` | swarp vs VMAS (throughput and/or peak device memory) |
 | `python -m swarp.benchmark.compare_sims` | swarp vs VMAS vs JaxMARL vs CAMAR, one subprocess per simulator |
 | `python -m swarp.benchmark.ablation` | cumulative optimization ablation of the same hot path, one feature per row, parity-gated |
-| `python -m swarp.benchmark.scenarios` | all 10 scenarios × robot model × lidar rays: baseline vs optimized, parity-gated |
+| `python -m swarp.benchmark.scenarios` | all 11 scenarios × robot model × lidar rays: baseline vs optimized, parity-gated |
 | `python -m swarp.benchmark.train_throughput` | end-to-end MAPPO training: [`swarp.rl`](training.md) vs TorchRL (as usually written and tuned), BenchMARL and rsl_rl |
 
 ## Throughput
@@ -72,6 +72,28 @@ GPU-bound configs where launch overhead was never the constraint.
 Raising `n_agents` at fixed `n_envs` is close to free until that point, which is the
 structural difference from per-entity simulators: the step is a fixed handful of Warp
 kernels whose thread count grows with agents, not a Python loop whose *length* does.
+
+### Ring road
+
+`ringroad` carries most of its work outside the engine: per step, its fused pass projects every vehicle onto the ring, runs an O(N²) leader search twice and integrates the IDM humans, for 22 vehicles per env at the default size.
+`python -m swarp.benchmark.scenarios --scenarios ringroad --envs 1024 4096 16000 --agents 1 16 64 --lidar-rays 0 --steps 300`, RTX 3070 Laptop GPU, ms/step.
+The ring holds `max(22, n_agents + 1)` vehicles, so the 64-agent rows simulate 65.
+Every row ran captured (`graph`):
+
+| n_envs | RL cars (vehicles) | baseline (torch obs/reward, eager) | optimized (fused + graph) | speedup |
+|---|---|---|---|---|
+| 1024 | 1 (22) | 1.136 | 0.040 | 28.4× |
+| 1024 | 16 (22) | 1.141 | 0.085 | 13.4× |
+| 1024 | 64 (65) | 3.356 | 0.350 | 9.6× |
+| 4096 | 1 (22) | 1.827 | 0.059 | 31.0× |
+| 4096 | 16 (22) | 1.905 | 0.146 | 13.0× |
+| 4096 | 64 (65) | 12.461 | 0.655 | 19.0× |
+| 16000 | 1 (22) | 5.998 | 0.208 | 28.8× |
+| 16000 | 16 (22) | 6.693 | 0.629 | 10.6× |
+| 16000 | 64 (65) | 48.437 | 3.349 | 14.5× |
+
+At the training recipe's size (1024 envs, 1 RL car among 22) the step costs 0.04 ms, about 25.6 M env-steps/s.
+A whole `swarp.rl` iteration (1024 envs × 32 steps, rollout plus PPO update) takes about 94 ms, so the update, not the ring, is the cost.
 
 ## Training throughput
 
@@ -411,3 +433,97 @@ task). Residual, deliberate differences: exact obs dimensionality still differs 
 `vmas-nolidar` also loses agent-agent collision physics (VMAS gates collisions and lidar
 on one flag); dynamics/collision constants differ so trajectories won't match. Use
 `--sims swarp vmas jaxmarl camar-grid` to compare each engine in its *native* setup instead.
+
+### Ring road in VMAS and JaxMARL
+
+Neither VMAS nor JaxMARL ships the ring road, so `compare_sims --scenarios ringroad` times two ports written for the comparison.
+`swarp/benchmark/_adapters/ringroad_vmas.py` is a VMAS scenario: each RL car is a VMAS agent with VMAS's own `KinematicBicycle` (Euler, drag and collisions off), and `process_action` turns swarp's `(accel, steer)` action into the bicycle's speed command.
+`swarp/benchmark/_adapters/ringroad_jax.py` is a JaxMARL `MultiAgentEnv`.
+Both run the same algorithm as `RingRoadScenario`: 22 vehicles, the IDM humans as one batched array (not one simulator entity each), a brute-force leader search before and after the IDM step, the same 9-wide observation and five-term reward.
+Each port is written the efficient way for its simulator: per-step tensor ops vectorised over envs for VMAS, and one jitted `vmap` + `lax.scan` over the rollout for JAX.
+Driven by the same IDM controller from their observations, all three reproduce the same physics: the wave dies on 6 cars (speed std 0.045 m/s, mean 3.512 m/s in all three) and persists on 22 (std 2.917 in VMAS, 2.918 in JAX, 2.925 in swarp), with no crashes.
+JaxMARL's `step` evaluates a reset every step and selects it on `done`, as every JaxMARL environment does; that cost is included.
+
+VMAS lives in its own venv (`uv venv --python 3.12 .venv-vmas && VIRTUAL_ENV=.venv-vmas uv pip install -e '.[bench]'`), JaxMARL in `.venv-jaxmarl` as above (with `jax[cuda13]==0.11.2` for JaxMARL's jax 0.11.2):
+
+```bash
+.venv/bin/python -m swarp.benchmark.compare_sims --device cuda:0 --scenarios ringroad \
+    --sims swarp swarp-fused swarp-eager vmas jaxmarl --envs 1024 4096 16384 --agents 1 4 \
+    --steps 300 --warmup 20 \
+    --python vmas=.venv-vmas/bin/python --python jaxmarl=.venv-jaxmarl/bin/python
+```
+
+env-steps/s on the RTX 3070 Laptop GPU, random actions over the action box, `n_agents` RL cars among 22 vehicles:
+
+| n_envs | RL cars | swarp | swarp-fused | swarp-eager | VMAS | JaxMARL port | swarp / VMAS | swarp / JAX |
+|---|---|---|---|---|---|---|---|---|
+| 1024 | 1 | 18.8 M | 3.2 M | 0.82 M | 0.58 M | 12.4 M | 32× | 1.5× |
+| 4096 | 1 | 55.5 M | 12.4 M | 2.24 M | 1.71 M | 30.1 M | 33× | 1.8× |
+| 16384 | 1 | 61.6 M | 45.8 M | 2.62 M | 2.41 M | 41.6 M | 26× | 1.5× |
+| 1024 | 4 | 17.0 M | 2.9 M | 0.78 M | 0.31 M | 8.5 M | 55× | 2.0× |
+| 4096 | 4 | 42.2 M | 12.7 M | 2.20 M | 1.05 M | 25.3 M | 40× | 1.7× |
+| 16384 | 4 | 55.7 M | 51.2 M | 2.59 M | 1.92 M | 26.2 M | 29× | 2.1× |
+
+Unlike navigation, swarp leads the JAX port at every size here, including the small batches where JAX's whole-rollout `lax.scan` beat swarp on navigation.
+A likely reason, not measured here: the ring road's step is a long chain of small dependent passes (arc projection, two leader searches, IDM, obs, reward), which the whole-step CUDA graph replays as one launch of hand-written kernels while XLA has to fuse the equivalent `jnp` ops.
+VMAS pays a Python-level step per env step; its eager torch path is close to `swarp-eager`, which runs the same task in plain torch ops.
+
+#### More envs
+
+Past 16384 envs the GPU is full, and swarp and the JAX port both plateau at the same ratio (1 RL car among 22 vehicles, `--steps 200`, one run):
+
+| n_envs | swarp | VMAS | JaxMARL port | swarp / VMAS | swarp / JAX |
+|---|---|---|---|---|---|
+| 16384 | 63.3 M | 2.51 M | 43.0 M | 25× | 1.47× |
+| 65536 | 75.9 M | 2.71 M | 52.0 M | 28× | 1.46× |
+| 262144 | 77.6 M | 2.78 M | 53.0 M | 28× | 1.46× |
+| 1048576 | 77.7 M | OOM | 52.8 M | – | 1.47× |
+
+More envs add the same work to both at the same per-env efficiency, so the ratio settles at swarp's per-env advantage, about 1.47×.
+Batch size is not where swarp's lead over JAX grows; work per env is, as in navigation, where it grew with the agent count.
+
+#### More vehicles
+
+`--vehicles` sets the vehicles per ring (RL cars included) at the fixed Sugiyama density, so the ring grows with them:
+
+```bash
+.venv/bin/python -m swarp.benchmark.compare_sims --device cuda:0 --scenarios ringroad \
+    --sims swarp vmas jaxmarl --envs 16384 --agents 1 --vehicles 22 64 128 256 \
+    --steps 300 --warmup 20 \
+    --python vmas=.venv-vmas/bin/python --python jaxmarl=.venv-jaxmarl/bin/python
+```
+
+env-steps/s at 16384 envs, 1 RL car (22–128 at `--steps 300`, 256 at `--steps 100`; the 64 and 128 rows were repeated within 1% for VMAS and JAX and 8% for swarp):
+
+| vehicles | swarp | VMAS | JaxMARL port | swarp / VMAS | swarp / JAX |
+|---|---|---|---|---|---|
+| 22 | 61.5 M | 2.44 M | 41.8 M | 25× | 1.5× |
+| 64 | 15.2 M | 0.36 M | 5.17 M | 42× | 2.9× |
+| 128 | 4.75 M | 0.10 M | 2.19 M | 46× | 2.2× |
+| 256 | 1.34 M | OOM | OOM | – | – |
+
+Every simulator's step grows with the square of the vehicle count, because the leader search compares every pair of vehicles in a ring.
+The ratio to JAX does not grow monotonically, so a finer sweep of swarp and the JAX port through the same adapters (best of three 100-step rollouts per size, 16384 envs unless noted) counts the pair comparisons per second as well:
+
+| vehicles | swarp | JaxMARL port | swarp / JAX | swarp pairs/s | JAX pairs/s |
+|---|---|---|---|---|---|
+| 22 | 72.4 M | 40.9 M | 1.8× | 35 G | 20 G |
+| 32 | 42.5 M | 10.6 M | 4.0× | 43 G | 11 G |
+| 48 | 24.9 M | 6.64 M | 3.7× | 57 G | 15 G |
+| 64 | 15.2 M | 5.18 M | 2.9× | 62 G | 21 G |
+| 96 | 7.73 M | 2.91 M | 2.7× | 71 G | 27 G |
+| 128 | 4.72 M | 2.22 M | 2.1× | 77 G | 37 G |
+| 192 | 2.25 M | 1.05 M | 2.1× | 83 G | 39 G |
+| 256 (4096 envs) | 1.32 M | 0.75 M | 1.8× | 87 G | 49 G |
+
+The compiled XLA program explains the shape.
+At 22 vehicles XLA emits each argmin of the leader search as a loop fusion, one thread per vehicle scanning the ring, which is the algorithm swarp's kernel runs.
+From 32 vehicles on it switches to its row-reduction emitter, where threads cooperate on each row; on rows this short a `(value, index)` reduction runs badly, so 2× the work costs 4× the time.
+That emitter improves as rows lengthen (JAX's pair rate rises 4.5× from 32 to 256 vehicles, swarp's 2×, since swarp's per-thread loop is already efficient and only its fixed per-step cost amortises), so the gap narrows from 4× toward 1.8×.
+XLA never writes the N×N distance arrays to memory up to 192 vehicles: they stay fused into the reductions, and its scratch memory grows linearly (97 MB at 128 vehicles, where one 16384×128×128 float32 array would be 1 GiB).
+At 256 vehicles and 16384 envs it fails allocating 4 GiB, exactly one 16384×256×256 float32 array; at 4096 envs it runs.
+
+Simulation is only part of training time.
+At the recipe's size (1024 envs × 32 steps per iteration) swarp simulates an iteration in about 1.7 ms of a 94 ms `swarp.rl` iteration; the PPO update is the rest.
+The same rollout costs about 57 ms in VMAS and 2.6 ms in the JAX port, so under the same PPO trainer VMAS would make an iteration about 1.6× slower, not 32×.
+The JAX port's training speed would depend on a JAX trainer, which this comparison does not include.

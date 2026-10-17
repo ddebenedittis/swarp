@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import csv as csvmod
+import inspect
 import time
 
 import torch
@@ -68,7 +69,11 @@ def build_scenario(name: str, n_agents: int, model_name: str | None):
     kwarg is passed at all. That is deliberate: ``make_scenario`` *warns* when it has to
     drop one, and a sweep should not be generating warnings it knows are expected.
     """
-    kw: dict = {"n_agents": n_agents, "world_size": max(1.0, n_agents**0.5 / 4)}
+    kw: dict = {"n_agents": n_agents}
+    # Only where accepted: ringroad's geometry is set by its density in metres, and a
+    # 1-2 unit ``world_size`` would mean nothing there.
+    if "world_size" in inspect.signature(SCENARIOS[name].__init__).parameters:
+        kw["world_size"] = max(1.0, n_agents**0.5 / 4)
     if model_name is not None:
         kw["model"] = MODELS[model_name]
     return make_scenario(name, **kw)
