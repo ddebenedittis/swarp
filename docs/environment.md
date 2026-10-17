@@ -68,6 +68,7 @@ This is the Gymnasium 5-tuple.
 - `info` — a dict of whatever the scenario chooses to expose; navigation reports `dist_to_goal`, Push-T reports the pose error, and so on.
 
 Episode end — for `auto_reset` and for the internal step counter — is `terminated | truncated`.
+`env.step_count` is that counter, `[n_envs]` int32 steps since each env's last reset; like the outputs it is a live buffer updated in place, so clone it to keep a value.
 Keeping the two apart is what lets a value estimator bootstrap through a timeout instead of treating it as a real terminal state; `swarp.interop.torchrl.SwarpEnv` forwards both, plus their OR as `done`.
 
 Reward, the two flags and info describe the transition that was just taken — the terminal state — while `obs` is already the next episode's first observation for any env that auto-reset.

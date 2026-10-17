@@ -21,6 +21,8 @@ uv run pytest                              # dynamics, gradients, neighbors, col
 uv run pytest -m "not gpu"                 # what CI runs (no CUDA device on the runners)
 python -m swarp.benchmark.throughput        # NavigationScenario hot-path env-steps/s
 python -m swarp.benchmark.compare_vmas      # vs VMAS; needs `.[bench]` (pulls in vmas, numpy<2)
+python -m swarp.rl --scenario navigation    # CUDA-graph MAPPO trainer (add --compile --tf32 for max speed)
+python -m swarp.benchmark.train_throughput  # end-to-end training speed: swarp.rl vs torchrl (plain/tuned), BenchMARL, rsl_rl
 uv pip install --group docs                # docs toolchain (no torch/warp needed)
 uv run --no-sync sphinx-build -b html -W docs docs/_build/html   # build the docs site
 ```
@@ -124,6 +126,8 @@ TorchRL `EnvBase` wrapper).
   four members and override none of the framework's. `swarp/core/hooks.py` holds
   `WholeStepHook`, the declared form of what the scenario hands `StepRuntime`. Contract and
   capture-safety rules: `docs/writing-a-scenario.md`.
+- `swarp/rl/` — the training layer on top of `Environment`, torch-only: `recipes.py` (the per-scenario `TrainSpec` table `SPECS`, `SolveRateWindow`, `score`; shared with the torchrl reference trainer in `examples/`, which re-exports it), `networks.py` (actor/critic, tanh-Gaussian log-prob) and `ppo.py` (`MAPPO`: rollout and update as four captured torch graphs around the env's own Warp graph, with Adam's `found_inf` skipping non-finite minibatches on device; `train`, the CLI behind `python -m swarp.rl`).
+  Its speed claim is end-to-end iteration time from `python -m swarp.benchmark.train_throughput`; at the recipes' sizes the PPO update, not the physics, is the cost.
 
 ## Design Invariants (read before extending the step)
 

@@ -30,6 +30,8 @@ Each extra is opt-in so the core stays lean.
 |---|---|---|
 | `viz` | `uv pip install -e '.[viz]'` | the pygame viewer, headless frames and mp4/webm export — see [Visualization](visualization.md) |
 | `torchrl` | `uv pip install -e '.[torchrl]'` | the TorchRL `EnvBase` wrapper `swarp.interop.torchrl.SwarpEnv` |
+| `rsl-rl` | `uv pip install -e '.[rsl-rl]'` | rsl_rl, for the `examples/train_rsl_rl.py` baseline in the training benchmark |
+| `benchmarl` | see [Benchmarks](benchmarks.md#training-throughput) | BenchMARL, for the `examples/train_benchmarl.py` baseline; it pins `torchrl < 0.12`, so it lives in its own venv |
 | `bench` | `uv pip install -e '.[bench]'` | VMAS, for `python -m swarp.benchmark.compare_vmas` (it pins `numpy < 2`) |
 | `bench-jaxmarl`, `bench-camar` | see [Benchmarks](benchmarks.md) | the JAX-based simulators the cross-simulator comparison drives, each in its own venv |
 | `dev` (dependency group) | `uv pip install -e . --group dev` | pytest and ruff |

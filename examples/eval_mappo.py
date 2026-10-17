@@ -1,4 +1,4 @@
-"""Evaluate / visualize a checkpoint saved by ``train_mappo.py``.
+"""Evaluate / visualize a checkpoint saved by ``train_mappo.py`` or ``python -m swarp.rl``.
 
 Three views of "performance", any combination:
 
@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from functools import partial
 
 import torch
 from mappo import (
@@ -65,10 +66,11 @@ from mappo import (
     greedy_actions,
     mcnemar_interval,
     plot_curve,
-    score,
 )
 
 import swarp
+from swarp.rl.ppo import CHECKPOINT_FORMAT, greedy_arm, load_checkpoint
+from swarp.rl.recipes import PolicyArm, score
 
 
 def _load(path: str, device: str):
@@ -86,6 +88,33 @@ def _load(path: str, device: str):
     policy.load_state_dict(ckpt["policy"])
     policy.eval()
     return policy, ckpt
+
+
+def _load_arm(path: str, device: str) -> tuple[PolicyArm, dict]:
+    """The greedy policy arm and metadata of either trainer's checkpoint.
+
+    A ``swarp.rl`` checkpoint acts with ``tanh(loc)``; a ``train_mappo.py`` one keeps its
+    historical ``loc.clamp(lo, hi)`` (see :func:`mappo.greedy_actions`).
+    """
+    ckpt = torch.load(path, map_location=device, weights_only=True)
+    if ckpt.get("format") == CHECKPOINT_FORMAT:
+        actor, _, ckpt = load_checkpoint(path, device)
+        return greedy_arm(actor), ckpt
+    if ckpt.get("format") == "rsl_rl/1":  # examples/train_rsl_rl.py: acts with clamp(mean)
+        import train_rsl_rl
+
+        actor, ckpt = train_rsl_rl.load_checkpoint(path, device)
+        return train_rsl_rl.greedy_arm(actor), ckpt
+    if ckpt.get("format") == "benchmarl/1":
+        # train_benchmarl.py saves its actor in swarp.rl's layout; tanh(loc) is BenchMARL's
+        # deterministic action too. No benchmarl import needed.
+        from swarp.rl.networks import Actor
+
+        actor = Actor(ckpt["obs_dim"], ckpt["act_dim"], ckpt["num_cells"]).to(device)
+        actor.load_state_dict(ckpt["actor"])
+        return greedy_arm(actor.eval()), ckpt
+    policy, ckpt = _load(path, device)
+    return partial(greedy_actions, policy), ckpt
 
 
 def main() -> int:
@@ -122,7 +151,7 @@ def main() -> int:
     if not args.checkpoint:
         return 0
 
-    policy, ckpt = _load(args.checkpoint, args.device)
+    arm, ckpt = _load_arm(args.checkpoint, args.device)
     scenario = args.scenario or ckpt.get("scenario")
     if scenario is None:
         p.error(
@@ -144,7 +173,7 @@ def main() -> int:
 
     res = score(
         scenario,
-        policy=policy,
+        policy=arm,
         n_agents=n_agents,
         n_envs=args.n_envs,
         steps=steps,
@@ -201,7 +230,7 @@ def main() -> int:
         )
         env.reset(seed=args.seed)
         lo, hi = env.action_bounds
-        act = greedy_actions(policy, 1, args.device, lo, hi)
+        act = arm(1, args.device, lo, hi)
         n = args.render_steps
         step_rate = args.speed / dt  # sim steps per second of wall clock
         print(

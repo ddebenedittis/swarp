@@ -13,6 +13,7 @@ The benchmark entry points (`swarp/benchmark/`):
 | `python -m swarp.benchmark.compare_sims` | swarp vs VMAS vs JaxMARL vs CAMAR, one subprocess per simulator |
 | `python -m swarp.benchmark.ablation` | cumulative optimization ablation of the same hot path, one feature per row, parity-gated |
 | `python -m swarp.benchmark.scenarios` | all 10 scenarios × robot model × lidar rays: baseline vs optimized, parity-gated |
+| `python -m swarp.benchmark.train_throughput` | end-to-end MAPPO training: [`swarp.rl`](training.md) vs TorchRL (as usually written and tuned), BenchMARL and rsl_rl |
 
 ## Throughput
 
@@ -71,6 +72,119 @@ GPU-bound configs where launch overhead was never the constraint.
 Raising `n_agents` at fixed `n_envs` is close to free until that point, which is the
 structural difference from per-entity simulators: the step is a fixed handful of Warp
 kernels whose thread count grows with agents, not a Python loop whose *length* does.
+
+## Training throughput
+
+`python -m swarp.benchmark.train_throughput` measures what a training run pays per iteration: rollout plus PPO update, logging and eval excluded.
+Each configuration runs its trainer's real CLI in a subprocess, and the number is the median `wall_s` from the `metrics.csv` it writes, after the warm-up iterations.
+`sim` is the simulator alone over the same rollout, and *sim share* is that time over the trainer's.
+RTX 3070 Laptop GPU, float32, nothing else on the GPU.
+
+Every trainer runs the same `TrainSpec` recipe (batch, epochs, minibatches, network width, learning rate, curriculum) through the library's own loop:
+
+| config | trainer | what it is |
+|---|---|---|
+| `torchrl` | `examples/train_mappo.py` | MAPPO written with TorchRL the usual way: `Collector`, `ClipPPOLoss`, `ReplayBuffer`, eager update |
+| `torchrl-tuned` | `examples/train_mappo_tuned.py` | the same MAPPO with TorchRL's own speed features: `cudagraph_policy` in the collector, the update step in `CudaGraphModule`, fused capturable Adam with an on-device skip, one host read per iteration |
+| `torchrl-tuned-fast` | the same, `--compile --tf32` | plus `torch.compile` of the update and policy, and TF32 matmuls |
+| `benchmarl` | `examples/train_benchmarl.py` | BenchMARL 1.5.2's `Experiment` with `MappoConfig`, swarp registered as a task like VMAS (own venv: BenchMARL pins `torchrl < 0.12`) |
+| `rsl_rl` | `examples/train_rsl_rl.py` | rsl_rl 5.5's `OnPolicyRunner`, one rsl_rl env per agent, the joint observation as the critic's observation group |
+| `eager` | `python -m swarp.rl --no-graphs` | the lean loop without CUDA graphs |
+| `graphs` | `python -m swarp.rl` | rollout and update CUDA-graph captured |
+| `fast` | `python -m swarp.rl --compile --tf32` | plus `torch.compile` of the loss and TF32 matmuls |
+
+The baselines are not identical algorithms, because each library fixes some choices; every script lists its deviations from `swarp.rl` in its module docstring.
+The ones that matter for speed: rsl_rl evaluates the critic once per agent on identical joint observations (`n_agents` times the critic work), and BenchMARL's MAPPO cannot normalise advantages.
+
+```bash
+uv pip install -e '.[torchrl,rsl-rl]' --group dev
+UV_PROJECT_ENVIRONMENT=.venv-benchmarl uv sync --extra benchmarl --group dev
+.venv/bin/python -m swarp.benchmark.train_throughput \
+    --configs torchrl torchrl-tuned torchrl-tuned-fast benchmarl rsl_rl eager graphs fast \
+    --python benchmarl=.venv-benchmarl/bin/python
+```
+
+At the recipes' own batch sizes:
+
+```
+scenario      n_envs   mb             config   ms/iter   env-steps/s vs torchrl sim share
+-----------------------------------------------------------------------------------------
+navigation       512    4            torchrl     232.0        70,621      1.00x      0.8%
+navigation       512    4      torchrl-tuned     120.5       135,967      1.93x      1.6%
+navigation       512    4 torchrl-tuned-fast     101.0       162,218      2.30x      1.9%
+navigation       512    4          benchmarl     251.5        65,145      0.92x      0.8%
+navigation       512    4             rsl_rl     162.0       101,136      1.43x      1.2%
+navigation       512    4              eager     105.5       155,299      2.20x      1.8%
+navigation       512    4             graphs      97.0       168,907      2.39x      2.0%
+navigation       512    4               fast      72.0       227,556      3.22x      2.7%
+navigation       512                     sim       1.9     8,502,622
+giveway         1024    8            torchrl     463.5        70,697      1.00x      0.8%
+giveway         1024    8      torchrl-tuned     242.0       135,405      1.92x      1.6%
+giveway         1024    8 torchrl-tuned-fast     189.5       172,918      2.45x      2.0%
+giveway         1024    8          benchmarl     479.5        68,338      0.97x      0.8%
+giveway         1024    8             rsl_rl     315.5       103,861      1.47x      1.2%
+giveway         1024    8              eager     204.0       160,627      2.27x      1.9%
+giveway         1024    8             graphs     189.0       173,376      2.45x      2.0%
+giveway         1024    8               fast     145.0       225,986      3.20x      2.6%
+giveway         1024                     sim       3.8     8,601,597
+```
+
+Scaling `n_envs` on navigation with the minibatch held at 4096 env-steps (`--minibatch-samples 4096`, so the minibatch count grows with the batch):
+
+```
+scenario      n_envs   mb             config   ms/iter   env-steps/s vs torchrl sim share
+-----------------------------------------------------------------------------------------
+navigation      1024    8            torchrl     430.5        76,116      1.00x      0.5%
+navigation      1024    8      torchrl-tuned     230.0       142,470      1.87x      1.0%
+navigation      1024    8 torchrl-tuned-fast     186.0       176,172      2.31x      1.2%
+navigation      1024    8          benchmarl     478.5        68,481      0.90x      0.5%
+navigation      1024    8             rsl_rl     316.0       103,696      1.36x      0.7%
+navigation      1024    8             graphs     192.0       170,667      2.24x      1.2%
+navigation      1024    8               fast     141.0       232,397      3.05x      1.6%
+navigation      1024                     sim       2.3    14,309,770
+navigation      4096   32            torchrl    1648.0        79,534      1.00x      0.1%
+navigation      4096   32      torchrl-tuned     842.5       155,575      1.96x      0.3%
+navigation      4096   32 torchrl-tuned-fast     638.5       205,281      2.58x      0.4%
+navigation      4096   32          benchmarl    1876.0        69,868      0.88x      0.1%
+navigation      4096   32             rsl_rl    1299.5       100,863      1.27x      0.2%
+navigation      4096   32             graphs     775.0       169,125      2.13x      0.3%
+navigation      4096   32               fast     561.0       233,640      2.94x      0.4%
+navigation      4096                     sim       2.4    53,930,683
+navigation     16384  128            torchrl    7499.5        69,910      1.00x      0.1%
+navigation     16384  128      torchrl-tuned    3606.5       145,373      2.08x      0.2%
+navigation     16384  128 torchrl-tuned-fast    2496.5       210,009      3.00x      0.2%
+navigation     16384  128          benchmarl    7049.5        74,372      1.06x      0.1%
+navigation     16384  128             rsl_rl    5010.0       104,648      1.50x      0.1%
+navigation     16384  128             graphs    3008.5       174,269      2.49x      0.2%
+navigation     16384  128               fast    2192.0       239,182      3.42x      0.3%
+navigation     16384                     sim       5.6    92,870,753
+```
+
+Reading it:
+
+- **The physics is not the cost.** The simulator is at most 2.7% of any trainer's iteration, so every trainer over swarp is bounded by its own loop and its PPO update. With the overhead gone that update is GPU-bound: 8 epochs through two 256-wide MLPs, ~170 k env-steps/s in fp32 and ~235 k with TF32 matmuls and Inductor-fused elementwise ops, flat in `n_envs`.
+- **Against TorchRL as usually written, `swarp.rl` is 2.1–2.5× faster (2.9–3.4× with `--compile --tf32`); against TorchRL with its own speed features on, 1.1–1.3× (1.1–1.4×).** Most of the first gap is overhead that TorchRL's APIs can remove: capturing the update alone takes the TorchRL trainer from ~240 to ~140 ms on navigation. What the tuned trainer still pays sits in TorchRL's env-step path, which its API does not let a user own: `EnvBase.step_and_maybe_reset` builds TensorDicts and reads `done.any()` on the host every step, and `CudaGraphModule` syncs the device before every replay, so collecting a 32-step rollout takes ~18 ms around ~2 ms of physics. Per minibatch it adds a sync, host-side `ReplayBuffer` sampling and a copy into the graph's static inputs. The gap narrows as the batch grows, because the GPU-bound update dominates both.
+- **Tuning TorchRL took two non-obvious workarounds.** In TorchRL 0.13.3 with tensordict 0.13.0, `cudagraph_policy` with a `ProbabilisticActor` hands the collector the graph's static output buffers uncloned, so every step of a batch carries the last step's action and log-probability: training runs without an error and never learns. TorchRL 0.14.0 fixed this ([pytorch/rl#3002](https://github.com/pytorch/rl/issues/3002), [#4143](https://github.com/pytorch/rl/pull/4143)), as did tensordict 0.15.0 for `CudaGraphModule` itself ([pytorch/tensordict#1999](https://github.com/pytorch/tensordict/pull/1999)). `TanhNormal` with float bounds issues a host-to-device copy that a CUDA graph cannot capture, still so in TorchRL 0.14.1. `examples/train_mappo_tuned.py` documents both fixes. The tables above were measured on TorchRL 0.13.3; on 0.14.1 both TorchRL trainers time within 4% of those numbers, as does `swarp.rl` measured alongside them, so the ratios stand.
+- **BenchMARL runs at the speed of the untuned TorchRL trainer (0.9–1.1×)**, which it is built on; as shipped it uses none of TorchRL's graph or compile options.
+- **rsl_rl sits in between (1.3–1.5×).** Its loop is lean but fully eager, with `.item()` reads per minibatch, and the agents-as-envs mapping makes it evaluate the critic `n_agents` times per env.
+- **TorchRL is the one that suffers under CPU contention.** With two Isaac Sim processes busy on the same laptop, the TorchRL trainer ran 1.3–1.4× slower (navigation at 512 envs: 328 ms per iteration instead of 244 ms) and ran out of GPU memory at 16,384 envs, while `swarp.rl` moved by under 5%. Its loop is host-bound; the captured one is not.
+
+Learning is unchanged by the speedup.
+On `giveway` (1024 envs, the full 3000-iteration recipe, seeds 0–2) every trainer learns the task, so the time to solve is the iteration time:
+
+| trainer | full difficulty at iteration | wall-clock to get there | whole run | greedy solve rate (2048 envs) | median solve step |
+|---|---|---|---|---|---|
+| `swarp.rl` | 413–414 | **79 s** | 581 s | 1.000 [0.998, 1.000] | 38–41 |
+| TorchRL, tuned | 414–416 | 102–103 s | 738 s | 1.000 | 38–40 |
+| rsl_rl | 413–414 | 133–134 s | 965 s | 1.000 | 38–39 |
+| TorchRL, as usually written | 415–416 | 187–188 s | 1354 s | 1.000 | 39–40 |
+| BenchMARL | 416–417 | 208–209 s | 1470 s | 1.000 | 42 |
+
+Every run reaches full difficulty with a windowed episode solve rate above 0.95 at that same iteration, and every final checkpoint solves all 2048 evaluation envs (the scripted controller: 1.000 at step 48); wall-clock excludes evaluation and is the range over the three seeds, and whole-run times are means.
+This measures speed, not sample efficiency: the recipe's curriculum raises difficulty by at most 1/400 per iteration, so no run can reach full difficulty before iteration 400, and every trainer clears the gate from about iteration 15 on.
+A comparison of sample efficiency needs a task where learning, not the curriculum, sets the pace.
+Every baseline learns `navigation` at the recipe: after 250 iterations, the greedy policy over 512 evaluation envs solves 1.000 [0.993, 1.000] for rsl_rl and for BenchMARL, and 0.982 [0.967, 0.991] for the tuned TorchRL trainer against 0.984 [0.969, 0.992] for the untuned one, from the same seed.
+The tuned trainer's update also matches the untuned one numerically on fixed batches (`tests/examples/test_mappo_tuned.py`).
 
 ## vs. VMAS
 

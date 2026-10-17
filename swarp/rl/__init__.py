@@ -1,0 +1,35 @@
+"""Training on swarp: a lean MAPPO whose rollout and update are CUDA-graph captured.
+
+``python -m swarp.rl --scenario navigation`` trains a built-in scenario from its recipe in
+:data:`swarp.rl.recipes.SPECS`; :func:`train` is the same loop as a function.
+"""
+
+from swarp.rl.networks import Actor, Critic
+from swarp.rl.ppo import (
+    MAPPO,
+    NonFiniteGradients,
+    TrainConfig,
+    check_action_box,
+    greedy_arm,
+    load_checkpoint,
+    load_policy,
+    parse_args,
+    train,
+)
+from swarp.rl.recipes import SPECS, TrainSpec
+
+__all__ = [
+    "MAPPO",
+    "SPECS",
+    "Actor",
+    "Critic",
+    "NonFiniteGradients",
+    "TrainConfig",
+    "TrainSpec",
+    "check_action_box",
+    "greedy_arm",
+    "load_checkpoint",
+    "load_policy",
+    "parse_args",
+    "train",
+]

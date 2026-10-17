@@ -74,6 +74,7 @@ from mappo import (
     score,
     wilson_ci,
 )
+from tensordict import TensorDictBase
 from torchrl.collectors import Collector
 from torchrl.data import LazyTensorStorage, ReplayBuffer, SamplerWithoutReplacement
 from torchrl.objectives import ClipPPOLoss, ValueEstimators
@@ -103,15 +104,15 @@ class TrainConfig:
     target_solve_rate: float | None = None
 
 
-def parse_args(argv: list[str] | None = None) -> TrainConfig:
-    """Parse into a :class:`TrainConfig`.
+def build_parser(description: str | None = __doc__) -> argparse.ArgumentParser:
+    """The CLI, before parsing, so a derived trainer can add its own flags.
 
     Hyperparameter flags default to ``None``, meaning "take the spec's value", so a
     user override is distinguishable from a spec value and the effective config can be
     printed and stored.
     """
     default_device = "cuda:0" if torch.cuda.is_available() else "cpu"
-    p = argparse.ArgumentParser(description=__doc__)
+    p = argparse.ArgumentParser(description=description)
     p.add_argument("--scenario", required=True, choices=sorted(SPECS))
     p.add_argument("--device", default=default_device)
     p.add_argument("--seed", type=int, default=0)
@@ -156,8 +157,14 @@ def parse_args(argv: list[str] | None = None) -> TrainConfig:
                    help="abort if this fraction of minibatches has non-finite grads")
     p.add_argument("--max-skip-iters", type=int, default=5,
                    help="consecutive iterations over --max-skip-frac before aborting")
-    a = p.parse_args(argv)
+    return p
 
+
+def config_from_args(
+    p: argparse.ArgumentParser, a: argparse.Namespace, run_suffix: str = ""
+) -> TrainConfig:
+    """Resolve parsed flags against ``SPECS[a.scenario]``. ``--checkpoint-dir`` defaults
+    to ``runs/<scenario><run_suffix>``."""
     spec = SPECS[a.scenario]
     overrides = {
         f: getattr(a, f)
@@ -184,7 +191,7 @@ def parse_args(argv: list[str] | None = None) -> TrainConfig:
         spec=spec,
         scen_kwargs=scen_kwargs,
         device=a.device,
-        checkpoint_dir=Path(a.checkpoint_dir or f"runs/{a.scenario}"),
+        checkpoint_dir=Path(a.checkpoint_dir or f"runs/{a.scenario}{run_suffix}"),
         resume=a.resume,
         start_difficulty=a.start_difficulty,
         checkpoint_every=a.checkpoint_every,
@@ -198,16 +205,131 @@ def parse_args(argv: list[str] | None = None) -> TrainConfig:
     )
 
 
+def parse_args(argv: list[str] | None = None) -> TrainConfig:
+    """Parse into a :class:`TrainConfig`."""
+    p = build_parser()
+    return config_from_args(p, p.parse_args(argv))
+
+
 class NonFiniteGradients(RuntimeError):
     """Raised when the run is producing non-finite gradients faster than it can learn."""
 
 
-def train(cfg: TrainConfig) -> Path:
+@dataclass
+class UpdateStats:
+    """One iteration's update: minibatches skipped and applied, and loss sums over the
+    applied ones."""
+
+    skips: int
+    updates: int
+    ent_sum: float
+    obj_sum: float
+    crit_sum: float
+
+
+def build_loss(policy: torch.nn.Module, critic: torch.nn.Module, spec: TrainSpec) -> ClipPPOLoss:
+    """The PPO loss with its GAE value estimator, as every trainer here uses it."""
+    loss_module = ClipPPOLoss(
+        actor_network=policy,
+        critic_network=critic,
+        entropy_coeff=spec.entropy_coeff,
+        normalize_advantage=spec.normalize_advantage,
+        # Normalize per agent, not pooled across the team. The advantage is
+        # [batch, n_agents, 1]; excluding the agent dim keeps each agent's statistics
+        # independent, which is what torchrl asks for in multi-agent settings and what
+        # BenchMARL's MAPPO does. With shared_reward=True every agent's advantage is
+        # identical so it makes no difference; with per-agent rewards, pooling would let
+        # one agent's scale distort another's.
+        normalize_advantage_exclude_dims=(-2,),
+    )
+    # Leaf names: the value estimator looks them up under ("next", ...) itself.
+    loss_module.set_keys(
+        reward="reward", done=DONE_NAME, terminated=TERM_NAME, value="state_value"
+    )
+    loss_module.make_value_estimator(
+        ValueEstimators.GAE, gamma=spec.gamma, lmbda=spec.lmbda
+    )
+    return loss_module
+
+
+class EagerUpdate:
+    """GAE, then ``epochs x minibatches`` eager PPO steps through a replay buffer.
+
+    A class so ``train_mappo_tuned.py`` can swap the update, and how the collector runs
+    the policy, while sharing the rest of :func:`train`.
+    """
+
+    def __init__(self, loss_module: ClipPPOLoss, cfg: TrainConfig, frames_per_batch: int):
+        self.loss_module, self.spec = loss_module, cfg.spec
+        self.buffer = ReplayBuffer(
+            storage=LazyTensorStorage(frames_per_batch, device=cfg.device),
+            sampler=SamplerWithoutReplacement(),
+            batch_size=frames_per_batch // cfg.spec.minibatches,
+        )
+        self.optim = torch.optim.Adam(loss_module.parameters(), lr=cfg.spec.lr)
+
+    @staticmethod
+    def collector_kwargs(policy: torch.nn.Module, cfg: TrainConfig) -> dict[str, Any]:
+        """``Collector`` arguments overriding :func:`train`'s, ``policy`` included."""
+        return {}
+
+    def __call__(self, batch: TensorDictBase, coeff: float) -> UpdateStats:
+        loss_module, optim, buffer, spec = self.loss_module, self.optim, self.buffer, self.spec
+        with torch.no_grad():
+            loss_module.value_estimator(
+                batch,
+                params=loss_module.critic_network_params,
+                target_params=loss_module.target_critic_network_params,
+            )
+
+        flat = batch.reshape(-1)
+        buffer.extend(flat)
+        skips = 0
+        updates = 0
+        ent_sum = obj_sum = crit_sum = 0.0
+        for _ in range(spec.epochs):
+            for _ in range(spec.minibatches):
+                sub = buffer.sample()
+                losses = loss_module(sub)
+                total = losses["loss_objective"] + losses["loss_critic"] + losses["loss_entropy"]
+                optim.zero_grad()
+                total.backward()
+                # `clip_grad_norm_` rescales but does not filter: one non-finite gradient
+                # goes straight into Adam, whose moments then turn *every* parameter NaN
+                # on the next step. That is unrecoverable, and nothing used to stop the
+                # run -- it kept collecting, reporting nan reward, for as long as you let
+                # it. A 1-agent Push-T run died this way at iter 351; the exact source was
+                # never pinned down. Skipping the minibatch costs one update, and on a
+                # healthy gradient this branch never runs.
+                gnorm = torch.nn.utils.clip_grad_norm_(loss_module.parameters(), 1.0)
+                if not torch.isfinite(gnorm):
+                    optim.zero_grad(set_to_none=True)
+                    skips += 1
+                    continue
+                optim.step()
+                updates += 1
+                obj_sum += losses["loss_objective"].item()
+                crit_sum += losses["loss_critic"].item()
+                # torchrl reports the raw differential entropy alongside the weighted
+                # loss term (`loss_entropy == -entropy_coeff * entropy`), so read it
+                # directly rather than dividing the loss back out -- no epsilon guard, and
+                # it stays correct if the coefficient schedule ever hits zero.
+                ent = losses.get("entropy", None)
+                if ent is None:
+                    ent_sum += -losses["loss_entropy"].item() / max(coeff, 1e-12)
+                else:
+                    ent_sum += float(ent.mean().item())
+        buffer.empty()
+        return UpdateStats(skips, updates, ent_sum, obj_sum, crit_sum)
+
+
+def train(cfg: TrainConfig, learner: type[EagerUpdate] = EagerUpdate) -> Path:
     """Run the training loop. Returns the final checkpoint path.
 
     Split out from ``main`` so ``tests/examples`` can drive a 2-iteration smoke run
     in-process: that test catches the shape/key/spec errors which are most of what breaks
-    a training script, and it is only possible because this is a function.
+    a training script, and it is only possible because this is a function. ``learner``
+    runs GAE and the update over each batch.
     """
     spec, device = cfg.spec, cfg.device
     n_agents = spec.n_agents
@@ -260,9 +382,8 @@ def train(cfg: TrainConfig) -> Path:
     critic = build_critic(obs_dim, n_agents, device, num_cells=spec.num_cells)
 
     frames_per_batch = spec.n_envs * spec.steps_per_batch
-    collector = Collector(
-        env,
-        policy,
+    collector_kwargs = dict(
+        policy=policy,
         frames_per_batch=frames_per_batch,
         total_frames=frames_per_batch * spec.iters,
         device=device,
@@ -276,32 +397,10 @@ def train(cfg: TrainConfig) -> Path:
         # this also skips are no-ops.
         no_cuda_sync=True,
     )
-    buffer = ReplayBuffer(
-        storage=LazyTensorStorage(frames_per_batch, device=device),
-        sampler=SamplerWithoutReplacement(),
-        batch_size=frames_per_batch // spec.minibatches,
-    )
-    loss_module = ClipPPOLoss(
-        actor_network=policy,
-        critic_network=critic,
-        entropy_coeff=spec.entropy_coeff,
-        normalize_advantage=spec.normalize_advantage,
-        # Normalize per agent, not pooled across the team. The advantage is
-        # [batch, n_agents, 1]; excluding the agent dim keeps each agent's statistics
-        # independent, which is what torchrl asks for in multi-agent settings and what
-        # BenchMARL's MAPPO does. With shared_reward=True every agent's advantage is
-        # identical so it makes no difference; with per-agent rewards, pooling would let
-        # one agent's scale distort another's.
-        normalize_advantage_exclude_dims=(-2,),
-    )
-    # Leaf names: the value estimator looks them up under ("next", ...) itself.
-    loss_module.set_keys(
-        reward="reward", done=DONE_NAME, terminated=TERM_NAME, value="state_value"
-    )
-    loss_module.make_value_estimator(
-        ValueEstimators.GAE, gamma=spec.gamma, lmbda=spec.lmbda
-    )
-    optim = torch.optim.Adam(loss_module.parameters(), lr=spec.lr)
+    collector_kwargs.update(learner.collector_kwargs(policy, cfg))
+    collector = Collector(env, **collector_kwargs)
+    loss_module = build_loss(policy, critic, spec)
+    update = learner(loss_module, cfg, frames_per_batch)
 
     if cfg.resume:
         ckpt = torch.load(cfg.resume, map_location=device, weights_only=True)
@@ -403,8 +502,12 @@ def train(cfg: TrainConfig) -> Path:
     if cfg.scen_kwargs:
         print(f"  scenario kwargs: {cfg.scen_kwargs}")
 
+    # Wall time covers collection *and* update: the clock restarts at the end of each
+    # iteration, before the collector rolls out the next batch. (It used to start after the
+    # collector yielded, so `env_sps` read frames per update-phase second.) Logging, eval
+    # and checkpointing stay outside it.
+    t0 = time.perf_counter()
     for it, batch in enumerate(collector):
-        t0 = time.perf_counter()
         # Entropy schedule: broad early exploration, committed late behaviour. Watched via
         # the `entropy` column -- an early collapse is the signature of a policy that has
         # locked into a local optimum.
@@ -420,51 +523,9 @@ def train(cfg: TrainConfig) -> Path:
         window.update(terminated, done)
         batch.set(DONE_KEY, expand_flag(done, n_agents))
         batch.set(TERM_KEY, expand_flag(terminated, n_agents))
-        with torch.no_grad():
-            loss_module.value_estimator(
-                batch,
-                params=loss_module.critic_network_params,
-                target_params=loss_module.target_critic_network_params,
-            )
-
-        flat = batch.reshape(-1)
-        buffer.extend(flat)
-        skips = 0
-        updates = 0
-        ent_sum = obj_sum = crit_sum = 0.0
-        for _ in range(spec.epochs):
-            for _ in range(spec.minibatches):
-                sub = buffer.sample()
-                losses = loss_module(sub)
-                total = losses["loss_objective"] + losses["loss_critic"] + losses["loss_entropy"]
-                optim.zero_grad()
-                total.backward()
-                # `clip_grad_norm_` rescales but does not filter: one non-finite gradient
-                # goes straight into Adam, whose moments then turn *every* parameter NaN
-                # on the next step. That is unrecoverable, and nothing used to stop the
-                # run -- it kept collecting, reporting nan reward, for as long as you let
-                # it. A 1-agent Push-T run died this way at iter 351; the exact source was
-                # never pinned down. Skipping the minibatch costs one update, and on a
-                # healthy gradient this branch never runs.
-                gnorm = torch.nn.utils.clip_grad_norm_(loss_module.parameters(), 1.0)
-                if not torch.isfinite(gnorm):
-                    optim.zero_grad(set_to_none=True)
-                    skips += 1
-                    continue
-                optim.step()
-                updates += 1
-                obj_sum += losses["loss_objective"].item()
-                crit_sum += losses["loss_critic"].item()
-                # torchrl reports the raw differential entropy alongside the weighted
-                # loss term (`loss_entropy == -entropy_coeff * entropy`), so read it
-                # directly rather than dividing the loss back out -- no epsilon guard, and
-                # it stays correct if the coefficient schedule ever hits zero.
-                ent = losses.get("entropy", None)
-                if ent is None:
-                    ent_sum += -losses["loss_entropy"].item() / max(coeff, 1e-12)
-                else:
-                    ent_sum += float(ent.mean().item())
-        buffer.empty()
+        stats = update(batch, coeff)
+        skips, updates = stats.skips, stats.updates
+        ent_sum, obj_sum, crit_sum = stats.ent_sum, stats.obj_sum, stats.crit_sum
         total_skips += skips
 
         n_mb = spec.epochs * spec.minibatches
@@ -546,6 +607,7 @@ def train(cfg: TrainConfig) -> Path:
         if rate is not None and (f, rate) > best_key:
             best_key = (f, rate)
             save("best")
+        t0 = time.perf_counter()
 
     final = save("final")
     csv_file.close()

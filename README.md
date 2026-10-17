@@ -41,6 +41,7 @@ The whole step — dynamics, soft collisions, walls — also runs under Warp's a
 - **Neighbor search without a sync** — padded within-radius lists, an explicit overflow flag, a COO radius graph for GNN policies, and three interchangeable backends tested to agree exactly. [→](https://ddebenedittis.github.io/swarp/world.html#neighbor-search)
 - **Ten scenarios** — navigation, flocking, formation, discovery, sampling, transport, Push-T, give-way, shepherding and caging, each with fused Warp obs/reward kernels alongside the torch reference they are parity-tested against. [→](https://ddebenedittis.github.io/swarp/scenarios.html)
 - **Fast by default** — **24.1 M env-steps/s** at 16,000 envs × 16 agents on one RTX 3070 Laptop GPU from the fused Warp obs/reward kernels alone, with whole-step CUDA-graph capture (on by default) taking 16,384 × 16 to 35.6 M. [→](https://ddebenedittis.github.io/swarp/performance.html)
+- **Fast training built in** — `python -m swarp.rl` trains MAPPO with the rollout and the update CUDA-graph captured, 2.4× faster end to end than the same recipes on TorchRL as usually written and 1.1–1.4× faster than TorchRL with its own CUDA-graph and compile options, with torch as the only dependency. [→](https://ddebenedittis.github.io/swarp/training.html)
 - **Interactive viewer** — an optional pygame renderer with headless frames, mp4/webm export, notebook embedding, a batch mosaic and live overlay toggles. [→](https://ddebenedittis.github.io/swarp/visualization.html)
 
 ## Install
