@@ -20,7 +20,37 @@ from swarp.benchmark.compare_vmas import make_vmas
 def build(
     scenario: str, n_envs: int, n_agents: int, device: str, seed: int = 0, collisions: bool = True
 ) -> Runner:
+    if scenario == "ringroad":
+        return _ringroad(n_envs, n_agents, device, seed)
     if scenario != "navigation":
-        raise ValueError(f"vmas adapter only implements 'navigation', got {scenario!r}")
+        raise ValueError(f"vmas adapter implements 'navigation' and 'ringroad', got {scenario!r}")
     env, step = make_vmas(n_envs, n_agents, device, collisions=collisions)
+    return make_torch_runner(env, step, n_envs, len(env.agents), device)
+
+
+def _ringroad(n_envs: int, n_agents: int, device: str, seed: int) -> Runner:
+    """The VMAS port of the ring road (:mod:`.ringroad_vmas`), random actions over its box."""
+    import torch
+    from vmas import make_env
+
+    from swarp.benchmark._adapters.ringroad_vmas import RingRoadVMAS
+
+    env = make_env(
+        scenario=RingRoadVMAS(),
+        num_envs=n_envs,
+        device=device,
+        continuous_actions=True,
+        seed=seed,
+        n_agents=n_agents,
+    )
+    env.reset()
+    gen = torch.Generator(device=device).manual_seed(seed)
+    hi = [a.action.u_range_tensor.to(device) for a in env.agents]
+    actions = [torch.empty(n_envs, 2, device=device) for _ in env.agents]
+
+    def step() -> None:
+        for a, h in zip(actions, hi, strict=True):
+            a.uniform_(-1.0, 1.0, generator=gen).mul_(h)
+        env.step(actions)
+
     return make_torch_runner(env, step, n_envs, len(env.agents), device)

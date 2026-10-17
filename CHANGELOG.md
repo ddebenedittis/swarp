@@ -17,6 +17,9 @@ All notable changes to `swarp`. Newest first. Nothing has been released yet — 
   Trained with `swarp.rl`, a policy from the 22-car ring dissipates the wave on rings of 6 to 30 cars, while one trained on a 6-car ring at the same density fails from 14 cars up and crashes from 18; the result holds with steering handed to a scripted controller. Training is bistable across checkpoints, the multi-AV variant does not train yet, and the Scenarios page has the details.
   The benchmark sweep now passes `world_size` only to scenarios that accept it.
 
+- **`compare_sims --scenarios ringroad`**: the ring road ported to VMAS (a VMAS scenario on its `KinematicBicycle`) and to JAX (a JaxMARL `MultiAgentEnv`), same algorithm and verified to reproduce swarp's wave physics.
+  On the RTX 3070 Laptop GPU swarp steps it 26–55× faster than VMAS and 1.5–2.1× faster than the JAX port at 1024–16384 envs; the Benchmarks page has the table and why simulation is only part of training time.
+
 - **`AgentConfig.min_speed`** (bicycle only): the lower speed clamp, defaulting to `-max_speed` as before. `0.0` is a car that brakes to a stop and stays there.
   The column is appended to `PARAM_FIELDS` (`P_MIN_SPEED`), so every existing column keeps its index.
   Measured cost on the captured hot path, interleaved A/B over six pairs: −0.5% to +1.2% on every `throughput` configuration, i.e. none.

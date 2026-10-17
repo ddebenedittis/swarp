@@ -71,7 +71,11 @@ SWARP_CONFIGS = {
 ALL_SIMS = (*SWARP_CONFIGS, "vmas", "vmas-nolidar", "jaxmarl", "camar", "camar-grid")
 # Default is the obs-aligned, obstacle-free set: same task + raycasting-free obs.
 DEFAULT_SIMS = ("swarp", "vmas-nolidar", "jaxmarl", "camar")
-SCENARIOS = ("navigation",)
+SCENARIOS = ("navigation", "ringroad")
+#: Sims with a port of each scenario. ``ringroad`` exists in swarp, as a VMAS scenario
+#: (``_adapters/ringroad_vmas.py``) and as a JaxMARL environment (``_adapters/ringroad_jax.py``);
+#: any other sim prints ``n/a`` for it rather than timing a different task.
+PORTS = {"ringroad": (*SWARP_CONFIGS, "vmas", "jaxmarl")}
 
 
 # --------------------------------------------------------------------- child side
@@ -135,6 +139,9 @@ def _child(sim, scenario, n_envs, n_agents, steps, warmup, device) -> None:
 
     from swarp.benchmark._adapters import CpuOnlyError
 
+    if scenario in PORTS and sim not in PORTS[scenario]:
+        print("n/a")
+        return
     try:
         runner = _build(sim, scenario, n_envs, n_agents, device)
         eps = bench_throughput(runner, steps, warmup)
@@ -164,7 +171,7 @@ def _run_child(python: str, sim, scenario, ne, na, steps, warmup, device) -> dic
         if line.startswith("RESULT"):
             kv = dict(p.split("=", 1) for p in line.split()[1:])
             return {"eps": float(kv["eps"]), "agents": int(kv["agents"])}
-        if line.strip() in ("OOM", "CPU-only"):
+        if line.strip() in ("OOM", "CPU-only", "n/a"):
             return {"status": line.strip()}
     sys.stderr.write(f"[{sim} {scenario} {ne}x{na}] no RESULT; stderr tail:\n")
     sys.stderr.write(out.stderr[-800:] + "\n")
@@ -263,7 +270,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="simulators to benchmark (swarp is the anchor; default: swarp vmas jaxmarl camar)",
     )
     p.add_argument(
-        "--scenarios", nargs="+", default=list(SCENARIOS), choices=list(SCENARIOS),
+        "--scenarios", nargs="+", default=["navigation"], choices=list(SCENARIOS),
+        help="navigation (default; every sim has it) or ringroad (swarp, vmas, jaxmarl)",
     )
     p.add_argument(
         "--python", action="append", type=_sim_path, metavar="SIM=PATH", default=[],

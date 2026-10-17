@@ -16,6 +16,8 @@ _SCENARIO_ENV = {"navigation": "MPE_simple_spread_v3"}
 
 
 def build(scenario: str, n_envs: int, n_agents: int, device: str, seed: int = 0) -> Runner:
+    if scenario == "ringroad":
+        return _ringroad(n_envs, n_agents, seed)
     if scenario not in _SCENARIO_ENV:
         raise ValueError(
             f"jaxmarl adapter has no analogue for scenario {scenario!r}; "
@@ -47,5 +49,31 @@ def build(scenario: str, n_envs: int, n_agents: int, device: str, seed: int = 0)
         sample_actions=sample_actions,
         n_envs=n_envs,
         n_agents=env.num_agents,
+        seed=seed,
+    )
+
+
+def _ringroad(n_envs: int, n_agents: int, seed: int) -> Runner:
+    """The JAX port of the ring road (:mod:`.ringroad_jax`), random actions over its box."""
+    assert_jax_gpu()
+
+    from jax import random
+
+    from swarp.benchmark._adapters.ringroad_jax import RingRoadJax
+
+    env = RingRoadJax(num_agents=n_agents)
+    agents = tuple(env.agents)
+    hi = env.action_space(agents[0]).high
+
+    def sample_actions(key, ne):
+        a = random.uniform(key, (len(agents), ne, 2), minval=-1.0, maxval=1.0) * hi
+        return {ag: a[i] for i, ag in enumerate(agents)}
+
+    return make_jax_runner(
+        reset_one=env.reset,
+        step_one=env.step,
+        sample_actions=sample_actions,
+        n_envs=n_envs,
+        n_agents=n_agents,
         seed=seed,
     )
