@@ -18,17 +18,23 @@ from swarp.benchmark.compare_vmas import make_vmas
 
 
 def build(
-    scenario: str, n_envs: int, n_agents: int, device: str, seed: int = 0, collisions: bool = True
+    scenario: str,
+    n_envs: int,
+    n_agents: int,
+    device: str,
+    seed: int = 0,
+    collisions: bool = True,
+    n_vehicles: int | None = None,
 ) -> Runner:
     if scenario == "ringroad":
-        return _ringroad(n_envs, n_agents, device, seed)
+        return _ringroad(n_envs, n_agents, device, seed, n_vehicles)
     if scenario != "navigation":
         raise ValueError(f"vmas adapter implements 'navigation' and 'ringroad', got {scenario!r}")
     env, step = make_vmas(n_envs, n_agents, device, collisions=collisions)
     return make_torch_runner(env, step, n_envs, len(env.agents), device)
 
 
-def _ringroad(n_envs: int, n_agents: int, device: str, seed: int) -> Runner:
+def _ringroad(n_envs: int, n_agents: int, device: str, seed: int, n_vehicles=None) -> Runner:
     """The VMAS port of the ring road (:mod:`.ringroad_vmas`), random actions over its box."""
     import torch
     from vmas import make_env
@@ -42,6 +48,7 @@ def _ringroad(n_envs: int, n_agents: int, device: str, seed: int) -> Runner:
         continuous_actions=True,
         seed=seed,
         n_agents=n_agents,
+        **({} if n_vehicles is None else {"n_vehicles": n_vehicles}),
     )
     env.reset()
     gen = torch.Generator(device=device).manual_seed(seed)

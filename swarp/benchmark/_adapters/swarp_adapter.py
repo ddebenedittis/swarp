@@ -28,13 +28,14 @@ def build(
     seed: int = 0,
     use_graph: bool = False,
     fused: bool | str = "auto",
+    n_vehicles: int | None = None,
 ) -> Runner:
     import torch
 
     from swarp import Environment, NavigationScenario
 
     if scenario == "ringroad":
-        return _ringroad(n_envs, n_agents, device, seed, use_graph, fused)
+        return _ringroad(n_envs, n_agents, device, seed, use_graph, fused, n_vehicles)
     if scenario != "navigation":
         raise ValueError(f"swarp adapter implements 'navigation' and 'ringroad', got {scenario!r}")
 
@@ -56,16 +57,16 @@ def build(
     return make_torch_runner(env, step, n_envs, env.n_agents, device)
 
 
-def _ringroad(n_envs, n_agents, device, seed, use_graph, fused) -> Runner:
-    """``RingRoadScenario`` at its defaults (22 vehicles), random actions over the real box."""
+def _ringroad(n_envs, n_agents, device, seed, use_graph, fused, n_vehicles=None) -> Runner:
+    """``RingRoadScenario`` at its defaults (22 vehicles unless ``n_vehicles``), random actions."""
     import torch
 
     from swarp import Environment
     from swarp.scenarios.ringroad import RingRoadScenario
 
     env = Environment(
-        RingRoadScenario(n_agents=n_agents), n_envs=n_envs, device=device, dt=0.1, substeps=1,
-        seed=seed, use_graph=use_graph, fused=fused,
+        RingRoadScenario(n_agents=n_agents, n_vehicles=n_vehicles), n_envs=n_envs, device=device,
+        dt=0.1, substeps=1, seed=seed, use_graph=use_graph, fused=fused,
     )
     env.reset(seed=seed)
     lo, hi = env.action_bounds

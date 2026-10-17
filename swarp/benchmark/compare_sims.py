@@ -81,22 +81,28 @@ PORTS = {"ringroad": (*SWARP_CONFIGS, "vmas", "jaxmarl")}
 # --------------------------------------------------------------------- child side
 
 
-def _build(sim: str, scenario: str, n_envs: int, n_agents: int, device: str):
-    """Dispatch to the per-sim adapter (imported lazily, in the child only)."""
+def _build(sim: str, scenario: str, n_envs: int, n_agents: int, device: str, n_vehicles=None):
+    """Dispatch to the per-sim adapter (imported lazily, in the child only).
+
+    ``n_vehicles`` is the ring road's vehicle count (``None``: the scenario default); only
+    the sims with a ``ringroad`` port take it.
+    """
     if sim in SWARP_CONFIGS:
         from swarp.benchmark._adapters import swarp_adapter
 
-        return swarp_adapter.build(scenario, n_envs, n_agents, device, **SWARP_CONFIGS[sim])
+        return swarp_adapter.build(
+            scenario, n_envs, n_agents, device, n_vehicles=n_vehicles, **SWARP_CONFIGS[sim]
+        )
     if sim in ("vmas", "vmas-nolidar"):
         from swarp.benchmark._adapters import vmas_adapter
 
         return vmas_adapter.build(
-            scenario, n_envs, n_agents, device, collisions=(sim == "vmas")
+            scenario, n_envs, n_agents, device, collisions=(sim == "vmas"), n_vehicles=n_vehicles
         )
     if sim == "jaxmarl":
         from swarp.benchmark._adapters import jaxmarl_adapter
 
-        return jaxmarl_adapter.build(scenario, n_envs, n_agents, device)
+        return jaxmarl_adapter.build(scenario, n_envs, n_agents, device, n_vehicles=n_vehicles)
     if sim in ("camar", "camar-grid"):
         from swarp.benchmark._adapters import camar_adapter
 
@@ -131,7 +137,7 @@ def bench_throughput(runner, steps: int, warmup: int) -> float:
     return runner.n_envs * steps / elapsed
 
 
-def _child(sim, scenario, n_envs, n_agents, steps, warmup, device) -> None:
+def _child(sim, scenario, n_envs, n_agents, steps, warmup, device, n_vehicles=None) -> None:
     """Benchmark one (sim, config) and print a single machine-readable line."""
     # XLA reads these at first `import jax`, so set them before the adapter imports.
     if sim in ("jaxmarl", "camar"):
@@ -143,7 +149,7 @@ def _child(sim, scenario, n_envs, n_agents, steps, warmup, device) -> None:
         print("n/a")
         return
     try:
-        runner = _build(sim, scenario, n_envs, n_agents, device)
+        runner = _build(sim, scenario, n_envs, n_agents, device, n_vehicles)
         eps = bench_throughput(runner, steps, warmup)
         runner.close()
     except CpuOnlyError:
@@ -160,11 +166,11 @@ def _child(sim, scenario, n_envs, n_agents, steps, warmup, device) -> None:
 # --------------------------------------------------------------------- parent side
 
 
-def _run_child(python: str, sim, scenario, ne, na, steps, warmup, device) -> dict:
-    """Spawn a child benchmark and parse its one-line result."""
+def _run_child(python: str, sim, scenario, ne, na, steps, warmup, device, nv=0) -> dict:
+    """Spawn a child benchmark and parse its one-line result (``nv=0``: default vehicles)."""
     cmd = [
         python, "-m", "swarp.benchmark.compare_sims", "--_child",
-        sim, scenario, str(ne), str(na), str(steps), str(warmup), device,
+        sim, scenario, str(ne), str(na), str(steps), str(warmup), device, str(nv),
     ]
     out = subprocess.run(cmd, capture_output=True, text=True)
     for line in out.stdout.splitlines():
@@ -173,7 +179,7 @@ def _run_child(python: str, sim, scenario, ne, na, steps, warmup, device) -> dic
             return {"eps": float(kv["eps"]), "agents": int(kv["agents"])}
         if line.strip() in ("OOM", "CPU-only", "n/a"):
             return {"status": line.strip()}
-    sys.stderr.write(f"[{sim} {scenario} {ne}x{na}] no RESULT; stderr tail:\n")
+    sys.stderr.write(f"[{sim} {scenario} {ne}x{na} nv={nv}] no RESULT; stderr tail:\n")
     sys.stderr.write(out.stderr[-800:] + "\n")
     return {"status": "ERR"}
 
@@ -192,18 +198,20 @@ def _fmt_cell(r: dict, requested_agents: int, per_agent: bool) -> str:
     return s + "*" if r["agents"] != requested_agents else s
 
 
-def _print_table(label: str, per_agent: bool, sims, grid, configs, _w) -> None:
+def _print_table(label: str, per_agent: bool, sims, grid, configs, _w, show_nv=False) -> None:
     comps = [s for s in sims if s != "swarp"]
     has_anchor = "swarp" in sims and bool(comps)
     print(f"metric: {label} (higher is better)" + ("   anchor: swarp" if has_anchor else ""))
-    head = f"{'n_envs':>8} {'n_agents':>9} | " + " ".join(f"{s:>{_w}}" for s in sims)
+    nv_head = f" {'n_veh':>6}" if show_nv else ""
+    head = f"{'n_envs':>8} {'n_agents':>9}{nv_head} | " + " ".join(f"{s:>{_w}}" for s in sims)
     if has_anchor:
         head += " | " + " ".join(f"{s + '/s':>{_w}}" for s in comps)
     print(head)
     print("-" * len(head))
-    for na, ne in configs:
-        cells = grid[(na, ne)]
-        row = f"{ne:>8} {na:>9} | " + " ".join(
+    for na, ne, nv in configs:
+        cells = grid[(na, ne, nv)]
+        nv_cell = f" {nv:>6}" if show_nv else ""
+        row = f"{ne:>8} {na:>9}{nv_cell} | " + " ".join(
             f"{_fmt_cell(cells[s], na, per_agent):>{_w}}" for s in sims
         )
         if has_anchor:
@@ -230,24 +238,27 @@ def run(args) -> None:
     print()
 
     mism: dict[str, int] = {}  # sim -> realized agents, when != requested
-    configs = [(na, ne) for na in args.agents for ne in args.envs]
+    # nv = 0 is "the scenario's default vehicle count"; --vehicles only applies to ringroad.
+    vehicles = args.vehicles or [0]
+    configs = [(na, ne, nv) for nv in vehicles for na in args.agents for ne in args.envs]
     for scenario in args.scenarios:
-        grid: dict[tuple[int, int], dict[str, dict]] = {}
-        for na, ne in configs:
+        grid: dict[tuple[int, int, int], dict[str, dict]] = {}
+        for na, ne, nv in configs:
             cells: dict[str, dict] = {}
             for sim in sims:
                 r = _run_child(
                     py.get(sim, default_py), sim, scenario, ne, na,
-                    args.steps, args.warmup, args.device,
+                    args.steps, args.warmup, args.device, nv,
                 )
                 cells[sim] = r
                 if "agents" in r and r["agents"] != na:
                     mism[sim] = r["agents"]
-            grid[(na, ne)] = cells
+            grid[(na, ne, nv)] = cells
 
         print(f"[{scenario}]")
-        _print_table("env-steps/s", False, sims, grid, configs, _w)
-        _print_table("agent-steps/s", True, sims, grid, configs, _w)
+        show_nv = bool(args.vehicles)
+        _print_table("env-steps/s", False, sims, grid, configs, _w, show_nv)
+        _print_table("agent-steps/s", True, sims, grid, configs, _w, show_nv)
 
     if mism:
         print("* realized agent count differs from requested (sim-fixed):")
@@ -274,6 +285,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="navigation (default; every sim has it) or ringroad (swarp, vmas, jaxmarl)",
     )
     p.add_argument(
+        "--vehicles", type=int, nargs="+", default=None,
+        help="ringroad only: vehicles per ring, RL cars included, at fixed density "
+        "(default: max(22, agents + 1))",
+    )
+    p.add_argument(
         "--python", action="append", type=_sim_path, metavar="SIM=PATH", default=[],
         help="map a sim to its venv interpreter, e.g. --python jaxmarl=.venv-jaxmarl/bin/python",
     )
@@ -283,20 +299,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     # Hidden: single-config benchmark run in a child process.
     p.add_argument(
-        "--_child", nargs=7, default=None,
-        metavar=("SIM", "SCENARIO", "N_ENVS", "N_AGENTS", "STEPS", "WARMUP", "DEVICE"),
+        "--_child", nargs=8, default=None,
+        metavar=("SIM", "SCENARIO", "N_ENVS", "N_AGENTS", "STEPS", "WARMUP", "DEVICE", "N_VEH"),
         help=argparse.SUPPRESS,
     )
     return p
 
 
 def main() -> None:
-    args = build_parser().parse_args()
+    parser = build_parser()
+    args = parser.parse_args()
 
     if args._child:
-        sim, scenario, ne, na, steps, warmup, device = args._child
-        _child(sim, scenario, int(ne), int(na), int(steps), int(warmup), device)
+        sim, scenario, ne, na, steps, warmup, device, nv = args._child
+        _child(sim, scenario, int(ne), int(na), int(steps), int(warmup), device, int(nv) or None)
         return
+    if args.vehicles and set(args.scenarios) != {"ringroad"}:
+        parser.error("--vehicles only applies to --scenarios ringroad")
 
     run(args)
 

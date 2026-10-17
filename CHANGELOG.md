@@ -19,6 +19,7 @@ All notable changes to `swarp`. Newest first. Nothing has been released yet — 
 
 - **`compare_sims --scenarios ringroad`**: the ring road ported to VMAS (a VMAS scenario on its `KinematicBicycle`) and to JAX (a JaxMARL `MultiAgentEnv`), same algorithm and verified to reproduce swarp's wave physics.
   On the RTX 3070 Laptop GPU swarp steps it 26–55× faster than VMAS and 1.5–2.1× faster than the JAX port at 1024–16384 envs; the Benchmarks page has the table and why simulation is only part of training time.
+  `--vehicles` sweeps the vehicles per ring at fixed density: swarp's lead over the JAX port is 1.5× at 22 vehicles, 2.9× at 64 and 2.2× at 128, following how XLA compiles the leader search's argmin (Benchmarks page); past 16384 envs the ratio stays at 1.47× up to 1M envs.
 
 - **`AgentConfig.min_speed`** (bicycle only): the lower speed clamp, defaulting to `-max_speed` as before. `0.0` is a car that brakes to a stop and stays there.
   The column is appended to `PARAM_FIELDS` (`P_MIN_SPEED`), so every existing column keeps its index.
