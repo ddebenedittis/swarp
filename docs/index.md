@@ -42,7 +42,7 @@ Holonomic, differential drive, kinematic bicycle and a 6-DOF quadrotor — mixab
 Soft agent-agent contacts, circle/box/segment obstacles, and movable compound rigid bodies pushed by agent reaction forces.
 :::
 
-:::{grid-item-card} Ten scenarios
+:::{grid-item-card} Eleven scenarios
 :link: scenarios
 :link-type: doc
 

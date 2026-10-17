@@ -170,6 +170,28 @@ def _draw_obstacles(surface, g, camera, style):
             pygame.draw.circle(surface, line, center_px, r_px, style.obstacle_outline_width)
 
 
+def _draw_vehicles(surface, g, camera, style):
+    """Scenario-owned vehicles that are not agents, from ``extras['vehicles']``.
+
+    Expected format: oriented boxes ``(cx, cy, angle, half_x, half_y)`` per row, the same
+    primitive :func:`_draw_goal_pose` takes, drawn filled like a movable obstacle. An
+    optional ``extras['road_ring'] = (r_inner, r_outer)`` shades the annulus they drive
+    on, centred at the origin (the ring road's lane).
+    """
+    ring = g.extras.get("road_ring")
+    if ring is not None:
+        r_in, r_out = (float(v) for v in ring)
+        c = to_px(camera, (0.0, 0.0))
+        width = max(1, radius_px(camera, r_out) - radius_px(camera, r_in))
+        pygame.draw.circle(surface, style.tile_border, c, radius_px(camera, r_out), width)
+    boxes = g.extras.get("vehicles")
+    if boxes is None:
+        return
+    boxes = np.asarray(boxes, dtype=np.float64).reshape(-1, 5)
+    for cx, cy, angle, hx, hy in boxes:
+        _filled_polygon(surface, style, to_px_batch(camera, _rotated_rect((cx, cy), angle, hx, hy)))
+
+
 def _filled_polygon(surface, style, pts, fill=None, outline=None) -> None:
     pygame.draw.polygon(surface, fill if fill is not None else style.obstacle_color, pts)
     pygame.draw.polygon(
@@ -771,6 +793,7 @@ def get_font(size: int) -> pygame.font.Font:
 OVERLAYS: tuple[Overlay, ...] = (
     Overlay("bounds", _draw_bounds, "b", True),
     Overlay("obstacles", _draw_obstacles, "o", True),
+    Overlay("vehicles", _draw_vehicles, None, True),
     Overlay("neighbor_graph", _draw_neighbor_graph, "n", False),
     Overlay("trajectories", _draw_trajectories, None, True),
     Overlay("goal_pose", _draw_goal_pose, "p", True),

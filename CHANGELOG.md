@@ -7,6 +7,27 @@ All notable changes to `swarp`. Newest first. Nothing has been released yet — 
 
 ### Added
 
+- **`ringroad`, an eleventh scenario: mixed-autonomy stop-and-go waves on the Flow / Sugiyama ring.**
+  `n_agents` kinematic-bicycle RL cars (actions `(accel, steer)`) share a single-lane ring with IDM human drivers that the scenario integrates itself as 1-D state, the way `shepherding` owns its sheep.
+  It is the one task here whose phenomenon needs many vehicles: at the Sugiyama density the IDM ring is stable up to 8 cars and string-unstable from 11, so a 6-car ring at the same density never grows the wave a 22-car ring does (linear growth rate −0.103/s against +0.024/s; the Scenarios page has the whole sweep).
+  The geometry is set by density, not `world_size`: `ring_length` defaults to `n_vehicles × 230/22` and `n_vehicles` to `max(22, n_agents + 1)`, so the registry-wide sweeps at 64 agents still build a valid ring and `--scen-kwarg n_vehicles=6` is the small-ring experiment.
+  A brute-force leader search runs twice per step (before and after the humans move), so overtaking needs no sort; the observation is 9-wide at any ring size, so one actor evaluates at any `N`.
+  The reward keeps Flow's `WaveAttenuationEnv` form with three measured changes (documented in the module): a smaller acceleration weight, a crash penalty large enough that crashing never beats braking, and a per-step cost that makes `done` (the wave dissipated) the best outcome.
+  `SPECS["ringroad"]` trains it; `BASELINES["ringroad"]` is the humans-only floor (the RL car driven as one more IDM human).
+  Trained with `swarp.rl`, a policy from the 22-car ring dissipates the wave on rings of 6 to 30 cars, while one trained on a 6-car ring at the same density fails from 14 cars up and crashes from 18; the result holds with steering handed to a scripted controller. Training is bistable across checkpoints, the multi-AV variant does not train yet, and the Scenarios page has the details.
+  The benchmark sweep now passes `world_size` only to scenarios that accept it.
+
+- **`AgentConfig.min_speed`** (bicycle only): the lower speed clamp, defaulting to `-max_speed` as before. `0.0` is a car that brakes to a stop and stays there.
+  The column is appended to `PARAM_FIELDS` (`P_MIN_SPEED`), so every existing column keeps its index.
+  Measured cost on the captured hot path, interleaved A/B over six pairs: −0.5% to +1.2% on every `throughput` configuration, i.e. none.
+
+- **`swarp.rl.Actor` maps its tanh sample onto the env's action box**, so `swarp.rl` trains scenarios whose box is not `[-1, 1]` (ring road's is accel ±2, steer ±0.6).
+  The map is affine, so its Jacobian cancels in the PPO ratio; the box lives in non-persistent buffers and the checkpoint's `act_low`/`act_high`, so older checkpoints still load, and the unit box is the plain `tanh` it always was.
+  `check_action_box` now returns the box and raises only when agents' boxes disagree. The TorchRL reference trainer still requires `[-1, 1]`.
+
+- **`examples/eval_mappo.py --scen-kwarg K=V --n-agents N`**, evaluated on the checkpoint's own scenario keywords rather than the spec's, so a policy can be scored on a ring (or fleet) of a different size than it trained on; each arm also prints its end-of-episode metrics.
+  A `vehicles` render overlay draws scenario-owned cars as oriented boxes on an optional road annulus.
+
 - **`swarp.rl`, a MAPPO trainer with the rollout and the update CUDA-graph captured.**
   Torch only, no torchrl.
   Per env step it replays a small *act* graph, calls `Environment.step` and replays a *store* graph; per iteration it replays a *prepare* graph (critic, GAE, permutations) and one *minibatch* graph per minibatch (forward, loss, backward, clipping, fused Adam), with one host sync for every logged statistic.
@@ -27,7 +48,7 @@ All notable changes to `swarp`. Newest first. Nothing has been released yet — 
   On `giveway`, over three seeds, all five trainers reach full curriculum difficulty at iteration 413–417 and solve all 2048 evaluation envs; `swarp.rl` gets there in 79 s, tuned TorchRL in 102 s, rsl_rl in 133 s, TorchRL as usually written in 187 s and BenchMARL in 208 s.
   `train_throughput` keeps its trainers in a registry and takes `--python CONFIG=PATH` to run one from another venv.
 
-- **`Environment.step_count`**, the per-env step counter `max_steps` truncates on, as a public read-only accessor (the live `[n_envs]` buffer), and **`swarp.rl.check_action_box`**, the `[-1, 1]` action-box check `train` runs, public for loops built on `Actor` outside it.
+- **`Environment.step_count`**, the per-env step counter `max_steps` truncates on, as a public read-only accessor (the live `[n_envs]` buffer), and **`swarp.rl.check_action_box`**, the action-box check `train` runs, public for loops built on `Actor` outside it.
 
 - **Three scenarios that break the assumptions the first seven share** — `giveway`,
   `shepherding` and `caging`, bringing the registry to ten. Every one of the original seven

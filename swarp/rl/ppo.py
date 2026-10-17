@@ -291,8 +291,26 @@ class MAPPO:
     # --------------------------------------------------------------------- rollout
 
     def reset(self) -> None:
-        """Reset every env and point the act graph at the env's observation buffer."""
-        self._out = (self.env.reset(), None, None, None, None)
+        """Reset every env and point the act graph at the env's observation buffer.
+
+        With ``spec.stagger_starts`` the envs are then desynchronised before the first
+        rollout: each is re-reset once at a random step of a ``max_steps``-long warm-up
+        under the initial greedy policy, so episode ages spread uniformly over
+        ``[0, max_steps)``. Without it, a scenario whose episodes all run to the time
+        limit truncates every env on the same step forever, and every batch is the same
+        ``steps_per_batch`` slice of the episode in all envs. Only the public
+        ``reset_at`` is used; the step counter stays the env's own.
+        """
+        obs = self.env.reset()
+        horizon = self.env.max_steps or 0
+        if self.spec.stagger_starts and horizon > 1:
+            gen = torch.Generator(device=self.device).manual_seed(0)
+            offset = torch.randint(0, horizon, (self.E,), device=self.device, generator=gen)
+            with torch.no_grad():
+                for t in range(horizon):
+                    obs = self.env.step(self.actor.greedy(obs))[0]
+                    obs = self.env.reset_at(offset == t)
+        self._out = (obs, None, None, None, None)
 
     def _signature(self, out: tuple[Any, ...]) -> tuple[int, ...]:
         _, rew, term, trunc, info = out
@@ -306,7 +324,7 @@ class MAPPO:
         self.obs_buf.index_copy_(0, self.t, obs.unsqueeze(0))
         loc, scale = self.actor(obs)
         u = loc + scale * torch.randn_like(loc)
-        self.actions.copy_(torch.tanh(u))
+        self.actions.copy_(self.actor.squash(u))
         self.u_buf.index_copy_(0, self.t, u.unsqueeze(0))
         self.logp_buf.index_copy_(0, self.t, tanh_normal_log_prob(u, loc, scale).unsqueeze(0))
 
@@ -423,7 +441,10 @@ def load_checkpoint(
     ckpt = torch.load(path, map_location=device, weights_only=True)
     if ckpt.get("format") != CHECKPOINT_FORMAT:
         raise ValueError(f"{path} is not a {CHECKPOINT_FORMAT} checkpoint")
-    actor = Actor(ckpt["obs_dim"], ckpt["act_dim"], ckpt["num_cells"]).to(device)
+    actor = Actor(
+        ckpt["obs_dim"], ckpt["act_dim"], ckpt["num_cells"],
+        low=ckpt.get("act_low"), high=ckpt.get("act_high"),
+    ).to(device)
     critic = Critic(ckpt["obs_dim"], ckpt["n_agents"], ckpt["num_cells"]).to(device)
     actor.load_state_dict(ckpt["actor"])
     critic.load_state_dict(ckpt["critic"])
@@ -561,22 +582,28 @@ def parse_args(argv: list[str] | None = None) -> TrainConfig:
 # --------------------------------------------------------------------------- training
 
 
-def check_action_box(env: Environment, scenario: str) -> None:
-    """Raise unless ``env``'s action box is ``[-1, 1]``, the range of :class:`Actor`'s tanh.
+def check_action_box(env: Environment, scenario: str) -> tuple[torch.Tensor, torch.Tensor]:
+    """The per-slot action box ``(low, high)``, each ``[act_dim]``, for :class:`Actor`.
 
-    Zero-width slots (past an agent's model arity in a mixed fleet) are ignored. Call it
-    before training an :class:`Actor` on an env from outside :func:`train`, which runs it.
+    The actor's weights are shared across agents, so it can only map onto one box: raise
+    unless every agent's box agrees with it. Zero-width slots (past an agent's model arity
+    in a mixed fleet) are ignored, as the kernels ignore them. Call it before building an
+    :class:`Actor` for an env from outside :func:`train`, which runs it.
     """
     lo, hi = env.action_bounds
     nonzero = hi > lo  # zero-width slots exist for mixed fleets and are legitimately 0
-    if not (
-        torch.allclose(lo[nonzero], torch.full_like(lo[nonzero], -1.0))
-        and torch.allclose(hi[nonzero], torch.full_like(hi[nonzero], 1.0))
-    ):
+    low = torch.where(nonzero, lo, torch.inf).amin(0)
+    high = torch.where(nonzero, hi, -torch.inf).amax(0)
+    unused = ~nonzero.any(0)
+    low = torch.where(unused, -1.0, low)
+    high = torch.where(unused, 1.0, high)
+    agrees = (lo == low) & (hi == high)
+    if not agrees[nonzero].all():
         raise ValueError(
-            f"{scenario!r} has action bounds ({lo.min().item():g}, {hi.max().item():g}) "
-            f"but the actor's tanh box is fixed to [-1, 1]."
+            f"{scenario!r} agents have different action boxes ({lo.tolist()} .. {hi.tolist()}); "
+            "a shared-weight actor maps onto one box."
         )
+    return low.float().cpu(), high.float().cpu()
 
 
 def train(cfg: TrainConfig) -> Path:
@@ -594,7 +621,7 @@ def train(cfg: TrainConfig) -> Path:
     )
     scen = env.scenario
     obs_dim, act_dim = env.obs_dim, env.act_dim
-    check_action_box(env, cfg.scenario)
+    act_low, act_high = check_action_box(env, cfg.scenario)
 
     env.reset()  # a probe: info() needs a reset world; the real reset follows the knobs
     info0 = scen.info()
@@ -617,7 +644,7 @@ def train(cfg: TrainConfig) -> Path:
     for k, w in metrics.items():
         metric_cols += [f"rew_term{i}" for i in range(w)] if k == "multiobj_reward" else [k]
 
-    actor = Actor(obs_dim, act_dim, spec.num_cells).to(device)
+    actor = Actor(obs_dim, act_dim, spec.num_cells, low=act_low, high=act_high).to(device)
     critic = Critic(obs_dim, n_agents, spec.num_cells).to(device)
     if cfg.resume:
         a, c, _ = load_checkpoint(cfg.resume, device)
@@ -671,6 +698,8 @@ def train(cfg: TrainConfig) -> Path:
                 "act_dim": act_dim,
                 "n_agents": n_agents,
                 "num_cells": spec.num_cells,
+                "act_low": act_low.tolist(),
+                "act_high": act_high.tolist(),
                 "scenario": cfg.scenario,
                 "scen_kwargs": {k: str(v) for k, v in cfg.scen_kwargs.items()},
                 "dt": spec.dt,

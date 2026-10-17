@@ -24,6 +24,7 @@ from swarp.scenarios.fused import Buf, FusedPass, FusedScenario
 from swarp.scenarios.giveway import GiveWayScenario
 from swarp.scenarios.navigation import NavigationScenario
 from swarp.scenarios.pusht import PushTScenario
+from swarp.scenarios.ringroad import RingRoadScenario
 from swarp.scenarios.sampling import SamplingScenario
 from swarp.scenarios.shepherding import ShepherdingScenario
 from swarp.scenarios.transport import TransportScenario
@@ -41,6 +42,7 @@ __all__ = [
     "GiveWayScenario",
     "NavigationScenario",
     "PushTScenario",
+    "RingRoadScenario",
     "SamplingScenario",
     "Scenario",
     "ShepherdingScenario",
@@ -65,6 +67,7 @@ SCENARIOS: dict[str, type[Scenario]] = {
     "giveway": GiveWayScenario,
     "shepherding": ShepherdingScenario,
     "caging": CagingScenario,
+    "ringroad": RingRoadScenario,
 }
 
 

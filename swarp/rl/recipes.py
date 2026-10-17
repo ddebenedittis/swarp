@@ -118,6 +118,11 @@ class TrainSpec:
     expanded into one column per reward term, which is how a shaping imbalance becomes
     visible at iteration 1 instead of hour 3."""
     target_solve_rate: float = 0.7
+    # --- rollout ------------------------------------------------------------------
+    stagger_starts: bool = False
+    """Desynchronise episode starts before the first rollout (see ``MAPPO.reset``). For a
+    scenario whose episodes mostly run to ``max_steps``: without it every env truncates on
+    the same step and each batch is one slice of the episode, in phase across all envs."""
 
 
 # Scenarios with no success criterion: both inherit the all-False ``Scenario.done``, so an
@@ -312,6 +317,43 @@ SPECS: dict[str, TrainSpec] = {
         ),
         curriculum_iters=600, curriculum_gate=0.35,
         metrics=("gap_max", "band_error", "caged", "multiobj_reward"),
+    ),
+    # Flow's ring: 1 AV among 21 IDM humans on the Sugiyama 230 m ring. The multi-AV variant
+    # is `--n-agents 4` (n_vehicles stays 22, so 18 humans): SPECS is keyed by registry
+    # name, and the obs width does not depend on either count. dt=0.1 is Flow's (SUMO's)
+    # step. max_steps=1500 (150 s), because a FollowerStopper AV needs 64 s to stabilise
+    # this ring at 58% of v_eq. 60 s, the first guess, left no margin for a learner.
+    # gamma 0.995: the 10 s credit horizon of 0.99 is shorter than the time a wave takes
+    # to travel once around the ring (about 30 s at the wave's backward speed), so the
+    # policy could not see the payoff of an early brake. Measured per-step terms at
+    # difficulty 1, 64 envs x 600 steps: the IDM-driven arm nets -1.44 (speed +0.56,
+    # accel -0.49, time -1.50, no crashes), coasting -5.69, random -6.53.
+    #
+    # The greedy policy is bistable across checkpoints: on the 22-car ring it flips between
+    # solving all 512 eval envs and solving none from one 250-iteration checkpoint to the
+    # next, and its failure mode is parking (the AV stops and the whole ring jams, which
+    # never crashes and never terminates). Measured greedy solve per 250-iteration
+    # checkpoint: lr 1e-3 solved at iters 1500 and 2750 only and parked from 3500 on; lr
+    # 3e-4 solved at 1000 (0.90), 2000 and 2500. Strengthening the speed term (speed_coef
+    # 0.5, time_penalty -3) did *not* help (0.004 best over 3000 iters). So: lr 3e-4,
+    # `--checkpoint-every 250`, and pick the checkpoint by greedy eval
+    # (`examples/eval_mappo.py`), not `_best.pt`, which is keyed on the stochastic window
+    # and here held a policy whose greedy action solves nothing.
+    "ringroad": TrainSpec(
+        dt=0.1, substeps=1, max_steps=1500, n_agents=1,
+        scen_kwargs={"n_vehicles": 22},
+        iters=3000, n_envs=1024, steps_per_batch=32, minibatches=8, lr=3e-4,
+        gamma=0.995, lmbda=0.97,
+        # The reset wave's amplitude. Even at 0.2 the 22-car ring grows a full wave within
+        # a minute, so the low end is not trivially solved; it only gives the policy a
+        # wave it can catch before it is fully developed.
+        curriculum=(CurriculumKnob("difficulty", 0.2, 1.0, none_at_full=False),),
+        curriculum_iters=300, curriculum_gate=0.35,
+        metrics=("speed_std", "mean_speed", "crashed", "multiobj_reward"),
+        # Nearly every early episode runs the full 1500 steps, so all 1024 envs would
+        # truncate on the same step, forever: each batch would be the same 32-step slice of
+        # the episode everywhere (measured: reward/step swinging -2 to -6 with episode time).
+        stagger_starts=True,
     ),
 }
 
@@ -568,6 +610,46 @@ def goal_p_controller(gain: float = 4.0) -> Callable[[Environment], ActionFn]:
     return make
 
 
+def ringroad_idm_driver(
+    k_off: float = 0.3, k_head: float = 1.0
+) -> Callable[[Environment], ActionFn]:
+    """Scripted ring-road arm: drive the RL car as one more IDM human.
+
+    This is the "humans only" reference. With it, the ring is the uncontrolled IDM ring
+    (up to the RL car's ``max_accel`` clamp), so its solve rate is the floor a policy has
+    to beat: at the Sugiyama density it is zero at N=22 and one at N <= 8.
+
+    Longitudinal: the IDM acceleration from the observation's own speed, leader speed and
+    gap, with the scenario's own IDM parameters. Lateral: the curvature feedforward
+    ``atan(L/R)`` plus a P law on the lateral offset and the heading error. Linearised,
+    the offset obeys ``o'' + (v k_head / L) o' + (v^2 k_off / L) o = 0``, which is damped
+    for any positive gains (zeta ~ 0.6 at the ring's 3.5 m/s equilibrium speed).
+    """
+
+    def make(env: Environment) -> ActionFn:
+        scen = env.scenario
+        lo, hi = env.action_bounds
+        half_lane = 0.5 * scen.lane_width
+
+        def action_fn(obs: torch.Tensor) -> torch.Tensor:
+            v = obs[..., 0] * scen.v_scale
+            dv = -obs[..., 1] * scen.v_scale  # own speed minus the leader's
+            gap = (obs[..., 2] * scen.gap_scale).clamp(min=0.1)
+            dyn = (v * scen.idm_time_headway + v * dv * scen._inv_2sqrt_ab).clamp(min=0.0)
+            ratio = (scen.idm_s0 + dyn) / gap
+            acc = scen.idm_accel * (1.0 - (v / scen.idm_v0) ** scen.idm_delta - ratio**2)
+            steer = (
+                obs[..., 8] * scen.max_steer
+                + k_off * obs[..., 5] * half_lane
+                - k_head * obs[..., 6]
+            )
+            return torch.stack([acc, steer], dim=-1).clamp(lo, hi)
+
+        return action_fn
+
+    return make
+
+
 # Per-scenario scripted baseline, keyed like SPECS. Only for scenarios where "drive at the
 # goal" is a meaningful controller; a scenario with no per-agent goal has no entry.
 BASELINES: dict[str, Callable[[Environment], ActionFn]] = {
@@ -577,6 +659,9 @@ BASELINES: dict[str, Callable[[Environment], ActionFn]] = {
     # step 48), paying heavily in collisions. So on giveway this arm is a ceiling on the
     # solve rate, not a floor; compare collisions and solve step instead.
     "giveway": goal_p_controller(),
+    # Not a goal controller: the RL car driven as one more IDM human, i.e. the humans-only
+    # ring. Its solve rate is the floor, zero wherever the ring is string-unstable.
+    "ringroad": ringroad_idm_driver(),
 }
 
 

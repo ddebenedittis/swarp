@@ -12,7 +12,7 @@ The benchmark entry points (`swarp/benchmark/`):
 | `python -m swarp.benchmark.compare_vmas` | swarp vs VMAS (throughput and/or peak device memory) |
 | `python -m swarp.benchmark.compare_sims` | swarp vs VMAS vs JaxMARL vs CAMAR, one subprocess per simulator |
 | `python -m swarp.benchmark.ablation` | cumulative optimization ablation of the same hot path, one feature per row, parity-gated |
-| `python -m swarp.benchmark.scenarios` | all 10 scenarios × robot model × lidar rays: baseline vs optimized, parity-gated |
+| `python -m swarp.benchmark.scenarios` | all 11 scenarios × robot model × lidar rays: baseline vs optimized, parity-gated |
 | `python -m swarp.benchmark.train_throughput` | end-to-end MAPPO training: [`swarp.rl`](training.md) vs TorchRL (as usually written and tuned), BenchMARL and rsl_rl |
 
 ## Throughput
@@ -72,6 +72,28 @@ GPU-bound configs where launch overhead was never the constraint.
 Raising `n_agents` at fixed `n_envs` is close to free until that point, which is the
 structural difference from per-entity simulators: the step is a fixed handful of Warp
 kernels whose thread count grows with agents, not a Python loop whose *length* does.
+
+### Ring road
+
+`ringroad` carries most of its work outside the engine: per step, its fused pass projects every vehicle onto the ring, runs an O(N²) leader search twice and integrates the IDM humans, for 22 vehicles per env at the default size.
+`python -m swarp.benchmark.scenarios --scenarios ringroad --envs 1024 4096 16000 --agents 1 16 64 --lidar-rays 0 --steps 300`, RTX 3070 Laptop GPU, ms/step.
+The ring holds `max(22, n_agents + 1)` vehicles, so the 64-agent rows simulate 65.
+Every row ran captured (`graph`):
+
+| n_envs | RL cars (vehicles) | baseline (torch obs/reward, eager) | optimized (fused + graph) | speedup |
+|---|---|---|---|---|
+| 1024 | 1 (22) | 1.136 | 0.040 | 28.4× |
+| 1024 | 16 (22) | 1.141 | 0.085 | 13.4× |
+| 1024 | 64 (65) | 3.356 | 0.350 | 9.6× |
+| 4096 | 1 (22) | 1.827 | 0.059 | 31.0× |
+| 4096 | 16 (22) | 1.905 | 0.146 | 13.0× |
+| 4096 | 64 (65) | 12.461 | 0.655 | 19.0× |
+| 16000 | 1 (22) | 5.998 | 0.208 | 28.8× |
+| 16000 | 16 (22) | 6.693 | 0.629 | 10.6× |
+| 16000 | 64 (65) | 48.437 | 3.349 | 14.5× |
+
+At the training recipe's size (1024 envs, 1 RL car among 22) the step costs 0.04 ms, about 25.6 M env-steps/s.
+A whole `swarp.rl` iteration (1024 envs × 32 steps, rollout plus PPO update) takes about 94 ms, so the update, not the ring, is the cost.
 
 ## Training throughput
 

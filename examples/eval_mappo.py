@@ -49,6 +49,8 @@ Run with::
 
     python examples/eval_mappo.py runs/navigation/navigation_final.pt --n-envs 2048
     python examples/eval_mappo.py runs/pusht/pusht_final.pt --window --speed 0.25
+    # a ring-road policy trained on 6 cars, evaluated on the 22-car ring
+    python examples/eval_mappo.py runs/rr6/ringroad_final.pt --scen-kwarg n_vehicles=22
 """
 
 from __future__ import annotations
@@ -70,7 +72,7 @@ from mappo import (
 
 import swarp
 from swarp.rl.ppo import CHECKPOINT_FORMAT, greedy_arm, load_checkpoint
-from swarp.rl.recipes import PolicyArm, score
+from swarp.rl.recipes import PolicyArm, coerce_scen_kwargs, score
 
 
 def _load(path: str, device: str):
@@ -110,7 +112,10 @@ def _load_arm(path: str, device: str) -> tuple[PolicyArm, dict]:
         # deterministic action too. No benchmarl import needed.
         from swarp.rl.networks import Actor
 
-        actor = Actor(ckpt["obs_dim"], ckpt["act_dim"], ckpt["num_cells"]).to(device)
+        actor = Actor(
+            ckpt["obs_dim"], ckpt["act_dim"], ckpt["num_cells"],
+            low=ckpt.get("act_low"), high=ckpt.get("act_high"),
+        ).to(device)
         actor.load_state_dict(ckpt["actor"])
         return greedy_arm(actor.eval()), ckpt
     policy, ckpt = _load(path, device)
@@ -129,6 +134,10 @@ def main() -> int:
     p.add_argument("--steps", type=int, help="episode length; default = the spec's")
     p.add_argument("--seed", type=int, default=123)
     p.add_argument("--substeps", type=int, help="keep equal to training")
+    p.add_argument("--n-agents", type=int,
+                   help="default = the checkpoint's; the shared-weight actor runs at any count")
+    p.add_argument("--scen-kwarg", action="append", default=[], metavar="K=V",
+                   help="scenario keyword over the checkpoint's own; repeatable")
     p.add_argument("--arms", default="policy,random,zero,scripted")
     p.add_argument("--target", type=float, help="exit nonzero below this solve rate")
     p.add_argument("--success-key", help="info() key to threshold, for a done()-less scenario")
@@ -159,7 +168,15 @@ def main() -> int:
             f"pass --scenario"
         )
     spec = SPECS[scenario]
-    n_agents = ckpt["n_agents"]
+    n_agents = args.n_agents or ckpt["n_agents"]
+    # The checkpoint's own scenario keywords (stored stringified), not the spec's: a run
+    # trained with --scen-kwarg must be evaluated on what it trained on unless overridden.
+    if "scen_kwargs" in ckpt:
+        stored = [f"{k}={v}" for k, v in ckpt["scen_kwargs"].items()]
+        scen_kwargs = coerce_scen_kwargs(scenario, stored)
+    else:
+        scen_kwargs = dict(spec.scen_kwargs)
+    scen_kwargs.update(coerce_scen_kwargs(scenario, args.scen_kwarg))
     steps = args.steps or ckpt.get("max_steps") or spec.max_steps
     substeps = args.substeps or ckpt.get("substeps") or spec.substeps
     dt = ckpt.get("dt") or spec.dt
@@ -181,7 +198,7 @@ def main() -> int:
         seed=args.seed,
         dt=dt,
         substeps=substeps,
-        scen_kwargs=spec.scen_kwargs,
+        scen_kwargs=scen_kwargs,
         metrics=spec.metrics,
         baseline=BASELINES.get(scenario),
         arms=tuple(a.strip() for a in args.arms.split(",") if a.strip()),
@@ -192,12 +209,17 @@ def main() -> int:
         f"{args.checkpoint}: {scenario}, {n_agents} agents, {steps} steps x "
         f"{args.n_envs} envs (seed {args.seed})"
     )
+    if scen_kwargs:
+        print(f"  scenario kwargs: {scen_kwargs}")
     for name, m in res.items():
         med = "n/a" if m.solve_step_median is None else f"{m.solve_step_median:.0f}"
         print(
             f"  {name:9s} solved {m.solve_rate:.3f} [{m.ci[0]:.3f}, {m.ci[1]:.3f}]"
             f"   median solve step {med}"
         )
+        last = {k: v for k, v in m.metrics_last.items() if k != "multiobj_reward"}
+        if last:
+            print("            final " + "  ".join(f"{k} {v:.3f}" for k, v in last.items()))
     if "scripted" not in res:
         print(
             f"  (no scripted baseline registered for {scenario!r}; the solve rate has no "
@@ -226,7 +248,7 @@ def main() -> int:
         env = swarp.make(
             scenario, n_envs=1, device=args.device, dt=dt, substeps=substeps,
             seed=args.seed, max_steps=episode_steps, auto_reset=True,
-            n_agents=n_agents, **dict(spec.scen_kwargs),
+            n_agents=n_agents, **scen_kwargs,
         )
         env.reset(seed=args.seed)
         lo, hi = env.action_bounds

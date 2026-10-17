@@ -106,6 +106,8 @@ PARAM_FIELDS: tuple[str, ...] = (
     "inertia_zz",
     "torque_coeff",
     "gravity",
+    # Appended last so every existing column keeps its index.
+    "min_speed",
 )
 NUM_PARAMS = len(PARAM_FIELDS)
 _COL = {name: i for i, name in enumerate(PARAM_FIELDS)}
@@ -129,6 +131,7 @@ P_IYY = _COL["inertia_yy"]
 P_IZZ = _COL["inertia_zz"]
 P_KAPPA = _COL["torque_coeff"]  # yaw reaction torque per unit rotor thrust
 P_GRAVITY = _COL["gravity"]  # gravitational acceleration (m/s^2)
+P_MIN_SPEED = _COL["min_speed"]  # bicycle's lower speed clamp (-max_speed if unset)
 
 
 @dataclass
@@ -150,6 +153,11 @@ class AgentConfig:
     l_f: float = 0.1  # front axle to center of gravity (bicycle only)
     l_r: float = 0.1  # rear axle to center of gravity (bicycle only)
     max_steer: float = math.pi / 4  # bicycle only
+    #: Lower clamp on the bicycle's signed speed; ``None`` means ``-max_speed`` (it can
+    #: reverse as fast as it drives). ``0.0`` is a car that brakes to a stop and stays.
+    #: Under RK4 only the final speed is clamped (its rule for every limit), so the pose
+    #: of a car braking at zero speed still creeps by the unclamped stages.
+    min_speed: float | None = None  # bicycle only
     # 6-DOF drone parameters (used only when model == DRONE).
     thrust_max: float = 10.0  # per-rotor max thrust (N)
     arm_length: float = 0.15  # rotor arm length from CoG (m)
@@ -167,14 +175,23 @@ class AgentConfig:
         for name in ("radius", "mass", "max_speed", "max_accel", "max_ang_vel", "max_ang_accel"):
             if getattr(self, name) <= 0.0:
                 raise ValueError(f"AgentConfig.{name} must be positive.")
+        if self.min_speed is not None and not -self.max_speed <= self.min_speed <= self.max_speed:
+            raise ValueError("AgentConfig.min_speed must lie in [-max_speed, max_speed].")
         if self.model == DynamicsModel.DRONE:
             for name in ("thrust_max", "arm_length", "inertia_xx", "inertia_yy", "inertia_zz"):
                 if getattr(self, name) <= 0.0:
                     raise ValueError(f"AgentConfig.{name} must be positive for a drone.")
 
     def to_row(self) -> list[float]:
-        """This config as one ``[NUM_PARAMS]`` kernel row, in :data:`PARAM_FIELDS` order."""
-        return [float(getattr(self, name)) for name in PARAM_FIELDS]
+        """This config as one ``[NUM_PARAMS]`` kernel row, in :data:`PARAM_FIELDS` order.
+
+        ``min_speed=None`` is resolved here rather than in ``__post_init__``, so a
+        ``dataclasses.replace(cfg, max_speed=...)`` cannot leave a stale lower bound.
+        """
+        row = {name: getattr(self, name) for name in PARAM_FIELDS}
+        if row["min_speed"] is None:
+            row["min_speed"] = -self.max_speed
+        return [float(row[name]) for name in PARAM_FIELDS]
 
 
 #: Which ``AgentConfig`` limit each model's integrate branch clamps each action slot

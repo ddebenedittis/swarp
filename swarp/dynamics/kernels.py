@@ -36,6 +36,7 @@ from swarp.dynamics.base import (
     P_MAX_ANG_VEL,
     P_MAX_SPEED,
     P_MAX_STEER,
+    P_MIN_SPEED,
     P_RADIUS,
     P_THRUST_MAX,
     AgentParams,
@@ -140,6 +141,7 @@ def _step_2d(
     force: Any,
     # per-agent parameters (scalars)
     max_speed: Any,
+    min_speed: Any,
     max_accel: Any,
     max_ang_vel: Any,
     max_ang_accel: Any,
@@ -188,7 +190,7 @@ def _step_2d(
         # Kinematic bicycle with slip angle beta (Polack et al. 2017, eq. 2).
         acc = wp.clamp(a0, -max_accel, max_accel)
         delta = wp.clamp(a1, -max_steer, max_steer)
-        s_new = wp.clamp(s + acc * dt, -max_speed, max_speed)
+        s_new = wp.clamp(s + acc * dt, min_speed, max_speed)
         wheelbase = l_f + l_r
         beta = wp.atan(wp.tan(delta) * l_r / wheelbase)
         v_trans = type(p)(s_new * wp.cos(th + beta), s_new * wp.sin(th + beta)) + dv_f
@@ -232,6 +234,7 @@ def _integrate_agent(
     # per-agent parameters, pre-loaded from either the shared or per-env layout
     mass: Any,
     max_speed: Any,
+    min_speed: Any,
     max_accel: Any,
     max_ang_vel: Any,
     max_ang_accel: Any,
@@ -309,6 +312,7 @@ def _integrate_agent(
             mode,
             force,
             max_speed,
+            min_speed,
             max_accel,
             max_ang_vel,
             max_ang_accel,
@@ -462,6 +466,7 @@ def _integrate_rk4(
     force: Any,
     mass: Any,
     max_speed: Any,
+    min_speed: Any,
     max_accel: Any,
     max_ang_vel: Any,
     max_ang_accel: Any,
@@ -666,7 +671,7 @@ def _integrate_rk4(
         v_out = type(p)(s_out * wp.cos(th_new), s_out * wp.sin(th_new)) + dv_f
         p_new = p_new + dv_f * dt
     elif tag == TAG_BICYCLE:
-        s_out = wp.clamp(s_i, -max_speed, max_speed)
+        s_out = wp.clamp(s_i, min_speed, max_speed)
         th_new = th_i
         delta = wp.clamp(a1, -max_steer, max_steer)
         wheelbase = l_f + l_r
@@ -782,6 +787,7 @@ def integrate_kernel(
             forces[e, a],
             params[a, P_MASS],
             params[a, P_MAX_SPEED],
+            params[a, P_MIN_SPEED],
             params[a, P_MAX_ACCEL],
             params[a, P_MAX_ANG_VEL],
             params[a, P_MAX_ANG_ACCEL],
@@ -832,6 +838,7 @@ def integrate_kernel(
             forces[e, a],
             params[a, P_MASS],
             params[a, P_MAX_SPEED],
+            params[a, P_MIN_SPEED],
             params[a, P_MAX_ACCEL],
             params[a, P_MAX_ANG_VEL],
             params[a, P_MAX_ANG_ACCEL],
@@ -930,6 +937,7 @@ def integrate_kernel_per_env(
             forces[e, a],
             params[e, a, P_MASS],
             params[e, a, P_MAX_SPEED],
+            params[e, a, P_MIN_SPEED],
             params[e, a, P_MAX_ACCEL],
             params[e, a, P_MAX_ANG_VEL],
             params[e, a, P_MAX_ANG_ACCEL],
@@ -980,6 +988,7 @@ def integrate_kernel_per_env(
             forces[e, a],
             params[e, a, P_MASS],
             params[e, a, P_MAX_SPEED],
+            params[e, a, P_MIN_SPEED],
             params[e, a, P_MAX_ACCEL],
             params[e, a, P_MAX_ANG_VEL],
             params[e, a, P_MAX_ANG_ACCEL],
@@ -1051,6 +1060,7 @@ def integrate2d_kernel(
         ctrl_mode[a],
         forces[e, a],
         params[a, P_MAX_SPEED],
+        params[a, P_MIN_SPEED],
         params[a, P_MAX_ACCEL],
         params[a, P_MAX_ANG_VEL],
         params[a, P_MAX_ANG_ACCEL],
@@ -1109,6 +1119,7 @@ def integrate2d_kernel_per_env(
         ctrl_mode[a],
         forces[e, a],
         params[e, a, P_MAX_SPEED],
+        params[e, a, P_MIN_SPEED],
         params[e, a, P_MAX_ACCEL],
         params[e, a, P_MAX_ANG_VEL],
         params[e, a, P_MAX_ANG_ACCEL],
