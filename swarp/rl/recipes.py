@@ -246,6 +246,30 @@ SPECS: dict[str, TrainSpec] = {
         curriculum_iters=250, curriculum_gate=0.0,
         metrics=("tee_dist_to_goal", "tee_angle_error"),
     ),
+    # Lidar Push-T, stage T0: Push-T's physics and shaping with five robots (two pushers,
+    # three observers) and the oracle T block still in the observation (obs_level 0), so
+    # this stage isolates the roles, the observer rewards and the privileged critic from
+    # the perception problem. The critic reads the role-sorted critic_state() with one
+    # value per role-sorted slot; the actor is one trunk with a head per role. The aux
+    # loss is off until the stages that drop the T pose (docs/pusht-lidar.md).
+    "pusht_lidar": TrainSpec(
+        dt=0.05, substeps=8, max_steps=400, n_agents=5,
+        scen_kwargs={
+            "pos_shaping_factor": 5.0, "rot_shaping_factor": 0.5, "rot_away_penalty": 1.0,
+            "obs_level": 0,
+        },
+        iters=4000, n_envs=512, steps_per_batch=32, epochs=8, minibatches=4,
+        lr=5e-4, entropy_coeff=3e-3, num_cells=256, normalize_advantage=False,
+        curriculum=(
+            CurriculumKnob("goal_spawn_radius", 0.25, 0.25 + 1.9),
+            CurriculumKnob("goal_spawn_angle", 0.4, math.pi),
+        ),
+        curriculum_iters=250, curriculum_gate=0.0,
+        metrics=("tee_dist_to_goal", "tee_angle_error", "team_coverage",
+                 "observer_visibility", "occlusion", "tee_seen", "multiobj_reward"),
+        actor="policynet", role_params="heads", critic_input="state",
+        per_agent_value=True, aux_coef=0.0,
+    ),
     # Give-way. Four agents, one per arm, crossing to the opposite arm through a junction
     # that fits one of them. shared_reward defaults True in the scenario: under per-agent
     # shaping the yielding agent pays the whole cost of a manoeuvre only the team benefits

@@ -188,9 +188,16 @@ def test_spec_network_defaults_reproduce_the_plain_trainer():
     assert (spec.actor, spec.critic_input, spec.per_agent_value, spec.aux_coef) == (
         "mlp", "obs", False, 0.0,
     )
+    # Every recipe that predates the training hooks keeps the plain networks; the lidar
+    # Push-T recipe is the one written for them.
     assert all(
         (s.actor, s.critic_input, s.per_agent_value, s.aux_coef) == ("mlp", "obs", False, 0.0)
-        for s in SPECS.values()
+        for name, s in SPECS.items()
+        if name != "pusht_lidar"
+    )
+    s = SPECS["pusht_lidar"]
+    assert (s.actor, s.role_params, s.critic_input, s.per_agent_value) == (
+        "policynet", "heads", "state", True,
     )
 
 
