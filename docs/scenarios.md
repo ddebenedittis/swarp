@@ -118,6 +118,7 @@ cls = swarp.scenario_class("pusht")                   # the class itself
 
 `SCENARIOS` is the one registry; `make` raises a `ValueError` listing the valid names for anything else.
 `make_scenario` drops a `model=` keyword for holonomic-only scenarios, so a sweep over dynamics models can pass it uniformly.
+`navigation` takes every planar model; `pusht` and `pusht_lidar` take holonomic and diff-drive robots (their `supported_models`), plus `agent_shape="box"`.
 
 ## Two execution paths
 

@@ -14,6 +14,7 @@ import warp as wp
 from swarp._overloads import concrete
 from swarp.core.cached_launch import CachedLaunch, ptr_key
 from swarp.core.world import World
+from swarp.dynamics.base import AgentShape
 from swarp.interop.autograd import torch_stream_scope
 from swarp.scenarios.fused import Buf, FusedPass
 from swarp.scenarios.pusht import PushTScenario
@@ -122,9 +123,19 @@ class PushTLidarScenario(PushTScenario):
         occlusion_weight: float = 0.1,
         contact_penalty: float = 0.0,
         contact_dist: float | None = None,
+        lidar_body_frame: bool | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(n_agents=n_agents, shape=shape, **kwargs)
+        # A unicycle pushes along its heading, so its scan is mounted on the body (the T
+        # straight ahead is always the same rays); a holonomic disc keeps world-axis rays.
+        self.lidar_body_frame = (
+            self.heading_obs if lidar_body_frame is None else bool(lidar_body_frame)
+        )
+        #: Widths of the self block and of a robot's critic-state block: the heading adds
+        #: its cos and sin to both when it matters.
+        self.self_dim = SELF_DIM + (2 if self.heading_obs else 0)
+        self.state_agent_dim = STATE_AGENT + (2 if self.heading_obs else 0)
         if obs_level not in (0, 1, 2):
             raise ValueError(f"obs_level must be 0, 1 or 2, got {obs_level}")
         if n_rays < 1 or frame_stack < 1 or n_comm_pts < 1:
@@ -175,7 +186,7 @@ class PushTLidarScenario(PushTScenario):
 
     @property
     def state_dim(self) -> int:  # type: ignore[override]
-        return STATE_HEAD + STATE_AGENT * self.n_agents
+        return STATE_HEAD + self.state_agent_dim * self.n_agents
 
     @property
     def aux_dim(self) -> int:  # type: ignore[override]
@@ -190,14 +201,16 @@ class PushTLidarScenario(PushTScenario):
         ``obs_dim``. ``"lidar"`` covers every stacked frame, ``"lidar_newest"`` the last."""
         na, w = self.n_agents, 3 * self.n_rays
         out = {
-            "self": slice(0, SELF_DIM),
+            "self": slice(0, self.self_dim),
             "pos": slice(0, 2),
             "vel": slice(2, 4),
             "role": slice(4, 5),
             "goal_rel": slice(5, 7),
             "goal_angle": slice(7, 9),
         }
-        k = SELF_DIM
+        if self.heading_obs:
+            out["heading"] = slice(9, 11)
+        k = self.self_dim
         out["teammates"] = slice(k, k + 3 * (na - 1))
         k += 3 * (na - 1)
         if self.obs_level == 0:
@@ -235,7 +248,7 @@ class PushTLidarScenario(PushTScenario):
         self.lidar = Lidar(
             self.n_rays,
             self.lidar_max_range,
-            body_frame=False,
+            body_frame=self.lidar_body_frame,
             return_hits=True,
             backend="warp",
         )
@@ -326,6 +339,8 @@ class PushTLidarScenario(PushTScenario):
             obstacle_angle=th.unsqueeze(1).expand(-1, self.n_boxes),
             obstacle_half=self._obs_half,
             obstacle_kind=self._obs_kind,
+            agent_shape=w.agent_shape if self.agent_shape == AgentShape.BOX else None,
+            agent_half=w.agent_half_extents,
             return_hits=True,
         )
         is_obj = hit_class == HIT_MOVABLE  # [E, A, R]
@@ -345,6 +360,8 @@ class PushTLidarScenario(PushTScenario):
             g.unsqueeze(1) - pos,
             torch.stack([gth.cos(), gth.sin()], dim=-1),
         ]
+        if self.heading_obs:
+            feats.append(torch.stack([s.theta.cos(), s.theta.sin()], dim=-1))
         others = self._others  # [A, A-1]
         mates = torch.cat(
             [pos[:, others] - pos.unsqueeze(2), sgn[:, others].unsqueeze(-1)], dim=-1
@@ -461,9 +478,14 @@ class PushTLidarScenario(PushTScenario):
             ],
             dim=-1,
         )  # [E, 15]
-        per_agent = torch.cat([pos, vel, sgn.unsqueeze(-1)], dim=-1)  # [E, A, 5]
+        blocks = [pos, vel, sgn.unsqueeze(-1)]
+        if self.heading_obs:
+            blocks.append(torch.stack([s.theta.cos(), s.theta.sin()], dim=-1))
+        per_agent = torch.cat(blocks, dim=-1)  # [E, A, state_agent_dim]
         perm = torch.argsort(roles, dim=-1, stable=True)
-        sorted_agents = per_agent.gather(1, perm.unsqueeze(-1).expand(-1, -1, STATE_AGENT))
+        sorted_agents = per_agent.gather(
+            1, perm.unsqueeze(-1).expand(-1, -1, self.state_agent_dim)
+        )
         critic = torch.cat([head, sorted_agents.flatten(1)], dim=-1)
         aux = torch.cat(
             [dq * self.aux_scale, torch.stack([ca, sa], -1).unsqueeze(1).expand(-1, na, -1)],
@@ -577,6 +599,7 @@ class PushTLidarScenario(PushTScenario):
             self.tee_radius,
             self.aux_scale,
             self.contact_dist,
+            int(self.heading_obs),
         )
         launch = self._lidar_obs_launch.get(
             concrete(pusht_lidar_obs_kernel, scalar),
@@ -602,6 +625,7 @@ class PushTLidarScenario(PushTScenario):
                 scalar(self.tee_radius),
                 scalar(self.aux_scale),
                 scalar(self.contact_dist),
+                wp.int32(int(self.heading_obs)),
                 wp.int32(advance_prev),
             ],
             outputs=outs,

@@ -40,13 +40,16 @@ wp.set_module_options({"default_grid_stride": False})
 def pusht_obs_kernel(
     pos: wp.array2d(dtype=Any),
     vel: wp.array2d(dtype=Any),
+    theta: wp.array2d(dtype=Any),
     tee_pos: wp.array(dtype=Any),
     tee_theta: wp.array(dtype=Any),
     goal_pos: wp.array(dtype=Any),
     goal_theta: wp.array(dtype=Any),
+    heading: wp.int32,
     obs: wp.array3d(dtype=Any),
 ):
-    """Thread per (env, agent): obs row (agent pose, T-relative, T->goal, angles)."""
+    """Thread per (env, agent): obs row (agent pose, T-relative, T->goal, angles,
+    teammates, then the robot's own cos/sin heading when ``heading`` is 1)."""
     e, a = wp.tid()
     p = pos[e, a]
     v = vel[e, a]
@@ -75,6 +78,9 @@ def pusht_obs_kernel(
             obs[e, a, k] = q2[0] - p[0]
             obs[e, a, k + 1] = q2[1] - p[1]
             k += wp.int32(2)
+    if heading == 1:
+        obs[e, a, k] = wp.cos(theta[e, a])
+        obs[e, a, k + 1] = wp.sin(theta[e, a])
 
 
 @wp.kernel
@@ -185,10 +191,12 @@ def _obs_signature(dtype) -> list:
     return [
         wp.array2d(dtype=vec2),  # pos
         wp.array2d(dtype=vec2),  # vel
+        wp.array2d(dtype=dtype),  # theta
         wp.array(dtype=vec2),  # tee_pos
         wp.array(dtype=dtype),  # tee_theta
         wp.array(dtype=vec2),  # goal_pos
         wp.array(dtype=dtype),  # goal_theta
+        wp.int32,  # heading
         wp.array3d(dtype=dtype),  # obs
     ]
 
@@ -313,6 +321,34 @@ def pusht_reset_kernel(
         goal_theta[e] = (_as(wp.randf(rng), lim) * two - one) * pi
 
 
+@wp.kernel
+def pusht_heading_reset_kernel(
+    reset_mask: wp.array(dtype=wp.uint8),
+    use_mask: wp.int32,
+    seed: wp.int32,
+    theta: wp.array2d(dtype=Any),
+    speed: wp.array2d(dtype=Any),
+    ang_vel: wp.array2d(dtype=Any),
+):
+    """Thread per (env, agent): a uniform heading and zero speed and spin, for robots whose
+    heading matters (unicycles, boxes), after :func:`pusht_reset_kernel` placed them. Its
+    own seed, so the spawn kernel's draws are the same with or without it."""
+    e, a = wp.tid()
+    if use_mask == 1 and reset_mask[e] == wp.uint8(0):
+        return
+    rng = wp.rand_init(seed, e * theta.shape[1] + a)
+    th = theta[e, a]
+    one = _as(1.0, th)
+    theta[e, a] = (_as(wp.randf(rng), th) * _as(2.0, th) - one) * _as(3.14159265358979, th)
+    speed[e, a] = _as(0.0, th)
+    ang_vel[e, a] = _as(0.0, th)
+
+
+def _heading_reset_signature(dtype) -> list:
+    a2s = wp.array2d(dtype=dtype)
+    return [wp.array(dtype=wp.uint8), wp.int32, wp.int32, a2s, a2s, a2s]
+
+
 def _reset_signature(dtype) -> list:
     a1v = wp.array(dtype=VEC2[dtype])
     a1s = wp.array(dtype=dtype)
@@ -343,3 +379,4 @@ for _T in (wp.float32, wp.float64):
     register(pusht_obs_kernel, _T, _obs_signature(_T))
     register(pusht_reward_kernel, _T, _reward_signature(_T))
     register(pusht_reset_kernel, _T, _reset_signature(_T))
+    register(pusht_heading_reset_kernel, _T, _heading_reset_signature(_T))

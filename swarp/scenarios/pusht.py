@@ -46,10 +46,11 @@ from swarp.core.cached_launch import CachedLaunch, ptr_key
 from swarp.core.config import ObstacleKind, Obstacles, ObstacleShape, WorldConfig
 from swarp.core.state import VEC2
 from swarp.core.world import World
-from swarp.dynamics.base import AgentConfig, ControlMode, DynamicsModel
+from swarp.dynamics.base import AgentConfig, AgentShape, ControlMode, DynamicsModel, _coerce
 from swarp.interop.autograd import torch_stream_scope
 from swarp.scenarios.fused import Buf, FusedPass, FusedScenario
 from swarp.scenarios.pusht_kernels import (
+    pusht_heading_reset_kernel,
     pusht_obs_kernel,
     pusht_reset_kernel,
     pusht_reward_kernel,
@@ -58,6 +59,12 @@ from swarp.scenarios.shapes import SHAPES, CompoundShape, tee
 
 
 class PushTScenario(FusedScenario):
+    #: The robot models the constructor's ``model`` accepts (see ``supports_model``).
+    supported_models: tuple[DynamicsModel, ...] = (
+        DynamicsModel.HOLONOMIC,
+        DynamicsModel.DIFF_DRIVE,
+    )
+
     def __init__(
         self,
         n_agents: int = 4,
@@ -84,9 +91,42 @@ class PushTScenario(FusedScenario):
         goal_tolerance: float = 0.1,
         angle_tolerance: float = 0.25,
         shape: str | CompoundShape | None = None,
+        model: DynamicsModel | str = DynamicsModel.HOLONOMIC,
+        agent_shape: AgentShape | str = AgentShape.DISC,
+        agent_half_extents: tuple[float, float] | None = None,
+        max_ang_vel: float = 2.0 * math.pi,
     ) -> None:
+        """``model="diff_drive"`` makes the robots unicycles commanded by ``(v, omega)``,
+        with turn rates up to ``max_ang_vel``; ``agent_shape="box"`` makes them rectangles
+        of ``agent_half_extents`` (default ``(agent_radius, agent_radius / 2)``, along and
+        across the heading). Either one makes the heading matter, so it is drawn at random
+        on reset and observed as its cos and sin (:attr:`heading_obs`). A box's radius is
+        its circumscribed one and replaces ``agent_radius`` wherever the scenario reads it
+        as a bound (spawn clearance, the lidar's ``contact_dist``); the contact margin
+        keeps the nominal ``agent_radius``."""
         self.n_agents = n_agents
-        self.agent_radius = agent_radius
+        self.model = _coerce(DynamicsModel, model, "model")
+        if self.model not in self.supported_models:
+            raise ValueError(f"Push-T supports holonomic and diff_drive robots, not {model!r}")
+        shape_tag = _coerce(AgentShape, agent_shape, "agent_shape")
+        if shape_tag == AgentShape.BOX:
+            if agent_half_extents is None:
+                agent_half_extents = (agent_radius, 0.5 * agent_radius)
+            footprint = AgentConfig(shape=shape_tag, half_extents=agent_half_extents)
+        else:
+            footprint = AgentConfig(radius=agent_radius)
+        self.agent_shape = footprint.shape
+        self.agent_half_extents = footprint.half_extents
+        self.max_ang_vel = max_ang_vel
+        # The contact margin stays a fraction of the nominal size, not of a box's
+        # circumscribed radius, which would widen the box contact's reach.
+        self._margin_radius = agent_radius
+        self.agent_radius = footprint.radius
+        #: Whether a robot's heading matters (a unicycle steers by it, a box collides by
+        #: it): then it is randomised on reset and observed.
+        self.heading_obs = (
+            self.model != DynamicsModel.HOLONOMIC or self.agent_shape == AgentShape.BOX
+        )
         self.world_size = world_size
         self.max_speed = max_speed
         # contact_k/contact_c ARE the engine's WorldConfig.collision_k/collision_c —
@@ -161,7 +201,8 @@ class PushTScenario(FusedScenario):
         self.goal_spawn_angle: float | None = None
 
     def _agent_configs(self) -> list[AgentConfig]:
-        """One :class:`AgentConfig` per agent: velocity-controlled holonomic pushers.
+        """One :class:`AgentConfig` per agent: velocity-controlled pushers of ``model``
+        (holonomic, or a unicycle commanded by ``(v, omega)``) and ``agent_shape``.
 
         Split out, as in :meth:`NavigationScenario._agent_configs
         <swarp.scenarios.navigation.NavigationScenario._agent_configs>`, so a subclass can
@@ -170,18 +211,21 @@ class PushTScenario(FusedScenario):
         """
         return [
             AgentConfig(
-                model=DynamicsModel.HOLONOMIC,
+                model=self.model,
                 ctrl_mode=ControlMode.VELOCITY,
-                radius=self.agent_radius,
+                radius=None if self.agent_shape == AgentShape.BOX else self.agent_radius,
                 max_speed=self.max_speed,
                 max_accel=2.0 * self.max_speed,
+                max_ang_vel=self.max_ang_vel,
+                shape=self.agent_shape,
+                half_extents=self.agent_half_extents,
             )
             for _ in range(self.n_agents)
         ]
 
     def make_world(self, n_envs, device, dt, substeps, dtype, world_config=None) -> World:
         cfgs = self._agent_configs()
-        margin = 0.5 * self.agent_radius
+        margin = 0.5 * self._margin_radius
         # A velocity-mode agent has no contact memory: each substep its velocity is
         # overwritten by the command plus f*sub_dt/m, so holding it out of the body needs
         # f >= m*max_speed/sub_dt, i.e. an equilibrium depth of
@@ -284,6 +328,7 @@ class PushTScenario(FusedScenario):
         # swarp/core/cached_launch.py. ``_launch_body_sync`` is excluded: it only ever
         # runs on the STEP pass, i.e. inside capture, where it is paid exactly once.
         self._reset_launch = CachedLaunch()
+        self._heading_launch = CachedLaunch()
         self._obs_launch = CachedLaunch()
         self._reward_launch = CachedLaunch()
         return self.world
@@ -302,8 +347,9 @@ class PushTScenario(FusedScenario):
 
     @property
     def obs_dim(self) -> int:
-        # 12 own/task features + the other agents' relative positions (coordination).
-        return 12 + 2 * (self.n_agents - 1)
+        # 12 own/task features + the other agents' relative positions (coordination),
+        # then the robot's own cos/sin heading when it matters.
+        return 12 + 2 * (self.n_agents - 1) + (2 if self.heading_obs else 0)
 
     # ------------------------------------------------------------------ reset
 
@@ -418,6 +464,30 @@ class PushTScenario(FusedScenario):
             launch.set_param_by_name("use_mask", use_mask)
             launch.set_param_by_name("seed", seed)
             launch.launch()
+            if self.heading_obs:
+                self._launch_heading_reset(st, mask, use_mask)
+
+    def _launch_heading_reset(self, st, mask, use_mask) -> None:
+        """Random headings, zero speed and spin for the respawned robots (only launched
+        when the heading matters, so the default fleet's reset is unchanged)."""
+        w = self.world
+        seed = wp.int32(w.next_kernel_seed())
+        launch = self._heading_launch.get(
+            concrete(pusht_heading_reset_kernel, w.wp_dtype),
+            dim=(w.n_envs, self.n_agents),
+            inputs=[mask, use_mask, seed, st.theta, st.speed, st.ang_vel],
+            device=w.device,
+            key=(
+                w.n_envs,
+                ptr_key(mask),
+                ptr_key(st.theta),
+                ptr_key(st.speed),
+                ptr_key(st.ang_vel),
+            ),
+        )
+        launch.set_param_by_name("use_mask", use_mask)
+        launch.set_param_by_name("seed", seed)
+        launch.launch()
 
     def _box_poses(self) -> tuple[torch.Tensor, torch.Tensor]:
         """The box centres ``[n_envs, n_boxes, 2]`` and angles ``[n_envs, n_boxes]``
@@ -501,6 +571,11 @@ class PushTScenario(FusedScenario):
         to be bit-comparable. :attr:`parity_rtol` / :attr:`parity_atol` say so numerically.
         """
         if self._grad_step():
+            if self.agent_shape == AgentShape.BOX:
+                raise NotImplementedError(
+                    "a taped Push-T step integrates the T in torch against disc robots; "
+                    "box robots push it only on the no-grad path"
+                )
             self._refresh(integrate=True)
         else:
             self._sync_from_engine()
@@ -613,7 +688,16 @@ class PushTScenario(FusedScenario):
         launch = self._obs_launch.get(
             concrete(pusht_obs_kernel, self.world.wp_dtype),
             dim=(w.n_envs, self.n_agents),
-            inputs=[st.pos, st.vel, tee_pos, tee_theta, goal_pos, goal_theta],
+            inputs=[
+                st.pos,
+                st.vel,
+                st.theta,
+                tee_pos,
+                tee_theta,
+                goal_pos,
+                goal_theta,
+                wp.int32(self.heading_obs),
+            ],
             outputs=[obs],
             device=w.device,
             key=(
@@ -621,6 +705,7 @@ class PushTScenario(FusedScenario):
                 self.n_agents,
                 ptr_key(st.pos),
                 ptr_key(st.vel),
+                ptr_key(st.theta),
                 ptr_key(tee_pos),
                 ptr_key(tee_theta),
                 ptr_key(goal_pos),
@@ -866,9 +951,10 @@ class PushTScenario(FusedScenario):
         angles = torch.stack([th.cos(), th.sin(), raw.cos(), raw.sin()], dim=-1)
         # Teammates' positions relative to each agent, ascending index, self skipped.
         rel = (s.pos[:, self._others] - s.pos.unsqueeze(2)).flatten(2)  # [E, A, 2(A-1)]
-        return torch.cat(
-            [s.pos, s.vel, self._cache["tee_rel"], tee_to_goal, angles, rel], dim=-1
-        )
+        parts = [s.pos, s.vel, self._cache["tee_rel"], tee_to_goal, angles, rel]
+        if self.heading_obs:
+            parts.append(torch.stack([s.theta.cos(), s.theta.sin()], dim=-1))
+        return torch.cat(parts, dim=-1)
 
     def global_reward(self) -> torch.Tensor:
         c = self._cache

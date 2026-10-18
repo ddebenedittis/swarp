@@ -80,9 +80,12 @@ def build_scenario(name: str, n_agents: int, model_name: str | None):
 
 
 def _model_axis(name: str) -> list[str | None]:
-    """Robot models to sweep for a scenario (holonomic-only -> [None])."""
-    if supports_model(SCENARIOS[name]):
-        return list(MODELS)
+    """Robot models to sweep for a scenario (holonomic-only -> [None]); a scenario that
+    takes only some models lists them in its ``supported_models`` class attribute."""
+    cls = SCENARIOS[name]
+    if supports_model(cls):
+        allowed = getattr(cls, "supported_models", None)
+        return [m for m in MODELS if allowed is None or MODELS[m] in allowed]
     return [None]
 
 

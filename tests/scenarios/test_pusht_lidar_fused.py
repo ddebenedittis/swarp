@@ -98,10 +98,31 @@ def _mismatch(a, b):
 @pytest.mark.parametrize("obs_level", [0, 1, 2])
 @pytest.mark.parametrize("n_agents", [3, 5])
 def test_fused_matches_torch(device, n_agents, obs_level):
-    fused = _rollout(_env(device, True, n_agents=n_agents, obs_level=obs_level), 20, device)
-    torchp = _rollout(_env(device, False, n_agents=n_agents, obs_level=obs_level), 20, device)
-    scen = _scen(n_agents=n_agents, obs_level=obs_level)
+    _assert_parity(device, n_agents=n_agents, obs_level=obs_level)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("obs_level", [1, 2])
+@pytest.mark.parametrize(
+    "fleet",
+    [
+        {"model": "diff_drive"},
+        {"agent_shape": "box"},
+        {"model": "diff_drive", "agent_shape": "box"},
+    ],
+    ids=["unicycle", "box", "unicycle-box"],
+)
+def test_fleet_fused_matches_torch(device, fleet, obs_level):
+    """Unicycles and boxes: heading in the obs and critic, body-frame rays, box hits."""
+    _assert_parity(device, obs_level=obs_level, **fleet)
+
+
+def _assert_parity(device, **kw):
+    fused = _rollout(_env(device, True, **kw), 20, device)
+    torchp = _rollout(_env(device, False, **kw), 20, device)
+    scen = _scen(**kw)
     assert fused[0]["obs"].shape[-1] == scen.obs_dim
+    assert fused[0]["critic"].shape[-1] == scen.state_dim
     # The features have to fire, or parity on them proves nothing.
     assert any(s["tee_seen"].any() for s in fused), "no robot ever saw the T"
     assert any((s["occlusion"] > 0).any() for s in fused), "no occlusion ever measured"

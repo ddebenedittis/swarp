@@ -48,9 +48,10 @@ OBJECTIVES = ("team", "approach", "standoff", "visibility", "coverage", "occlusi
 
 #: Width of the per-env head of the critic state (T pose, goal, T velocity).
 STATE_HEAD = 15
-#: Per-agent width of the critic state: pos, vel, role sign.
+#: Per-agent width of the critic state: pos, vel, role sign (plus cos/sin heading, when
+#: the heading matters).
 STATE_AGENT = 5
-#: Width of the self block of the observation.
+#: Width of the self block of the observation (plus cos/sin heading, when it matters).
 SELF_DIM = 9
 #: Width of the oracle T block (obs level 0), the same eight numbers Push-T observes.
 TEE_DIM = 8
@@ -120,6 +121,7 @@ def pusht_lidar_obs_kernel(
     tee_radius: Any,
     aux_scale: Any,
     contact_dist: Any,
+    heading: wp.int32,
     advance_prev: wp.int32,
     obs: wp.array3d(dtype=Any),
     ring: wp.array3d(dtype=Any),
@@ -159,6 +161,10 @@ def pusht_lidar_obs_kernel(
     obs[e, a, 7] = wp.cos(gth)
     obs[e, a, 8] = wp.sin(gth)
     k = wp.int32(9)
+    if heading == 1:
+        obs[e, a, 9] = wp.cos(theta[e, a])
+        obs[e, a, 10] = wp.sin(theta[e, a])
+        k = wp.int32(11)
     # ---- teammates: relative position + role sign, ascending index, self skipped
     for j in range(n_agents):
         if j != a:
@@ -310,12 +316,16 @@ def pusht_lidar_obs_kernel(
             rank += wp.int32(1)
     if role == 1:
         rank += n_pushers
-    off = wp.int32(STATE_HEAD) + wp.int32(STATE_AGENT) * rank
+    agent_w = wp.int32(STATE_AGENT) + wp.int32(2) * heading
+    off = wp.int32(STATE_HEAD) + agent_w * rank
     critic[e, off] = p[0]
     critic[e, off + 1] = p[1]
     critic[e, off + 2] = v[0]
     critic[e, off + 3] = v[1]
     critic[e, off + 4] = sgn
+    if heading == 1:
+        critic[e, off + 5] = wp.cos(theta[e, a])
+        critic[e, off + 6] = wp.sin(theta[e, a])
     if a == 0:
         tv = tee_vel[e]
         err = th - gth
@@ -571,6 +581,7 @@ def _obs_signature(dtype) -> list:
         dtype,  # tee_radius
         dtype,  # aux_scale
         dtype,  # contact_dist
+        wp.int32,  # heading
         wp.int32,  # advance_prev
         wp.array3d(dtype=dtype),  # obs
         wp.array3d(dtype=dtype),  # ring

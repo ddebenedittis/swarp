@@ -4,6 +4,7 @@ import pytest
 
 from swarp.benchmark.scenarios import (
     MODELS,
+    _model_axis,
     build_scenario,
     resolve_scenarios,
     run_config,
@@ -56,13 +57,22 @@ def test_resolve_scenarios_unknown_lists_valid():
         assert name in msg
 
 
-def test_only_navigation_supports_model():
-    assert supports_model(SCENARIOS["navigation"])
+def test_model_support_by_scenario():
+    # pusht_lidar forwards **kwargs to pusht, so it inherits pusht's answer.
+    for name in ("navigation", "pusht", "pusht_lidar"):
+        assert supports_model(SCENARIOS[name])
     for name in (
-        "flocking", "formation", "discovery", "sampling", "transport", "pusht", "giveway",
+        "flocking", "formation", "discovery", "sampling", "transport", "giveway",
         "shepherding", "caging", "ringroad",
-    ):  # every scenario but navigation is single-model by design
+    ):  # single-model by design
         assert not supports_model(SCENARIOS[name])
+
+
+def test_model_axis_honours_supported_models():
+    assert _model_axis("pusht") == [
+        m for m in MODELS if MODELS[m] in SCENARIOS["pusht"].supported_models
+    ]
+    assert _model_axis("navigation") == list(MODELS)
 
 
 def test_build_scenario_applies_model_only_where_supported():

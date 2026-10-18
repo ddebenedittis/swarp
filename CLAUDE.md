@@ -136,6 +136,7 @@ TorchRL `EnvBase` wrapper).
   (launched inside the whole-step graph), hold per-episode pusher/observer roles, and it is
   the one scenario that implements the training hooks (`critic_state`, `agent_roles`,
   `aux_targets`).
+  `pusht`/`pusht_lidar` take `model` (holonomic or diff_drive, their `supported_models`) and `agent_shape="box"`; either makes the heading matter: randomised by a separate reset kernel, observed as cos/sin, body-frame lidar. Default fleets stay bit-identical.
   `giveway`/`shepherding`/`caging`/`ringroad`/`pusht_lidar` each emit `info()["multiobj_reward"]`
   `[n_envs, n_agents, n_obj]` summing to the scalar reward, so a shaping imbalance is visible
   on the first training iteration rather than after an hour — that check has already caught

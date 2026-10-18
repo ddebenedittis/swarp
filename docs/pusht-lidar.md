@@ -74,14 +74,20 @@ Every `PushTScenario` keyword passes through, and `shape=` takes any compound fr
 
 ### Robots and roles
 
-The robots are identical holonomic discs, and any of them can push the T.
+The robots are identical, and any of them can push the T.
+By default they are holonomic discs commanded by a velocity `(vx, vy)`.
+`model="diff_drive"` makes them unicycles commanded by `(v, omega)`, with turn rates up to `max_ang_vel` (default 2π rad/s), and `agent_shape="box"` makes them rectangles of `agent_half_extents` (default `(agent_radius, agent_radius / 2)`, along and across the heading); the two combine, and both pass through to Push-T, which supports them too.
+Box robots collide with the T, each other and the walls as oriented rectangles, and the lidar sees them as such.
+Either option makes the heading matter: it is drawn uniformly on every reset (by a separate kernel with its own seed, so the default fleet's spawn is unchanged), observed as its cos and sin, and added to each robot's critic-state block.
+The taped (gradient) step integrates the T in torch against disc robots, so it refuses box robots; they push it on the no-grad path.
 `n_pushers` of them (default 2) are pushers, role 0, and the rest are observers, role 1.
 Each reset draws a fresh assignment per env with a masked Fisher-Yates kernel on its own seed, launched after Push-T's spawn kernel, so the counts are exact in every env and an env the reset does not select keeps its roles.
 `agent_roles()` is that `[n_envs, n_agents]` int32 tensor, at a fixed address.
 
 ### Lidar
 
-Every robot carries a 32-ray lidar over the full circle, in the world frame because a holonomic robot's heading never changes.
+Every robot carries a 32-ray lidar over the full circle.
+For a holonomic disc it is in the world frame, because such a robot's heading never changes; when the heading matters it is mounted on the body (ray 0 along the heading), so a unicycle sees the T it pushes on the same rays whatever its pose. `lidar_body_frame` overrides either default.
 Its range defaults to `0.8 * world_size`: a robot sees the T from about three T radii away but not from across the arena, and the T's narrowest silhouette (about 0.4 m) still spans two to three ray spacings at the edge of the range.
 Each ray reports its range and what it hit, so the observation carries an object mask and a robot mask next to the ranges.
 The fused path launches the capture-safe Warp lidar inside the whole-step CUDA graph; the torch path scans with the `lidar_scan` oracle against boxes it rebuilds from the body pose, which keeps it differentiable in the T pose.
@@ -93,13 +99,13 @@ The widths below are for the defaults (`n_agents = 5`, `n_rays = 32`, `frame_sta
 
 | block | levels | width | content |
 |---|---|---|---|
-| self | all | 9 | own position and velocity, role sign (+1 observer, −1 pusher), goal position relative to the robot, cos and sin of the goal heading |
+| self | all | 9 (11) | own position and velocity, role sign (+1 observer, −1 pusher), goal position relative to the robot, cos and sin of the goal heading; then cos and sin of the robot's heading when it matters (unicycles, boxes) |
 | teammates | all | 12 | per teammate in ascending index, self skipped: relative position and role sign |
 | T | 0 | 8 | Push-T's eight numbers: T relative to the robot, goal relative to the T, cos and sin of the T heading and of its heading error |
 | lidar | all | 96 per frame | range / max range, object mask and robot mask per ray; `frame_stack` keeps a ring of the last scans, oldest first, zeroed at reset |
 | pooled hits | 2 | 90 | per robot (self included, ascending index), `n_comm_pts` of its object-hit points relative to the observer, each with a valid flag |
 
-That makes 125 at level 0, 117 at level 1 and 207 at level 2.
+That makes 125 at level 0, 117 at level 1 and 207 at level 2, two more each when the heading is observed.
 Level 0 is the oracle stage; level 1 is a robot's own sensing; level 2 adds the engineered communication of the design list above.
 A pooled point is `j`'s object hit number `floor((k + 0.5) n_hit / K)` in ray order, placed in the world frame, which every robot can do because it knows its own pose; it is invalid when `j` sees no part of the T or is farther than `comm_range` (default unlimited).
 
@@ -138,7 +144,7 @@ Occlusion is rare under a random policy (11% of observer steps, covering a third
 
 The observation kernel writes the three trainer buffers on every pass, the obs-only pass after an auto-reset included, so they always describe the state the observation does.
 
-- `critic_state()`, `[n_envs, 15 + 5 n_agents]`: the T's position, the goal relative to it, cos and sin of its heading and heading error, its velocity and angular velocity, the goal pose, then per robot in role-sorted order its position, velocity and role sign.
+- `critic_state()`, `[n_envs, 15 + 5 n_agents]` (`15 + 7 n_agents` when the heading is observed): the T's position, the goal relative to it, cos and sin of its heading and heading error, its velocity and angular velocity, the goal pose, then per robot in role-sorted order its position, velocity, role sign and, when it matters, cos and sin of its heading.
 - `agent_roles()` with `role_counts = (n_pushers, n_agents − n_pushers)` and `n_roles = 2`.
 - `aux_targets()`, `[n_envs, n_agents, 4]`: the T's position relative to each robot divided by the lidar range, and cos and sin of its heading.
 
