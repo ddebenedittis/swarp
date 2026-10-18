@@ -34,6 +34,9 @@ from swarp.core.config import ObstacleShape
 from swarp.core.state import VEC2
 from swarp.dynamics.base import P_MASS, P_RADIUS, AgentParams
 
+# Lean launches (no grid-stride loop); see docs/performance.md.
+wp.set_module_options({"default_grid_stride": False})
+
 _EPS2 = 1.0e-10  # distance^2 floor: keeps sqrt adjoint finite for coincident points
 
 # Kernel-side obstacle shape tags, derived from the enum so there is one source of truth.
@@ -219,7 +222,7 @@ def box_force(
 
 
 @wp.func
-def _static_forces(
+def _obstacle_forces(
     e: wp.int32,
     p: Any,
     v: Any,
@@ -237,14 +240,8 @@ def _static_forces(
     margin: Any,
     damp_denom: Any,
     max_overlap: Any,
-    soft_walls: wp.int32,
-    bounds_min: Any,
-    bounds_max: Any,
 ):
-    """Env-static contact forces on an agent at ``p`` (radius ``ra``): obstacles
-    and soft walls. Independent of the per-agent param layout, so both the
-    shared and per-env kernels reuse it; only the pairwise-neighbor radius read
-    differs between them.
+    """Contact forces on an agent at ``p`` (radius ``ra``) from every obstacle.
 
     ``obs_vel``/``obs_ang_vel`` are the obstacles' own velocities (zero for a genuinely
     static obstacle), so the damper sees the closing velocity in every case."""
@@ -275,27 +272,78 @@ def _static_forces(
             f += pair_force(
                 p - center, v - vo, ra + obs_radius[o] + margin, k, c, damp_denom, max_overlap
             )
+    return f
 
+
+@wp.func
+def _wall_forces(
+    p: Any,
+    v: Any,
+    ra: Any,
+    k: Any,
+    c: Any,
+    margin: Any,
+    damp_denom: Any,
+    max_overlap: Any,
+    bounds_min: Any,
+    bounds_max: Any,
+):
+    """Contact force on an agent at ``p`` (radius ``ra``) from the four soft walls."""
+    zero = type(k)(0.0)
+    reach = ra + margin
+    fx = zero
+    fy = zero
+    # Walls are static, and each contributes along its own inward normal, so the
+    # closing velocity is +-v[i]; same implicit, clamped-repulsive coefficient.
+    pen = reach - (p[0] - bounds_min[0])  # left wall, inward normal (+1, 0)
+    if pen > zero:
+        fx += _normal_coeff(pen, v[0], k, c, damp_denom, max_overlap)
+    pen = reach - (bounds_max[0] - p[0])  # right wall, inward normal (-1, 0)
+    if pen > zero:
+        fx += -_normal_coeff(pen, -v[0], k, c, damp_denom, max_overlap)
+    pen = reach - (p[1] - bounds_min[1])  # bottom wall
+    if pen > zero:
+        fy += _normal_coeff(pen, v[1], k, c, damp_denom, max_overlap)
+    pen = reach - (bounds_max[1] - p[1])  # top wall
+    if pen > zero:
+        fy += -_normal_coeff(pen, -v[1], k, c, damp_denom, max_overlap)
+    return type(p)(fx, fy)
+
+
+@wp.func
+def _static_forces(
+    e: wp.int32,
+    p: Any,
+    v: Any,
+    ra: Any,
+    obs_pos: wp.array2d(dtype=Any),
+    obs_radius: wp.array(dtype=Any),
+    obs_type: wp.array(dtype=wp.int32),
+    obs_angle: wp.array2d(dtype=Any),
+    obs_half: wp.array(dtype=Any),
+    obs_vel: wp.array2d(dtype=Any),
+    obs_ang_vel: wp.array2d(dtype=Any),
+    n_obstacles: wp.int32,
+    k: Any,
+    c: Any,
+    margin: Any,
+    damp_denom: Any,
+    max_overlap: Any,
+    soft_walls: wp.int32,
+    bounds_min: Any,
+    bounds_max: Any,
+):
+    """Env-static contact forces on an agent at ``p`` (radius ``ra``): obstacles
+    and soft walls. Independent of the per-agent param layout, so both the
+    shared and per-env kernels reuse it; only the pairwise-neighbor radius read
+    differs between them. The two halves are separate functions so the fused substep
+    chain (swarp/core/fused_substeps.py) can compile out the one a world does not use."""
+    f = _obstacle_forces(
+        e, p, v, ra, obs_pos, obs_radius, obs_type, obs_angle, obs_half, obs_vel,
+        obs_ang_vel, n_obstacles, k, c, margin, damp_denom, max_overlap,
+    )
     if soft_walls == 1:
-        reach = ra + margin
-        fx = zero
-        fy = zero
-        # Walls are static, and each contributes along its own inward normal, so the
-        # closing velocity is +-v[i]; same implicit, clamped-repulsive coefficient.
-        pen = reach - (p[0] - bounds_min[0])  # left wall, inward normal (+1, 0)
-        if pen > zero:
-            fx += _normal_coeff(pen, v[0], k, c, damp_denom, max_overlap)
-        pen = reach - (bounds_max[0] - p[0])  # right wall, inward normal (-1, 0)
-        if pen > zero:
-            fx += -_normal_coeff(pen, -v[0], k, c, damp_denom, max_overlap)
-        pen = reach - (p[1] - bounds_min[1])  # bottom wall
-        if pen > zero:
-            fy += _normal_coeff(pen, v[1], k, c, damp_denom, max_overlap)
-        pen = reach - (bounds_max[1] - p[1])  # top wall
-        if pen > zero:
-            fy += -_normal_coeff(pen, -v[1], k, c, damp_denom, max_overlap)
-        f += type(p)(fx, fy)
-
+        f += _wall_forces(p, v, ra, k, c, margin, damp_denom, max_overlap, bounds_min, bounds_max)
     return f
 
 

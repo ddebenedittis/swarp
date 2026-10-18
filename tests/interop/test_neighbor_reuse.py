@@ -21,6 +21,9 @@ def _make_env(device, reuse, n_agents=4, n_envs=16, substeps=1, n_obstacles=0, a
         fused=False,  # exercise the torch path so reuse is the only variable
     )
     env.world.stepper.neighbor_reuse = reuse
+    # Reuse is a property of the layered substep chain; the fused chain reads no list
+    # (tests/interop/test_fused_substeps.py covers its build accounting).
+    env.world.stepper.enable_fused_substeps = False
     return env
 
 

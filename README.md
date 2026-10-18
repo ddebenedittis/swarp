@@ -40,8 +40,8 @@ The whole step — dynamics, soft collisions, walls — also runs under Warp's a
 - **Soft contacts and rigid bodies** — spring-damper interactions against agents, circle/box/segment obstacles and walls, plus movable compound rigid bodies pushed by the reaction of those same contacts. [→](https://ddebenedittis.github.io/swarp/docs/world.html)
 - **Neighbor search without a sync** — padded within-radius lists, an explicit overflow flag, a COO radius graph for GNN policies, and three interchangeable backends tested to agree exactly. [→](https://ddebenedittis.github.io/swarp/docs/world.html#neighbor-search)
 - **Eleven scenarios** — navigation, flocking, formation, discovery, sampling, transport, Push-T, give-way, shepherding, caging and a mixed-autonomy ring road, each with fused Warp obs/reward kernels alongside the torch reference they are parity-tested against. [→](https://ddebenedittis.github.io/swarp/docs/scenarios.html)
-- **Fast by default** — **24.1 M env-steps/s** at 16,000 envs × 16 agents on one RTX 3070 Laptop GPU from the fused Warp obs/reward kernels alone, with whole-step CUDA-graph capture (on by default) taking 16,384 × 16 to 35.6 M. [→](https://ddebenedittis.github.io/swarp/docs/performance.html)
-- **Fast training built in** — `python -m swarp.rl` trains MAPPO with the rollout and the update CUDA-graph captured, 2.4× faster end to end than the same recipes on TorchRL as usually written and 1.1–1.4× faster than TorchRL with its own CUDA-graph and compile options, with torch as the only dependency. [→](https://ddebenedittis.github.io/swarp/docs/training.html)
+- **Fast by default** — **33.9 M env-steps/s** at 16,000 envs × 16 agents on one RTX 3070 Laptop GPU from the fused Warp obs/reward kernels alone, with whole-step CUDA-graph capture (on by default) taking the same shape to 38.8 M. [→](https://ddebenedittis.github.io/swarp/docs/performance.html)
+- **Fast training built in** — `python -m swarp.rl` trains MAPPO with the rollout and the update CUDA-graph captured, 2.3–2.4× faster end to end than the same recipes on TorchRL as usually written and 1.3–1.5× faster than TorchRL with its own CUDA-graph and compile options, with torch as the only dependency. [→](https://ddebenedittis.github.io/swarp/docs/training.html)
 - **Interactive viewer** — an optional pygame renderer with headless frames, mp4/webm export, notebook embedding, a batch mosaic and live overlay toggles. [→](https://ddebenedittis.github.io/swarp/docs/visualization.html)
 
 ## Install
@@ -99,8 +99,8 @@ The [quickstart](https://ddebenedittis.github.io/swarp/docs/quickstart.html) wal
 
 ## Benchmarks
 
-The full NavigationScenario hot path — dynamics, neighbor lists, soft collisions, obs and reward — sustains **24.1 M env-steps/s** at 16,000 envs × 16 agents on a single RTX 3070 Laptop GPU (385 M agent-steps/s), peaking at 491 M agent-steps/s at 16,000 × 64.
-Those are fused kernels with capture *off* (`use_graph=False`, which `throughput.py` pins so the table stays comparable across commits); capture on top is worth another ~1.3–2× — 35.6 M env-steps/s at 16,384 × 16.
+The full NavigationScenario hot path — dynamics, neighbor lists, soft collisions, obs and reward — sustains **33.9 M env-steps/s** at 16,000 envs × 16 agents on a single RTX 3070 Laptop GPU (543 M agent-steps/s).
+Those are fused kernels with capture *off* (`use_graph=False`, which `throughput.py --no-graph` pins so the table stays comparable across commits); capture on top is worth another 1.1–10× — 38.8 M env-steps/s at 16,000 × 16 and 146 M at 16,000 × 4.
 
 ```bash
 python -m swarp.benchmark.throughput      # the full (n_envs, n_agents) grid

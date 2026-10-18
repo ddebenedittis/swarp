@@ -44,6 +44,9 @@ from swarp.dynamics.base import (
     Integrator,
 )
 
+# Lean launches (no grid-stride loop); see docs/performance.md.
+wp.set_module_options({"default_grid_stride": False})
+
 TAG_HOLONOMIC = wp.constant(int(DynamicsModel.HOLONOMIC))
 TAG_DIFF_DRIVE = wp.constant(int(DynamicsModel.DIFF_DRIVE))
 TAG_BICYCLE = wp.constant(int(DynamicsModel.KINEMATIC_BICYCLE))

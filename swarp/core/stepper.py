@@ -28,6 +28,8 @@ import warp as wp
 from swarp.core.bodies import launch_obstacle_dynamics
 from swarp.core.collisions import launch_collision_forces
 from swarp.core.config import Obstacles, WorldConfig
+from swarp.core.fused_substeps import MAX_AGENTS as FUSED_MAX_AGENTS
+from swarp.core.fused_substeps import launch_fused_substeps
 from swarp.core.neighbors import NeighborGrid
 from swarp.core.state import VEC2, WorldState
 from swarp.dynamics.base import (
@@ -40,6 +42,11 @@ from swarp.dynamics.base import (
     build_agent_params,
 )
 from swarp.dynamics.kernels import launch_integrate
+
+#: ``"auto"`` fuses the substep chain only up to this many agents per env per substep...
+FUSE_AGENTS_PER_SUBSTEP = 4
+#: ...and, with a single substep, up to this many agents over the whole batch.
+FUSE_MAX_AGENTS_ONE_SUBSTEP = 16384
 
 
 @dataclass
@@ -193,6 +200,14 @@ class Stepper:
         # kernel would drop). ``enable_slim2d`` lets the ablation disable it.
         self.has_drone: bool = any(c.model == DynamicsModel.DRONE for c in configs)
         self.enable_slim2d: bool = True
+        # The single-launch substep chain (swarp/core/fused_substeps.py): ``"auto"`` takes
+        # it where it measured faster (see _can_fuse_substeps), ``True`` wherever it is
+        # eligible (the parity tests), ``False`` never (the ablation).
+        self.enable_fused_substeps: bool | str = "auto"
+        # Whether the fused chain also emits the post-step neighbor list. Off until
+        # something asks for a list on a post-step state (``World.build_neighbors``),
+        # so a scenario that never reads one does not pay for building it.
+        self.emit_post_list: bool = False
         # field name -> (identity key, Warp view, the tensor it views). Zero-copy wraps of
         # the obstacle install's *source* tensors, kept across installs; see _src_handle.
         self._src_handles: dict[str, tuple[tuple, wp.array, torch.Tensor]] = {}
@@ -600,6 +615,43 @@ class Stepper:
 
     # ---------------------------------------------------------------- stepping
 
+    def _can_fuse_substeps(self, state_in: WorldState, buffers: StepBuffers) -> bool:
+        """Whether this step runs as the single-launch chain of
+        :mod:`swarp.core.fused_substeps` (see its module docstring for the eligibility
+        conditions).
+
+        Under ``"auto"`` an eligible step also has to be one the chain is faster on. It
+        trades launches for occupancy: one launch instead of ~3 per substep, but a kernel
+        that holds the whole chain needs ~100 registers where the layered kernels need
+        35-80, and its O(n_agents^2) scans are latency-bound. A graph-mode sweep of
+        navigation on an RTX 3070 Laptop (1k-16k envs, 4-64 agents, 1-8 substeps) put the
+        crossover near ``n_agents = 4 * substeps``: below it the chain was 6-57% faster,
+        above it up to 29% slower (a single substep with 16+ agents per env). A single
+        substep saves only two launches, so there the batch decides too: 4 agents were 15%
+        faster at 1k envs and 5% slower at 16k, so it fuses up to
+        :data:`FUSE_MAX_AGENTS_ONE_SUBSTEP` agents in total."""
+        mode = self.enable_fused_substeps
+        if mode == "auto" and (
+            self.n_agents > FUSE_AGENTS_PER_SUBSTEP * self.substeps
+            or (
+                self.substeps == 1
+                and state_in.pos.shape[0] * self.n_agents > FUSE_MAX_AGENTS_ONE_SUBSTEP
+            )
+        ):
+            return False
+        return (
+            bool(mode)
+            and self.enable_slim2d
+            and not self.has_drone
+            and not buffers.taped
+            and self.world.integrator == Integrator.EULER
+            and not self.any_movable
+            and self.params.floats_per_env is None
+            and state_in.pos.device.is_cuda
+            and self.n_agents <= FUSED_MAX_AGENTS
+            and (not self.collisions or self.grid(state_in.pos.shape[0]).method == "brute")
+        )
+
     def launch_substeps(
         self,
         state_in: WorldState,
@@ -639,6 +691,28 @@ class Stepper:
         """
         n_envs = state_in.pos.shape[0]
         world = self.world
+        if self._can_fuse_substeps(state_in, buffers):
+            # One launch for the whole chain, under the same substep-0 reuse rule as below.
+            grid = self.grid(n_envs) if self.collisions else None
+            reuse = (
+                reuse_neighbors
+                and self.neighbor_reuse
+                and grid is not None
+                and grid.built_version == self.state_version
+            )
+            emit = self.emit_post_list and self.collisions
+            launch_fused_substeps(self, state_in, actions, state_out, emit_list=emit, reuse=reuse)
+            if not skip_drone and state_out is not state_in:
+                wp.copy(state_out.z, state_in.z)
+                wp.copy(state_out.vz, state_in.vz)
+                wp.copy(state_out.attitude, state_in.attitude)
+                wp.copy(state_out.body_rates, state_in.body_rates)
+            self.state_version += 1
+            if emit:
+                grid.build_count += 1
+                grid.built_version = self.state_version
+                grid.post_step_version = self.state_version
+            return
         slim = (
             self.enable_slim2d
             and not self.has_drone

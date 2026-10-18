@@ -86,7 +86,8 @@ World                swarp/core/world.py        batched state tensors, goals, ob
 Stepper              swarp/core/stepper.py      THE substep pipeline: neighbors → forces → bodies → integrate
     ↓ launches
 kernels              swarp/dynamics/kernels.py, swarp/core/collisions.py, swarp/core/neighbors.py,
-                     swarp/core/bodies.py, swarp/sensors/lidar_kernels.py, swarp/scenarios/*_kernels.py
+                     swarp/core/bodies.py, swarp/core/fused_substeps.py,
+                     swarp/sensors/lidar_kernels.py, swarp/scenarios/*_kernels.py
 ```
 
 Off to the side of that spine (all optional, none on the hot path unless asked for):
@@ -104,6 +105,10 @@ TorchRL `EnvBase` wrapper).
   sharing a body id form one compound rigid pose (Push-T's T). **Not taped**
   (`record_tape=False`), so a scenario needing gradients through a body integrates it in
   torch itself. Box-box obstacle-obstacle contacts are not modelled.
+- `swarp/core/fused_substeps.py` — the whole no-grad substep chain (forces, integration, every substep, optionally the post-step neighbor list) as one kernel: a CUDA block per group of whole envs, a `__syncthreads` barrier (`wp.func_native`) between the force and the in-place integrate phase.
+  It is bit-identical to the layered pipeline by construction (same neighbor membership and order, same `pair_force`/`_step_2d`), which `tests/interop/test_fused_substeps.py` checks for every scenario.
+  `Stepper.enable_fused_substeps="auto"` routes to it only where it measured faster (≤ 4 agents per env per substep; with one substep, ≤ 16,384 agents in all): it trades ~3 launches per substep for ~100 registers per thread, and loses on large single-substep batches.
+  Kernel variants are compiled per world (`wp.static` flags) and their `(emit, reuse)` siblings are loaded together, because a variant first launched inside a capture cannot be loaded there.
 - `swarp/dynamics/base.py` — `DynamicsModel`/`ControlMode`/`Integrator` enums, `AgentConfig`
   (per-agent, mixable in one world), and `build_agent_params`. Four models: holonomic point,
   diff-drive, kinematic bicycle (all 2D), and a 6-DOF `+`-config quadrotor whose `AgentConfig`

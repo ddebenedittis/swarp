@@ -49,12 +49,12 @@ Soft agent-agent contacts, circle/box/segment obstacles, and movable compound ri
 Navigation, flocking, formation, discovery, sampling, transport, Push-T, give-way, shepherding and caging — each with fused Warp obs/reward kernels.
 :::
 
-:::{grid-item-card} 24 M env-steps/s
+:::{grid-item-card} 34 M env-steps/s
 :link: benchmarks
 :link-type: doc
 
 Full navigation hot path at 16,000 envs × 16 agents on one RTX 3070 Laptop GPU — fused
-kernels, capture off. Whole-step CUDA-graph capture reaches 35.6 M at 16,384 × 16.
+kernels, capture off. Whole-step CUDA-graph capture reaches 38.8 M at the same shape.
 :::
 
 ::::

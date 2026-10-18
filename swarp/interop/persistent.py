@@ -313,6 +313,10 @@ class StepRuntime:
                 reuse_neighbors=True,
                 skip_drone=True,
             )
+            if stepper.collisions:
+                # A list the fused chain emitted here is of the discarded scratch output;
+                # the hook and ``after_warmup`` must rebuild rather than trust it.
+                stepper.grid(self.n_envs).post_step_version = -1
             if self._hook is not None:
                 self._hook.run()
             for c, s in zip(carries, saved, strict=True):

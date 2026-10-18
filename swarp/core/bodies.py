@@ -48,6 +48,9 @@ from swarp.core.config import ObstacleKind
 from swarp.core.state import VEC2
 from swarp.dynamics.base import P_MASS, P_RADIUS
 
+# Lean launches (no grid-stride loop); see docs/performance.md.
+wp.set_module_options({"default_grid_stride": False})
+
 # Derived from the enum so the kernel tag and the public tag cannot drift.
 KIND_MOVABLE = wp.constant(int(ObstacleKind.MOVABLE))
 
