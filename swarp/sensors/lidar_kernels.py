@@ -1,20 +1,27 @@
-"""Warp-kernel lidar backend: ray-circle scan with no dense pairwise intermediate.
+"""Warp-kernel lidar backend: a per-ray running minimum over every shape in the world.
 
-The torch backend in :mod:`swarp.sensors.lidar` materializes a family of dense
-``[n_envs, n_agents, n_rays, n_targets]`` tensors (``proj``, ``perp2``, ``thc``,
-``t``, ``valid``), so its memory scales as ``O(E*A*R*T)``. This kernel computes
-the identical ranges (same analytic ray-circle test) but one thread owns a single
-``(env, agent, ray)`` and keeps a thread-local running-min over the targets — so
-only the ``[E, A, R]`` output is stored (``O(E*A*R)``, flat in the target count).
-This is the trick Isaac Sim uses to keep high ray counts affordable.
+The torch backend in :mod:`swarp.sensors.lidar` materializes dense
+``[n_envs, n_agents, n_rays, n_targets]`` tensors, so its memory scales as
+``O(E*A*R*T)``. Here one thread owns a single ``(env, agent, ray)`` and keeps a
+thread-local running minimum over the targets, so only the ``[E, A, R]`` outputs are
+stored (``O(E*A*R)``, flat in the target count). The ray is a *launch* dimension rather
+than a loop, which is what lets a high ray count saturate the GPU.
 
-The ray is a *launch* dimension rather than a loop, which is what makes the 256-ray
-case saturate a GPU: at ``E*A`` threads a 24-env, 4-agent scan launches 96 threads and
-leaves the device idle, while ``E*A*R`` gives it 24576.
+Geometry, identical to the torch oracle (:func:`swarp.sensors.lidar.lidar_scan`):
 
-The kernel is inference-only (launched ``record_tape=False``); the differentiable
-path stays the torch backend. Kept numerically equivalent to ``lidar_scan`` and
-asserted so in ``tests/unit/test_lidar.py``.
+* disc agent / circle obstacle — the closed-form ray-circle test (:func:`_ray_hit`);
+* box agent / box obstacle — a slab test in the box frame (:func:`_ray_box`);
+* segment obstacle — the exact capsule the collision step uses: the rectangle
+  ``(half_len, radius)`` around the core plus a circle at each end (:func:`_ray_capsule`).
+
+A ray whose origin lies inside a shape misses that shape. Targets are visited agents first
+(by index), then obstacles (by shape index), and a target replaces the current best only
+when strictly nearer, so ties resolve to the first in that order.
+
+Kernels are compiled per configuration (:func:`lidar_kernel`): agents on/off, obstacles
+on/off, box agents on/off and which hit outputs are written are ``wp.static`` flags, so a
+disc-only, range-only scan runs exactly the arithmetic it always did. Inference-only
+(``enable_backward=False``); gradients come from the torch path.
 """
 
 from __future__ import annotations
@@ -25,20 +32,51 @@ from typing import Any
 import torch
 import warp as wp
 
-from swarp._overloads import concrete, register
+from swarp.core.config import ObstacleShape
 from swarp.core.state import TORCH_DTYPE_TO_WP, VEC2
+from swarp.dynamics.base import NUM_PARAMS, P_HALF_X, P_HALF_Y, P_RADIUS, P_SHAPE
 from swarp.interop.autograd import torch_stream_scope
 
 # Lean launches (no grid-stride loop); see docs/performance.md.
 wp.set_module_options({"default_grid_stride": False})
 
+_SHAPE_BOX = wp.constant(int(ObstacleShape.BOX))
+_SHAPE_SEGMENT = wp.constant(int(ObstacleShape.SEGMENT))
+
+#: Per-ray ``hit_class`` values.
+HIT_NONE = 0
+HIT_AGENT = 1
+HIT_IMMOVABLE = 2  # an obstacle's class is HIT_IMMOVABLE + its ObstacleKind
+HIT_MOVABLE = 3
+
+#: Direction components smaller than this are replaced by ``±DIR_EPS`` in the slab test,
+#: so ``1/d`` stays finite (and so do its gradients on the torch side).
+DIR_EPS = 1.0e-12
+
+
+def ray_step(n_rays: int, angle_start: float, angle_end: float | None) -> float:
+    """Host-side angular spacing of the rays (the one place both backends take it from).
+
+    A full circle (``angle_end`` unset, or a span of at least ``2*pi``) spaces ``n_rays``
+    rays ``2*pi / n_rays`` apart, so the last ray stops one step short of the first. A
+    partial field of view puts the first ray at ``angle_start`` and the last at
+    ``angle_end``: ``(angle_end - angle_start) / (n_rays - 1)`` apart.
+    """
+    if angle_end is None:
+        return 2.0 * math.pi / n_rays
+    span = angle_end - angle_start
+    if span < 0.0:
+        raise ValueError(f"angle_end={angle_end} must not be below angle_start={angle_start}")
+    if span >= 2.0 * math.pi:
+        return 2.0 * math.pi / n_rays
+    return span / (n_rays - 1) if n_rays > 1 else 0.0
+
 
 @wp.func
 def _ray_hit(oc: Any, d: Any, rad: Any, miss: Any):
     """Range along unit dir ``d`` to the circle at relative center ``oc`` (center -
-    origin), or ``miss`` if the ray does not hit. Mirrors the torch ``cast`` at
-    ``lidar.py``: ``proj``/``perp2`` projection, ``t = proj - sqrt(rad^2 - perp2)``,
-    hit iff ``perp2 <= rad^2`` and ``proj > 0`` and ``t > 0``."""
+    origin), or ``miss``. ``t = proj - sqrt(rad^2 - perp2)``, a hit iff
+    ``perp2 <= rad^2`` and ``proj > 0`` and ``t > 0`` (an origin inside misses)."""
     zero = type(rad)(0.0)
     proj = wp.dot(oc, d)
     perp2 = wp.dot(oc, oc) - proj * proj
@@ -51,42 +89,154 @@ def _ray_hit(oc: Any, d: Any, rad: Any, miss: Any):
     return out
 
 
-@wp.kernel
-def lidar_scan_kernel(
-    pos: wp.array2d(dtype=Any),  # [E, A] vec2
-    theta: wp.array2d(dtype=Any),  # [E, A] scalar
-    agent_radius: wp.array(dtype=Any),  # [A] scalar
-    obs_pos: wp.array2d(dtype=Any),  # [E, T] vec2
-    obs_radius: wp.array(dtype=Any),  # [T] scalar
-    max_range: Any,
-    ray_step: Any,  # 2*pi / n_rays, precomputed to match torch exactly
-    angle_start: Any,
-    body_frame: wp.int32,
-    include_agents: wp.int32,
-    n_obstacles: wp.int32,
-    range_out: wp.array3d(dtype=Any),  # [E, A, R] scalar
-):
-    e, a, r = wp.tid()
-    p = pos[e, a]
-    n_agents = pos.shape[1]
+@wp.func
+def _safe_dir(x: Any):
+    """``x``, or ``±DIR_EPS`` (sign of ``x``, ``+`` at zero) when ``|x| < DIR_EPS``."""
+    eps = type(x)(DIR_EPS)
+    out = x
+    if wp.abs(x) < eps:
+        out = eps
+        if x < type(x)(0.0):
+            out = -eps
+    return out
 
-    base = type(max_range)(0.0)
-    if body_frame != 0:
-        base = theta[e, a]
 
-    # ``r`` comes from the launch grid, so the ray count is the third launch dimension
-    # rather than a kernel argument. The arithmetic is unchanged from the loop it
-    # replaces, which is what keeps ``test_warp_matches_torch`` exact.
-    ang = base + angle_start + type(max_range)(r) * ray_step
-    d = type(p)(wp.cos(ang), wp.sin(ang))
-    best = max_range
-    if include_agents != 0:
-        for b in range(n_agents):
-            if b != a:
-                best = wp.min(best, _ray_hit(pos[e, b] - p, d, agent_radius[b], max_range))
-    for o in range(n_obstacles):
-        best = wp.min(best, _ray_hit(obs_pos[e, o] - p, d, obs_radius[o], max_range))
-    range_out[e, a, r] = best
+@wp.func
+def _ray_box(rel: Any, d: Any, angle: Any, hx: Any, hy: Any, miss: Any):
+    """Range along unit dir ``d`` from ``origin = center + rel`` to the box of
+    half-extents ``(hx, hy)`` rotated by ``angle``, or ``miss``.
+
+    Slab test in the box frame: the ray enters at ``tnear = max`` of the per-axis entry
+    times and leaves at ``tfar = min`` of the exit times; a hit iff ``tnear <= tfar`` and
+    ``tnear > 0``. An origin inside the box has ``tnear < 0`` and misses."""
+    zero = type(hx)(0.0)
+    ca = wp.cos(angle)
+    sa = wp.sin(angle)
+    ox = ca * rel[0] + sa * rel[1]
+    oy = -sa * rel[0] + ca * rel[1]
+    dx = _safe_dir(ca * d[0] + sa * d[1])
+    dy = _safe_dir(-sa * d[0] + ca * d[1])
+    t1x = (-hx - ox) / dx
+    t2x = (hx - ox) / dx
+    t1y = (-hy - oy) / dy
+    t2y = (hy - oy) / dy
+    tnear = wp.max(wp.min(t1x, t2x), wp.min(t1y, t2y))
+    tfar = wp.min(wp.max(t1x, t2x), wp.max(t1y, t2y))
+    out = miss
+    if (tnear <= tfar) and (tnear > zero):
+        out = tnear
+    return out
+
+
+@wp.func
+def _ray_capsule(rel: Any, d: Any, angle: Any, half_len: Any, rad: Any, miss: Any):
+    """Range along unit dir ``d`` from ``origin = center + rel`` to the capsule of core
+    half-length ``half_len`` and radius ``rad`` oriented by ``angle``, or ``miss``.
+
+    The capsule is the rectangle ``(half_len, rad)`` around its core united with a circle
+    of radius ``rad`` at each end, which is exactly the set the collision step's
+    ``closest_on_segment`` contact treats as solid. From outside, the first hit on a union
+    is the nearest of the parts' first hits. An origin inside the capsule misses: tested
+    directly, since an origin inside one end circle still sees the rectangle from
+    outside."""
+    u = type(rel)(wp.cos(angle), wp.sin(angle))
+    s = wp.clamp(wp.dot(rel, u), -half_len, half_len)
+    q = rel - s * u
+    out = miss
+    if wp.dot(q, q) >= rad * rad:
+        out = _ray_box(rel, d, angle, half_len, rad, miss)
+        out = wp.min(out, _ray_hit(half_len * u - rel, d, rad, miss))
+        out = wp.min(out, _ray_hit(-half_len * u - rel, d, rad, miss))
+    return out
+
+
+def _make_kernel(
+    agents: bool, obstacles: bool, box_agents: bool, emit_class: bool, emit_index: bool
+) -> wp.Kernel:
+    """The scan kernel with the given features compiled in (see the module docstring)."""
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def lidar_scan_kernel(
+        pos: wp.array2d(dtype=Any),  # [E, A] vec2
+        theta: wp.array2d(dtype=Any),  # [E, A]
+        params: wp.array2d(dtype=Any),  # [A, NUM_PARAMS]: P_RADIUS, P_SHAPE, P_HALF_*
+        obs_pos: wp.array2d(dtype=Any),  # [E, T] vec2, live pose
+        obs_angle: wp.array2d(dtype=Any),  # [E, T], live pose
+        obs_radius: wp.array(dtype=Any),  # [T]
+        obs_half: wp.array(dtype=Any),  # [T] vec2
+        obs_type: wp.array(dtype=wp.int32),  # [T] ObstacleShape
+        obs_kind: wp.array(dtype=wp.int32),  # [T] ObstacleKind
+        n_obstacles: wp.int32,
+        max_range: Any,
+        ray_step: Any,
+        angle_start: Any,
+        body_frame: wp.int32,
+        range_out: wp.array3d(dtype=Any),  # [E, A, R]
+        class_out: wp.array3d(dtype=wp.uint8),  # [E, A, R] when emit_class
+        index_out: wp.array3d(dtype=wp.int32),  # [E, A, R] when emit_index
+    ):
+        e, a, r = wp.tid()
+        p = pos[e, a]
+        n_agents = pos.shape[1]
+
+        base = type(max_range)(0.0)
+        if body_frame != 0:
+            base = theta[e, a]
+        # Same arithmetic as the torch offsets (angle_start + r * ray_step, added to the
+        # heading), which is what keeps the two backends' ranges equal.
+        ang = base + angle_start + type(max_range)(r) * ray_step
+        d = type(p)(wp.cos(ang), wp.sin(ang))
+        best = max_range
+        cls = wp.int32(0)
+        idx = wp.int32(-1)
+        if wp.static(agents):
+            for b in range(n_agents):
+                if b != a:
+                    q = pos[e, b]
+                    t = max_range
+                    if wp.static(box_agents):
+                        if params[b, P_SHAPE] > type(max_range)(0.5):
+                            t = _ray_box(
+                                p - q,
+                                d,
+                                theta[e, b],
+                                params[b, P_HALF_X],
+                                params[b, P_HALF_Y],
+                                max_range,
+                            )
+                        else:
+                            t = _ray_hit(q - p, d, params[b, P_RADIUS], max_range)
+                    else:
+                        t = _ray_hit(q - p, d, params[b, P_RADIUS], max_range)
+                    if t < best:
+                        best = t
+                        cls = wp.int32(1)
+                        idx = b
+        if wp.static(obstacles):
+            for o in range(n_obstacles):
+                c = obs_pos[e, o]
+                st = obs_type[o]
+                t = max_range
+                if st == _SHAPE_BOX:
+                    h = obs_half[o]
+                    t = _ray_box(p - c, d, obs_angle[e, o], h[0], h[1], max_range)
+                elif st == _SHAPE_SEGMENT:
+                    t = _ray_capsule(
+                        p - c, d, obs_angle[e, o], obs_half[o][0], obs_radius[o], max_range
+                    )
+                else:
+                    t = _ray_hit(c - p, d, obs_radius[o], max_range)
+                if t < best:
+                    best = t
+                    cls = wp.int32(2) + obs_kind[o]
+                    idx = o
+        range_out[e, a, r] = best
+        if wp.static(emit_class):
+            class_out[e, a, r] = wp.uint8(cls)
+        if wp.static(emit_index):
+            index_out[e, a, r] = idx
+
+    return lidar_scan_kernel
 
 
 def _signature(dtype) -> list:
@@ -94,53 +244,121 @@ def _signature(dtype) -> list:
     return [
         wp.array2d(dtype=vec2),  # pos
         wp.array2d(dtype=dtype),  # theta
-        wp.array(dtype=dtype),  # agent_radius
+        wp.array2d(dtype=dtype),  # params
         wp.array2d(dtype=vec2),  # obs_pos
+        wp.array2d(dtype=dtype),  # obs_angle
         wp.array(dtype=dtype),  # obs_radius
+        wp.array(dtype=vec2),  # obs_half
+        wp.array(dtype=wp.int32),  # obs_type
+        wp.array(dtype=wp.int32),  # obs_kind
+        wp.int32,  # n_obstacles
         dtype,  # max_range
         dtype,  # ray_step
         dtype,  # angle_start
         wp.int32,  # body_frame
-        wp.int32,  # include_agents
-        wp.int32,  # n_obstacles
         wp.array3d(dtype=dtype),  # range_out
+        wp.array3d(dtype=wp.uint8),  # class_out
+        wp.array3d(dtype=wp.int32),  # index_out
     ]
 
 
-for _T in (wp.float32, wp.float64):
-    register(lidar_scan_kernel, _T, _signature(_T))
+#: (agents, obstacles, box_agents, emit_class, emit_index, dtype) -> concrete kernel.
+_KERNELS: dict[tuple, wp.Kernel] = {}
 
 
-# Single-slot wrap caches, one per kernel input, exactly as ``Stepper.wrap_actions``
-# does for the action tensor: ``wp.from_torch`` is a handle allocation plus a few
-# attribute reads, and a scan re-wraps the *same* live buffers on every step. Keyed on
-# ``(data_ptr, shape, dtype)``, and the wrapped torch tensor is held alongside so its
-# storage cannot be freed and recycled into a different tensor that would then hit the
-# cache spuriously. Single-slot: two Lidars over different worlds just re-wrap, which is
-# what the uncached path did anyway.
-_WRAPS: dict[str, tuple[tuple, wp.array, torch.Tensor]] = {}
-#: Reused output / empty-obstacle arrays, keyed by shape+dtype+device.
-_BUFFERS: dict[tuple, wp.array] = {}
+def lidar_kernel(
+    dtype,
+    agents: bool,
+    obstacles: bool,
+    box_agents: bool,
+    emit_class: bool,
+    emit_index: bool,
+    *,
+    device=None,
+) -> wp.Kernel:
+    """The concrete scan kernel for these flags and ``dtype``, built on first request.
+
+    With ``device`` the kernel's module is also loaded there, together with its sibling
+    that differs only in ``obstacles``: whether obstacles are scanned is decided per launch
+    from the installed obstacle count, and a kernel first launched inside a graph capture
+    cannot be loaded there. Without ``device`` the module loads lazily on first launch.
+    """
+    key = (agents, obstacles, box_agents, emit_class, emit_index, dtype)
+    kernel = _KERNELS.get(key)
+    if kernel is None or device is not None:
+        for obs in (False, True):
+            sib = (agents, obs, box_agents, emit_class, emit_index, dtype)
+            k = _KERNELS.get(sib)
+            if k is None:
+                k = wp.overload(_make_kernel(*sib[:-1]), _signature(dtype))
+                _KERNELS[sib] = k
+            if device is not None:
+                wp.load_module(k.module, device=device)
+        kernel = _KERNELS[key]
+    return kernel
 
 
-def _wrap(slot: str, t: torch.Tensor, dtype) -> wp.array:
-    tc = t.contiguous()
-    key = (tc.data_ptr(), tuple(tc.shape), dtype)
-    cached = _WRAPS.get(slot)
-    if cached is not None and cached[0] == key:
-        return cached[1]
-    arr = wp.from_torch(tc, dtype=dtype, requires_grad=False)
-    _WRAPS[slot] = (key, arr, tc)
-    return arr
+def launch_lidar(
+    *,
+    pos: wp.array,
+    theta: wp.array,
+    params: wp.array,
+    obs_pos: wp.array,
+    obs_angle: wp.array,
+    obs_radius: wp.array,
+    obs_half: wp.array,
+    obs_type: wp.array,
+    obs_kind: wp.array,
+    n_obstacles: int,
+    n_rays: int,
+    max_range: float,
+    ray_step: float,
+    angle_start: float,
+    body_frame: bool,
+    include_agents: bool,
+    box_agents: bool,
+    range_out: wp.array,
+    class_out: wp.array,
+    index_out: wp.array,
+    emit_class: bool,
+    emit_index: bool,
+) -> None:
+    """One scan launch: ``wp.launch`` and nothing else, so it is legal inside a capture.
+
+    Every argument is a ready Warp array or a host scalar; the launch names its device and
+    does not scope a stream (the caller decides that, see :meth:`Lidar.scan`)."""
+    dtype = range_out.dtype
+    n_envs, n_agents = pos.shape[0], pos.shape[1]
+    kernel = lidar_kernel(
+        dtype, include_agents, n_obstacles > 0, box_agents, emit_class, emit_index
+    )
+    wp.launch(
+        kernel,
+        dim=(n_envs, n_agents, n_rays),
+        inputs=[
+            pos,
+            theta,
+            params,
+            obs_pos,
+            obs_angle,
+            obs_radius,
+            obs_half,
+            obs_type,
+            obs_kind,
+            wp.int32(n_obstacles),
+            dtype(max_range),
+            dtype(ray_step),
+            dtype(angle_start),
+            wp.int32(1 if body_frame else 0),
+        ],
+        outputs=[range_out, class_out, index_out],
+        device=range_out.device,
+        record_tape=False,
+    )
 
 
-def _buffer(shape: tuple[int, ...], dtype, device) -> wp.array:
-    key = (shape, dtype, str(device))
-    arr = _BUFFERS.get(key)
-    if arr is None:
-        arr = wp.empty(shape=shape, dtype=dtype, device=device)
-        _BUFFERS[key] = arr
-    return arr
+def _wp(t: torch.Tensor, dtype) -> wp.array:
+    return wp.from_torch(t.detach().contiguous(), dtype=dtype, requires_grad=False)
 
 
 def lidar_scan_warp(
@@ -152,69 +370,95 @@ def lidar_scan_warp(
     *,
     body_frame: bool = True,
     angle_start: float = 0.0,
+    angle_end: float | None = None,
     include_agents: bool = True,
+    agent_shape: torch.Tensor | None = None,  # [n_agents] AgentShape
+    agent_half: torch.Tensor | None = None,  # [n_agents, 2]
     obstacle_pos: torch.Tensor | None = None,  # [n_envs, n_obstacles, 2]
     obstacle_radius: torch.Tensor | None = None,  # [n_obstacles]
-) -> torch.Tensor:
-    """Warp-kernel equivalent of :func:`swarp.sensors.lidar.lidar_scan`.
+    obstacle_shape: torch.Tensor | None = None,  # [n_obstacles] ObstacleShape
+    obstacle_angle: torch.Tensor | None = None,  # [n_obstacles] or [n_envs, n_obstacles]
+    obstacle_half: torch.Tensor | None = None,  # [n_obstacles, 2]
+    obstacle_kind: torch.Tensor | None = None,  # [n_obstacles] ObstacleKind
+    return_hits: bool = False,
+):
+    """Warp-kernel equivalent of :func:`swarp.sensors.lidar.lidar_scan`, from tensors.
 
-    Same signature and identical ranges (to fp tolerance), but without the dense
-    pairwise intermediate. Inference-only — not differentiable (launched with
-    ``record_tape=False``). Callers needing gradients use the torch path.
-
-    **The returned tensor is a view of a reused buffer**, unlike the torch backend's
-    freshly-allocated one: the next scan of the same shape overwrites it. Consume it
-    immediately (concatenating into an observation copies) or ``clone()`` to retain it.
-    That is the same convention :meth:`swarp.core.environment.Environment.step` follows
-    for its outputs, and it is what keeps a per-step scan allocation-free.
-
-    Launches are scoped onto torch's current stream, so the scan is ordered against the
-    torch ops that produced ``pos``/``theta`` under a user-created stream too.
+    Same signature and the same results (to fp tolerance), freshly allocated. This is the
+    standalone eager entry point (it wraps and packs its inputs on every call); a scenario
+    scanning its own world every step uses :meth:`swarp.sensors.lidar.Lidar.bind` and
+    :meth:`~swarp.sensors.lidar.Lidar.launch` instead, which do that once. Inference-only.
     """
-    wp.init()  # idempotent; ``from_torch`` needs the runtime, and callers may scan
-    # before any other Warp API (Environment/World init it in normal use).
+    wp.init()  # idempotent; callers may scan before any other Warp API
+    device = pos.device
+    tdt = pos.dtype
+    wdt = TORCH_DTYPE_TO_WP[str(tdt)]
+    vec2 = VEC2[wdt]
     n_envs, n_agents = pos.shape[0], pos.shape[1]
-    wp_dtype = TORCH_DTYPE_TO_WP[str(pos.dtype)]
-    vec2 = VEC2[wp_dtype]
-    has_obstacles = (
-        obstacle_pos is not None and obstacle_radius is not None and obstacle_pos.shape[1] > 0
-    )
-    n_obstacles = obstacle_pos.shape[1] if has_obstacles else 0
-    ray_step = 2.0 * math.pi / n_rays
+    box_agents = agent_shape is not None
+    params = torch.zeros(n_agents, NUM_PARAMS, device=device, dtype=tdt)
+    params[:, P_RADIUS] = agent_radius
+    if box_agents:
+        params[:, P_SHAPE] = agent_shape.to(tdt)
+        if agent_half is not None:
+            params[:, P_HALF_X] = agent_half[:, 0]
+            params[:, P_HALF_Y] = agent_half[:, 1]
+    n_obs = 0
+    if obstacle_pos is not None and obstacle_radius is not None:
+        n_obs = obstacle_pos.shape[1]
+    if n_obs > 0:
 
-    # Everything Warp-side inside the scope: mempool allocations are stream-ordered too,
-    # so the ``_buffer`` calls belong in here with the launch.
-    with torch_stream_scope(str(pos.device)):
-        pos_wp = _wrap("pos", pos, vec2)
-        theta_wp = _wrap("theta", theta, wp_dtype)
-        radius_wp = _wrap("radius", agent_radius, wp_dtype)
-        device = pos_wp.device
-        if has_obstacles:
-            obs_pos_wp = _wrap("obs_pos", obstacle_pos, vec2)
-            obs_radius_wp = _wrap("obs_radius", obstacle_radius, wp_dtype)
-        else:
-            obs_pos_wp = _buffer((n_envs, 0), vec2, device)
-            obs_radius_wp = _buffer((0,), wp_dtype, device)
-        range_out = _buffer((n_envs, n_agents, n_rays), wp_dtype, device)
+        def fill(t, shape, dt=tdt):
+            return torch.zeros(shape, device=device, dtype=dt) if t is None else t.to(dt)
 
-        wp.launch(
-            concrete(lidar_scan_kernel, wp_dtype),
-            dim=(n_envs, n_agents, n_rays),
-            inputs=[
-                pos_wp,
-                theta_wp,
-                radius_wp,
-                obs_pos_wp,
-                obs_radius_wp,
-                wp_dtype(max_range),
-                wp_dtype(ray_step),
-                wp_dtype(angle_start),
-                wp.int32(1 if body_frame else 0),
-                wp.int32(1 if include_agents else 0),
-                wp.int32(n_obstacles),
-            ],
-            outputs=[range_out],
-            device=device,
-            record_tape=False,
+        o_angle = fill(obstacle_angle, (n_envs, n_obs))
+        if o_angle.dim() == 1:
+            o_angle = o_angle.unsqueeze(0).expand(n_envs, n_obs)
+        obs = dict(
+            obs_pos=_wp(obstacle_pos.to(tdt), vec2),
+            obs_angle=_wp(o_angle, wdt),
+            obs_radius=_wp(obstacle_radius.to(tdt), wdt),
+            obs_half=_wp(fill(obstacle_half, (n_obs, 2)), vec2),
+            obs_type=_wp(fill(obstacle_shape, (n_obs,), torch.int32), wp.int32),
+            obs_kind=_wp(fill(obstacle_kind, (n_obs,), torch.int32), wp.int32),
         )
-    return wp.to_torch(range_out, requires_grad=False)
+    else:
+        obs = dict(
+            obs_pos=wp.zeros((1, 1), dtype=vec2, device=str(device)),
+            obs_angle=wp.zeros((1, 1), dtype=wdt, device=str(device)),
+            obs_radius=wp.zeros(1, dtype=wdt, device=str(device)),
+            obs_half=wp.zeros(1, dtype=vec2, device=str(device)),
+            obs_type=wp.zeros(1, dtype=wp.int32, device=str(device)),
+            obs_kind=wp.zeros(1, dtype=wp.int32, device=str(device)),
+        )
+    out_shape = (n_envs, n_agents, n_rays)
+    ranges = torch.empty(out_shape, device=device, dtype=tdt)
+    if return_hits:
+        hit_class = torch.empty(out_shape, device=device, dtype=torch.uint8)
+        hit_index = torch.empty(out_shape, device=device, dtype=torch.int32)
+    else:
+        hit_class = torch.empty((1, 1, 1), device=device, dtype=torch.uint8)
+        hit_index = torch.empty((1, 1, 1), device=device, dtype=torch.int32)
+    with torch_stream_scope(str(device)):
+        launch_lidar(
+            pos=_wp(pos, vec2),
+            theta=_wp(theta, wdt),
+            params=_wp(params, wdt),
+            **obs,
+            n_obstacles=n_obs,
+            n_rays=n_rays,
+            max_range=max_range,
+            ray_step=ray_step(n_rays, angle_start, angle_end),
+            angle_start=angle_start,
+            body_frame=body_frame,
+            include_agents=include_agents,
+            box_agents=box_agents,
+            range_out=_wp(ranges, wdt),
+            class_out=_wp(hit_class, wp.uint8),
+            index_out=_wp(hit_index, wp.int32),
+            emit_class=return_hits,
+            emit_index=return_hits,
+        )
+    if return_hits:
+        return ranges, hit_class, hit_index
+    return ranges

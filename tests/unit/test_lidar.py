@@ -1,4 +1,5 @@
-"""Lidar ranges vs hand-computed ray-circle intersections, plus a gradcheck."""
+"""Lidar ranges and hits vs hand-computed and independent intersections, backend parity,
+gradchecks, host-sync freedom and a captured launch."""
 
 import math
 
@@ -211,37 +212,8 @@ def test_lidar_component_on_world(backend):
     assert (ranges >= 0).all() and (ranges <= 1.0).all()
 
 
-def test_segment_obstacle_is_excluded():
-    """A SEGMENT obstacle must be invisible, not a phantom circle at its midpoint.
-
-    ``Lidar.scan`` has no ray-segment test, so a segment fed through the ray-circle
-    formula would report a hit on a disc of the obstacle's ``radius`` centred at the
-    segment midpoint. The ray here points straight down the segment's own axis, where
-    the phantom disc sits, so an unfiltered scan reads well under ``max_range``.
-    """
-    from swarp.core.config import Obstacles, ObstacleShape
-
-    world = _tiny_world(dtype=torch.float64)
-    world.state = world.state._replace(
-        pos=torch.zeros(4, 3, 2, dtype=torch.float64),
-        theta=torch.zeros(4, 3, dtype=torch.float64),
-    )
-    n_envs = world.n_envs
-    world.set_obstacles(
-        Obstacles(
-            pos=torch.tensor([[[1.0, 0.0]]], dtype=torch.float64).expand(n_envs, 1, 2).clone(),
-            radius=torch.tensor([0.3], dtype=torch.float64),
-            shape=torch.tensor([int(ObstacleShape.SEGMENT)]),
-            half_extents=torch.tensor([[2.0, 0.0]], dtype=torch.float64),
-        )
-    )
-    # Ray 0 (angle 0) points straight at the segment's midpoint.
-    lidar = Lidar(n_rays=4, max_range=MAXR, include_agents=False)
-    ranges = lidar.scan(world)
-    assert torch.allclose(ranges, torch.full_like(ranges, MAXR))
-
-
-def test_movable_obstacle_scan_tracks_live_pose():
+@pytest.mark.parametrize("backend", ["torch", "warp"])
+def test_movable_obstacle_scan_tracks_live_pose(backend):
     """The scan must follow a movable obstacle, not the pose the scenario installed.
 
     A movable body is integrated in place inside the stepper's own arrays, so
@@ -280,7 +252,7 @@ def test_movable_obstacle_scan_tracks_live_pose():
             mass=torch.tensor([0.05], dtype=torch.float64),
         )
     )
-    lidar = Lidar(n_rays=4, max_range=MAXR, include_agents=False)
+    lidar = Lidar(n_rays=4, max_range=MAXR, include_agents=False, backend=backend)
     before = lidar.scan(world).clone()
 
     actions = torch.zeros(n_envs, 3, world.act_dim, dtype=torch.float64)
@@ -299,45 +271,591 @@ def test_movable_obstacle_scan_tracks_live_pose():
     torch.testing.assert_close(after[:, 0, 0], gap)
 
 
-def test_circle_filter_is_memoized_no_per_scan_sync():
-    """Deciding which obstacles are circles must cost syncs once, not once per scan.
+# ------------------------------------------------------------------ shapes and classes
 
-    ``is_circle.all()`` and ``nonzero()`` are both device->host stalls, and the answer is
-    fixed for as long as one obstacle set is installed — poses move, shape tags do not.
-    Guarding the entry points is the only way to see the difference: an un-memoized filter
-    still returns the right ranges, it just stalls the pipeline twice a step.
+
+def _obstacle_world(obstacles, *, n_agents=3, dtype=torch.float64, device="cpu", configs=None):
+    """A collision-free world (so nothing moves unless stepped) with ``obstacles``."""
+    from swarp.core.config import WorldConfig
+    from swarp.core.world import World
+    from swarp.dynamics.base import AgentConfig
+
+    cfgs = configs or [AgentConfig(radius=0.05) for _ in range(n_agents)]
+    world = World(cfgs, WorldConfig(collisions=False), n_envs=2, device=device, dtype=dtype)
+    if obstacles is not None:
+        world.set_obstacles(obstacles)
+    return world
+
+
+def _place(world, pos, theta=None):
+    n_envs, n_agents = world.n_envs, world.n_agents
+    p = torch.tensor(pos, dtype=world.dtype, device=world.device)
+    th = torch.zeros(n_agents, dtype=world.dtype, device=world.device)
+    if theta is not None:
+        th = torch.tensor(theta, dtype=world.dtype, device=world.device)
+    world.state = world.state._replace(
+        pos=p.expand(n_envs, n_agents, 2).clone(), theta=th.expand(n_envs, n_agents).clone()
+    )
+
+
+def _obstacles(n_envs, centres, shapes, *, radius=None, half=None, angle=None, kind=None):
+    from swarp.core.config import Obstacles
+
+    n = len(centres)
+    t = torch.float64
+    return Obstacles(
+        pos=torch.tensor([centres], dtype=t).expand(n_envs, n, 2).clone(),
+        radius=torch.tensor(radius if radius is not None else [0.0] * n, dtype=t),
+        shape=torch.tensor([int(s) for s in shapes]),
+        half_extents=torch.tensor(half if half is not None else [[0.0, 0.0]] * n, dtype=t),
+        angle=None if angle is None else torch.tensor(angle, dtype=t),
+        kind=None if kind is None else torch.tensor([int(k) for k in kind]),
+    )
+
+
+def _scan_both(world, **kw):
+    """``Lidar.scan`` on both backends; asserts they agree and returns the torch result."""
+    kw.setdefault("max_range", MAXR)
+    kw.setdefault("body_frame", False)
+    kw.setdefault("return_hits", True)
+    ref = Lidar(backend="torch", **kw).scan(world)
+    got = Lidar(backend="warp", **kw).scan(world)
+    for r, g in zip(ref, got, strict=True):
+        if r.dtype.is_floating_point:
+            torch.testing.assert_close(g, r, **_TOL[r.dtype])
+        else:
+            assert torch.equal(g, r)
+    return ref
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_segment_obstacle_is_hit(device):
+    """A segment is scanned as the capsule it collides as (core plus radius).
+
+    Down the segment's own axis the first surface is the end cap, at distance
+    ``centre - half_len - radius``; across it, the flat side at ``radius`` from the core.
+    """
+    from swarp.core.config import ObstacleShape
+
+    obs = _obstacles(2, [[1.5, 0.0]], [ObstacleShape.SEGMENT], radius=[0.1], half=[[0.5, 0.0]])
+    world = _obstacle_world(obs, device=device)
+    _place(world, [[0.0, 0.0], [1.5, -1.0], [5.0, 5.0]])
+    ranges, cls, idx = _scan_both(world, n_rays=4, include_agents=False)
+    np.testing.assert_allclose(ranges[:, 0, 0].cpu(), 1.5 - 0.5 - 0.1, atol=1e-12)  # axis
+    np.testing.assert_allclose(ranges[:, 1, 1].cpu(), 1.0 - 0.1, atol=1e-12)  # flat side
+    assert (cls[:, 0, 0] == 2).all() and (idx[:, 0, 0] == 0).all()
+    assert (cls[:, 0, 1:] == 0).all() and (idx[:, 0, 1:] == -1).all()
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_box_face_hit(device):
+    from swarp.core.config import ObstacleShape
+
+    obs = _obstacles(2, [[1.0, 0.0]], [ObstacleShape.BOX], half=[[0.2, 0.1]])
+    world = _obstacle_world(obs, device=device)
+    _place(world, [[0.0, 0.0], [1.0, -1.0], [1.0, 0.0]])  # agent 2 sits inside the box
+    ranges = _scan_both(world, n_rays=4, include_agents=False)[0]
+    np.testing.assert_allclose(ranges[:, 0, 0].cpu(), 0.8, atol=1e-12)  # +x onto the -x face
+    np.testing.assert_allclose(ranges[:, 1, 1].cpu(), 0.9, atol=1e-12)  # +y onto the -y face
+    assert (ranges[:, 0, 1:] == MAXR).all()
+    assert (ranges[:, 2] == MAXR).all()  # an origin inside the box misses it
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_box_corner_graze(device):
+    """A ray just outside a corner misses; one just inside it hits the near face."""
+    from swarp.core.config import ObstacleShape
+
+    obs = _obstacles(2, [[1.0, 0.0]], [ObstacleShape.BOX], half=[[0.2, 0.2]])
+    world = _obstacle_world(obs, device=device)
+    _place(world, [[0.0, 0.2 + 1e-6], [0.0, 0.2 - 1e-6], [0.0, -0.2 - 1e-6]])
+    ranges = _scan_both(world, n_rays=1, include_agents=False)[0]
+    assert (ranges[:, 0, 0] == MAXR).all()
+    np.testing.assert_allclose(ranges[:, 1, 0].cpu(), 0.8, atol=1e-12)
+    assert (ranges[:, 2, 0] == MAXR).all()
+
+
+def _np_ray_polygon(o, d, verts):
+    """Independent oracle: nearest ``t > 0`` at which ``o + t d`` crosses an edge."""
+    best = np.inf
+    for k in range(len(verts)):
+        a, b = verts[k], verts[(k + 1) % len(verts)]
+        e = b - a
+        den = d[0] * (-e[1]) + d[1] * e[0]
+        if abs(den) < 1e-15:
+            continue
+        w = a - o
+        t = (w[0] * (-e[1]) + w[1] * e[0]) / den
+        s = (d[0] * w[1] - d[1] * w[0]) / den
+        if t > 0 and 0 <= s <= 1:
+            best = min(best, t)
+    return best
+
+
+def _np_box_verts(c, ang, hx, hy):
+    ca, sa = math.cos(ang), math.sin(ang)
+    local = [(-hx, -hy), (hx, -hy), (hx, hy), (-hx, hy)]
+    return [np.array([c[0] + ca * x - sa * y, c[1] + sa * x + ca * y]) for x, y in local]
+
+
+def _np_inside_box(o, c, ang, hx, hy):
+    ca, sa = math.cos(ang), math.sin(ang)
+    rel = o - np.asarray(c)
+    lx, ly = ca * rel[0] + sa * rel[1], -sa * rel[0] + ca * rel[1]
+    return abs(lx) < hx and abs(ly) < hy
+
+
+def _np_ray_circle(o, d, c, r):
+    oc = np.asarray(c) - o
+    proj = oc @ d
+    perp2 = oc @ oc - proj * proj
+    if perp2 > r * r or proj <= 0:
+        return np.inf
+    t = proj - math.sqrt(r * r - perp2)
+    return t if t > 0 else np.inf
+
+
+def _np_ray_capsule(o, d, c, ang, half_len, r):
+    u = np.array([math.cos(ang), math.sin(ang)])
+    rel = o - np.asarray(c)
+    s = np.clip(rel @ u, -half_len, half_len)
+    if np.sum((rel - s * u) ** 2) < r * r:
+        return np.inf
+    rect = _np_box_verts(c, ang, half_len, r)
+    ends = [np.asarray(c) + half_len * u, np.asarray(c) - half_len * u]
+    return min(_np_ray_polygon(o, d, rect), *(_np_ray_circle(o, d, e, r) for e in ends))
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_rotated_box_and_capsule_match_independent_oracle(seed):
+    """Random rotated boxes and capsules against a ray-vs-edges numpy intersection."""
+    from swarp.core.config import ObstacleShape
+
+    rng = np.random.default_rng(seed)
+    n_rays = 32
+    centre = rng.uniform(-0.3, 0.3, 2)
+    ang = float(rng.uniform(0, 2 * math.pi))
+    hx, hy = rng.uniform(0.1, 0.4, 2)
+    for shape in (ObstacleShape.BOX, ObstacleShape.SEGMENT):
+        half = [[hx, 0.0 if shape == ObstacleShape.SEGMENT else hy]]
+        obs = _obstacles(2, [centre.tolist()], [shape], radius=[hy * 0.5], half=half, angle=[ang])
+        world = _obstacle_world(obs)
+        origins = rng.uniform(-1.0, 1.0, (3, 2))
+        _place(world, origins.tolist())
+        ranges = _scan_both(world, n_rays=n_rays, include_agents=False)[0]
+        for a in range(3):
+            for r in range(n_rays):
+                th = r * (2 * math.pi / n_rays)
+                d = np.array([math.cos(th), math.sin(th)])
+                if shape == ObstacleShape.BOX:
+                    inside = _np_inside_box(origins[a], centre, ang, hx, hy)
+                    verts = _np_box_verts(centre, ang, hx, hy)
+                    exp = np.inf if inside else _np_ray_polygon(origins[a], d, verts)
+                else:
+                    exp = _np_ray_capsule(origins[a], d, centre, ang, hx, hy * 0.5)
+                np.testing.assert_allclose(float(ranges[0, a, r]), min(exp, MAXR), atol=1e-9)
+
+
+def _box_agent_configs(n=3, box=(1,), half=(0.2, 0.1)):
+    from swarp.dynamics.base import AgentConfig, AgentShape
+
+    return [
+        AgentConfig(shape=AgentShape.BOX, half_extents=half) if i in box else AgentConfig()
+        for i in range(n)
+    ]
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_box_agents_are_oriented_by_theta(device):
+    """A box agent is hit on its faces as rotated by its heading."""
+    world = _obstacle_world(None, configs=_box_agent_configs(), device=device)
+    # Agent 1 (0.2 x 0.1 half-extents) turned by 90 deg presents its 0.1 side along x.
+    _place(world, [[0.0, 0.0], [1.0, 0.0], [5.0, 5.0]], theta=[0.0, math.pi / 2, 0.0])
+    ranges, cls, idx = _scan_both(world, n_rays=4)
+    np.testing.assert_allclose(ranges[:, 0, 0].cpu(), 1.0 - 0.1, atol=1e-12)
+    assert (cls[:, 0, 0] == 1).all() and (idx[:, 0, 0] == 1).all()
+    # The box agent itself sees the disc agent 0 at 1 - 0.05, its own box excluded.
+    np.testing.assert_allclose(ranges[:, 1, 2].cpu(), 1.0 - 0.05, atol=1e-12)
+    assert (idx[:, 1, 2] == 0).all()
+    _place(world, [[0.0, 0.0], [1.0, 0.0], [5.0, 5.0]], theta=[0.0, 0.0, 0.0])
+    ranges = _scan_both(world, n_rays=4)[0]
+    np.testing.assert_allclose(ranges[:, 0, 0].cpu(), 1.0 - 0.2, atol=1e-12)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_box_agent_occludes_another_agent(device):
+    world = _obstacle_world(None, configs=_box_agent_configs(), device=device)
+    _place(world, [[0.0, 0.0], [0.5, 0.0], [1.0, 0.0]], theta=[0.0, 0.3, 0.0])
+    ranges, cls, idx = _scan_both(world, n_rays=4)
+    assert (idx[:, 0, 0] == 1).all()  # the box, not the disc behind it
+    assert (ranges[:, 0, 0] < 0.5).all()
+    assert (idx[:, 2, 2] == 1).all()  # and from the other side too
+    _place(world, [[0.0, 0.0], [0.5, 2.0], [1.0, 0.0]])
+    ranges, cls, idx = _scan_both(world, n_rays=4)
+    assert (idx[:, 0, 0] == 2).all()
+    np.testing.assert_allclose(ranges[:, 0, 0].cpu(), 0.95, atol=1e-12)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_occlusion_order_and_hit_classes(device):
+    """Nearest wins across agents, immovable and movable obstacles; ties go to agents,
+    then to the lower index."""
+    from swarp.core.config import ObstacleKind, ObstacleShape
+
+    im, mv = ObstacleKind.IMMOVABLE, ObstacleKind.MOVABLE
+    circle, box = ObstacleShape.CIRCLE, ObstacleShape.BOX
+    obs = _obstacles(
+        2,
+        [[1.0, 0.0], [2.0, 0.0], [0.0, 1.05], [0.0, -1.0], [0.0, -1.0]],
+        [circle, box, circle, box, box],
+        radius=[0.1, 0.0, 0.05, 0.0, 0.0],
+        half=[[0.0, 0.0], [0.1, 0.1], [0.0, 0.0], [0.2, 0.2], [0.2, 0.2]],
+        kind=[im, mv, mv, mv, im],
+    )
+    world = _obstacle_world(obs, device=device)
+    # Agent 2 has the same centre and radius as obstacle 2.
+    _place(world, [[0.0, 0.0], [3.0, 0.0], [0.0, 1.05]])
+    ranges, cls, idx = _scan_both(world, n_rays=4)
+    # +x: the immovable circle at 0.9 hides the movable box and agent 1 behind it.
+    np.testing.assert_allclose(ranges[:, 0, 0].cpu(), 0.9, atol=1e-12)
+    assert (cls[:, 0, 0] == 2).all() and (idx[:, 0, 0] == 0).all()
+    # +y: agent 2 and movable circle 2 tie at 1.0, and the agent wins.
+    np.testing.assert_allclose(ranges[:, 0, 1].cpu(), 1.0, atol=1e-12)
+    assert (cls[:, 0, 1] == 1).all() and (idx[:, 0, 1] == 2).all()
+    # -y: two coincident boxes, movable 3 and immovable 4: the lower index wins.
+    np.testing.assert_allclose(ranges[:, 0, 3].cpu(), 0.8, atol=1e-12)
+    assert (cls[:, 0, 3] == 3).all() and (idx[:, 0, 3] == 3).all()
+    # -x: nothing.
+    assert (cls[:, 0, 2] == 0).all() and (idx[:, 0, 2] == -1).all()
+    # Agent 1 looking back (-x) sees the movable box first.
+    np.testing.assert_allclose(ranges[:, 1, 2].cpu(), 0.9, atol=1e-12)
+    assert (cls[:, 1, 2] == 3).all() and (idx[:, 1, 2] == 1).all()
+
+
+def test_fov_endpoints():
+    """A partial field of view puts its first and last rays exactly at its endpoints;
+    the full circle keeps the historical 2*pi/n spacing."""
+    from swarp.sensors.lidar_kernels import ray_step
+
+    lidar = Lidar(n_rays=5, angle_start=-math.pi / 4, angle_end=math.pi / 4)
+    off = lidar.ray_offsets(dtype=torch.float64)
+    torch.testing.assert_close(
+        off, torch.linspace(-math.pi / 4, math.pi / 4, 5, dtype=torch.float64)
+    )
+    assert ray_step(8, 0.0, None) == 2.0 * math.pi / 8
+    assert ray_step(8, 0.0, 2.0 * math.pi) == 2.0 * math.pi / 8  # a full span is a circle
+    assert ray_step(1, 0.3, 1.0) == 0.0
+    with pytest.raises(ValueError, match="angle_end"):
+        Lidar(angle_start=1.0, angle_end=0.5)
+
+    # The endpoint rays hit targets placed exactly at the endpoint angles.
+    a = math.pi / 4
+    obs_pos = torch.tensor(
+        [[[math.cos(a), -math.sin(a)], [math.cos(a), math.sin(a)]]], dtype=torch.float64
+    )
+    kw = dict(
+        n_rays=5,
+        max_range=MAXR,
+        body_frame=False,
+        angle_start=-a,
+        angle_end=a,
+        obstacle_pos=obs_pos,
+        obstacle_radius=torch.tensor([0.1, 0.1], dtype=torch.float64),
+    )
+    args = (
+        torch.zeros(1, 1, 2, dtype=torch.float64),
+        torch.zeros(1, 1, dtype=torch.float64),
+        torch.tensor([0.05], dtype=torch.float64),
+    )
+    for fn in (lidar_scan, lidar_scan_warp):
+        r = fn(*args, **kw)
+        np.testing.assert_allclose(r[0, 0, [0, 4]], 0.9, atol=1e-12)
+        assert (r[0, 0, 1:4] == MAXR).all()
+
+
+def _random_scene(seed, device, dtype, e=3, a=6, t=8):
+    """Mixed scene: discs and box agents, circles, boxes and capsules of both kinds."""
+    g = torch.Generator(device="cpu").manual_seed(seed)
+
+    def u(*shape, lo=0.0, hi=1.0):
+        x = torch.rand(*shape, generator=g, dtype=torch.float64) * (hi - lo) + lo
+        return x.to(device=device, dtype=dtype)
+
+    shape_a = (torch.rand(a, generator=g) < 0.5).to(torch.int32).to(device)
+    half_a = u(a, 2, lo=0.04, hi=0.15) * (shape_a == 1).unsqueeze(-1)
+    radius_a = torch.where(shape_a == 1, half_a.norm(dim=-1), u(a, lo=0.04, hi=0.12))
+    return dict(
+        pos=u(e, a, 2, lo=-1.0, hi=1.0),
+        theta=u(e, a, lo=0.0, hi=6.28),
+        agent_radius=radius_a,
+        agent_shape=shape_a,
+        agent_half=half_a,
+        obstacle_pos=u(e, t, 2, lo=-1.0, hi=1.0),
+        obstacle_radius=u(t, lo=0.02, hi=0.12),
+        obstacle_shape=torch.randint(0, 3, (t,), generator=g).to(torch.int32).to(device),
+        obstacle_angle=u(e, t, lo=0.0, hi=6.28),
+        obstacle_half=u(t, 2, lo=0.03, hi=0.3),
+        obstacle_kind=torch.randint(0, 2, (t,), generator=g).to(torch.int32).to(device),
+    )
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("body_frame", [True, False])
+@pytest.mark.parametrize("fov", [None, 2.0])
+def test_warp_matches_torch_on_mixed_shapes(device, dtype, body_frame, fov):
+    """Warp vs torch on randomized mixed scenes: ranges, classes and indices.
+
+    float64 agrees exactly on what was hit. In float32 a grazing ray can flip between
+    "just hit" and "just missed" (or between two near-equal targets) on the backends' own
+    sin/cos/sqrt rounding, so there the share of disagreeing rays is bounded instead, and
+    ranges are compared on the rays that agree.
+    """
+    for seed in range(3):
+        s = _random_scene(seed, device, dtype)
+        pos, theta, rad = s.pop("pos"), s.pop("theta"), s.pop("agent_radius")
+        kw = dict(
+            n_rays=128,
+            max_range=1.5,
+            body_frame=body_frame,
+            angle_start=-1.0 if fov else 0.3,
+            angle_end=(-1.0 + fov) if fov else None,
+            return_hits=True,
+            **s,
+        )
+        r_ref, c_ref, i_ref = lidar_scan(pos, theta, rad, **kw)
+        r_got, c_got, i_got = lidar_scan_warp(pos, theta, rad, **kw)
+        assert c_got.dtype == torch.uint8 and i_got.dtype == torch.int32
+        assert set(c_ref.unique().tolist()) == {0, 1, 2, 3}
+        same = (c_ref == c_got) & (i_ref == i_got)
+        if dtype == torch.float64:
+            assert same.all()
+        else:
+            assert (~same).double().mean() < 2e-3
+        torch.testing.assert_close(r_got[same], r_ref[same], **_TOL[dtype])
+
+
+def test_lidar_gradcheck_boxes_and_capsules():
+    """float64 gradcheck through box agents, boxes and capsules at generic poses, with
+    respect to agent positions and headings and obstacle positions and angles."""
+    from swarp.dynamics.base import AgentShape
+
+    f64 = torch.float64
+    pos = torch.tensor([[[0.0, 0.0], [0.55, 0.23], [-0.4, 0.5]]], dtype=f64, requires_grad=True)
+    theta = torch.tensor([[0.1, 0.7, -0.4]], dtype=f64, requires_grad=True)
+    shape = torch.tensor([0, int(AgentShape.BOX), int(AgentShape.BOX)], dtype=torch.int32)
+    half = torch.tensor([[0.0, 0.0], [0.12, 0.07], [0.1, 0.1]], dtype=f64)
+    radius = torch.cat([torch.tensor([0.05], dtype=f64), half[1:].norm(dim=-1)])
+    obs_pos = torch.tensor(
+        [[[0.9, -0.35], [-0.7, -0.6], [0.2, 0.95]]], dtype=f64, requires_grad=True
+    )
+    obs_angle = torch.tensor([[0.37, -1.1, 2.0]], dtype=f64, requires_grad=True)
+    obs_shape = torch.tensor([1, 2, 0], dtype=torch.int32)  # box, capsule, circle
+    obs_half = torch.tensor([[0.2, 0.15], [0.3, 0.0], [0.0, 0.0]], dtype=f64)
+    obs_rad = torch.tensor([0.0, 0.08, 0.12], dtype=f64)
+
+    def fn(p, th, op, oa):
+        return lidar_scan(
+            p,
+            th,
+            radius,
+            n_rays=13,
+            max_range=MAXR,
+            agent_shape=shape,
+            agent_half=half,
+            obstacle_pos=op,
+            obstacle_radius=obs_rad,
+            obstacle_shape=obs_shape,
+            obstacle_angle=oa,
+            obstacle_half=obs_half,
+        )
+
+    _, cls, _ = lidar_scan(
+        pos,
+        theta,
+        radius,
+        n_rays=13,
+        max_range=MAXR,
+        agent_shape=shape,
+        agent_half=half,
+        obstacle_pos=obs_pos,
+        obstacle_radius=obs_rad,
+        obstacle_shape=obs_shape,
+        obstacle_angle=obs_angle,
+        obstacle_half=obs_half,
+        return_hits=True,
+    )
+    assert (cls == 1).sum() >= 3 and (cls == 2).sum() >= 6  # the shapes are exercised
+    assert torch.autograd.gradcheck(fn, (pos, theta, obs_pos, obs_angle), eps=1e-6, atol=1e-5)
+
+
+def test_axis_aligned_hits_have_finite_gradients():
+    """A ray parallel to a box face (a zero direction component in the box frame) and a
+    ray straight at a radius-zero box's centre (a zero-argument sqrt in the unselected
+    circle branch) must both backpropagate finite gradients."""
+    from swarp.core.config import ObstacleShape
+
+    pos = torch.zeros(1, 1, 2, dtype=torch.float64, requires_grad=True)
+    obs_pos = torch.tensor([[[1.0, 0.0], [0.0, 1.0]]], dtype=torch.float64, requires_grad=True)
+    obs_angle = torch.zeros(1, 2, dtype=torch.float64, requires_grad=True)
+    r = lidar_scan(
+        pos,
+        torch.zeros(1, 1, dtype=torch.float64),
+        torch.tensor([0.05], dtype=torch.float64),
+        n_rays=4,
+        max_range=MAXR,
+        obstacle_pos=obs_pos,
+        obstacle_radius=torch.tensor([0.0, 0.1], dtype=torch.float64),
+        obstacle_shape=torch.tensor([int(ObstacleShape.BOX), int(ObstacleShape.SEGMENT)]),
+        obstacle_angle=obs_angle,
+        obstacle_half=torch.tensor([[0.2, 0.1], [0.3, 0.0]], dtype=torch.float64),
+    )
+    np.testing.assert_allclose(r[0, 0, :2].detach(), [0.8, 0.9], atol=1e-12)
+    r.sum().backward()
+    for t in (pos, obs_pos, obs_angle):
+        assert torch.isfinite(t.grad).all()
+    np.testing.assert_allclose(pos.grad[0, 0], [-1.0, -1.0], atol=1e-9)
+
+
+# ----------------------------------------------------------- host sync and capture
+
+
+def _mixed_world(device, dtype=torch.float64):
+    from swarp.core.config import ObstacleShape
+
+    obs = _obstacles(
+        2,
+        [[0.6, 0.0], [0.0, 0.7], [-0.6, -0.4]],
+        [ObstacleShape.BOX, ObstacleShape.SEGMENT, ObstacleShape.CIRCLE],
+        radius=[0.0, 0.05, 0.1],
+        half=[[0.1, 0.1], [0.3, 0.0], [0.0, 0.0]],
+        angle=[0.3, 0.0, 0.0],
+    )
+    world = _obstacle_world(obs, configs=_box_agent_configs(), device=device, dtype=dtype)
+    _place(world, [[0.0, 0.0], [-0.2, 0.3], [0.3, -0.4]], theta=[0.0, 0.4, 1.0])
+    return world
+
+
+@pytest.mark.parametrize("backend", ["torch", "warp"])
+def test_scan_has_no_host_sync(backend):
+    """A scan over every shape kind reads nothing back to the host.
+
+    The circle-only filter this replaces needed two device->host transfers to decide
+    which obstacles to keep; scanning every shape needs none. On CPU the transfer entry
+    points are trapped directly (``test_scan_has_no_cuda_sync`` is the CUDA check).
     """
     from unittest import mock
 
-    from swarp.core.config import Obstacles, ObstacleShape
-
-    world = _tiny_world(dtype=torch.float64)
-    world.state = world.state._replace(
-        pos=torch.zeros(4, 3, 2, dtype=torch.float64),
-        theta=torch.zeros(4, 3, dtype=torch.float64),
-    )
-    n_envs = world.n_envs
-    world.set_obstacles(
-        Obstacles(
-            pos=torch.tensor([[[1.0, 0.0], [0.0, 1.0]]], dtype=torch.float64)
-            .expand(n_envs, 2, 2)
-            .clone(),
-            radius=torch.tensor([0.3, 0.3], dtype=torch.float64),
-            shape=torch.tensor([int(ObstacleShape.SEGMENT), int(ObstacleShape.CIRCLE)]),
-            half_extents=torch.tensor([[2.0, 0.0], [0.0, 0.0]], dtype=torch.float64),
-        )
-    )
-    lidar = Lidar(n_rays=4, max_range=MAXR, include_agents=False)
-    warm = lidar.scan(world)  # one install -> one filter decision
+    world = _mixed_world("cpu")
+    lidar = Lidar(n_rays=8, max_range=MAXR, return_hits=True, backend=backend)
+    warm = [t.clone() for t in lidar.scan(world)]
 
     def _raise(*a, **kw):
         raise AssertionError("device->host transfer on a lidar scan")
 
-    with mock.patch.object(torch.Tensor, "__bool__", _raise), mock.patch.object(
-        torch.Tensor, "nonzero", _raise
+    with (
+        mock.patch.object(torch.Tensor, "__bool__", _raise),
+        mock.patch.object(torch.Tensor, "item", _raise),
+        mock.patch.object(torch.Tensor, "nonzero", _raise),
+        mock.patch.object(torch.Tensor, "tolist", _raise),
     ):
         again = lidar.scan(world)
-    assert torch.equal(warm, again)
-    # The circle is still seen and the segment still is not: ray 1 (+y) hits, ray 0 does not.
-    assert again[0, 0, 1].item() < MAXR
-    assert again[0, 0, 0].item() == pytest.approx(MAXR)
+    for w, g in zip(warm, again, strict=True):
+        assert torch.equal(w, g)
+    assert (again[1] == 2).any() and (again[1] == 1).any()  # obstacles and agents seen
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("backend", ["torch", "warp"])
+def test_scan_has_no_cuda_sync(backend):
+    world = _mixed_world("cuda:0", dtype=torch.float32)
+    lidar = Lidar(n_rays=8, max_range=MAXR, return_hits=True, backend=backend)
+    lidar.scan(world)
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        lidar.scan(world)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+
+
+def test_launch_requires_bind():
+    world = _mixed_world("cpu")
+    with pytest.raises(RuntimeError, match="bind"):
+        Lidar(backend="warp").launch(world)
+
+
+def test_bind_is_idempotent():
+    world = _mixed_world("cpu")
+    lidar = Lidar(n_rays=8, backend="warp")
+    lidar.bind(world)
+    ptr, version = lidar.ranges.data_ptr(), lidar.version
+    lidar.bind(world)
+    lidar.scan(world)
+    assert (lidar.ranges.data_ptr(), lidar.version) == (ptr, version)
+
+
+@pytest.mark.gpu
+def test_captured_launch_replays_live_geometry():
+    """``bind`` outside, ``launch`` inside ``wp.ScopedCapture``: replaying the graph after
+    the movable box has been pushed equals an eager scan of the pushed scene."""
+    import warp as wp
+
+    from swarp.core.config import ObstacleKind, Obstacles, ObstacleShape, WorldConfig
+    from swarp.core.world import World
+    from swarp.dynamics.base import AgentConfig
+
+    dev, dt = "cuda:0", torch.float32
+    cfgs = [AgentConfig(radius=0.05) for _ in range(3)]
+    world = World(
+        cfgs,
+        WorldConfig(collisions=True, obstacle_linear_damping=1.0),
+        n_envs=4,
+        device=dev,
+        dtype=dt,
+        substeps=4,
+    )
+    n_envs = world.n_envs
+    world.state = world.state._replace(
+        pos=torch.tensor([[-0.3, 0.0], [-5.0, 5.0], [0.0, -1.0]], device=dev, dtype=dt)
+        .expand(n_envs, 3, 2)
+        .clone(),
+        theta=torch.zeros(n_envs, 3, device=dev, dtype=dt),
+    )
+    world.set_obstacles(
+        Obstacles(
+            pos=torch.tensor([[[0.0, 0.0], [1.0, 1.0]]], device=dev, dtype=dt)
+            .expand(n_envs, 2, 2)
+            .clone(),
+            radius=torch.tensor([0.0, 0.05], device=dev, dtype=dt),
+            shape=torch.tensor([int(ObstacleShape.BOX), int(ObstacleShape.SEGMENT)]),
+            half_extents=torch.tensor([[0.1, 0.1], [0.4, 0.0]], device=dev, dtype=dt),
+            kind=torch.tensor([int(ObstacleKind.MOVABLE), int(ObstacleKind.IMMOVABLE)]),
+            mass=torch.tensor([0.05, 1.0], device=dev, dtype=dt),
+        )
+    )
+    world.enable_persistent(use_graph=False)  # pointer-stable state, as under capture
+    lidar = Lidar(n_rays=16, max_range=MAXR, return_hits=True, backend="warp")
+    lidar.bind(world)  # the only allocation and module load: none happen in the capture
+    wp.synchronize_device(dev)
+    with wp.ScopedCapture(device=dev) as capture:
+        lidar.launch(world)
+
+    actions = torch.zeros(n_envs, 3, world.act_dim, device=dev, dtype=dt)
+    actions[:, 0, 0] = 1.0  # agent 0 pushes the movable box along +x
+    outs = []
+    views = (lidar.ranges, lidar.hit_class, lidar.hit_index)
+    for _ in range(2):
+        with torch.no_grad():
+            for _ in range(10):
+                world.step(actions)
+        eager = [t.clone() for t in lidar.scan(world)]
+        for t in views:
+            t.zero_()
+        wp.capture_launch(capture.graph)
+        wp.synchronize_device(dev)
+        for e, g in zip(eager, views, strict=True):
+            assert torch.equal(e, g)
+        outs.append(eager[0])
+    assert not torch.equal(outs[0], outs[1])  # the body moved between the two replays
+    assert (lidar.hit_class[:, 0, 0] == 3).all()  # agent 0's +x ray is on the movable box

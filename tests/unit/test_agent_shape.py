@@ -85,7 +85,7 @@ def test_stepping_a_box_agent_world_raises_but_building_and_scanning_work():
     world.write_state(pos=torch.tensor([[0.0, 0.0], [0.5, 0.0]]))
     for backend in ("torch", "warp"):
         r = Lidar(n_rays=4, max_range=2.0, body_frame=False, backend=backend).scan(world)
-        assert (r[:, 0, 0] < 0.5).all()
+        torch.testing.assert_close(r[:, 0, 0], torch.full((2,), 0.4))
     actions = torch.zeros(2, 2, world.act_dim)
     with pytest.raises(NotImplementedError, match="box-agent contact physics"), torch.no_grad():
         world.step(actions)
