@@ -2,7 +2,8 @@
 
 The T is a **movable compound obstacle** (:class:`~swarp.core.config.ObstacleKind`):
 two oriented ``BOX`` shapes tagged with the same body id and placed by their offsets in
-the body frame, so :mod:`swarp.core.bodies` integrates one rigid pose for the pair from
+the body frame (any other box compound from :mod:`swarp.scenarios.shapes` via ``shape=``),
+so :mod:`swarp.core.bodies` integrates one rigid pose for the set from
 the reaction of the very same agent contacts the collision kernel applies. That happens
 *inside* the substep loop, so the pose an agent collides against is at most one substep
 old — a body advanced once per env step instead sweeps its surface across agents that
@@ -53,6 +54,7 @@ from swarp.scenarios.pusht_kernels import (
     pusht_reset_kernel,
     pusht_reward_kernel,
 )
+from swarp.scenarios.shapes import SHAPES, CompoundShape, tee
 
 
 class PushTScenario(FusedScenario):
@@ -81,10 +83,10 @@ class PushTScenario(FusedScenario):
         goal_reward: float = 5.0,
         goal_tolerance: float = 0.1,
         angle_tolerance: float = 0.25,
+        shape: str | CompoundShape | None = None,
     ) -> None:
         self.n_agents = n_agents
         self.agent_radius = agent_radius
-        self.tee_mass = tee_mass
         self.world_size = world_size
         self.max_speed = max_speed
         # contact_k/contact_c ARE the engine's WorldConfig.collision_k/collision_c —
@@ -129,30 +131,26 @@ class PushTScenario(FusedScenario):
         self.goal_tolerance = goal_tolerance
         self.angle_tolerance = angle_tolerance
 
-        # --- T geometry, in the body frame, origin at the area centroid ---------
-        # Crossbar sits on top at local y=0; the stem hangs below it. Shifting both
-        # by the centroid puts the rotation origin and the inertia origin together.
-        a_bar = bar_len * bar_width
-        a_stem = stem_width * stem_len
-        y_stem = -(bar_width + stem_len) / 2.0
-        cy = a_stem * y_stem / (a_bar + a_stem)
-        self.box_half = ((bar_len / 2.0, bar_width / 2.0), (stem_width / 2.0, stem_len / 2.0))
-        self.box_off = ((0.0, -cy), (0.0, y_stem - cy))
-        self.n_boxes = len(self.box_half)
-
-        # Mass splits by area; inertia about the centroid by the parallel-axis theorem.
-        inertia = 0.0
-        for (hx, hy), (_, oy) in zip(self.box_half, self.box_off, strict=True):
-            m_i = tee_mass * (4.0 * hx * hy) / (a_bar + a_stem)
-            inertia += m_i * ((2.0 * hx) ** 2 + (2.0 * hy) ** 2) / 12.0 + m_i * oy * oy
-        self.tee_inertia = inertia
-        # Farthest corner from the centroid: the clamp radius that keeps the whole
-        # T inside the world bounds.
-        self.tee_radius = max(
-            math.hypot(hx, oy + sy * hy)
-            for (hx, hy), (_, oy) in zip(self.box_half, self.box_off, strict=True)
-            for sy in (-1.0, 1.0)
-        )
+        # --- body geometry, in the body frame, origin at the area centroid -----
+        # See swarp.scenarios.shapes: mass splits by area, inertia about the centroid by
+        # the parallel-axis theorem, radius to the farthest corner (the clamp radius that
+        # keeps the whole body inside the world bounds). The default is the T, crossbar
+        # first; ``shape`` swaps in any other compound body: a ``SHAPES`` name (built at
+        # its defaults with ``tee_mass``) or a ``CompoundShape``, which carries its own
+        # mass. Either way the ``bar_*``/``stem_*`` sizes are ignored.
+        if shape is None:
+            shape = tee(bar_len, bar_width, stem_len, stem_width, mass=tee_mass)
+        elif isinstance(shape, str):
+            if shape not in SHAPES:
+                raise ValueError(f"unknown shape {shape!r}; choose from {sorted(SHAPES)}")
+            shape = SHAPES[shape](mass=tee_mass)
+        self.shape = shape
+        self.tee_mass = shape.mass
+        self.box_half = shape.half
+        self.box_off = shape.off
+        self.n_boxes = shape.n_boxes
+        self.tee_inertia = shape.inertia
+        self.tee_radius = shape.radius
         # Staging point for the approach shaping, push_point_offset past the T centre
         # directly away from the goal. 0 = the T centre itself: plain approach shaping.
         # (>0 turned out noisier in practice — the point moves with the T.)
@@ -162,8 +160,15 @@ class PushTScenario(FusedScenario):
         self.goal_spawn_radius: float | None = None
         self.goal_spawn_angle: float | None = None
 
-    def make_world(self, n_envs, device, dt, substeps, dtype, world_config=None) -> World:
-        cfgs = [
+    def _agent_configs(self) -> list[AgentConfig]:
+        """One :class:`AgentConfig` per agent: velocity-controlled holonomic pushers.
+
+        Split out, as in :meth:`NavigationScenario._agent_configs
+        <swarp.scenarios.navigation.NavigationScenario._agent_configs>`, so a subclass can
+        vary the fleet without reimplementing ``make_world``. The contact derivation in
+        ``make_world`` assumes velocity control at ``self.max_speed``.
+        """
+        return [
             AgentConfig(
                 model=DynamicsModel.HOLONOMIC,
                 ctrl_mode=ControlMode.VELOCITY,
@@ -173,6 +178,9 @@ class PushTScenario(FusedScenario):
             )
             for _ in range(self.n_agents)
         ]
+
+    def make_world(self, n_envs, device, dt, substeps, dtype, world_config=None) -> World:
+        cfgs = self._agent_configs()
         margin = 0.5 * self.agent_radius
         # A velocity-mode agent has no contact memory: each substep its velocity is
         # overwritten by the command plus f*sub_dt/m, so holding it out of the body needs
@@ -217,14 +225,14 @@ class PushTScenario(FusedScenario):
         idx = torch.arange(na, device=device)
         others = idx.unsqueeze(0).expand(na, -1)[idx.unsqueeze(1) != idx.unsqueeze(0)]
         self._others = others.view(na, na - 1)  # [A, A-1]
-        # Env-independent obstacle attributes (both boxes, every env).
+        # Env-independent obstacle attributes (every box, every env).
         self._obs_shape = torch.full((self.n_boxes,), int(ObstacleShape.BOX), device=device,
                                      dtype=torch.int32)
         self._obs_radius = torch.zeros(self.n_boxes, **tt)  # a box ignores radius
         self._obs_half = torch.tensor(self.box_half, **tt)
         self._box_off_t = torch.tensor(self.box_off, **tt)  # [n_boxes, 2]
-        # The T is ONE movable compound body: both boxes share body 0 (the root) and sit
-        # at their local offsets, so the engine integrates a single pose for the pair.
+        # The T is ONE movable compound body: all boxes share body 0 (the root) and sit
+        # at their local offsets, so the engine integrates a single pose for the set.
         # Mass/inertia are read from the root and are about the body origin (the centroid).
         self._obs_kind = torch.full(
             (self.n_boxes,), int(ObstacleKind.MOVABLE), device=device, dtype=torch.int32
@@ -309,13 +317,28 @@ class PushTScenario(FusedScenario):
         path's ``_refresh`` still reassigns them (fresh tensors for the tape), which the
         framework's handle resync catches on the next no-grad step.
         """
+        mask, use_mask = self.reset_mask_wp(env_mask)
+        self._launch_spawn(mask, use_mask)
+        self.world.mark_pos_dirty()
+
+        self._install_obstacles()
+        self.finish_reset(env_mask, obs_only=obs_only)
+
+    def _launch_spawn(self, mask, use_mask) -> None:
+        """Respawn agents, body and goal in the masked envs: one ``pusht_reset_kernel``.
+
+        ``mask``/``use_mask`` are what :meth:`reset_mask_wp` returned. A subclass that
+        samples extra per-env state on reset (roles, say) overrides this, calls
+        ``super()._launch_spawn(mask, use_mask)`` and launches its own kernel with the
+        same mask; ``reset_world`` still marks positions dirty, re-installs the body and
+        finishes the reset afterwards.
+        """
         w = self.world
         lim = self.world_size - 2.0 * self.agent_radius
         tlim = self.world_size - self.tee_radius
         # Any agent inside the T's bounding disk is pushed out to its rim by the kernel:
         # with a stiff contact_k a spawn overlap is a violent ejection.
         clear = self.tee_radius + 2.0 * self.agent_radius
-        mask, use_mask = self.reset_mask_wp(env_mask)
         st = w.state_wp()
         scalar = w.wp_dtype
         vec2 = VEC2[scalar]
@@ -395,13 +418,9 @@ class PushTScenario(FusedScenario):
             launch.set_param_by_name("use_mask", use_mask)
             launch.set_param_by_name("seed", seed)
             launch.launch()
-        w.mark_pos_dirty()
-
-        self._install_obstacles()
-        self.finish_reset(env_mask, obs_only=obs_only)
 
     def _box_poses(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """The two box centres ``[n_envs, n_boxes, 2]`` and angles ``[n_envs, n_boxes]``
+        """The box centres ``[n_envs, n_boxes, 2]`` and angles ``[n_envs, n_boxes]``
         for the current T pose, written **into** the persistent pose buffers.
 
         Torch (the fused path does this inside the body kernel). Returns the buffers so the
@@ -868,7 +887,7 @@ class PushTScenario(FusedScenario):
     def render_extras(self, env_idx: int) -> dict[str, Any]:
         """The target pose of the T, as oriented boxes for the ``goal_pose`` overlay.
 
-        Same two boxes the body is built from, placed at ``(goal_pos, goal_theta)``:
+        Same boxes the body is built from, placed at ``(goal_pos, goal_theta)``:
         the outline shows exactly where the T has to end up.
         """
         th = float(self.goal_theta[env_idx])
