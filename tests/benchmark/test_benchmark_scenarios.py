@@ -28,6 +28,7 @@ def test_registry_has_all_scenarios():
         "shepherding",
         "caging",
         "ringroad",
+        "pusht_lidar",
     }
 
 

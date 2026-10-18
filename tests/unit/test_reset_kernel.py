@@ -252,6 +252,14 @@ RESET_STATE = {
     # The humans are scenario-owned 1-D state; the reset draws the wave's phase and the
     # ring offset, so both their arc positions and speeds are fresh each episode.
     "ringroad": [("idm_s", "draw"), ("idm_v", "draw")],
+    # Push-T's body and goal, plus the role permutation drawn by its own kernel.
+    "pusht_lidar": [
+        ("tee_pos", "draw"),
+        ("goal_pos", "draw"),
+        ("tee_vel", "clear"),
+        ("tee_ang_vel", "clear"),
+        ("roles", "draw"),
+    ],
 }
 
 

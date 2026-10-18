@@ -13,6 +13,7 @@ from swarp import (
     FormationScenario,
     GiveWayScenario,
     NavigationScenario,
+    PushTLidarScenario,
     PushTScenario,
     RingRoadScenario,
     SamplingScenario,
@@ -131,10 +132,11 @@ def test_matches_under_a_user_created_stream(use_graph):
         lambda n: ShepherdingScenario(n_agents=n),
         lambda n: CagingScenario(n_agents=n),
         lambda n: RingRoadScenario(n_agents=n),
+        lambda n: PushTLidarScenario(n_agents=n),
     ],
     ids=[
         "navigation", "flocking", "formation", "discovery", "sampling", "transport",
-        "pusht", "giveway", "shepherding", "caging", "ringroad",
+        "pusht", "giveway", "shepherding", "caging", "ringroad", "pusht_lidar",
     ],
 )
 def test_graph_matches_eager_all_scenarios(scen_factory):
