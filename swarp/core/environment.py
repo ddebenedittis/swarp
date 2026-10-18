@@ -500,6 +500,11 @@ class Environment:
         live buffer that belongs to the current observation."""
         return self.scenario.aux_targets()
 
+    def comm_mask(self) -> torch.Tensor | None:
+        """Who may hear whom ``[n_envs, n_agents, n_agents]`` (bool), or ``None`` for
+        everyone. A live buffer that belongs to the current observation."""
+        return self.scenario.comm_mask()
+
     @property
     def action_bounds(self) -> tuple[torch.Tensor, torch.Tensor]:
         """The action box the dynamics kernels clamp against: ``(low, high)``, each

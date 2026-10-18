@@ -102,6 +102,13 @@ class Scenario(ABC):
         hidden pose in the agent's frame), or ``None``."""
         return None
 
+    def comm_mask(self) -> torch.Tensor | None:
+        """Who may hear whom, ``[n_envs, n_agents, n_agents]`` bool (``[e, i, j]``: agent
+        ``i`` receives agent ``j``'s message, e.g. within a radio range), or ``None``,
+        meaning every agent hears every teammate. Read by a communicating policy; the
+        diagonal is ignored (an agent never messages itself)."""
+        return None
+
     @property
     @abstractmethod
     def obs_dim(self) -> int:
