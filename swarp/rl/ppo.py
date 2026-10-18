@@ -447,6 +447,7 @@ class MAPPO:
 
         self._out: tuple[Any, ...] | None = None
         self._act_ptrs: tuple[int, ...] = ()  # the buffers the act graph reads
+        self.act_recaptures = 0  # act-graph recaptures in the current rollout
         self._sig: tuple[int, ...] | None = None  # the buffers the store graph reads
         self._act = _Graphed(self._act_body, self.graphs, carries=(self.t,))
         self._store = _Graphed(
@@ -582,6 +583,7 @@ class MAPPO:
             self.reset()
         self.t.zero_()
         self.metric_acc.zero_()
+        self.act_recaptures = 0
         env, actions = self.env, self.actions
         for _ in range(self.T):
             # The graphs read the env's output buffers by address. They are fixed in
@@ -590,6 +592,7 @@ class MAPPO:
             if ptrs != self._act_ptrs:
                 self._act.invalidate()
                 self._act_ptrs = ptrs
+                self._count_act_recapture()
             self._act()
             out = env.step(actions)
             sig = self._signature(out)
@@ -605,6 +608,26 @@ class MAPPO:
             self.state_buf[self.T].copy_(state)
         if self.role_buf is not None:
             self.role_buf[self.T].copy_(roles)
+
+    def _count_act_recapture(self) -> None:
+        """Raise once the act graph recaptures more than twice within one rollout.
+
+        A first rollout recaptures up to twice (the reset's buffers, then the step's), and
+        a buffer that moves once at a rollout boundary costs one more; a hook that hands
+        back a fresh tensor every call recaptures on every step, and would otherwise only
+        run slowly and silently.
+        """
+        if not self.graphs:
+            return
+        self.act_recaptures += 1
+        if self.act_recaptures > 2:
+            raise RuntimeError(
+                f"the act graph was recaptured {self.act_recaptures} times in one rollout: "
+                "the observation, critic_state(), agent_roles() or aux_targets() returns a "
+                "tensor at a new address on every call. Each must return the same "
+                "fixed-address buffer, updated in place (see 'Training hooks' in "
+                "docs/writing-a-scenario.md)."
+            )
 
     # ---------------------------------------------------------------------- update
 

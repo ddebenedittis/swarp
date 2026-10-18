@@ -366,8 +366,10 @@ def test_features_add_their_buffers_and_the_aux_stat():
 def test_captured_rollout_fills_consistent_slots():
     """Every slot's stored log-prob is the actor's log-prob of that slot's (obs, u)."""
     algo = _algo(graphs=True)
-    for _ in range(2):  # the second rollout replays graphs captured in the first
-        algo.rollout()
+    algo.rollout()
+    assert 1 <= algo.act_recaptures <= 2
+    algo.rollout()  # replays the graphs captured in the first
+    assert algo.act_recaptures == 0
     assert algo.t.item() == algo.T
     with torch.no_grad():
         loc, scale = algo.actor(algo.obs_buf[: algo.T])
@@ -392,6 +394,21 @@ def test_captured_rollout_records_state_roles_and_aux_with_their_obs():
         loc, scale = algo.actor(algo.obs_buf[:T], algo.role_buf[:T])
         ref = tanh_normal_log_prob(algo.u_buf, loc, scale)
     assert torch.allclose(algo.logp_buf, ref, atol=1e-4)
+
+
+@pytest.mark.gpu
+def test_a_hook_returning_fresh_tensors_is_refused():
+    """A fresh agent_roles() tensor per call would recapture the act graph every step."""
+
+    def fresh_roles(env):
+        _patch_training_hooks(env)
+        roles = env.scenario.agent_roles()
+        env.scenario.agent_roles = lambda: roles.clone()
+
+    algo = _algo(graphs=True, features=True, patch=fresh_roles)
+    with pytest.raises(RuntimeError, match="fixed-address buffer"):
+        algo.rollout()
+    assert algo.act_recaptures == 3
 
 
 _ROLLOUT = ("obs_buf", "u_buf", "logp_buf", "rew_buf", "term_buf", "trunc_buf",
