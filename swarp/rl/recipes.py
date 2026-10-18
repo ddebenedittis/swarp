@@ -26,7 +26,7 @@ import torch
 
 import swarp
 from swarp import Environment
-from swarp.rl.networks import ROLE_PARAMS
+from swarp.rl.networks import COMMS, ROLE_PARAMS
 from swarp.scenarios import scenario_class
 from swarp.scenarios.base import Scenario
 
@@ -152,10 +152,26 @@ class TrainSpec:
     """Weight of the auxiliary loss ``mse(aux_head(features), scenario.aux_targets())``;
     0 disables it. Above 0 it needs ``actor="policynet"`` and a scenario with
     ``aux_dim > 0``."""
+    # --- memory and communication (a ``"policynet"`` actor only) ----------------------
+    recurrent: bool = False
+    """A GRU after the policy's trunk, its hidden state carried across steps and reset at
+    episode ends; the update backpropagates through time over ``seq_len`` chunks."""
+    hidden_dim: int = 128
+    """Width of the GRU's hidden state. Ignored unless ``recurrent``."""
+    seq_len: int = 0
+    """Length of the update's BPTT chunks; 0 means ``steps_per_batch`` (one chunk per env
+    and rollout). Must divide ``steps_per_batch``. Ignored unless ``recurrent``."""
+    comm: str = "none"
+    """``"none"``, or ``"attn"``: one round of attention over teammates' encoded inputs
+    before the trunk, restricted by the scenario's ``comm_mask()`` when it has one."""
+    comm_dim: int = 64
+    """Width of the encoded input, the keys, the values and the message. Ignored unless
+    ``comm="attn"``."""
 
     def __post_init__(self) -> None:
         for name, allowed in (
             ("actor", ACTORS), ("role_params", ROLE_PARAMS), ("critic_input", CRITIC_INPUTS),
+            ("comm", COMMS),
         ):
             if getattr(self, name) not in allowed:
                 raise ValueError(f"{name} must be one of {allowed}, got {getattr(self, name)!r}")
@@ -163,6 +179,22 @@ class TrainSpec:
             raise ValueError(f"aux_coef must be >= 0, got {self.aux_coef}")
         if self.aux_coef > 0 and self.actor != "policynet":
             raise ValueError("aux_coef > 0 needs actor='policynet' (the aux head lives there)")
+        if self.recurrent and self.actor != "policynet":
+            raise ValueError("recurrent=True needs actor='policynet' (the GRU lives there)")
+        if self.comm != "none" and self.actor != "policynet":
+            raise ValueError(f"comm={self.comm!r} needs actor='policynet' (the attention "
+                             "lives there)")
+        for name in ("hidden_dim", "comm_dim"):
+            if getattr(self, name) < 1:
+                raise ValueError(f"{name} must be >= 1, got {getattr(self, name)}")
+        if self.seq_len < 0:
+            raise ValueError(f"seq_len must be >= 0 (0 means steps_per_batch), got {self.seq_len}")
+        if self.seq_len and not self.recurrent:
+            raise ValueError("seq_len is the BPTT chunk length: it needs recurrent=True")
+        if self.seq_len and self.steps_per_batch % self.seq_len:
+            raise ValueError(
+                f"seq_len {self.seq_len} must divide steps_per_batch {self.steps_per_batch}"
+            )
 
 
 # Scenarios with no success criterion: both inherit the all-False ``Scenario.done``, so an

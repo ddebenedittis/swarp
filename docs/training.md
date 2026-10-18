@@ -65,7 +65,7 @@ Three are its own:
 `--compile`
 : `torch.compile` the minibatch loss (needs triton). Adds tens of seconds of startup; the compiled code is still captured by the minibatch graph.
 
-The network options (`--actor`, `--role-params`, `--critic-input`, `--per-agent-value`, `--aux-coef`, `--resume-critic-only`) are described in [Roles, privileged critics and auxiliary losses](#roles-privileged-critics-and-auxiliary-losses).
+The network options (`--actor`, `--role-params`, `--critic-input`, `--per-agent-value`, `--aux-coef`, `--resume-critic-only`) are described in [Roles, privileged critics and auxiliary losses](#roles-privileged-critics-and-auxiliary-losses), and the actor's memory and communication (`--recurrent`, `--hidden-dim`, `--seq-len`, `--comm`, `--comm-dim`) in [Memory and communication](#memory-and-communication).
 
 ## Using it from Python
 
@@ -147,6 +147,54 @@ A checkpoint of a role-aware policy evaluates through `examples/eval_mappo.py` a
 ```bash
 python -m swarp.rl --scenario <name> --actor policynet --role-params heads \
     --critic-input state+obs --per-agent-value --aux-coef 0.1
+```
+
+## Memory and communication
+
+A `"policynet"` actor can also remember and talk.
+Both are off by default, and with both off the networks, buffers and graphs are the ones above.
+
+| field | flag | values (default first) | needs from the scenario |
+|---|---|---|---|
+| `recurrent` | `--recurrent` | `False`, `True` | nothing |
+| `hidden_dim` | `--hidden-dim` | `128`, any width | nothing |
+| `seq_len` | `--seq-len` | `0` (= `steps_per_batch`), a divisor of `steps_per_batch` | nothing |
+| `comm` | `--comm` | `"none"`, `"attn"` | `comm_mask()`, optionally |
+| `comm_dim` | `--comm-dim` | `64`, any width | nothing |
+
+**Memory.**
+`recurrent` puts a `GRUCell` after the trunk (one per role with `"separate"`), and the action heads and the auxiliary head read its output.
+Its hidden state is the policy's memory of the episode: what a lidar-only agent saw a few steps ago, or where an object went when it left the field of view.
+The rollout carries the hidden state `[n_envs, n_agents, hidden_dim]` from step to step and from one rollout to the next, and zeroes it in each env whose episode just ended, since with `auto_reset=True` the next observation already belongs to the next episode.
+The act graph also stores the hidden state *entering* each step, so the update never has to recompute it.
+
+The update trains it by backpropagation through time.
+Each env's `steps_per_batch` steps are cut into chunks of `seq_len` consecutive steps, minibatches are drawn over whole chunks, and each chunk is unrolled from its stored starting hidden state, with the hidden state zeroed after every episode end inside it.
+The recomputed log-probs are then the ones the rollout sampled with, which is what makes the PPO ratio start at one.
+A minibatch holds as many env steps as without memory; only the GRU steps one at a time, while the trunk, the heads and the critic run over the whole minibatch at once.
+A shorter `seq_len` gives more, shorter chunks per minibatch: cheaper gradients that cannot reach as far back.
+
+**Communication.**
+`comm="attn"` adds one round of learned communication before the trunk.
+Each agent's input (its observation and role one-hot) is encoded to a `comm_dim`-wide vector and projected to a query, a key and a value.
+Each agent then attends over its teammates' keys with single-head scaled dot-product attention, and the trunk reads its encoding concatenated with the weighted sum of their values, the message.
+An agent never attends to itself.
+A scenario that limits who hears whom (a radio range, line of sight) provides `comm_mask()`, a `[n_envs, n_agents, n_agents]` bool tensor where entry `[e, i, j]` lets agent `i` hear agent `j`; without one every agent hears every teammate.
+An agent that hears nobody gets a zero message.
+The message is computed from the current step's inputs, so communication works with and without memory, and with memory the GRU is what lets a message's content persist.
+Communication needs one shared trunk, so it combines with `role_params` `"heads"` or `"shared"`; with roles and `"separate"`, `train` refuses it.
+
+The mask is a training hook with the same fixed-address contract as the others ([Writing a scenario](writing-a-scenario.md#training-hooks-optional)); the rollout records it next to the observation and the update reads it back with each sample.
+Whether a scenario has one is decided once, when `MAPPO` is built, from whether `comm_mask()` returns `None`.
+
+**Evaluation.**
+`swarp.rl.greedy_env_arm(actor)` (and `examples/eval_mappo.py`, which goes through it) gives a recurrent policy a stateful action function: it starts from a zero hidden state and carries it from call to call, which is right for the evaluator's single un-reset episode per env.
+A loop whose envs reset mid-run builds a fresh action function per episode.
+`PolicyNet.greedy(obs, roles, h)` acts from a given hidden state and drops the new one; `PolicyNet.step` returns it.
+
+```bash
+python -m swarp.rl --scenario <name> --actor policynet --recurrent --hidden-dim 128 \
+    --seq-len 16 --comm attn --comm-dim 64
 ```
 
 ## What differs from the TorchRL trainer

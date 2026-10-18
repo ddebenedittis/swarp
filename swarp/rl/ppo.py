@@ -58,6 +58,7 @@ from swarp.rl.networks import (
 )
 from swarp.rl.recipes import (
     ACTORS,
+    COMMS,
     CRITIC_INPUTS,
     ROLE_PARAMS,
     SPECS,
@@ -234,10 +235,30 @@ def policy_outputs(
     obs: torch.Tensor,
     roles: torch.Tensor | None = None,
     with_aux: bool = False,
+    h0: torch.Tensor | None = None,
+    done: torch.Tensor | None = None,
+    comm_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    """``(loc, scale, aux)`` from either actor: :class:`Actor` reads only ``obs``."""
+    """``(loc, scale, aux)`` from either actor: :class:`Actor` reads only ``obs``.
+
+    With ``h0`` ``[S, A, H]`` and ``done`` ``[L, S]``, the rows of ``obs`` (and of
+    ``roles``, ``comm_mask``) are ``S`` sequences of ``L`` steps, time-major (row
+    ``l * S + s`` is step ``l`` of sequence ``s``), and a recurrent :class:`PolicyNet`
+    unrolls each from its stored starting hidden state (:meth:`PolicyNet.unroll`). The
+    outputs come back in the same flat row order.
+    """
+    if h0 is not None:
+        L = done.shape[0]
+
+        def seq(x: torch.Tensor | None) -> torch.Tensor | None:
+            return None if x is None else x.view(L, -1, *x.shape[1:])
+
+        loc, scale, aux, _ = actor.unroll(
+            seq(obs), seq(roles), h0, done, with_aux=with_aux, comm_mask=seq(comm_mask)
+        )
+        return loc.flatten(0, 1), scale.flatten(0, 1), None if aux is None else aux.flatten(0, 1)
     if isinstance(actor, PolicyNet):
-        loc, scale, aux, _ = actor.step(obs, roles, with_aux=with_aux)
+        loc, scale, aux, _ = actor.step(obs, roles, with_aux=with_aux, comm_mask=comm_mask)
         return loc, scale, aux
     loc, scale = actor(obs)
     return loc, scale, None
@@ -269,6 +290,9 @@ def ppo_loss(
     roles: torch.Tensor | None = None,
     aux_target: torch.Tensor | None = None,
     role_counts: Sequence[int] = (),
+    h0: torch.Tensor | None = None,
+    done: torch.Tensor | None = None,
+    comm_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, ...]:
     """Clipped surrogate, smooth-L1 value loss and MC entropy for one minibatch.
 
@@ -279,7 +303,10 @@ def ppo_loss(
     ``aux_target`` ``[B, A, aux_dim]`` for a :class:`PolicyNet`'s aux head. Returns
     ``(objective, critic, entropy)``, plus the unweighted auxiliary MSE when
     ``aux_target`` is given. With ``roles`` and ``role_counts`` the advantages are
-    normalized per role-sorted slot (:func:`standardize_advantage`).
+    normalized per role-sorted slot (:func:`standardize_advantage`). ``comm_mask``
+    ``[B, A, A]`` goes to a communicating :class:`PolicyNet`; ``h0`` and ``done`` make the
+    ``B`` rows sequences for a recurrent one (see :func:`policy_outputs`), and every other
+    input then lists its rows in the same time-major order.
 
     A thin wrapper over :func:`ppo_terms` that keeps the original op order (advantages,
     actor, policy terms, critic), so a default run launches the same kernels in the same
@@ -287,7 +314,10 @@ def ppo_loss(
     """
     if normalize_advantage:
         adv = standardize_advantage(adv, roles, role_counts)
-    loc, scale, aux = policy_outputs(actor, obs, roles, with_aux=aux_target is not None)
+    loc, scale, aux = policy_outputs(
+        actor, obs, roles, with_aux=aux_target is not None, h0=h0, done=done,
+        comm_mask=comm_mask,
+    )
     objective, entropy = ppo_terms(loc, scale, u, logp_old, adv, noise)
     value = critic_values(critic, obs, state, roles)
     if aux_target is None:
@@ -329,6 +359,17 @@ class MAPPO:
     targets)``. Each is written next to the observation by the act graph. With
     :class:`Actor`, :class:`Critic`, ``aux_coef=0`` and no roles none exists and the
     graphs are the plain ones.
+
+    A communicating :class:`PolicyNet` on a scenario whose ``comm_mask()`` is not
+    ``None`` (decided once, here) adds a ``[T, E, A, A]`` buffer of the mask. A recurrent
+    one adds the carried hidden state ``h`` ``[E, A, H]`` and ``h_buf`` ``[T, E, A, H]``,
+    the hidden state *entering* each step, written by the act graph; the store graph
+    zeroes ``h`` for the envs whose episode just ended, since the next observation already
+    belongs to the next episode. The update then draws minibatches of whole sequences:
+    each env's ``T`` steps split into chunks of ``L = spec.seq_len`` (``T`` when 0), each
+    chunk unrolled from its stored ``h_buf`` row with the hidden state zeroed after every
+    done, so the recomputed log-probs are the rollout's. A minibatch holds
+    ``(E * T / L) // minibatches`` chunks, the same number of samples as without memory.
     """
 
     def __init__(
@@ -411,12 +452,37 @@ class MAPPO:
         self.state_buf = z(T + 1, E, env.state_dim) if self.use_state else None
         self.role_buf = z(T + 1, E, A, dtype=torch.long) if self.use_roles else None
         self.aux_buf = z(T, E, A, env.aux_dim) if self.use_aux else None
-        self._src: tuple[torch.Tensor | None, ...] = (None, None, None)  # state, roles, aux
+        # Memory and communication.
+        self.recurrent = self.policy_net and actor.recurrent
+        self.use_mask = self.policy_net and actor.communicates and env.comm_mask() is not None
+        self.mask_buf = z(T, E, A, A, dtype=torch.bool) if self.use_mask else None
+        self.h = self.h_buf = self.done_buf = None
+        # The update draws minibatches of ``mb_units`` units out of ``n_units``: samples,
+        # or (recurrent) chunks of L consecutive steps of one env.
+        self.L, self.n_units, self.mb_units = 1, N, self.B
+        if self.recurrent:
+            L = spec.seq_len or T
+            if T % L:
+                raise ValueError(f"seq_len {L} must divide steps_per_batch {T}")
+            self.L, self.n_units = L, E * T // L
+            self.mb_units = self.n_units // self.M
+            if self.mb_units < 1:
+                raise ValueError(
+                    f"{self.n_units} chunks of {L} steps cannot make {self.M} minibatches"
+                )
+            self.B = self.mb_units * L
+            H = actor.hidden_dim
+            self.h = z(E, A, H)
+            self.h_buf = z(T, E, A, H)
+            self.done_buf = z(T, E)
+            self._steps = torch.arange(L, device=dev)
+        # state, roles, aux targets, comm mask
+        self._src: tuple[torch.Tensor | None, ...] = (None, None, None, None)
         # Update.
         self.v_buf = z(T + 1, E, A)
         self.adv_buf = z(T, E, A)
         self.ret_buf = z(T, E, A)
-        self.perms = z(spec.epochs * self.M, self.B, dtype=torch.long)
+        self.perms = z(spec.epochs * self.M, self.mb_units, dtype=torch.long)
         self.k = z(1, dtype=torch.long)
         self.ent_coef = torch.tensor(spec.entropy_coeff, device=dev)
         # [mean reward, n_terminated, n_done] from prepare, then
@@ -449,9 +515,11 @@ class MAPPO:
         self._act_ptrs: tuple[int, ...] = ()  # the buffers the act graph reads
         self.act_recaptures = 0  # act-graph recaptures in the current rollout
         self._sig: tuple[int, ...] | None = None  # the buffers the store graph reads
-        self._act = _Graphed(self._act_body, self.graphs, carries=(self.t,))
+        # The warm-up runs the bodies for real: the carried hidden state is restored too.
+        hidden = (self.h,) if self.recurrent else ()
+        self._act = _Graphed(self._act_body, self.graphs, carries=(self.t, *hidden))
         self._store = _Graphed(
-            self._store_body, self.graphs, carries=(self.t, self.metric_acc)
+            self._store_body, self.graphs, carries=(self.t, self.metric_acc, *hidden)
         )
         self._prepare = _Graphed(self._prepare_body, self.graphs, carries=(), warmup=1)
         self._minibatch = _Graphed(
@@ -472,16 +540,27 @@ class MAPPO:
         limit truncates every env on the same step forever, and every batch is the same
         ``steps_per_batch`` slice of the episode in all envs. Only the public
         ``reset_at`` is used; the step counter stays the env's own.
+
+        A recurrent policy's hidden state starts at zero and is carried through the
+        warm-up, zeroed in each env whose episode ends or is re-reset, so the first
+        rollout continues every env's episode with the memory of it.
         """
         obs = self.env.reset()
+        if self.recurrent:
+            self.h.zero_()
         horizon = self.env.max_steps or 0
         if self.spec.stagger_starts and horizon > 1:
             gen = torch.Generator(device=self.device).manual_seed(0)
             offset = torch.randint(0, horizon, (self.E,), device=self.device, generator=gen)
             with torch.no_grad():
                 for t in range(horizon):
-                    obs = self.env.step(self._greedy(obs))[0]
-                    obs = self.env.reset_at(offset == t)
+                    obs, _, term, trunc, _ = self.env.step(self._greedy(obs))
+                    restart = offset == t
+                    if self.recurrent:
+                        done = torch.logical_or(torch.logical_or(term, trunc), restart)
+                    obs = self.env.reset_at(restart)
+                    if self.recurrent:
+                        self.h.masked_fill_(done.view(-1, 1, 1), 0.0)
         self._out = (obs, None, None, None, None)
         self._fetch_sources()
         if self.use_roles:
@@ -514,17 +593,26 @@ class MAPPO:
         )
 
     def _greedy(self, obs: torch.Tensor) -> torch.Tensor:
-        if self.actor_roles:
-            return self.actor.greedy(obs, self.env.agent_roles())
-        return self.actor.greedy(obs)
+        """The greedy action; a recurrent policy advances ``self.h``."""
+        if not (self.recurrent or self.use_mask):
+            if self.actor_roles:
+                return self.actor.greedy(obs, self.env.agent_roles())
+            return self.actor.greedy(obs)
+        roles = self.env.agent_roles() if self.actor_roles else None
+        mask = self.env.comm_mask() if self.use_mask else None
+        with torch.no_grad():
+            loc, _, _, h = self.actor.step(obs, roles, self.h, comm_mask=mask)
+        if self.recurrent:
+            self.h.copy_(h)
+        return self.actor.squash(loc)
 
     def _fetch_sources(self) -> None:
-        """Point at the env's state/role/aux buffers for the current observation (host
-        only)."""
-        if not (self.use_state or self.use_roles or self.use_aux):
+        """Point at the env's state/role/aux/mask buffers for the current observation
+        (host only)."""
+        if not (self.use_state or self.use_roles or self.use_aux or self.use_mask):
             return
         E, A = self.E, self.A
-        state = roles = aux = None
+        state = roles = aux = mask = None
         if self.use_state:
             state = self.env.critic_state()
             want = (E, self.env.state_dim)
@@ -541,7 +629,13 @@ class MAPPO:
             want = (E, A, self.env.aux_dim)
             if aux is None or tuple(aux.shape) != want:
                 raise ValueError(f"aux_targets() must be a {want} tensor, got {_shape(aux)}")
-        self._src = (state, roles, aux)
+        if self.use_mask:
+            mask = self.env.comm_mask()
+            if mask is None or tuple(mask.shape) != (E, A, A) or mask.dtype != torch.bool:
+                raise ValueError(
+                    f"comm_mask() must be a bool {(E, A, A)} tensor, got {_shape(mask)}"
+                )
+        self._src = (state, roles, aux, mask)
 
     def _act_inputs(self) -> tuple[torch.Tensor, ...]:
         """The env-owned buffers the act graph reads by address."""
@@ -550,7 +644,7 @@ class MAPPO:
     def _act_body(self) -> None:
         obs = self._out[0]
         self.obs_buf.index_copy_(0, self.t, obs.unsqueeze(0))
-        state, roles, aux = self._src
+        state, roles, aux, mask = self._src
         if self.state_buf is not None:
             self.state_buf.index_copy_(0, self.t, state.unsqueeze(0))
         if self.role_buf is not None:
@@ -558,7 +652,14 @@ class MAPPO:
             self.role_buf.index_copy_(0, self.t, roles.unsqueeze(0))
         if self.aux_buf is not None:
             self.aux_buf.index_copy_(0, self.t, aux.unsqueeze(0))
-        loc, scale, _ = policy_outputs(self.actor, obs, roles)
+        if self.mask_buf is not None:
+            self.mask_buf.index_copy_(0, self.t, mask.unsqueeze(0))
+        if self.recurrent:
+            self.h_buf.index_copy_(0, self.t, self.h.unsqueeze(0))
+            loc, scale, _, h = self.actor.step(obs, roles, self.h, comm_mask=mask)
+            self.h.copy_(h)
+        else:
+            loc, scale, _ = policy_outputs(self.actor, obs, roles, comm_mask=mask)
         u = loc + scale * torch.randn_like(loc)
         self.actions.copy_(self.actor.squash(u))
         self.u_buf.index_copy_(0, self.t, u.unsqueeze(0))
@@ -574,6 +675,9 @@ class MAPPO:
             x = info[key].float().reshape(-1, width).mean(0)
             self.metric_acc[off : off + width] += x
             off += width
+        if self.recurrent:
+            # The observation after a done already belongs to the next episode.
+            self.h.masked_fill_(torch.logical_or(term, trunc).view(-1, 1, 1), 0.0)
         self.t.add_(1)
 
     @torch.no_grad()
@@ -603,7 +707,7 @@ class MAPPO:
             self._fetch_sources()
             self._store()
         self.obs_buf[self.T].copy_(self._out[0])
-        state, roles, _ = self._src
+        state, roles = self._src[:2]
         if self.state_buf is not None:
             self.state_buf[self.T].copy_(state)
         if self.role_buf is not None:
@@ -623,7 +727,8 @@ class MAPPO:
         if self.act_recaptures > 2:
             raise RuntimeError(
                 f"the act graph was recaptured {self.act_recaptures} times in one rollout: "
-                "the observation, critic_state(), agent_roles() or aux_targets() returns a "
+                "the observation, critic_state(), agent_roles(), aux_targets() or "
+                "comm_mask() returns a "
                 "tensor at a new address on every call. Each must return the same "
                 "fixed-address buffer, updated in place (see 'Training hooks' in "
                 "docs/writing-a-scenario.md)."
@@ -640,10 +745,12 @@ class MAPPO:
             term = self.term_buf
             gae(self.rew_buf, self.v_buf, term, self.trunc_buf, gamma, lmbda, out=self.adv_buf)
             torch.add(self.adv_buf, self.v_buf[:T], out=self.ret_buf)
-            n = self.M * self.B
+            if self.recurrent:
+                torch.maximum(term, self.trunc_buf, out=self.done_buf)
+            n = self.M * self.mb_units
             for e in range(spec.epochs):
-                p = torch.rand(self.N, device=self.device).argsort()[:n]
-                self.perms[e * self.M : (e + 1) * self.M] = p.view(self.M, self.B)
+                p = torch.rand(self.n_units, device=self.device).argsort()[:n]
+                self.perms[e * self.M : (e + 1) * self.M] = p.view(self.M, self.mb_units)
             self.prep_stats[0] = self.rew_buf.mean()
             self.prep_stats[1] = term.sum()
             self.prep_stats[2] = torch.maximum(term, self.trunc_buf).sum()
@@ -658,9 +765,22 @@ class MAPPO:
         roles = None if self.role_buf is None else self.role_buf[t]
         return self.critic(self.obs_buf[t], state, roles)
 
+    def _sequence_rows(self, chunks: torch.Tensor) -> torch.Tensor:
+        """The flat rollout rows ``t * E + e`` of ``S`` chunks, time-major ``[L * S]``.
+
+        Chunk ``c * E + e`` is steps ``[c * L, (c + 1) * L)`` of env ``e``, so the first
+        ``S`` rows are the chunks' first steps."""
+        E, L = self.E, self.L
+        start = torch.div(chunks, E, rounding_mode="floor") * L
+        env = chunks.remainder(E)
+        return ((start.unsqueeze(0) + self._steps.unsqueeze(1)) * E + env.unsqueeze(0)).view(-1)
+
     def _minibatch_body(self) -> None:
         A = self.A
         idx = self.perms.index_select(0, self.k).view(-1)
+        if self.recurrent:
+            n_chunks = idx.numel()
+            idx = self._sequence_rows(idx)
         obs = self.obs_buf[: self.T].reshape(self.N, A, -1).index_select(0, idx)
         u = self.u_buf.reshape(self.N, A, -1).index_select(0, idx)
         logp_old = self.logp_buf.reshape(self.N, A).index_select(0, idx)
@@ -675,6 +795,13 @@ class MAPPO:
             extra["role_counts"] = self.role_counts
         if self.aux_buf is not None:
             extra["aux_target"] = self.aux_buf.reshape(self.N, A, -1).index_select(0, idx)
+        if self.mask_buf is not None:
+            extra["comm_mask"] = self.mask_buf.reshape(self.N, A, A).index_select(0, idx)
+        if self.recurrent:
+            # The stored hidden state entering each chunk's first step, not a recomputed one.
+            h_rows = self.h_buf.reshape(self.N, A, -1)
+            extra["h0"] = h_rows.index_select(0, idx[:n_chunks])
+            extra["done"] = self.done_buf.reshape(self.N).index_select(0, idx).view(self.L, -1)
         noise = torch.randn_like(u)  # drawn here, not in the (possibly compiled) loss
         losses = self._loss(
             self.actor, self.critic, obs, u, logp_old, adv, ret, noise,
@@ -801,6 +928,10 @@ def _network_flags(cls: str, kwargs: Mapping[str, Any]) -> list[str]:
         return ["--actor", "mlp", *flags]
     if cls == "PolicyNet":
         flags = ["--actor", "policynet", "--role-params", kwargs["role_params"], *flags]
+        if kwargs.get("recurrent"):
+            flags += ["--recurrent", "--hidden-dim", str(kwargs["hidden_dim"])]
+        if kwargs.get("comm", "none") != "none":
+            flags += ["--comm", kwargs["comm"], "--comm-dim", str(kwargs["comm_dim"])]
         return [*flags, "--aux-coef", "<positive>"] if kwargs.get("aux_dim") else flags
     if cls == "Critic":
         return ["--critic-input", "obs", "--no-per-agent-value", *flags]
@@ -854,21 +985,42 @@ def greedy_arm(actor: Actor) -> PolicyArm:
 
 def greedy_env_arm(actor: torch.nn.Module) -> Callable[[Environment], ActionFn]:
     """The env-reading policy arm of :func:`~swarp.rl.recipes.score`: the greedy action
-    of ``actor`` with the roles ``env.agent_roles()`` holds at each call, for an actor
-    that reads roles (a stateful actor would keep its hidden state here)."""
+    of ``actor`` with the roles ``env.agent_roles()`` and the mask ``env.comm_mask()``
+    hold at each call.
+
+    For a recurrent :class:`PolicyNet` the action function is stateful: each ``make(env)``
+    starts from a zero hidden state and carries it from call to call. It never resets it,
+    which is right for :func:`score`'s one un-reset episode per env; a loop whose env
+    resets mid-run must build a fresh action function per episode.
+    """
 
     def make(env: Environment) -> ActionFn:
-        if getattr(actor, "uses_roles", False):
-            return lambda obs: actor.greedy(obs, env.agent_roles())
-        return actor.greedy
+        uses_roles = getattr(actor, "uses_roles", False)
+        if not getattr(actor, "stateful", False):
+            if uses_roles:
+                return lambda obs: actor.greedy(obs, env.agent_roles())
+            return actor.greedy
+        h: torch.Tensor | None = None
+
+        @torch.no_grad()
+        def act(obs: torch.Tensor) -> torch.Tensor:
+            nonlocal h
+            roles = env.agent_roles() if uses_roles else None
+            mask = env.comm_mask() if actor.communicates else None
+            loc, _, _, h_next = actor.step(obs, roles, h, comm_mask=mask)
+            h = h_next if actor.recurrent else None
+            return actor.squash(loc)
+
+        return act
 
     return make
 
 
 def greedy_score_kwargs(actor: torch.nn.Module) -> dict[str, Any]:
     """The keyword :func:`~swarp.rl.recipes.score` takes for ``actor``'s greedy policy:
-    ``policy`` for an obs-only actor, ``policy_from_env`` for one that reads roles."""
-    if getattr(actor, "uses_roles", False):
+    ``policy`` for an obs-only actor, ``policy_from_env`` for one that reads roles, carries
+    a hidden state or reads a communication mask."""
+    if getattr(actor, "uses_roles", False) or getattr(actor, "stateful", False):
         return {"policy_from_env": greedy_env_arm(actor)}
     return {"policy": greedy_arm(actor)}
 
@@ -903,6 +1055,16 @@ def network_archs(
             "aux_dim": env.aux_dim if spec.aux_coef > 0 else 0,
             "low": act_low.tolist(), "high": act_high.tolist(),
         }
+        # Only when on, as PolicyNet.config writes them.
+        if spec.recurrent:
+            actor[1].update(recurrent=True, hidden_dim=spec.hidden_dim)
+        if spec.comm != "none":
+            if roles and spec.role_params == "separate":
+                raise ValueError(
+                    f"comm={spec.comm!r} needs one shared trunk; with roles use "
+                    "role_params 'heads' or 'shared', not 'separate'"
+                )
+            actor[1].update(comm=spec.comm, comm_dim=spec.comm_dim)
     use_state = spec.critic_input in ("state", "state+obs")
     if use_state and env.state_dim == 0:
         raise ValueError(
@@ -995,6 +1157,14 @@ def parse_args(argv: list[str] | None = None) -> TrainConfig:
                    help="one value per agent (role-sorted slot) instead of one per team")
     p.add_argument("--no-per-agent-value", dest="per_agent_value", action="store_false")
     p.add_argument("--aux-coef", type=float, help="auxiliary-loss weight (needs policynet)")
+    p.add_argument("--recurrent", action="store_true", default=None,
+                   help="a GRU after the policynet's trunk, trained by BPTT")
+    p.add_argument("--hidden-dim", type=int, help="GRU hidden-state width (with --recurrent)")
+    p.add_argument("--seq-len", type=int,
+                   help="BPTT chunk length; must divide --steps-per-batch (default: all of it)")
+    p.add_argument("--comm", choices=COMMS,
+                   help="attn: one round of attention over teammates before the trunk")
+    p.add_argument("--comm-dim", type=int, help="message width (with --comm attn)")
     p.add_argument("--normalize-advantage", action="store_true", default=None)
     p.add_argument("--no-normalize-advantage", dest="normalize_advantage",
                    action="store_false")
@@ -1029,7 +1199,8 @@ def parse_args(argv: list[str] | None = None) -> TrainConfig:
             "steps_per_batch", "epochs", "minibatches", "lr", "gamma", "lmbda",
             "entropy_coeff", "entropy_coeff_final", "num_cells", "normalize_advantage",
             "curriculum_iters", "curriculum_gate", "actor", "role_params", "critic_input",
-            "per_agent_value", "aux_coef",
+            "per_agent_value", "aux_coef", "recurrent", "hidden_dim", "seq_len", "comm",
+            "comm_dim",
         )
         if getattr(a, f) is not None
     }
@@ -1225,6 +1396,9 @@ def train(cfg: TrainConfig) -> Path:
             f"  actor {actor_cls} {actor_kwargs.get('role_params', '')}, critic {critic_cls} "
             f"(input {spec.critic_input}, per-agent {spec.per_agent_value}), "
             f"roles {list(env.role_counts)}, aux_coef {spec.aux_coef}"
+            + (f", GRU {spec.hidden_dim} (BPTT {algo.L} steps)" if algo.recurrent else "")
+            + (f", comm {spec.comm} {spec.comm_dim}" if spec.comm != "none" else "")
+            + (" over comm_mask()" if algo.use_mask else "")
         )
     if cfg.scen_kwargs:
         print(f"  scenario kwargs: {cfg.scen_kwargs}")

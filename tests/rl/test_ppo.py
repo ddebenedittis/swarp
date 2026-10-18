@@ -12,8 +12,16 @@ import torch
 
 from swarp.rl import MAPPO, Actor, Critic, load_checkpoint, parse_args, train
 from swarp.rl.networks import PolicyNet, StateCritic, role_permutation, tanh_normal_log_prob
-from swarp.rl.ppo import LEGACY_STAT_NAMES, gae, network_archs, standardize_advantage
-from swarp.rl.recipes import SPECS, build_env
+from swarp.rl.ppo import (
+    LEGACY_STAT_NAMES,
+    gae,
+    greedy_env_arm,
+    greedy_score_kwargs,
+    network_archs,
+    policy_outputs,
+    standardize_advantage,
+)
+from swarp.rl.recipes import SPECS, build_env, score
 
 SMOKE = [
     "--device", "cpu", "--iters", "2", "--n-envs", "8", "--steps-per-batch", "4",
@@ -147,6 +155,10 @@ def test_train_with_a_policynet_and_a_per_agent_critic_round_trips(tmp_path):
         (["--critic-input", "state"], "no critic_state"),
         (["--aux-coef", "0.1"], "needs actor='policynet'"),
         (["--actor", "policynet", "--aux-coef", "0.1"], "no aux_targets"),
+        (["--recurrent"], "recurrent=True needs actor='policynet'"),
+        (["--comm", "attn"], "needs actor='policynet'"),
+        (["--actor", "policynet", "--recurrent", "--seq-len", "3"], "must divide"),
+        (["--actor", "policynet", "--seq-len", "2"], "needs recurrent=True"),
     ],
 )
 def test_train_refuses_options_the_scenario_cannot_feed(tmp_path, flags, match, capsys):
@@ -192,6 +204,7 @@ def test_spec_network_defaults_reproduce_the_plain_trainer():
         (s.actor, s.critic_input, s.per_agent_value, s.aux_coef) == ("mlp", "obs", False, 0.0)
         for s in SPECS.values()
     )
+    assert all((s.recurrent, s.seq_len, s.comm) == (False, 0, "none") for s in SPECS.values())
 
 
 def test_a_v2_checkpoint_round_trips_a_role_aware_architecture(tmp_path):
@@ -336,16 +349,25 @@ def _algo(
     )
     torch.manual_seed(seed)
     Ob, A = env.obs_dim, env.n_agents
+    memory = {
+        "recurrent": spec.recurrent, "hidden_dim": spec.hidden_dim, "comm": spec.comm,
+        "comm_dim": spec.comm_dim,
+    }
     if features:
         patch(env)
         actor = PolicyNet(
             Ob, env.act_dim, spec.num_cells, role_counts=ROLE_COUNTS,
-            role_params=spec.role_params, aux_dim=AUX_DIM,
+            role_params=spec.role_params, aux_dim=AUX_DIM, **memory,
         )
         critic = StateCritic(
             env.state_dim, Ob, A, spec.num_cells, use_obs=True, role_counts=ROLE_COUNTS,
             per_agent=True,
         )
+    elif spec.actor == "policynet":
+        if patch is not _patch_training_hooks:
+            patch(env)
+        actor = PolicyNet(Ob, env.act_dim, spec.num_cells, **memory)
+        critic = Critic(Ob, A, spec.num_cells)
     else:
         actor = Actor(Ob, env.act_dim, spec.num_cells)
         critic = Critic(Ob, A, spec.num_cells)
@@ -494,8 +516,27 @@ def test_roles_that_change_at_auto_reset_are_recorded_with_their_obs():
     assert torch.allclose(algo.logp_buf, ref, atol=1e-4)
 
 
+HIDDEN = 16
+# Three-step episodes from staggered starts, so at a given step some envs end their
+# episode and others do not.
+_MEMORY = {"actor": "policynet", "recurrent": True, "hidden_dim": HIDDEN, "max_steps": 3,
+           "stagger_starts": True}
+
+
+def _patch_comm_mask(env) -> None:
+    """A fixed-address ``[E, A, A]`` comm mask: each agent hears a random half of its
+    teammates."""
+    gen = torch.Generator().manual_seed(11)
+    mask = (torch.rand(env.n_envs, env.n_agents, env.n_agents, generator=gen) < 0.5)
+    mask = mask.to(env.device)
+    env.scenario.comm_mask = lambda: mask
+
+
+_COMM = {"actor": "policynet", "comm": "attn", "comm_dim": 8, "patch": _patch_comm_mask}
+
+
 _ROLLOUT = ("obs_buf", "u_buf", "logp_buf", "rew_buf", "term_buf", "trunc_buf",
-            "state_buf", "role_buf", "aux_buf")
+            "state_buf", "role_buf", "aux_buf", "h_buf", "mask_buf")
 
 
 def _copy_rollout(dst: MAPPO, src: MAPPO) -> None:
@@ -507,20 +548,30 @@ def _copy_rollout(dst: MAPPO, src: MAPPO) -> None:
 @pytest.mark.gpu
 @pytest.mark.parametrize(
     ("features", "kw"),
-    [(False, {}), (True, {}), (True, {"role_params": "separate", **_RESET_ROLES})],
-    ids=["default", "features", "reset-roles"],
+    [
+        (False, {}), (True, {}), (True, {"role_params": "separate", **_RESET_ROLES}),
+        (False, {**_MEMORY, "seq_len": 4}), (False, _COMM),
+        (True, {**_MEMORY, "seq_len": 2, "comm": "attn", "comm_dim": 8}),
+        (True, {**_MEMORY, "role_params": "separate"}),
+    ],
+    ids=["default", "features", "reset-roles", "recurrent", "comm", "recurrent-comm-features",
+         "recurrent-separate"],
 )
 def test_captured_update_matches_eager_update(features, kw):
     """Same weights, same rollout, same permutations: the graphed update lands where the
     eager one does. Entropy is off, since its sample is the one draw the two cannot share.
     ``features`` runs it with the state critic, role heads and aux loss all on;
     ``reset-roles`` with per-role networks and roles redrawn at every auto-reset, so the
-    rollout's roles (and the per-slot advantage statistics) move between agents."""
+    rollout's roles (and the per-slot advantage statistics) move between agents.
+    The recurrent cases also force a done in the middle of a BPTT chunk; ``comm`` runs
+    attention under a scenario comm mask."""
     eager = _algo(graphs=False, features=features, **kw)
     graphed = _algo(graphs=True, features=features, **kw)
     graphed.actor.load_state_dict(eager.actor.state_dict())
     graphed.critic.load_state_dict(eager.critic.state_dict())
     eager.rollout()
+    if eager.recurrent:
+        eager.term_buf[eager.L // 2 - 1, ::3] = 1.0  # mid-chunk, in a third of the envs
     _copy_rollout(graphed, eager)
     for algo in (eager, graphed):
         algo.ent_coef.fill_(0.0)
@@ -554,3 +605,112 @@ def test_non_finite_minibatch_is_skipped_on_device():
         assert torch.equal(p, q)
     for s, a, n in zip(algo.optim.state.values(), state, steps, strict=True):
         assert torch.equal(s["exp_avg"], a) and torch.equal(s["step"], n)
+
+
+# ---------------------------------------------------------------- memory and communication
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda:0", marks=pytest.mark.gpu)])
+def test_hidden_state_resets_only_in_envs_whose_episode_ended(device):
+    """``h_buf[t]`` is the hidden state entering step ``t``: the GRU output of step
+    ``t - 1``, zeroed exactly in the envs whose episode ended there and carried in the
+    rest, including across the rollout boundary and under the captured graphs."""
+    algo = _algo(graphs=device != "cpu", device=device, **_MEMORY)
+    assert algo.h.shape == (algo.E, algo.A, HIDDEN)
+    algo.rollout()
+    carried = algo.h.clone()
+    algo.rollout()  # replays the graphs captured in the first
+    assert torch.equal(algo.h_buf[0], carried)
+    T = algo.T
+    with torch.no_grad():
+        h_next = algo.actor.step(algo.obs_buf[:T], None, algo.h_buf)[3]
+    ended = torch.maximum(algo.term_buf, algo.trunc_buf) > 0  # [T, E]
+    handed = torch.cat([algo.h_buf[1:], algo.h.unsqueeze(0)])  # what step t handed on
+    assert (ended.any(-1) & (~ended).any(-1)).any()  # some envs end while others go on
+    assert torch.equal(handed[ended], torch.zeros_like(handed[ended]))
+    assert torch.allclose(handed[~ended], h_next[~ended], atol=1e-5)
+    assert (handed[~ended].abs().sum(-1) > 0).all()
+
+
+@pytest.mark.parametrize("seq_len", [0, 4])
+@pytest.mark.parametrize("comm", [False, True], ids=["gru", "gru+comm"])
+def test_bptt_from_stored_chunk_starts_recomputes_the_rollout_log_probs(seq_len, comm):
+    """Unrolling every chunk from its stored ``h_buf`` row, with the hidden state zeroed
+    after each done, gives back each step's stored log-prob; the chunks tile the rollout
+    and a minibatch holds as many samples as without memory."""
+    kw = {**_MEMORY, "seq_len": seq_len}
+    if comm:
+        kw.update(comm="attn", comm_dim=8, patch=_patch_comm_mask)
+    algo = _algo(graphs=False, device="cpu", **kw)
+    algo.rollout()
+    algo._prepare_body()
+    T, N, A = algo.T, algo.N, algo.A
+    chunk, per_minibatch = seq_len or T, N // algo.M
+    assert chunk == algo.L and per_minibatch == algo.B
+    assert (algo.mask_buf is not None) is comm
+    if comm:
+        assert torch.equal(algo.mask_buf, algo.env.comm_mask().expand_as(algo.mask_buf))
+    rows = algo._sequence_rows(torch.arange(algo.n_units))
+    assert torch.equal(rows.sort().values, torch.arange(N))
+    done = algo.done_buf.reshape(N)[rows].view(algo.L, -1)
+    assert done[:-1].any()  # an episode ends inside a chunk
+    mask = None if algo.mask_buf is None else algo.mask_buf.reshape(N, A, A)[rows]
+    with torch.no_grad():
+        loc, scale, _ = policy_outputs(
+            algo.actor, algo.obs_buf[:T].reshape(N, A, -1)[rows], None,
+            h0=algo.h_buf.reshape(N, A, -1)[rows[: algo.n_units]], done=done, comm_mask=mask,
+        )
+    logp = tanh_normal_log_prob(algo.u_buf.reshape(N, A, -1)[rows], loc, scale)
+    assert torch.allclose(logp, algo.logp_buf.reshape(N, A)[rows], atol=1e-5)
+    stats = algo.update(algo.spec.entropy_coeff)
+    assert stats["grad_skips"] == 0 and math.isfinite(stats["loss_objective"])
+
+
+def test_comm_with_separate_role_networks_is_refused():
+    env = build_env(
+        "navigation", n_envs=4, n_agents=4, device="cpu", dt=0.05, substeps=1,
+        max_steps=5, seed=0,
+    )
+    _patch_training_hooks(env)
+    box = (-torch.ones(env.act_dim), torch.ones(env.act_dim))
+    spec = replace(SPECS["navigation"], actor="policynet", role_params="separate", comm="attn")
+    with pytest.raises(ValueError, match="not 'separate'"):
+        network_archs(spec, env, *box)
+
+
+def test_train_round_trips_a_recurrent_communicating_policy_and_scores_it(tmp_path):
+    """Through train(), its checkpoint, a resume, and the greedy eval, which carries the
+    hidden state over score()'s one un-reset episode per env."""
+    memory = ["--actor", "policynet", "--recurrent", "--hidden-dim", "6", "--seq-len", "2",
+              "--comm", "attn", "--comm-dim", "4"]
+    flags = ["--scenario", "navigation", *SMOKE, "--checkpoint-dir", str(tmp_path)]
+    path = train(parse_args([*flags, *memory]))
+    actor, _, meta = load_checkpoint(path)
+    assert isinstance(actor, PolicyNet) and actor.recurrent and actor.communicates
+    assert (actor.hidden_dim, actor.comm_dim) == (6, 4)
+    kw = meta["actor_kwargs"]
+    assert (kw["recurrent"], kw["hidden_dim"], kw["comm"], kw["comm_dim"]) == (True, 6, "attn", 4)
+    train(parse_args([*flags, *memory, "--resume", str(path)]))
+    with pytest.raises(ValueError, match="--recurrent --hidden-dim 6 --comm attn --comm-dim 4"):
+        train(parse_args([*flags, "--actor", "policynet", "--resume", str(path)]))
+
+    seen = []
+    make = greedy_score_kwargs(actor)["policy_from_env"]
+
+    def spy(env):
+        seen.append((env.auto_reset, env.max_steps))
+        return make(env)
+
+    res = score("navigation", policy_from_env=spy, n_agents=4, n_envs=8, steps=6,
+                device="cpu", seed=1, dt=0.1, substeps=1, arms=("policy",))["policy"]
+    assert seen == [(False, None)] and 0.0 <= res.solve_rate <= 1.0  # one episode, no resets
+    env = build_env("navigation", n_envs=3, n_agents=4, device="cpu", dt=0.1, substeps=1,
+                    max_steps=None, seed=0)
+    obs = env.reset()
+    act = greedy_env_arm(actor)(env)
+    first, second = act(obs), act(obs)
+    with torch.no_grad():
+        h1 = actor.step(obs)[3]
+    assert torch.equal(first, actor.greedy(obs))  # from a zero hidden state
+    assert torch.equal(second, actor.greedy(obs, h=h1)) and not torch.equal(first, second)
+    assert torch.equal(greedy_env_arm(actor)(env)(obs), first)  # a fresh arm starts at zero
