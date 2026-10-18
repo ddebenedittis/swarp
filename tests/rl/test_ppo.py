@@ -283,12 +283,38 @@ def _patch_training_hooks(env) -> None:
     scen.aux_targets = lambda: scen.observations()[..., :AUX_DIM]
 
 
+def _patch_reset_roles(env) -> None:
+    """:func:`_patch_training_hooks`, with roles that change at every reset: a
+    fixed-address buffer that ``reset_world`` re-permutes for the masked envs with
+    capturable ops (a random argsort into the base role vector, written through a
+    ``where``), so an auto-reset hands the next episode new roles in place."""
+    _patch_training_hooks(env)
+    scen, E, A = env.scenario, env.n_envs, env.n_agents
+    base = torch.tensor(
+        [r for r, c in enumerate(ROLE_COUNTS) for _ in range(c)], device=env.device
+    )
+    roles = torch.zeros(E, A, dtype=torch.int32, device=env.device)
+    reset_world = scen.reset_world
+
+    def draw(mask: torch.Tensor | None) -> None:
+        new = base[torch.rand(E, A, device=env.device).argsort(-1)].to(roles.dtype)
+        roles.copy_(new if mask is None else torch.where(mask.unsqueeze(-1), new, roles))
+
+    def reset_with_roles(env_mask=None, *, obs_only=False):
+        draw(env_mask)
+        reset_world(env_mask, obs_only=obs_only)
+
+    scen.reset_world = reset_with_roles
+    scen.agent_roles = lambda: roles
+
+
 def _algo(
     graphs: bool,
     seed: int = 0,
     device: str = "cuda:0",
     features: bool = False,
     patch=_patch_training_hooks,
+    scen_kwargs=(),
     **spec_kw,
 ) -> MAPPO:
     """Navigation at test size; ``features`` turns on the state critic (state + obs, per
@@ -306,7 +332,7 @@ def _algo(
     env = build_env(
         "navigation", n_envs=spec.n_envs, n_agents=spec.n_agents, device=device,
         dt=spec.dt, substeps=spec.substeps, max_steps=spec.max_steps, seed=seed,
-        env_kwargs={"auto_reset": True},
+        scen_kwargs=scen_kwargs, env_kwargs={"auto_reset": True},
     )
     torch.manual_seed(seed)
     Ob, A = env.obs_dim, env.n_agents
@@ -314,7 +340,7 @@ def _algo(
         patch(env)
         actor = PolicyNet(
             Ob, env.act_dim, spec.num_cells, role_counts=ROLE_COUNTS,
-            aux_dim=AUX_DIM,
+            role_params=spec.role_params, aux_dim=AUX_DIM,
         )
         critic = StateCritic(
             env.state_dim, Ob, A, spec.num_cells, use_obs=True, role_counts=ROLE_COUNTS,
@@ -432,6 +458,42 @@ def test_a_hook_returning_fresh_tensors_is_refused():
     assert algo.act_recaptures == 3
 
 
+# Navigation with an obstacle resets on the host (its reset is not capture-safe), so the
+# patched reset_world runs at every auto-reset; three-step episodes end inside a rollout.
+_RESET_ROLES = {"patch": _patch_reset_roles, "scen_kwargs": {"n_obstacles": 1}, "max_steps": 3}
+
+
+@pytest.mark.gpu
+def test_roles_that_change_at_auto_reset_are_recorded_with_their_obs():
+    """Each role_buf row is the roles live when its obs was written, including the row
+    right after a done, when the auto-reset has already drawn the next episode's roles;
+    and the act graph sampled under those roles."""
+    algo = _algo(graphs=True, features=True, role_params="separate", **_RESET_ROLES)
+    env, live = algo.env, []
+    step = env.step
+
+    def recording_step(actions):
+        out = step(actions)
+        live.append(env.agent_roles().long().clone())
+        return out
+
+    env.step = recording_step
+    for _ in range(2):  # the second rollout replays the graphs
+        live.clear()
+        start = env.agent_roles().long().clone()
+        algo.rollout()
+        expected = torch.stack([start, *live])
+        assert torch.equal(algo.role_buf, expected)
+    done = torch.maximum(algo.term_buf, algo.trunc_buf) > 0  # [T, E]
+    changed = (expected[1:] != expected[:-1]).any(-1)
+    assert changed.any() and not (changed & ~done).any()  # new roles, only at a done
+    T = algo.T
+    with torch.no_grad():
+        loc, scale = algo.actor(algo.obs_buf[:T], algo.role_buf[:T])
+        ref = tanh_normal_log_prob(algo.u_buf, loc, scale)
+    assert torch.allclose(algo.logp_buf, ref, atol=1e-4)
+
+
 _ROLLOUT = ("obs_buf", "u_buf", "logp_buf", "rew_buf", "term_buf", "trunc_buf",
             "state_buf", "role_buf", "aux_buf")
 
@@ -443,13 +505,19 @@ def _copy_rollout(dst: MAPPO, src: MAPPO) -> None:
 
 
 @pytest.mark.gpu
-@pytest.mark.parametrize("features", [False, True], ids=["default", "features"])
-def test_captured_update_matches_eager_update(features):
+@pytest.mark.parametrize(
+    ("features", "kw"),
+    [(False, {}), (True, {}), (True, {"role_params": "separate", **_RESET_ROLES})],
+    ids=["default", "features", "reset-roles"],
+)
+def test_captured_update_matches_eager_update(features, kw):
     """Same weights, same rollout, same permutations: the graphed update lands where the
     eager one does. Entropy is off, since its sample is the one draw the two cannot share.
-    ``features`` runs it with the state critic, role heads and aux loss all on."""
-    eager = _algo(graphs=False, features=features)
-    graphed = _algo(graphs=True, features=features)
+    ``features`` runs it with the state critic, role heads and aux loss all on;
+    ``reset-roles`` with per-role networks and roles redrawn at every auto-reset, so the
+    rollout's roles (and the per-slot advantage statistics) move between agents."""
+    eager = _algo(graphs=False, features=features, **kw)
+    graphed = _algo(graphs=True, features=features, **kw)
     graphed.actor.load_state_dict(eager.actor.state_dict())
     graphed.critic.load_state_dict(eager.critic.state_dict())
     eager.rollout()
