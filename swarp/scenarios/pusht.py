@@ -175,10 +175,12 @@ class PushTScenario(FusedScenario):
         # See swarp.scenarios.shapes: mass splits by area, inertia about the centroid by
         # the parallel-axis theorem, radius to the farthest corner (the clamp radius that
         # keeps the whole body inside the world bounds). The default is the T, crossbar
-        # first; ``shape`` swaps in any other compound body: a ``SHAPES`` name (built at
-        # its defaults with ``tee_mass``) or a ``CompoundShape``, which carries its own
-        # mass. Either way the ``bar_*``/``stem_*`` sizes are ignored.
-        if shape is None:
+        # first, sized by ``bar_*``/``stem_*`` whether ``shape`` is ``None`` or ``"tee"``
+        # (pusht_lidar's default, so its T can be resized too). ``shape`` swaps in any
+        # other compound body: another ``SHAPES`` name (built at its defaults with
+        # ``tee_mass``) or a ``CompoundShape``, which carries its own mass; either way the
+        # ``bar_*``/``stem_*`` sizes are ignored.
+        if shape is None or shape == "tee":
             shape = tee(bar_len, bar_width, stem_len, stem_width, mass=tee_mass)
         elif isinstance(shape, str):
             if shape not in SHAPES:

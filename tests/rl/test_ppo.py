@@ -21,7 +21,7 @@ from swarp.rl.ppo import (
     policy_outputs,
     standardize_advantage,
 )
-from swarp.rl.recipes import SPECS, build_env, score
+from swarp.rl.recipes import SPECS, build_env, scenario_name, score
 
 SMOKE = [
     "--device", "cpu", "--iters", "2", "--n-envs", "8", "--steps-per-batch", "4",
@@ -201,11 +201,11 @@ def test_spec_network_defaults_reproduce_the_plain_trainer():
         "mlp", "obs", False, 0.0,
     )
     # Every recipe that predates the training hooks keeps the plain networks; the lidar
-    # Push-T recipe is the one written for them.
+    # Push-T recipes are the ones written for them.
     assert all(
         (s.actor, s.critic_input, s.per_agent_value, s.aux_coef) == ("mlp", "obs", False, 0.0)
         for name, s in SPECS.items()
-        if name != "pusht_lidar"
+        if scenario_name(name) != "pusht_lidar"
     )
     s = SPECS["pusht_lidar"]
     assert (s.actor, s.role_params, s.critic_input, s.per_agent_value) == (

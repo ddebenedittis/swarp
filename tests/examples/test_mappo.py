@@ -43,6 +43,7 @@ from mappo import (  # noqa: E402
     coerce_scen_kwargs,
     mcnemar_interval,
     requires_success_spec,
+    scenario_name,
     score,
     wilson_ci,
 )
@@ -82,13 +83,14 @@ def test_specs_cover_registry():
     This is the guard that adding a scenario does not silently omit it from
     ``--scenario``.
     """
-    unaccounted = set(SCENARIOS) - set(SPECS) - set(UNTRAINABLE)
+    trained = {scenario_name(name) for name in SPECS}
+    unaccounted = set(SCENARIOS) - trained - set(UNTRAINABLE)
     assert not unaccounted, (
         f"scenario(s) {sorted(unaccounted)} have neither a TrainSpec nor an UNTRAINABLE "
         f"entry explaining why they cannot be trained"
     )
-    assert not (set(SPECS) & set(UNTRAINABLE)), "a scenario cannot be both"
-    assert set(SPECS) <= set(SCENARIOS)
+    assert not (trained & set(UNTRAINABLE)), "a scenario cannot be both"
+    assert trained <= set(SCENARIOS)
     assert set(UNTRAINABLE) <= set(SCENARIOS)
 
 
@@ -104,7 +106,7 @@ def test_untrainable_scenarios_really_lack_a_terminal_condition():
 def test_every_spec_metric_is_a_real_info_key():
     """A metric key not in info() would log a blank column forever."""
     for name, spec in SPECS.items():
-        env = swarp.make(name, n_envs=2, device="cpu", n_agents=spec.n_agents,
+        env = swarp.make(scenario_name(name), n_envs=2, device="cpu", n_agents=spec.n_agents,
                          **dict(spec.scen_kwargs))
         env.reset(seed=0)
         keys = set(env.scenario.info())
@@ -117,7 +119,7 @@ def test_every_curriculum_knob_names_a_real_attribute():
     for name, spec in SPECS.items():
         if not spec.curriculum:
             continue
-        scen = swarp.scenarios.make_scenario(name, n_agents=spec.n_agents,
+        scen = swarp.scenarios.make_scenario(scenario_name(name), n_agents=spec.n_agents,
                                              **dict(spec.scen_kwargs))
         for knob in spec.curriculum:
             assert hasattr(scen, knob.attr), f"{name}: no attribute {knob.attr!r}"
@@ -377,7 +379,7 @@ def test_mcnemar_interval_is_paired():
 def test_trainable_scenarios_have_a_terminal_condition(name):
     """Every scenario with a spec must have something to train *toward*."""
     spec = SPECS[name]
-    env = swarp.make(name, n_envs=2, device="cpu", n_agents=spec.n_agents,
+    env = swarp.make(scenario_name(name), n_envs=2, device="cpu", n_agents=spec.n_agents,
                      **dict(spec.scen_kwargs))
     assert not requires_success_spec(env.scenario)
 

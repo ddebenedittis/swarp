@@ -150,6 +150,10 @@ The observation kernel writes the three trainer buffers on every pass, the obs-o
 
 `SPECS["pusht_lidar"]` is stage T0: Push-T's recipe with five robots at `obs_level=0`, a `PolicyNet` with one head per role, and a per-slot `StateCritic` on `critic_state()`, with the auxiliary loss off.
 
+`SPECS["pusht_lidar_limo"]` (`python -m swarp.rl --scenario pusht_lidar_limo`) builds the same scenario at the physical scale of two AgileX Limo robots, in metres and seconds, for deployment in Gazebo: 0.322 × 0.220 m unicycle boxes at up to 0.4 m/s and 1.5 rad/s, a 1 m T in a 4 × 4 m arena, a 1.5 m lidar, a 10 Hz policy (`dt = 0.1`, 16 substeps to keep Push-T's contact sub-step) and 900-step episodes.
+Its comment in `swarp/rl/recipes.py` derives every value that differs from U-H1's.
+A recipe keyed by a name other than its scenario's sets `TrainSpec.scenario`, which `scenario_name` resolves wherever a scenario is built from a `SPECS` key.
+
 ## Results
 
 Every number below is the greedy solve rate at full curriculum difficulty over 512 evaluation envs (the Wilson interval is about ±0.01 near 0.98 and ±0.04 near 0.6), from `python -m swarp.rl --scenario pusht_lidar` with the recipe's 4000 iterations and 512 training envs.

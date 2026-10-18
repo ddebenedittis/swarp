@@ -73,7 +73,7 @@ from mappo import (
 
 import swarp
 from swarp.rl.ppo import CHECKPOINT_FORMATS, greedy_arm, greedy_score_kwargs, load_checkpoint
-from swarp.rl.recipes import ActionFn, coerce_scen_kwargs, score
+from swarp.rl.recipes import ActionFn, coerce_scen_kwargs, scenario_name, score
 
 
 def _load(path: str, device: str):
@@ -258,7 +258,7 @@ def main() -> int:
         # of episodes instead of one clip that freezes at the end.
         episode_steps = args.episode_steps or steps
         env = swarp.make(
-            scenario, n_envs=1, device=args.device, dt=dt, substeps=substeps,
+            scenario_name(scenario), n_envs=1, device=args.device, dt=dt, substeps=substeps,
             seed=args.seed, max_steps=episode_steps, auto_reset=True,
             n_agents=n_agents, **scen_kwargs,
         )

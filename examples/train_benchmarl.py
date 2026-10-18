@@ -106,6 +106,7 @@ from swarp.rl.recipes import (
     SolveRateWindow,
     TrainSpec,
     coerce_scen_kwargs,
+    scenario_name,
     wilson_ci,
 )
 
@@ -230,7 +231,10 @@ class SwarpClass(TaskClass):
     ) -> Callable[[], EnvBase]:
         config = dict(self.config)
         return lambda: GroupedSwarpEnv(
-            swarp.make(self.name.lower(), n_envs=num_envs, device=device, seed=seed, **config)
+            swarp.make(
+                scenario_name(self.name.lower()), n_envs=num_envs, device=device, seed=seed,
+                **config,
+            )
         )
 
     def supports_continuous_actions(self) -> bool:

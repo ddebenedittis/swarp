@@ -87,6 +87,10 @@ class TrainSpec:
     """
 
     # --- simulation ---------------------------------------------------------------
+    scenario: str | None = None
+    """The registered scenario this recipe builds, for a recipe keyed by another name (a
+    variant of a scenario, such as its physical-scale configuration). ``None`` means the
+    ``SPECS`` key itself; :func:`scenario_name` resolves either."""
     dt: float = 0.1
     substeps: int = 1
     max_steps: int = 200
@@ -302,6 +306,67 @@ SPECS: dict[str, TrainSpec] = {
         actor="policynet", role_params="heads", critic_input="state",
         per_agent_value=True, aux_coef=0.0,
     ),
+    # Lidar Push-T at the physical scale of two AgileX Limo robots, in metres and seconds,
+    # for deployment in Gazebo: 0.322 x 0.220 m unicycle boxes at up to 0.4 m/s and
+    # 1.5 rad/s, a 1 m T in a 4 x 4 m arena, a 1.5 m lidar, and a 10 Hz policy matching the
+    # lidar. Otherwise the U-H1 run (two pushers, own lidar, frame_stack 4, aux 0.1), which
+    # reached 0.99 greedy at the default scale.
+    #
+    # substeps=16 keeps Push-T's validated sub_dt of 6.25 ms, so the contact law (k 8000,
+    # c 100, unit robot and T masses, drag 40/s) is the same per second as there. At 8
+    # substeps (12.5 ms, k sub_dt^2 / m = 1.25) a straight push chatters: the robot's
+    # speed swings 0.1-0.3 m/s and the T crawls at half speed. At 16 the T follows a
+    # centred push at 0.30 m/s (two pushers: 0.34), the robot sits ~2 mm inside the
+    # 12.5 mm contact margin, and the T stops within a step of contact ending.
+    #
+    # The masses stay at 1, not 4.2 kg and ~0.5 kg: a velocity-mode robot has no inertia
+    # in contact, so its mass only sets the contact depth, and the T's response is set by
+    # mass * drag. A lighter T is kicked ahead of its pusher by the stiff contact (0.42-0.47
+    # m/s against the robot's 0.4 at tee_mass 0.12-0.3) and pushes in bounces.
+    #
+    # Lengths are 2x (arena) to 2.5x (T) Push-T's and the robot 2.5x slower, so a task
+    # takes ~4.5x as long: max_steps 900 (90 s) is Push-T's 400 x 0.05 s scaled by that.
+    # gamma 0.995 and lmbda 0.97 stretch the 10 s / 2 s credit horizons of 0.99 / 0.95 at
+    # this dt to 20 s / 3.3 s, about the time one push of the T across the arena takes;
+    # stagger_starts because untrained episodes all run the full 900 steps. The length-
+    # based shaping weights are halved (pos 2.5, approach 0.5) so a whole episode's
+    # shaping keeps Push-T's ratio to the dimensionless goal bonus and joint crater
+    # (pos 2.5 x 1.43 m mean goal distance = 3.6, U-H1 5 x 0.79 = 3.9). Measured over
+    # 512 envs with robots driving at the T, the per-step position shaping (0.023) and
+    # turn-away cost (0.0089) match U-H1's (0.024, 0.0083).
+    # Curriculum: the goal radius starts at 0.4 (Push-T's 2.5 goal tolerances) and ramps
+    # to the 3.8 m diagonal of the T's spawn square; 500 iterations, because each env sees
+    # ~2.5x fewer episodes per iteration than Push-T's 250. 6000 iterations, not U-H1's
+    # 4000 (0.98 greedy by 2000), for the same reason.
+    #
+    # standoff_dist 1.0 is H2b's 1.5 T corner radii, so the same recipe with observers
+    # (--n-agents 5) clears the scenario's standoff check; two pushers never read it.
+    "pusht_lidar_limo": TrainSpec(
+        scenario="pusht_lidar",
+        dt=0.1, substeps=16, max_steps=900, n_agents=2,
+        scen_kwargs={
+            "n_pushers": 2, "model": "diff_drive", "agent_shape": "box",
+            "agent_half_extents": (0.161, 0.110), "max_speed": 0.4, "max_ang_vel": 1.5,
+            "world_size": 2.0, "bar_len": 1.0, "bar_width": 0.3, "stem_len": 0.7,
+            "stem_width": 0.3, "lidar_max_range": 1.5, "goal_tolerance": 0.15,
+            "angle_tolerance": 0.25, "obs_level": 1, "frame_stack": 4, "standoff_dist": 1.0,
+            "pos_shaping_factor": 2.5, "rot_shaping_factor": 0.5, "rot_away_penalty": 1.0,
+            "agent_dist_shaping": 0.5,
+        },
+        iters=6000, n_envs=512, steps_per_batch=32, epochs=8, minibatches=4,
+        lr=5e-4, gamma=0.995, lmbda=0.97, entropy_coeff=3e-3, num_cells=256,
+        normalize_advantage=False,
+        curriculum=(
+            CurriculumKnob("goal_spawn_radius", 0.4, 3.8),
+            CurriculumKnob("goal_spawn_angle", 0.4, math.pi),
+        ),
+        curriculum_iters=500, curriculum_gate=0.0,
+        metrics=("tee_dist_to_goal", "tee_angle_error", "team_coverage",
+                 "observer_visibility", "occlusion", "tee_seen", "multiobj_reward"),
+        stagger_starts=True,
+        actor="policynet", role_params="heads", critic_input="state",
+        per_agent_value=True, aux_coef=0.1,
+    ),
     # Give-way. Four agents, one per arm, crossing to the opposite arm through a junction
     # that fits one of them. shared_reward defaults True in the scenario: under per-agent
     # shaping the yielding agent pays the whole cost of a manoeuvre only the team benefits
@@ -415,7 +480,7 @@ SPECS: dict[str, TrainSpec] = {
         metrics=("gap_max", "band_error", "caged", "multiobj_reward"),
     ),
     # Flow's ring: 1 AV among 21 IDM humans on the Sugiyama 230 m ring. The multi-AV variant
-    # is `--n-agents 4` (n_vehicles stays 22, so 18 humans): SPECS is keyed by registry
+    # is `--n-agents 4` (n_vehicles stays 22, so 18 humans): SPECS keys it by its registry
     # name, and the obs width does not depend on either count. dt=0.1 is Flow's (SUMO's)
     # step. max_steps=1500 (150 s), because a FollowerStopper AV needs 64 s to stabilise
     # this ring at 58% of v_eq. 60 s, the first guess, left no margin for a learner.
@@ -452,6 +517,13 @@ SPECS: dict[str, TrainSpec] = {
         stagger_starts=True,
     ),
 }
+
+
+def scenario_name(name: str) -> str:
+    """The registered scenario behind ``name``: a ``SPECS`` key's ``scenario`` when it
+    sets one, else ``name`` itself (a registry name, or a key that is one)."""
+    spec = SPECS.get(name)
+    return name if spec is None or spec.scenario is None else spec.scenario
 
 
 # ------------------------------------------------------------- episode solve accounting
@@ -623,7 +695,7 @@ def coerce_scen_kwargs(name: str, pairs: Sequence[str]) -> dict[str, Any]:
     ``tests/scenarios/test_scenarios.py`` pins that the two parameter-name sets are
     disjoint for every registered scenario, so this can never false-positive.
     """
-    params = inspect.signature(scenario_class(name).__init__).parameters
+    params = inspect.signature(scenario_class(scenario_name(name)).__init__).parameters
     out: dict[str, Any] = {}
     for pair in pairs:
         if "=" not in pair:
@@ -810,10 +882,11 @@ def build_env(
     Goes through :func:`swarp.make`, which already routes keywords by name and raises a
     legible ``TypeError`` (with a ``difflib`` suggestion) for a misspelling -- there is no
     reason for this file to reimplement any of that. ``auto_reset`` defaults to ``False``,
-    which is what ``SwarpEnv`` requires; the lean trainer passes ``True``.
+    which is what ``SwarpEnv`` requires; the lean trainer passes ``True``. ``scenario`` is
+    a registry name or a ``SPECS`` key (see :func:`scenario_name`).
     """
     return swarp.make(
-        scenario, n_envs=n_envs, device=device, dt=dt, substeps=substeps,
+        scenario_name(scenario), n_envs=n_envs, device=device, dt=dt, substeps=substeps,
         seed=seed, max_steps=max_steps, n_agents=n_agents, **dict(env_kwargs),
         **dict(scen_kwargs),
     )
