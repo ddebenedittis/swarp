@@ -47,7 +47,15 @@ import torch
 from torch.nn import functional as F
 
 from swarp import Environment
-from swarp.rl.networks import Actor, Critic, PolicyNet, StateCritic, tanh_normal_log_prob
+from swarp.rl.networks import (
+    Actor,
+    Critic,
+    PolicyNet,
+    StateCritic,
+    invert_permutation,
+    role_slots,
+    tanh_normal_log_prob,
+)
 from swarp.rl.recipes import (
     ACTORS,
     CRITIC_INPUTS,
@@ -178,9 +186,23 @@ def gae(
 # ------------------------------------------------------------------------------ the loss
 
 
-def standardize_advantage(adv: torch.Tensor) -> torch.Tensor:
-    """Per agent: statistics over the minibatch (dim 0), agent dim excluded."""
-    return (adv - adv.mean(0)) / adv.std(0).clamp_min(_ADV_EPS)
+def standardize_advantage(
+    adv: torch.Tensor, roles: torch.Tensor | None = None, role_counts: Sequence[int] = ()
+) -> torch.Tensor:
+    """Per agent: statistics over the minibatch (dim 0), agent dim excluded.
+
+    With ``roles`` ``[B, A]`` and the scenario's ``role_counts``, per role-sorted slot
+    instead: the advantages are gathered into role-sorted order (role 0's agents by
+    ascending index, then role 1's, ...), standardized per column and scattered back, so
+    when roles move between agents every column still holds one role. ``role_counts``
+    is static; the permutation is a one-hot cumulative sum, capturable like the rest.
+    """
+    if roles is None or not role_counts:
+        return (adv - adv.mean(0)) / adv.std(0).clamp_min(_ADV_EPS)
+    slots = role_slots(roles, len(role_counts))  # agent -> slot
+    ranked = adv.gather(-1, invert_permutation(slots))  # slot -> agent's advantage
+    ranked = (ranked - ranked.mean(0)) / ranked.std(0).clamp_min(_ADV_EPS)
+    return ranked.gather(-1, slots)
 
 
 def ppo_terms(
@@ -246,6 +268,7 @@ def ppo_loss(
     state: torch.Tensor | None = None,
     roles: torch.Tensor | None = None,
     aux_target: torch.Tensor | None = None,
+    role_counts: Sequence[int] = (),
 ) -> tuple[torch.Tensor, ...]:
     """Clipped surrogate, smooth-L1 value loss and MC entropy for one minibatch.
 
@@ -255,14 +278,15 @@ def ppo_loss(
     :class:`StateCritic`, ``roles`` ``[B, A]`` for role-reading networks, and
     ``aux_target`` ``[B, A, aux_dim]`` for a :class:`PolicyNet`'s aux head. Returns
     ``(objective, critic, entropy)``, plus the unweighted auxiliary MSE when
-    ``aux_target`` is given.
+    ``aux_target`` is given. With ``roles`` and ``role_counts`` the advantages are
+    normalized per role-sorted slot (:func:`standardize_advantage`).
 
     A thin wrapper over :func:`ppo_terms` that keeps the original op order (advantages,
     actor, policy terms, critic), so a default run launches the same kernels in the same
     sequence.
     """
     if normalize_advantage:
-        adv = standardize_advantage(adv)
+        adv = standardize_advantage(adv, roles, role_counts)
     loc, scale, aux = policy_outputs(actor, obs, roles, with_aux=aux_target is not None)
     objective, entropy = ppo_terms(loc, scale, u, logp_old, adv, noise)
     value = critic_values(critic, obs, state, roles)
@@ -297,12 +321,14 @@ class MAPPO:
 
     The networks and ``spec.aux_coef`` decide what else is recorded, once, here: a
     :class:`StateCritic` with a ``state_dim`` adds a ``[T + 1, E, state_dim]`` buffer of
-    ``env.critic_state()``, a role-reading network a ``[T + 1, E, A]`` buffer of
-    ``env.agent_roles()``, and ``aux_coef > 0`` (with a :class:`PolicyNet` that has an aux
-    head) a ``[T, E, A, aux_dim]`` buffer of ``env.aux_targets()`` and the loss term
-    ``aux_coef * mse(aux_head(features), targets)``. Each is written next to the
-    observation by the act graph. With :class:`Actor`, :class:`Critic` and
-    ``aux_coef=0`` none exists and the graphs are the plain ones.
+    ``env.critic_state()``, a role-reading network (or a scenario with roles under
+    ``normalize_advantage``, whose statistics are then per role-sorted slot) a
+    ``[T + 1, E, A]`` buffer of ``env.agent_roles()``, and ``aux_coef > 0`` (with a
+    :class:`PolicyNet` that has an aux head) a ``[T, E, A, aux_dim]`` buffer of
+    ``env.aux_targets()`` and the loss term ``aux_coef * mse(aux_head(features),
+    targets)``. Each is written next to the observation by the act graph. With
+    :class:`Actor`, :class:`Critic`, ``aux_coef=0`` and no roles none exists and the
+    graphs are the plain ones.
     """
 
     def __init__(
@@ -352,7 +378,13 @@ class MAPPO:
         self.policy_net = isinstance(actor, PolicyNet)
         self.actor_roles = self.policy_net and actor.uses_roles
         self.use_state = self.state_critic and critic.state_dim > 0
-        self.use_roles = self.actor_roles or (self.state_critic and critic.uses_roles)
+        self.role_counts = tuple(env.role_counts)
+        # With roles, the advantages are normalized per role-sorted slot, which reads them
+        # too (see standardize_advantage).
+        self.role_adv = bool(self.role_counts) and spec.normalize_advantage
+        self.use_roles = (
+            self.actor_roles or (self.state_critic and critic.uses_roles) or self.role_adv
+        )
         self.use_aux = spec.aux_coef > 0
         if self.use_aux and not (self.policy_net and actor.aux_head is not None):
             raise ValueError("aux_coef > 0 needs a PolicyNet with an aux head (aux_dim > 0)")
@@ -595,6 +627,8 @@ class MAPPO:
             extra["state"] = self.state_buf[: self.T].reshape(self.N, -1).index_select(0, idx)
         if self.role_buf is not None:
             extra["roles"] = self.role_buf[: self.T].reshape(self.N, A).index_select(0, idx)
+        if self.role_adv:
+            extra["role_counts"] = self.role_counts
         if self.aux_buf is not None:
             extra["aux_target"] = self.aux_buf.reshape(self.N, A, -1).index_select(0, idx)
         noise = torch.randn_like(u)  # drawn here, not in the (possibly compiled) loss

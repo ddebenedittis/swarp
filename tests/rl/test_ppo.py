@@ -11,8 +11,8 @@ import pytest
 import torch
 
 from swarp.rl import MAPPO, Actor, Critic, load_checkpoint, parse_args, train
-from swarp.rl.networks import PolicyNet, StateCritic, tanh_normal_log_prob
-from swarp.rl.ppo import LEGACY_STAT_NAMES, gae, network_archs
+from swarp.rl.networks import PolicyNet, StateCritic, role_permutation, tanh_normal_log_prob
+from swarp.rl.ppo import LEGACY_STAT_NAMES, gae, network_archs, standardize_advantage
 from swarp.rl.recipes import SPECS, build_env
 
 SMOKE = [
@@ -48,6 +48,27 @@ def test_tanh_normal_log_prob_matches_torch_distributions():
     )
     ref = dist.log_prob(torch.tanh(u)).sum(-1)
     assert torch.allclose(tanh_normal_log_prob(u, loc, scale), ref, atol=1e-4)
+
+
+def test_advantages_are_standardized_per_role_slot():
+    """Roles move between agents per row: each role-sorted slot gets its own statistics,
+    not each agent index, and the result comes back in agent order."""
+    torch.manual_seed(0)
+    B, counts = 64, (1, 3)
+    base = torch.tensor([0, 1, 1, 1])
+    roles = torch.stack([base[torch.randperm(4)] for _ in range(B)])
+    # Role 0 is worth 10x the others: per-agent-index statistics would mix the two.
+    adv = torch.randn(B, 4) * torch.where(roles == 0, 10.0, 1.0) + 3.0 * roles
+    out = standardize_advantage(adv, roles, counts)
+    perm = torch.argsort(roles, dim=-1, stable=True)
+    ranked = adv.gather(-1, perm)
+    ref = (ranked - ranked.mean(0)) / ranked.std(0)
+    assert torch.allclose(out.gather(-1, perm), ref, atol=1e-5)
+    assert torch.equal(perm, role_permutation(roles, counts))
+    # Without roles (or counts) it is the per-agent-index formula, unchanged.
+    plain = (adv - adv.mean(0)) / adv.std(0)
+    assert torch.equal(standardize_advantage(adv), plain)
+    assert torch.equal(standardize_advantage(adv, roles, ()), plain)
 
 
 def test_actor_scale_is_one_at_zero_output():

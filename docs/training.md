@@ -137,6 +137,9 @@ The mean auxiliary MSE is logged as a `loss_aux` column, which `metrics.csv` has
 The rollout records the critic state, the roles and the auxiliary targets next to the observation, inside the same captured act graph, and reads them back by address, as it reads the observation.
 That is why the scenario has to write them in the observation pass.
 
+**Advantages.**
+With roles and `normalize_advantage`, the advantages are standardized per role-sorted slot rather than per agent index, so each column of statistics holds one role however the roles were drawn.
+
 `--resume-critic-only` with `--resume` loads only the critic from a checkpoint and starts a fresh actor.
 A checkpoint of a role-aware policy evaluates through `examples/eval_mappo.py` as any other: the evaluator reads the roles from the env at every step.
 
