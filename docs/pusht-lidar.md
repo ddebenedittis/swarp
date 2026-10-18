@@ -149,3 +149,45 @@ The observation kernel writes the three trainer buffers on every pass, the obs-o
 - `aux_targets()`, `[n_envs, n_agents, 4]`: the T's position relative to each robot divided by the lidar range, and cos and sin of its heading.
 
 `SPECS["pusht_lidar"]` is stage T0: Push-T's recipe with five robots at `obs_level=0`, a `PolicyNet` with one head per role, and a per-slot `StateCritic` on `critic_state()`, with the auxiliary loss off.
+
+## Results
+
+Every number below is the greedy solve rate at full curriculum difficulty over 512 evaluation envs (the Wilson interval is about ±0.01 near 0.98 and ±0.04 near 0.6), from `python -m swarp.rl --scenario pusht_lidar` with the recipe's 4000 iterations and 512 training envs.
+The robots are holonomic discs.
+
+### Default arena
+
+Lidar range 0.8, two pushers and three observers unless noted, one seed each.
+
+| run | iter 1000 | final (iter) |
+|---|---|---|
+| oracle T pose (level 0) | 0.47 | 0.99 (4000) |
+| own lidar (level 1), `frame_stack` 4, aux loss 0.1 | 0.81 | 0.99 (4000) |
+| pooled hits (level 2), `frame_stack` 4, aux loss 0.1 | 0.90 | 1.00 (4000) |
+| level 1 with lidar range 0.05 (leak control) | 0.004 | stopped at 1500 |
+| level 1, `frame_stack` 1 | 0.81 | 0.98 (2500) |
+| level 1, no aux loss | 0.86 | 0.96 (2000) |
+| two pushers, no observers | 0.96 | 0.97 (1500) |
+| five pushers, no observers | 0.24 | 0.95 (2000) |
+
+The leak control is the check that matters most: with a lidar too short to see the T the team never learns, so the policies above do not read the T pose from anywhere but their scans.
+Otherwise this arena is too easy to separate the variants: the T is almost always in some robot's view, and memory, the aux loss and observers barely change the outcome.
+
+### Short range
+
+Lidar range 0.3 and observer standoff 0.4, level 1 or 2 with `frame_stack` 4 and aux loss 0.1, three seeds each (0, 1, 2).
+
+| run | iter 1000 | iter 1500 | iter 4000 |
+|---|---|---|---|
+| two pushers only | 0.62 / 0.83 / 0.92 (mean 0.79) | 0.83 / 0.91 / 0.96 (0.90) | 0.95 / 0.99 / 0.99 (0.98) |
+| + three observers, own lidar | 0.77 / 0.81 / 0.46 (0.68) | 0.80 / 0.96 / 0.88 (0.88) | 0.99 / 1.00 / 0.98 (0.99) |
+| + three observers, pooled hits | 0.69 / 0.61 / 0.63 (0.64) | 0.91 / 0.90 / 0.91 (0.91) | 0.98 / 0.98 / 0.98 (0.98) |
+| + three observers, own lidar, attention communication | 0.87 / 0.14 / 0.74 (0.58) | 0.95 / 0.91 / 0.93 (0.93) | 0.98 / 0.99 / 0.98 (0.99) |
+| + three observers, pooled hits, GRU (seed 0 only) | 0.80 | 0.94 | 0.97 |
+
+Every variant ends between 0.975 and 1.000 on every seed, so at 4000 iterations observers, pooled hits and learned communication neither help nor hurt.
+Early on the seed spread is wider than any difference between variants: seed 0 alone suggested attention communication > pooled hits > own lidar ≈ pushers only, but at iteration 1000 the three-seed means run the other way round (pushers only 0.79, own lidar 0.68, pooled hits 0.64, attention 0.58, whose seed-1 run sat at 0.14), and by iteration 1500 all four are within 0.05 of each other.
+At this range two pushers still find and turn the T on their own, so a regime that needs the observers has to make the T harder to keep in view: a shorter range, clutter that occludes it, or a larger arena.
+
+An earlier short-range batch with observer standoff 0.22 is excluded: the standoff sat inside the T's 0.265 corner radius, so the shaping parked observers against the T and they jammed its rotation (the angle error stayed near 1.6 rad).
+The scenario now refuses a standoff below `tee_radius + agent_radius`.
