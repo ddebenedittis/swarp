@@ -25,7 +25,7 @@ from swarp.core.config import Obstacles, WorldConfig
 from swarp.core.rng import advance_seed_kernel
 from swarp.core.state import VEC2
 from swarp.core.world import World
-from swarp.dynamics.base import AgentConfig, ControlMode, DynamicsModel
+from swarp.dynamics.base import AgentConfig, AgentShape, ControlMode, DynamicsModel, _coerce
 from swarp.interop.autograd import torch_stream_scope
 from swarp.scenarios.fused import Buf, FusedPass, FusedScenario
 from swarp.scenarios.navigation_kernels import (
@@ -55,7 +55,29 @@ class NavigationScenario(FusedScenario):
         goal_tolerance: float | None = None,
         min_spawn_separation: float | None = None,
         neighbor_method: str = "auto",
+        agent_shape: AgentShape | str = AgentShape.DISC,
+        agent_half_extents: tuple[float, float] | None = None,
     ) -> None:
+        """``agent_shape="box"`` makes every agent a box of ``agent_half_extents``
+        (default ``(agent_radius, agent_radius / 2)``, along and across the heading). A
+        box's radius is then its circumscribed one, and that replaces ``agent_radius``
+        everywhere the scenario reads it (contact margin, neighbor reach, spawn spacing,
+        goal tolerance, the touching penalty), so every radius-based bound stays
+        conservative."""
+        # Resolved through AgentConfig, which owns the footprint rules (and raises on a
+        # bad shape or half-extents) and derives a box's circumscribed radius.
+        shape = _coerce(AgentShape, agent_shape, "agent_shape")
+        if shape == AgentShape.BOX:
+            if agent_half_extents is None:
+                agent_half_extents = (agent_radius, 0.5 * agent_radius)
+            footprint = AgentConfig(shape=shape, half_extents=agent_half_extents)
+        else:
+            footprint = AgentConfig(
+                radius=agent_radius, half_extents=agent_half_extents or (0.0, 0.0)
+            )
+        self.agent_shape = footprint.shape
+        self.agent_half_extents = footprint.half_extents
+        agent_radius = footprint.radius
         self.n_agents = n_agents
         self.agent_radius = agent_radius
         self.model = model
@@ -93,9 +115,11 @@ class NavigationScenario(FusedScenario):
             AgentConfig(
                 model=self.model,
                 ctrl_mode=self.ctrl_mode,
-                radius=self.agent_radius,
+                radius=None if self.agent_shape == AgentShape.BOX else self.agent_radius,
                 max_speed=self.max_speed,
                 max_accel=2.0 * self.max_speed,
+                shape=self.agent_shape,
+                half_extents=self.agent_half_extents,
             )
             for _ in range(self.n_agents)
         ]

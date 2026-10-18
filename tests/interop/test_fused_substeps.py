@@ -1,10 +1,12 @@
 """The single-launch substep chain must be bit-identical to the layered one."""
 
+import dataclasses
+
 import pytest
 import torch
 
 from swarp import Environment, NavigationScenario
-from swarp.core.config import WorldConfig
+from swarp.core.config import Obstacles, WorldConfig
 from swarp.core.fused_substeps import block_layout
 from swarp.scenarios import SCENARIOS, make_scenario
 
@@ -134,3 +136,70 @@ def test_auto_routes_by_agents_per_substep(n_envs, n_agents, substeps, fused):
     assert stepper.enable_fused_substeps == "auto"
     state = stepper.alloc_state(n_envs)
     assert stepper._can_fuse_substeps(state, stepper.cached_buffers(n_envs)) is fused
+
+
+class _MixedNavigation(NavigationScenario):
+    """Every other agent a diff-drive box whose circumscribed radius is the disc's, so the
+    scenario's radius-based bounds hold for both shapes, among obstacles cycling through
+    circle, box and segment (navigation itself installs circles)."""
+
+    def _agent_configs(self):
+        cfgs = super()._agent_configs()
+        box = dict(shape="box", half_extents=(0.04, 0.03), radius=None, model="diff_drive")
+        return [dataclasses.replace(c, **box) if i % 2 else c for i, c in enumerate(cfgs)]
+
+    def make_world(self, n_envs, device, dt, substeps, dtype, world_config=None):
+        world = super().make_world(n_envs, device, dt, substeps, dtype, world_config)
+        n = self.n_obstacles
+        if n > 0:
+            tt = {"device": device, "dtype": dtype}
+            # Re-installed by every reset with fresh poses, keeping these shapes.
+            world.set_obstacles(
+                Obstacles(
+                    torch.zeros(n_envs, n, 2, **tt),
+                    torch.full((n,), 0.05, **tt),
+                    shape=torch.arange(n, device=device, dtype=torch.int32) % 3,
+                    half_extents=torch.tensor([[0.0, 0.0], [0.08, 0.04], [0.1, 0.0]] * n, **tt)[
+                        :n
+                    ],
+                    angle=torch.linspace(-1.0, 1.0, n, **tt).expand(n_envs, n).contiguous(),
+                )
+            )
+        return world
+
+
+def _mixed_env(substeps, use_graph, n_obstacles, bounds_mode, n_agents=6):
+    scen = _MixedNavigation(n_agents=n_agents, n_obstacles=n_obstacles, world_size=0.5)
+    return Environment(
+        scen,
+        n_envs=23,
+        device="cuda:0",
+        dt=0.05,
+        substeps=substeps,
+        seed=0,
+        use_graph=use_graph,
+        auto_reset=True,
+        max_steps=5,
+        world_config=WorldConfig(bounds_mode=bounds_mode),
+    )
+
+
+@pytest.mark.parametrize("use_graph", [False, True])
+@pytest.mark.parametrize("substeps", [1, 4])
+@pytest.mark.parametrize("n_obstacles", [0, 3])
+@pytest.mark.parametrize("bounds_mode", ["soft", "clamp"])
+def test_box_agents_bit_identical(use_graph, substeps, n_obstacles, bounds_mode):
+    """The ``boxes`` variant sums the layered box kernel's terms in its order: a mixed
+    disc/box world is bit-identical through agent pairs, obstacles, walls and the clamp."""
+    env = _mixed_env(substeps, use_graph, n_obstacles, bounds_mode)
+    assert env.world.stepper.has_box_agents
+    _assert_same(lambda: _mixed_env(substeps, use_graph, n_obstacles, bounds_mode))
+
+
+def test_auto_keeps_box_worlds_layered():
+    env = _mixed_env(4, True, 0, "soft", n_agents=2)
+    stepper = env.world.stepper
+    state = stepper.alloc_state(env.n_envs)
+    assert not stepper._can_fuse_substeps(state, stepper.cached_buffers(env.n_envs))
+    stepper.enable_fused_substeps = True
+    assert stepper._can_fuse_substeps(state, stepper.cached_buffers(env.n_envs))

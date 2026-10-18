@@ -100,11 +100,9 @@ A box's `radius` is derived: it is the circumscribed radius `hypot(hx, hy)`, so 
 A box needs positive half-extents, a disc must leave them at `(0, 0)`, and a drone cannot be a box.
 The footprint is packed into the parameter matrix as `P_SHAPE` (the tag as a float), `P_HALF_X` and `P_HALF_Y`, and mirrored on the world as `World.agent_shape` (`[n_agents]` int32) and `World.agent_half_extents` (`[n_agents, 2]`).
 
-:::{note}
-Box-agent contact physics has not landed yet: every contact kernel still treats an agent as a disc.
-Rather than silently simulating a box as its circumscribed disc, stepping a world that holds a box agent raises `NotImplementedError`.
-Such a world can already be built and reset, and the [lidar](world.md#lidar) sees box agents as the oriented boxes they are.
-:::
+A box agent collides as the oriented rectangle it is, against agents, obstacles and walls, and the [lidar](world.md#lidar) sees it the same way; the contact law is in [Box agents](world.md#box-agents).
+Contacts push its centre and apply no torque, so its heading is the one its dynamics model drives: a diff-drive or bicycle box turns as it steers, a holonomic box keeps the heading it was reset with.
+`NavigationScenario(agent_shape="box", agent_half_extents=(hx, hy))` builds a fleet of them.
 
 ## Heterogeneous fleets
 

@@ -59,6 +59,16 @@ The trade is launches against occupancy: a kernel that holds the whole chain nee
 It also needs the CUDA device, the slim 2D Euler path, shared agent parameters, no movable obstacles and the `brute` neighbor backend.
 `True` forces it wherever it is eligible, `False` turns it off.
 
+The chain is compiled per world from `wp.static` flags, and `boxes` is one of them: a world holding a [box agent](world.md#box-agents) runs a variant that dispatches every pair on the two agents' shapes and adds the oriented-box obstacle, wall and clamp terms, summed in the layered box kernel's order.
+With `boxes=False` the box branches compile out and the generated code is the disc chain's, line for line.
+`"auto"` keeps box worlds on the layered pipeline: the variant carries the box contact on top of the disc chain's register budget and its crossover has not been measured, so the thresholds above say nothing about it.
+It takes 213–255 registers per thread against the disc chain's 119–150 (float32, RTX 3070 Laptop), the occupancy cost that crossover has to be measured against.
+`True` runs it.
+
+Every kernel of a box world (the layered box force pass, the box-world copy of the slim integrator, the box variants of the chain and of the body pass) compiles without floating-point contraction (`fuse_fp=False`).
+With contraction on, nvcc fused the box contact into FMAs differently inside the large chain than inside the layered kernel, a 1-ulp drift; without it each operation rounds alone, so the two paths are bit-identical again (`tests/interop/test_fused_substeps.py`).
+Disc worlds keep contraction on and launch exactly the kernels they did before.
+
 At 1024 envs × 4 agents × 8 substeps with `auto_reset=True` the step drops from 84 to 43 µs; the full table is in [Benchmarks](benchmarks.md#fused-substep-chain).
 
 ### Lean launches

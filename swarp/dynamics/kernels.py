@@ -24,6 +24,8 @@ from swarp.core.state import QUAT, VEC2, VEC3, WorldState
 from swarp.dynamics.base import (
     P_ARM,
     P_GRAVITY,
+    P_HALF_X,
+    P_HALF_Y,
     P_IXX,
     P_IYY,
     P_IZZ,
@@ -38,6 +40,7 @@ from swarp.dynamics.base import (
     P_MAX_STEER,
     P_MIN_SPEED,
     P_RADIUS,
+    P_SHAPE,
     P_THRUST_MAX,
     AgentParams,
     DynamicsModel,
@@ -62,6 +65,34 @@ INT_RK4 = wp.constant(1)
 def clamp_norm(v: Any, limit: Any):
     """Scale ``v`` so its norm does not exceed ``limit`` (differentiable, branch-free)."""
     return v * (limit / wp.max(wp.length(v), limit))
+
+
+#: ``clamp_bounds`` tag of the footprint clamp, which a world holding box agents uses
+#: (``0`` is off and ``1`` the disc clamp, inset by the radius).
+CLAMP_FOOTPRINT = wp.constant(2)
+
+
+@wp.func
+def clamp_footprint(
+    p: Any, th: Any, radius: Any, shape: Any, hx: Any, hy: Any, b_min: Any, b_max: Any
+):
+    """Hard-clamp a position so the agent's whole footprint stays inside the bounds.
+
+    A disc (``shape`` 0) is inset by its radius, the same arithmetic as the disc clamp. A
+    box at heading ``th`` is inset by its support extents ``ex = hx|cos| + hy|sin|`` and
+    ``ey = hx|sin| + hy|cos|``, so a box turned 45 degrees is held off the wall by its
+    corner rather than by its circumscribed radius."""
+    ex = radius
+    ey = radius
+    if shape > type(radius)(0.5):
+        ca = wp.abs(wp.cos(th))
+        sa = wp.abs(wp.sin(th))
+        ex = hx * ca + hy * sa
+        ey = hx * sa + hy * ca
+    return type(p)(
+        wp.clamp(p[0], b_min[0] + ex, b_max[0] - ex),
+        wp.clamp(p[1], b_min[1] + ey, b_max[1] - ey),
+    )
 
 
 # ------------------------------------------------------------------ drone (6-DOF)
@@ -245,6 +276,9 @@ def _integrate_agent(
     l_r: Any,
     max_steer: Any,
     radius: Any,
+    shape: Any,
+    half_x: Any,
+    half_y: Any,
     thrust_max: Any,
     arm: Any,
     ixx: Any,
@@ -330,6 +364,10 @@ def _integrate_agent(
         p_new = type(p)(
             wp.clamp(p_new[0], bounds_min[0] + radius, bounds_max[0] - radius),
             wp.clamp(p_new[1], bounds_min[1] + radius, bounds_max[1] - radius),
+        )
+    elif clamp_bounds == CLAMP_FOOTPRINT:
+        p_new = clamp_footprint(
+            p_new, th_new, radius, shape, half_x, half_y, bounds_min, bounds_max
         )
 
     pos_out[e, a] = p_new
@@ -477,6 +515,9 @@ def _integrate_rk4(
     l_r: Any,
     max_steer: Any,
     radius: Any,
+    shape: Any,
+    half_x: Any,
+    half_y: Any,
     thrust_max: Any,
     arm: Any,
     ixx: Any,
@@ -704,6 +745,10 @@ def _integrate_rk4(
             wp.clamp(p_new[0], bounds_min[0] + radius, bounds_max[0] - radius),
             wp.clamp(p_new[1], bounds_min[1] + radius, bounds_max[1] - radius),
         )
+    elif clamp_bounds == CLAMP_FOOTPRINT:
+        p_new = clamp_footprint(
+            p_new, th_new, radius, shape, half_x, half_y, bounds_min, bounds_max
+        )
 
     pos_out[e, a] = p_new
     theta_out[e, a] = th_new
@@ -798,6 +843,9 @@ def integrate_kernel(
             params[a, P_LR],
             params[a, P_MAX_STEER],
             params[a, P_RADIUS],
+            params[a, P_SHAPE],
+            params[a, P_HALF_X],
+            params[a, P_HALF_Y],
             params[a, P_THRUST_MAX],
             params[a, P_ARM],
             params[a, P_IXX],
@@ -849,6 +897,9 @@ def integrate_kernel(
             params[a, P_LR],
             params[a, P_MAX_STEER],
             params[a, P_RADIUS],
+            params[a, P_SHAPE],
+            params[a, P_HALF_X],
+            params[a, P_HALF_Y],
             params[a, P_THRUST_MAX],
             params[a, P_ARM],
             params[a, P_IXX],
@@ -948,6 +999,9 @@ def integrate_kernel_per_env(
             params[e, a, P_LR],
             params[e, a, P_MAX_STEER],
             params[e, a, P_RADIUS],
+            params[e, a, P_SHAPE],
+            params[e, a, P_HALF_X],
+            params[e, a, P_HALF_Y],
             params[e, a, P_THRUST_MAX],
             params[e, a, P_ARM],
             params[e, a, P_IXX],
@@ -999,6 +1053,9 @@ def integrate_kernel_per_env(
             params[e, a, P_LR],
             params[e, a, P_MAX_STEER],
             params[e, a, P_RADIUS],
+            params[e, a, P_SHAPE],
+            params[e, a, P_HALF_X],
+            params[e, a, P_HALF_Y],
             params[e, a, P_THRUST_MAX],
             params[e, a, P_ARM],
             params[e, a, P_IXX],
@@ -1079,6 +1136,17 @@ def integrate2d_kernel(
             wp.clamp(p_new[0], bounds_min[0] + radius, bounds_max[0] - radius),
             wp.clamp(p_new[1], bounds_min[1] + radius, bounds_max[1] - radius),
         )
+    elif clamp_bounds == CLAMP_FOOTPRINT:
+        p_new = clamp_footprint(
+            p_new,
+            th_new,
+            params[a, P_RADIUS],
+            params[a, P_SHAPE],
+            params[a, P_HALF_X],
+            params[a, P_HALF_Y],
+            bounds_min,
+            bounds_max,
+        )
     pos_out[e, a] = p_new
     theta_out[e, a] = th_new
     vel_out[e, a] = v_out
@@ -1138,11 +1206,34 @@ def integrate2d_kernel_per_env(
             wp.clamp(p_new[0], bounds_min[0] + radius, bounds_max[0] - radius),
             wp.clamp(p_new[1], bounds_min[1] + radius, bounds_max[1] - radius),
         )
+    elif clamp_bounds == CLAMP_FOOTPRINT:
+        p_new = clamp_footprint(
+            p_new,
+            th_new,
+            params[e, a, P_RADIUS],
+            params[e, a, P_SHAPE],
+            params[e, a, P_HALF_X],
+            params[e, a, P_HALF_Y],
+            bounds_min,
+            bounds_max,
+        )
     pos_out[e, a] = p_new
     theta_out[e, a] = th_new
     vel_out[e, a] = v_out
     speed_out[e, a] = s_out
     ang_vel_out[e, a] = w_out
+
+
+#: Box-world copies of the slim kernels: the same functions compiled without FP
+#: contraction (see ``swarp.core.collisions.BOX_MODULE_OPTIONS``), so a box world's
+#: layered step rounds exactly like its fused one. Disc worlds launch the originals.
+_BOX_OPTS = {"fuse_fp": False}
+integrate2d_box_kernel = wp.kernel(
+    integrate2d_kernel.func, module="unique", module_options=_BOX_OPTS, grid_stride=False
+)
+integrate2d_box_kernel_per_env = wp.kernel(
+    integrate2d_kernel_per_env.func, module="unique", module_options=_BOX_OPTS, grid_stride=False
+)
 
 
 def _signature2d(dtype, per_env: bool = False) -> list:
@@ -1201,6 +1292,8 @@ for _T in (wp.float32, wp.float64):
     register(integrate_kernel_per_env, _T, _signature(_T, per_env=True))
     register(integrate2d_kernel, _T, _signature2d(_T))
     register(integrate2d_kernel_per_env, _T, _signature2d(_T, per_env=True))
+    register(integrate2d_box_kernel, _T, _signature2d(_T))
+    register(integrate2d_box_kernel_per_env, _T, _signature2d(_T, per_env=True))
 
 
 #: Integrator enum value -> kernel tag (must match the INT_* constants above).
@@ -1218,12 +1311,15 @@ def launch_integrate(
     integrator: Integrator = Integrator.EULER,
     slim: bool = False,
     skip_drone: bool = False,
+    footprint: bool = False,
 ) -> None:
     """Launch one integration sub-step. Functional: never writes to ``state_in``.
 
     ``clamp_bounds=(x_min, x_max, y_min, y_max)`` hard-clamps positions inside
-    the rectangle (inset by each agent's radius). ``integrator`` selects the
-    semi-implicit Euler recurrence (default) or classic RK4.
+    the rectangle (inset by each agent's radius). ``footprint=True`` insets each box
+    agent by its support extents at its new heading instead (the stepper passes it exactly
+    when the world holds a box agent; a disc is inset by its radius either way).
+    ``integrator`` selects the semi-implicit Euler recurrence (default) or classic RK4.
 
     ``slim=True`` launches the 2D-only Euler kernel that computes five state
     arrays instead of nine (no drone math, no RK4 branch). The caller must
@@ -1240,11 +1336,15 @@ def launch_integrate(
         b_min, b_max, do_clamp = vec2(0.0, 0.0), vec2(0.0, 0.0), 0
     else:
         x_min, x_max, y_min, y_max = clamp_bounds
-        b_min, b_max, do_clamp = vec2(x_min, y_min), vec2(x_max, y_max), 1
+        b_min, b_max = vec2(x_min, y_min), vec2(x_max, y_max)
+        do_clamp = 2 if footprint else 1
     per_env = params.floats_per_env is not None
     floats = params.floats_per_env if per_env else params.floats
     if slim:
-        kernel2d = integrate2d_kernel_per_env if per_env else integrate2d_kernel
+        if footprint:
+            kernel2d = integrate2d_box_kernel_per_env if per_env else integrate2d_box_kernel
+        else:
+            kernel2d = integrate2d_kernel_per_env if per_env else integrate2d_kernel
         wp.launch(
             concrete(kernel2d, dtype),
             dim=(n_envs, n_agents),

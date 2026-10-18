@@ -14,6 +14,17 @@ All notable changes to `swarp`. Newest first. Nothing has been released yet — 
   It is the first scenario with the trainer hooks: a role-sorted `critic_state()`, `agent_roles()` and `aux_targets()` (the T in each robot's frame), all written by the observation pass; `SPECS["pusht_lidar"]` is the oracle stage that trains with role heads and a state critic.
   The fused path launches the capture-safe Warp lidar inside the whole-step graph; the torch path scans with the `lidar_scan` oracle.
 
+- **Box agents collide as oriented boxes.**
+  `obb_contact` (`swarp/core/collisions.py`) gives every box pair a signed distance, a normal and a contact point: a separating-axis test over the four face normals with an early out past the reach, the exact vertex-versus-box distance when the boxes are disjoint, and the axis of least overlap with its contact point centred on the reference face when they intersect, so the distance is continuous through contact and a `+` crossing of two thin boxes is caught.
+  One frictionless spring-damper per pair uses the disc law, damped by the closing velocity of the two material points at the contact point.
+  Box agents collide with disc agents (`box_force` with the disc as the point), box agents (one contact per pair, lower index first, so equal-mass forces cancel exactly), box, segment (an exact capsule, round end caps) and circle obstacles, soft walls through their support extents, and the clamp, which insets a box by its extents at its new heading.
+  Movable bodies take a box agent's reaction from the same contact, so action equals reaction, and spin from an off-centre push.
+  The step stays differentiable through the contact geometry, headings included (gradchecked in float64).
+  A box agent feels no contact torque yet: its heading is driven by its dynamics model alone.
+  `NavigationScenario(agent_shape="box", agent_half_extents=...)` builds a box fleet, `python -m swarp.benchmark.throughput --agent-shape box` benchmarks one, and the viewer draws a box agent as its rotated rectangle.
+  Box worlds launch their own kernels (`collision_forces_box_kernel`, the `boxes` variants of the body pass and of the fused substep chain), all compiled without FP contraction so the layered and fused paths are bit-identical; `"auto"` keeps them on the layered pipeline until the fused crossover is measured.
+  Disc-only worlds launch the kernels they did before, and their trajectories are bit-identical.
+
 - **The lidar sees every shape: boxes, segments as capsules, and box agents, and reports what each ray hit.**
   `lidar_scan`, `lidar_scan_warp` and `Lidar` ray-cast against oriented boxes (a slab test in the box frame), segment obstacles as the exact capsule the collision step uses, and box agents oriented by their heading, alongside the circles they already handled.
   The circle-only filter that made boxes and segments invisible is gone, and with it the two host syncs it cost per install.
@@ -27,7 +38,7 @@ All notable changes to `swarp`. Newest first. Nothing has been released yet — 
 - **`AgentConfig(shape=AgentShape.BOX, half_extents=(hx, hy))`, the plumbing for box agents.**
   The footprint is appended to the parameter matrix as `P_SHAPE`, `P_HALF_X` and `P_HALF_Y` (every existing column keeps its index) and mirrored as `World.agent_shape` and `World.agent_half_extents`.
   A box's radius is its circumscribed one, so every radius-based bound stays conservative.
-  Box-agent contact physics is not in yet, so stepping a world with a box agent raises `NotImplementedError` instead of simulating the box as a disc; building, resetting and scanning one work.
+  The contact physics is the entry above.
   Disc-only worlds run the same arithmetic as before; only the parameter row grew from 17 to 20 columns.
 
 - **`ringroad`, an eleventh scenario: mixed-autonomy stop-and-go waves on the Flow / Sugiyama ring.**

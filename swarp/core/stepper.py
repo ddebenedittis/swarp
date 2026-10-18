@@ -203,8 +203,9 @@ class Stepper:
         self.has_drone: bool = any(c.model == DynamicsModel.DRONE for c in configs)
         # Host-side, static for the life of the stepper (the shape column is structural;
         # set_agent_params_per_env refuses to change it). Read by the lidar to compile its
-        # box-agent branch in or out, and by launch_substeps to refuse a step it would get
-        # wrong: every contact kernel still treats an agent as a disc of its radius.
+        # box-agent branch in or out, and by launch_substeps to route the force pass, the
+        # movable-body reactions and the bounds clamp to their box-aware kernels. A
+        # disc-only world never launches those, so its step is the disc step unchanged.
         self.has_box_agents: bool = any(c.shape == AgentShape.BOX for c in configs)
         self.enable_slim2d: bool = True
         # The single-launch substep chain (swarp/core/fused_substeps.py): ``"auto"`` takes
@@ -450,8 +451,8 @@ class Stepper:
             and str(floats.device) == str(self.device)
         )
         if not in_place:
-            # The shape column is structural, like the model tag: the lidar and (once box
-            # contacts land) the force kernels pick their branch from the shared row. This is
+            # The shape column is structural, like the model tag: the lidar and the box-agent
+            # kernel routing (has_box_agents) are decided from the configs. This is
             # the first-install / reallocation path, never the per-reset in-place refresh, so
             # its host read stays off the hot loop (and out of any capture).
             shared = np.array([float(c.shape) for c in self.configs])
@@ -653,10 +654,17 @@ class Stepper:
         above it up to 29% slower (a single substep with 16+ agents per env). A single
         substep saves only two launches, so there the batch decides too: 4 agents were 15%
         faster at 1k envs and 5% slower at 16k, so it fuses up to
-        :data:`FUSE_MAX_AGENTS_ONE_SUBSTEP` agents in total."""
+        :data:`FUSE_MAX_AGENTS_ONE_SUBSTEP` agents in total.
+
+        A world holding box agents runs the chain's ``boxes`` variant when asked for it
+        (``True``), but ``"auto"`` keeps it on the layered pipeline: that variant carries
+        the oriented-box contact on top of the disc chain's register budget, and its
+        crossover has not been measured yet, so the thresholds above are not evidence for
+        it."""
         mode = self.enable_fused_substeps
         if mode == "auto" and (
-            self.n_agents > FUSE_AGENTS_PER_SUBSTEP * self.substeps
+            self.has_box_agents
+            or self.n_agents > FUSE_AGENTS_PER_SUBSTEP * self.substeps
             or (
                 self.substeps == 1
                 and state_in.pos.shape[0] * self.n_agents > FUSE_MAX_AGENTS_ONE_SUBSTEP
@@ -713,14 +721,6 @@ class Stepper:
         the recorded neighbor lists survive until backward (the grid's own lists
         get overwritten by the next build before then).
         """
-        if self.has_box_agents:
-            raise NotImplementedError(
-                "stepping a world with box agents (AgentShape.BOX) is not supported yet: "
-                "box-agent contact physics (box-agent vs agent, obstacle and wall "
-                "contacts) has not landed, and every contact kernel would treat the box as "
-                "a disc of its circumscribed radius. Such a world can be built, reset and "
-                "scanned by the lidar, but not stepped."
-            )
         n_envs = state_in.pos.shape[0]
         world = self.world
         if self._can_fuse_substeps(state_in, buffers):
@@ -808,6 +808,10 @@ class Stepper:
                     bounds_min=self._bounds_min,
                     bounds_max=self._bounds_max,
                     dtype=self.dtype,
+                    # Box contacts read the headings and spins; a disc world passes None
+                    # and keeps the disc kernel.
+                    theta=st.theta if self.has_box_agents else None,
+                    ang_vel=st.ang_vel if self.has_box_agents else None,
                 )
                 if self.any_movable and not buffers.taped:
                     # Same state the force pass just used, so action and reaction match;
@@ -835,6 +839,9 @@ class Stepper:
                         bounds_max=self._bounds_max,
                         clamp_bounds=world.bounds is not None,
                         dtype=self.dtype,
+                        theta=st.theta,
+                        ang_vel=st.ang_vel,
+                        boxes=self.has_box_agents,
                     )
             launch_integrate(
                 st,
@@ -847,6 +854,7 @@ class Stepper:
                 integrator=world.integrator,
                 slim=slim,
                 skip_drone=skip_drone and slim,
+                footprint=self.has_box_agents,
             )
         # State has advanced; the grid's lists no longer match this generation.
         self.state_version += 1

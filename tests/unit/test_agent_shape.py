@@ -1,5 +1,5 @@
 """Agent footprint plumbing: AgentShape, derived box radius, the P_SHAPE/P_HALF_* columns,
-the World mirrors, and the loud refusal to step a box agent before box contacts exist."""
+and the World mirrors. The contact physics of box agents is tested in test_box_agents.py."""
 
 import math
 
@@ -76,7 +76,7 @@ def test_world_mirrors_the_footprint():
     assert not _world([AgentConfig(), AgentConfig()]).stepper.has_box_agents
 
 
-def test_stepping_a_box_agent_world_raises_but_building_and_scanning_work():
+def test_a_box_agent_world_builds_scans_and_steps():
     from swarp.sensors.lidar import Lidar
 
     world = _world([AgentConfig(), AgentConfig(shape="box", half_extents=(0.1, 0.05))])
@@ -87,10 +87,11 @@ def test_stepping_a_box_agent_world_raises_but_building_and_scanning_work():
         r = Lidar(n_rays=4, max_range=2.0, body_frame=False, backend=backend).scan(world)
         torch.testing.assert_close(r[:, 0, 0], torch.full((2,), 0.4))
     actions = torch.zeros(2, 2, world.act_dim)
-    with pytest.raises(NotImplementedError, match="box-agent contact physics"), torch.no_grad():
+    with torch.no_grad():
         world.step(actions)
-    with pytest.raises(NotImplementedError, match="box agents"):
-        world.step(actions.requires_grad_(True))
+    world.step(actions.requires_grad_(True))
+    world.state.pos.sum().backward()
+    assert torch.isfinite(actions.grad).all()
 
 
 def test_per_env_params_cannot_change_the_shape():
