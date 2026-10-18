@@ -26,6 +26,7 @@ import torch
 
 import swarp
 from swarp import Environment
+from swarp.rl.networks import ROLE_PARAMS
 from swarp.scenarios import scenario_class
 from swarp.scenarios.base import Scenario
 
@@ -58,6 +59,12 @@ class CurriculumKnob:
         if f >= 1.0 and self.none_at_full:
             return None
         return self.lo + (self.hi - self.lo) * f ** self.exponent
+
+
+#: ``TrainSpec.actor`` values: the obs-only Actor or the role-aware PolicyNet.
+ACTORS = ("mlp", "policynet")
+#: ``TrainSpec.critic_input`` values.
+CRITIC_INPUTS = ("obs", "state", "state+obs")
 
 
 @dataclass(frozen=True)
@@ -99,9 +106,6 @@ class TrainSpec:
     """When set, ``entropy_coeff`` decays linearly to this over the run. Apt for
     deadlock-prone tasks that want broad early exploration and committed late behaviour."""
     num_cells: int = 256
-    aux_coef: float = 0.0
-    """Weight of the auxiliary loss ``mse(aux_head(features), scenario.aux_targets())``;
-    0 disables it, and any value above needs a scenario with ``aux_dim > 0``."""
     normalize_advantage: bool = True
     """torchrl's ``ClipPPOLoss`` defaults this to ``False``. With a large sparse terminal
     bonus on top of small dense shaping -- which is every scenario here -- unnormalized
@@ -126,6 +130,39 @@ class TrainSpec:
     """Desynchronise episode starts before the first rollout (see ``MAPPO.reset``). For a
     scenario whose episodes mostly run to ``max_steps``: without it every env truncates on
     the same step and each batch is one slice of the episode, in phase across all envs."""
+    # --- networks -----------------------------------------------------------------
+    # The defaults are the plain shared-weight Actor and obs-only Critic. The rest needs
+    # the scenario's training hooks (``Scenario.critic_state`` / ``agent_roles`` /
+    # ``aux_targets``); see docs/training.md.
+    actor: str = "mlp"
+    """``"mlp"``: :class:`~swarp.rl.networks.Actor`, obs only. ``"policynet"``:
+    :class:`~swarp.rl.networks.PolicyNet`, which reads the scenario's roles (if it has
+    any) through ``role_params`` and carries the aux head when ``aux_coef > 0``."""
+    role_params: str = "heads"
+    """How a ``"policynet"`` actor's parameters depend on the role: ``"shared"`` (role as an
+    input only), ``"heads"`` (one output head per role) or ``"separate"`` (one network per
+    role). Ignored for ``"mlp"`` and for a scenario without roles."""
+    critic_input: str = "obs"
+    """``"obs"`` (every agent's observation), ``"state"`` (the scenario's privileged
+    ``critic_state()``) or ``"state+obs"``."""
+    per_agent_value: bool = False
+    """One value per agent (per role-sorted slot when the scenario has roles) instead of
+    one team value broadcast to every agent."""
+    aux_coef: float = 0.0
+    """Weight of the auxiliary loss ``mse(aux_head(features), scenario.aux_targets())``;
+    0 disables it. Above 0 it needs ``actor="policynet"`` and a scenario with
+    ``aux_dim > 0``."""
+
+    def __post_init__(self) -> None:
+        for name, allowed in (
+            ("actor", ACTORS), ("role_params", ROLE_PARAMS), ("critic_input", CRITIC_INPUTS),
+        ):
+            if getattr(self, name) not in allowed:
+                raise ValueError(f"{name} must be one of {allowed}, got {getattr(self, name)!r}")
+        if self.aux_coef < 0:
+            raise ValueError(f"aux_coef must be >= 0, got {self.aux_coef}")
+        if self.aux_coef > 0 and self.actor != "policynet":
+            raise ValueError("aux_coef > 0 needs actor='policynet' (the aux head lives there)")
 
 
 # Scenarios with no success criterion: both inherit the all-False ``Scenario.done``, so an

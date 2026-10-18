@@ -103,6 +103,55 @@ def test_train_smoke_writes_metrics_and_a_loadable_checkpoint(tmp_path):
     assert torch.equal(actor.greedy(obs), actor.greedy(obs))
 
 
+def test_train_with_a_policynet_and_a_per_agent_critic_round_trips(tmp_path):
+    """Navigation has no roles, state or aux targets, so this is PolicyNet's plain path and
+    an obs-reading per-agent StateCritic, through train(), its checkpoint and the resume."""
+    flags = ["--scenario", "navigation", *SMOKE, "--checkpoint-dir", str(tmp_path),
+             "--actor", "policynet", "--critic-input", "obs", "--per-agent-value"]
+    path = train(parse_args(flags))
+    actor, critic, meta = load_checkpoint(path)
+    assert isinstance(actor, PolicyNet) and isinstance(critic, StateCritic)
+    assert (meta["actor_cls"], meta["critic_cls"]) == ("PolicyNet", "StateCritic")
+    assert critic.per_agent and critic.use_obs and critic.state_dim == 0
+    obs = torch.randn(3, 4, actor.obs_dim)
+    assert critic(obs).shape == (3, 4) and actor.greedy(obs).shape == (3, 4, 2)
+    resumed = parse_args([*flags, "--resume", str(path), "--resume-critic-only"])
+    assert resumed.resume_critic_only
+    train(resumed)
+
+
+@pytest.mark.parametrize(
+    ("flags", "match"),
+    [
+        (["--critic-input", "state"], "no critic_state"),
+        (["--aux-coef", "0.1"], "needs actor='policynet'"),
+        (["--actor", "policynet", "--aux-coef", "0.1"], "no aux_targets"),
+    ],
+)
+def test_train_refuses_options_the_scenario_cannot_feed(tmp_path, flags, match, capsys):
+    argv = ["--scenario", "navigation", *SMOKE, "--checkpoint-dir", str(tmp_path), *flags]
+    try:
+        cfg = parse_args(argv)
+    except SystemExit:  # rejected by the spec itself, as a CLI error
+        assert match in capsys.readouterr().err
+        return
+    with pytest.raises(ValueError, match=match):
+        train(cfg)
+
+
+def test_spec_network_defaults_reproduce_the_plain_trainer():
+    from swarp.rl.recipes import TrainSpec
+
+    spec = TrainSpec()
+    assert (spec.actor, spec.critic_input, spec.per_agent_value, spec.aux_coef) == (
+        "mlp", "obs", False, 0.0,
+    )
+    assert all(
+        (s.actor, s.critic_input, s.per_agent_value, s.aux_coef) == ("mlp", "obs", False, 0.0)
+        for s in SPECS.values()
+    )
+
+
 def test_a_v2_checkpoint_round_trips_a_role_aware_architecture(tmp_path):
     torch.manual_seed(0)
     counts = (1, 2)
@@ -202,7 +251,7 @@ def _algo(
     # it. ``torch.cuda.graph`` collects before its own captures for the same reason.
     gc.collect()
     if features:
-        spec_kw.setdefault("aux_coef", 0.5)
+        spec_kw = {"actor": "policynet", "aux_coef": 0.5, **spec_kw}
     spec = replace(
         SPECS["navigation"], n_envs=64, steps_per_batch=8, epochs=2, minibatches=4,
         num_cells=32, **spec_kw,

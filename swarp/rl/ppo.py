@@ -49,6 +49,9 @@ from torch.nn import functional as F
 from swarp import Environment
 from swarp.rl.networks import Actor, Critic, PolicyNet, StateCritic, tanh_normal_log_prob
 from swarp.rl.recipes import (
+    ACTORS,
+    CRITIC_INPUTS,
+    ROLE_PARAMS,
     SPECS,
     ActionFn,
     PolicyArm,
@@ -721,6 +724,50 @@ def greedy_score_kwargs(actor: torch.nn.Module) -> dict[str, Any]:
     return {"policy": greedy_arm(actor)}
 
 
+def network_archs(
+    spec: TrainSpec, env: Environment, act_low: torch.Tensor, act_high: torch.Tensor
+) -> tuple[str, dict[str, Any], str, dict[str, Any]]:
+    """``(actor_cls, actor_kwargs, critic_cls, critic_kwargs)`` for a spec on an env, as
+    :data:`ARCHS` names and primitive keywords (what a checkpoint stores).
+
+    The defaults give :class:`Actor` and :class:`Critic`. Raises when the spec asks for a
+    hook the scenario does not provide.
+    """
+    obs_dim, n_agents, cells = env.obs_dim, env.n_agents, spec.num_cells
+    roles = list(env.role_counts)
+    if roles and sum(roles) != n_agents:
+        raise ValueError(f"the scenario's role_counts {roles} do not sum to {n_agents} agents")
+    if spec.actor == "mlp":
+        actor = "Actor", {
+            "obs_dim": obs_dim, "act_dim": env.act_dim, "num_cells": cells,
+            "low": act_low.tolist(), "high": act_high.tolist(),
+        }
+    else:
+        if spec.aux_coef > 0 and env.aux_dim == 0:
+            raise ValueError("aux_coef > 0, but the scenario provides no aux_targets()")
+        actor = "PolicyNet", {
+            "obs_dim": obs_dim, "act_dim": env.act_dim, "num_cells": cells,
+            "role_counts": roles, "role_params": spec.role_params,
+            "aux_dim": env.aux_dim if spec.aux_coef > 0 else 0,
+            "low": act_low.tolist(), "high": act_high.tolist(),
+        }
+    use_state = spec.critic_input in ("state", "state+obs")
+    if use_state and env.state_dim == 0:
+        raise ValueError(
+            f"critic_input={spec.critic_input!r}, but the scenario provides no critic_state()"
+        )
+    if spec.critic_input == "obs" and not spec.per_agent_value:
+        critic = "Critic", {"obs_dim": obs_dim, "n_agents": n_agents, "num_cells": cells}
+    else:
+        critic = "StateCritic", {
+            "state_dim": env.state_dim if use_state else 0, "obs_dim": obs_dim,
+            "n_agents": n_agents, "num_cells": cells,
+            "use_obs": spec.critic_input in ("obs", "state+obs"), "role_counts": roles,
+            "per_agent": spec.per_agent_value,
+        }
+    return (*actor, *critic)
+
+
 # ----------------------------------------------------------------------------- the CLI
 
 
@@ -786,6 +833,16 @@ def parse_args(argv: list[str] | None = None) -> TrainConfig:
     p.add_argument("--entropy-coeff", type=float)
     p.add_argument("--entropy-coeff-final", type=float, help="linear schedule target")
     p.add_argument("--num-cells", type=int, help="MLP width")
+    p.add_argument("--actor", choices=ACTORS,
+                   help="mlp: obs-only Actor; policynet: role-aware PolicyNet (+ aux head)")
+    p.add_argument("--role-params", choices=ROLE_PARAMS,
+                   help="how a policynet's parameters depend on the role")
+    p.add_argument("--critic-input", choices=CRITIC_INPUTS,
+                   help="what the centralised critic reads")
+    p.add_argument("--per-agent-value", action="store_true", default=None,
+                   help="one value per agent (role-sorted slot) instead of one per team")
+    p.add_argument("--no-per-agent-value", dest="per_agent_value", action="store_false")
+    p.add_argument("--aux-coef", type=float, help="auxiliary-loss weight (needs policynet)")
     p.add_argument("--normalize-advantage", action="store_true", default=None)
     p.add_argument("--no-normalize-advantage", dest="normalize_advantage",
                    action="store_false")
@@ -819,11 +876,15 @@ def parse_args(argv: list[str] | None = None) -> TrainConfig:
             "dt", "substeps", "max_steps", "n_agents", "iters", "n_envs",
             "steps_per_batch", "epochs", "minibatches", "lr", "gamma", "lmbda",
             "entropy_coeff", "entropy_coeff_final", "num_cells", "normalize_advantage",
-            "curriculum_iters", "curriculum_gate",
+            "curriculum_iters", "curriculum_gate", "actor", "role_params", "critic_input",
+            "per_agent_value", "aux_coef",
         )
         if getattr(a, f) is not None
     }
-    spec = replace(spec, **overrides)
+    try:
+        spec = replace(spec, **overrides)
+    except ValueError as exc:
+        p.error(str(exc))
     if spec.n_agents < 1:
         p.error("--n-agents must be >= 1")
     if a.resume_critic_only and not a.resume:
@@ -909,13 +970,9 @@ def train(cfg: TrainConfig) -> Path:
     }
     metric_cols = metric_names(metrics)
 
-    actor_cls, actor_kwargs = "Actor", {
-        "obs_dim": obs_dim, "act_dim": act_dim, "num_cells": spec.num_cells,
-        "low": act_low.tolist(), "high": act_high.tolist(),
-    }
-    critic_cls, critic_kwargs = "Critic", {
-        "obs_dim": obs_dim, "n_agents": n_agents, "num_cells": spec.num_cells,
-    }
+    actor_cls, actor_kwargs, critic_cls, critic_kwargs = network_archs(
+        spec, env, act_low, act_high
+    )
     actor = build_arch(actor_cls, actor_kwargs).to(device)
     critic = build_arch(critic_cls, critic_kwargs).to(device)
     if cfg.resume:
@@ -953,10 +1010,13 @@ def train(cfg: TrainConfig) -> Path:
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     csv_file = (ckpt_dir / "metrics.csv").open("w", newline="")
     csv_writer = csv.writer(csv_file)
+    # loss_aux only when the aux loss is on, so a default run's header is unchanged.
+    aux_col = ["loss_aux"] if algo.use_aux else []
     csv_writer.writerow(
         ["iter", "frames", "wall_s", "env_sps", "reward_per_step", "ep_solve_rate",
          "ep_ends", "ep_len_mean", "difficulty", "entropy", "loss_objective",
-         "loss_critic", "grad_skips", "eval_solve_rate", "eval_ci_lo", "eval_ci_hi"]
+         "loss_critic", *aux_col, "grad_skips", "eval_solve_rate", "eval_ci_lo",
+         "eval_ci_hi"]
         + metric_cols
     )
     target = spec.target_solve_rate if cfg.target_solve_rate is None else cfg.target_solve_rate
@@ -1006,6 +1066,12 @@ def train(cfg: TrainConfig) -> Path:
         f"graphs {'on' if algo.graphs else 'off'}, tf32 {'on' if cfg.tf32 else 'off'}, "
         f"compile {'on' if cfg.compile else 'off'}"
     )
+    if (actor_cls, critic_cls) != ("Actor", "Critic") or algo.use_aux:
+        print(
+            f"  actor {actor_cls} {actor_kwargs.get('role_params', '')}, critic {critic_cls} "
+            f"(input {spec.critic_input}, per-agent {spec.per_agent_value}), "
+            f"roles {list(env.role_counts)}, aux_coef {spec.aux_coef}"
+        )
     if cfg.scen_kwargs:
         print(f"  scenario kwargs: {cfg.scen_kwargs}")
 
@@ -1060,7 +1126,8 @@ def train(cfg: TrainConfig) -> Path:
             [it, (it + 1) * frames_per_batch, f"{wall:.3f}", f"{frames_per_batch / wall:.0f}",
              f"{mean_reward:.6f}", "" if rate is None else f"{rate:.4f}", window.ends,
              "" if ep_len is None else f"{ep_len:.1f}", f"{f:.3f}",
-             f"{ent / updates:.4f}", f"{obj / updates:.4f}", f"{crit / updates:.4f}", skips,
+             f"{ent / updates:.4f}", f"{obj / updates:.4f}", f"{crit / updates:.4f}",
+             *(f"{stats[k] / updates:.4f}" for k in aux_col), skips,
              "" if eval_rate is None else f"{eval_rate:.4f}",
              "" if eval_lo is None else f"{eval_lo:.4f}",
              "" if eval_hi is None else f"{eval_hi:.4f}"]
