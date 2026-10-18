@@ -770,6 +770,77 @@ def load_checkpoint(
     return actor.eval(), critic.eval(), ckpt
 
 
+def checkpoint_archs(ckpt: Mapping[str, Any]) -> tuple[str, dict[str, Any], str, dict[str, Any]]:
+    """``(actor_cls, actor_kwargs, critic_cls, critic_kwargs)`` of a loaded checkpoint, in
+    :func:`network_archs`' form. A ``swarp.rl/1`` checkpoint's are rebuilt from its dims."""
+    if ckpt.get("format") != "swarp.rl/1":
+        return (
+            ckpt["actor_cls"], dict(ckpt["actor_kwargs"]),
+            ckpt["critic_cls"], dict(ckpt["critic_kwargs"]),
+        )
+    D = ckpt["act_dim"]
+    low, high = ckpt.get("act_low"), ckpt.get("act_high")
+    actor = {
+        "obs_dim": ckpt["obs_dim"], "act_dim": D, "num_cells": ckpt["num_cells"],
+        "low": [-1.0] * D if low is None else list(low),
+        "high": [1.0] * D if high is None else list(high),
+    }
+    critic = {"obs_dim": ckpt["obs_dim"], "n_agents": ckpt["n_agents"],
+              "num_cells": ckpt["num_cells"]}
+    return "Actor", actor, "Critic", critic
+
+
+# Constructor keywords that follow from the scenario and its size, not from a network flag.
+_SCENARIO_KEYS = ("obs_dim", "act_dim", "n_agents", "state_dim", "role_counts", "low", "high")
+
+
+def _network_flags(cls: str, kwargs: Mapping[str, Any]) -> list[str]:
+    """The ``python -m swarp.rl`` flags that build a network like ``cls(**kwargs)``."""
+    flags = ["--num-cells", str(kwargs["num_cells"])]
+    if cls == "Actor":
+        return ["--actor", "mlp", *flags]
+    if cls == "PolicyNet":
+        flags = ["--actor", "policynet", "--role-params", kwargs["role_params"], *flags]
+        return [*flags, "--aux-coef", "<positive>"] if kwargs.get("aux_dim") else flags
+    if cls == "Critic":
+        return ["--critic-input", "obs", "--no-per-agent-value", *flags]
+    state, obs = kwargs.get("state_dim", 0) > 0, kwargs.get("use_obs", False)
+    critic_input = "state+obs" if state and obs else "state" if state else "obs"
+    per_agent = "--per-agent-value" if kwargs.get("per_agent") else "--no-per-agent-value"
+    return ["--critic-input", critic_input, per_agent, *flags]
+
+
+def check_resume(
+    path: str | Path,
+    ckpt: Mapping[str, Any],
+    built: tuple[str, dict[str, Any], str, dict[str, Any]],
+    critic_only: bool = False,
+) -> None:
+    """Raise unless the checkpoint's networks are the ones ``built`` (what
+    :func:`network_archs` gives for the current flags) describes, naming the mismatch and
+    the flags that rebuild the checkpoint's networks. With ``critic_only`` only the critic
+    must match."""
+    saved = checkpoint_archs(ckpt)
+    nets = [("critic", 2)] if critic_only else [("actor", 0), ("critic", 2)]
+    problems: list[str] = []
+    for which, i in nets:
+        (cls_s, kw_s), (cls_b, kw_b) = saved[i : i + 2], built[i : i + 2]
+        keys = [k for k in sorted(set(kw_s) | set(kw_b)) if kw_s.get(k) != kw_b.get(k)]
+        if cls_s == cls_b and not keys:
+            continue
+        diffs = [f"class {cls_s} vs {cls_b}"] if cls_s != cls_b else []
+        diffs += [f"{k} {kw_s.get(k)!r} vs {kw_b.get(k)!r}" for k in keys]
+        hint = f"pass {' '.join(_network_flags(cls_s, kw_s))}"
+        if any(k in _SCENARIO_KEYS for k in keys):
+            hint += ", and the scenario settings it was trained with (--n-agents, --scen-kwarg)"
+        problems.append(f"{which} (checkpoint vs flags: {', '.join(diffs)}); {hint}")
+    if problems:
+        raise ValueError(
+            f"--resume {path}: the checkpoint's networks differ from the ones these flags "
+            f"build: " + "; ".join(problems)
+        )
+
+
 def load_policy(path: str | Path, device: str = "cpu") -> torch.nn.Module:
     """The actor of a :func:`train` checkpoint; ``actor.greedy(obs)`` is the eval action
     (``actor.greedy(obs, roles)`` for a role-aware :class:`PolicyNet`)."""
@@ -1057,7 +1128,9 @@ def train(cfg: TrainConfig) -> Path:
     actor = build_arch(actor_cls, actor_kwargs).to(device)
     critic = build_arch(critic_cls, critic_kwargs).to(device)
     if cfg.resume:
-        a, c, _ = load_checkpoint(cfg.resume, device)
+        a, c, ckpt = load_checkpoint(cfg.resume, device)
+        built = (actor_cls, actor_kwargs, critic_cls, critic_kwargs)
+        check_resume(cfg.resume, ckpt, built, critic_only=cfg.resume_critic_only)
         if not cfg.resume_critic_only:
             actor.load_state_dict(a.state_dict())
         critic.load_state_dict(c.state_dict())

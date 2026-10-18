@@ -141,6 +141,7 @@ That is why the scenario has to write them in the observation pass.
 With roles and `normalize_advantage`, the advantages are standardized per role-sorted slot rather than per agent index, so each column of statistics holds one role however the roles were drawn.
 
 `--resume-critic-only` with `--resume` loads only the critic from a checkpoint and starts a fresh actor.
+`--resume` refuses a checkpoint whose networks differ from the ones the flags build, and names the flags that rebuild them.
 A checkpoint of a role-aware policy evaluates through `examples/eval_mappo.py` as any other: the evaluator reads the roles from the env at every step.
 
 ```bash

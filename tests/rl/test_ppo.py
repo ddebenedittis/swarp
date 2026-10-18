@@ -160,6 +160,27 @@ def test_train_refuses_options_the_scenario_cannot_feed(tmp_path, flags, match, 
         train(cfg)
 
 
+def test_resume_refuses_a_checkpoint_of_other_networks(tmp_path):
+    """A policynet checkpoint resumed under the default flags: the error names the
+    mismatch and the flags that rebuild it, rather than a state-dict key error."""
+    flags = ["--scenario", "navigation", *SMOKE, "--checkpoint-dir", str(tmp_path)]
+    path = train(parse_args([*flags, "--actor", "policynet", "--per-agent-value"]))
+    with pytest.raises(ValueError, match=r"actor \(checkpoint vs flags: class PolicyNet") as e:
+        train(parse_args([*flags, "--resume", str(path)]))
+    msg = str(e.value)
+    assert "--actor policynet --role-params heads" in msg
+    assert "--critic-input obs --per-agent-value" in msg
+    # Critic only: the actor may differ, the critic may not.
+    with pytest.raises(ValueError, match="critic") as e:
+        train(parse_args([*flags, "--resume", str(path), "--resume-critic-only"]))
+    assert "actor (" not in str(e.value)
+    critic_only = ["--resume", str(path), "--resume-critic-only", "--per-agent-value"]
+    train(parse_args([*flags, *critic_only]))
+    with pytest.raises(ValueError, match="num_cells 8 vs 16"):
+        train(parse_args([*flags, "--resume", str(path), "--actor", "policynet",
+                          "--per-agent-value", "--num-cells", "16"]))
+
+
 def test_spec_network_defaults_reproduce_the_plain_trainer():
     from swarp.rl.recipes import TrainSpec
 
