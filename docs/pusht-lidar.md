@@ -153,7 +153,7 @@ The observation kernel writes the three trainer buffers on every pass, the obs-o
 ## Results
 
 Every number below is the greedy solve rate at full curriculum difficulty over 512 evaluation envs (the Wilson interval is about ±0.01 near 0.98 and ±0.04 near 0.6), from `python -m swarp.rl --scenario pusht_lidar` with the recipe's 4000 iterations and 512 training envs.
-The robots are holonomic discs.
+The robots are holonomic discs except in the last table.
 
 ### Default arena
 
@@ -191,3 +191,17 @@ At this range two pushers still find and turn the T on their own, so a regime th
 
 An earlier short-range batch with observer standoff 0.22 is excluded: the standoff sat inside the T's 0.265 corner radius, so the shaping parked observers against the T and they jammed its rotation (the angle error stayed near 1.6 rad).
 The scenario now refuses a standoff below `tee_radius + agent_radius`.
+
+### Unicycle box robots
+
+The same recipe with `model="diff_drive"` and `agent_shape="box"` (5 × 2.5 cm rectangles commanded by `(v, omega)`, body-frame lidar), level 1, `frame_stack` 4, aux loss 0.1, seed 0.
+
+| run | iter 1000 | iter 2000 | iter 4000 |
+|---|---|---|---|
+| short range, two pushers only | 0.80 | 0.98 | 0.99 |
+| short range, + three observers | 0.24 | 0.52 | 0.94 |
+| default range, + three observers | 0.08 | 0.47 | 0.95 |
+
+Two unicycle pushers learn the task as fast as holonomic ones.
+With observers the team gets there about 1000 iterations later than the holonomic team and ends four to five points lower, still rising.
+The observers keep the T in view better than holonomic ones do (visibility 0.85–0.96 against 0.67–0.75 at iterations 500–1500), while the team reward lags at a third of the holonomic run's: in rollouts the observers bunch on one side of the T, often between it and its goal, and a unicycle cannot sidestep out of a pusher's way.
