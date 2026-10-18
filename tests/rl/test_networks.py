@@ -257,3 +257,20 @@ def test_communication_needs_a_shared_trunk():
     with pytest.raises(ValueError, match="comm must be one of"):
         PolicyNet(4, 2, 8, comm="radio")
     PolicyNet(4, 2, 8, role_params="separate", comm="attn")  # no roles: one trunk anyway
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda:0", marks=pytest.mark.gpu)])
+def test_the_hoisted_gru_step_is_torchs_gru_cell(device):
+    """PolicyNet runs the GRU's input projection once per sequence and the rest per step;
+    composed, the two halves are ``nn.GRUCell``, values and gradients."""
+    torch.manual_seed(0)
+    net = PolicyNet(3, 2, 8, recurrent=True, hidden_dim=5).to(device)
+    x = torch.randn(6, 4, 8, device=device, requires_grad=True)
+    h = torch.randn(6, 4, 5, device=device, requires_grad=True)
+    out = net._gru(net.gru, net._input_gates(x), h)
+    ref = net.gru(x.reshape(-1, 8), h.reshape(-1, 5)).view(6, 4, 5)
+    assert torch.allclose(out, ref, atol=1e-6)
+    g = torch.autograd.grad(out.square().sum(), (x, h, net.gru.weight_hh))
+    g_ref = torch.autograd.grad(ref.square().sum(), (x, h, net.gru.weight_hh))
+    for a, b in zip(g, g_ref, strict=True):
+        assert torch.allclose(a, b, atol=1e-5)

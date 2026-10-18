@@ -327,21 +327,43 @@ class PolicyNet(nn.Module):
             x = self._communicate(x, comm_mask)[0]
         return self.trunk(x)
 
-    @staticmethod
-    def _gru(cell: nn.GRUCell, x: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
-        out = cell(x.reshape(-1, x.shape[-1]), h.reshape(-1, h.shape[-1]))
-        return out.view(*x.shape[:-1], out.shape[-1])
+    def _input_gates(self, feat):
+        """The GRU's input projection ``W_ih x + b_ih``, the part that never reads ``h``:
+        :meth:`unroll` runs it once over the whole sequence."""
+        if self.separate:
+            return [
+                F.linear(f, gru.weight_ih, gru.bias_ih)
+                for gru, f in zip(self.grus, feat, strict=True)
+            ]
+        return F.linear(feat, self.gru.weight_ih, self.gru.bias_ih)
 
-    def _core(self, feat, h, route):
-        """One GRU step: ``(features for the heads, new h in agent order)``."""
+    @staticmethod
+    def _gru(cell: nn.GRUCell, gi: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
+        """``cell(x, h)`` from the input gates ``gi`` of ``x``: torch's GRU cell, the fused
+        kernel ``GRUCell`` itself runs on CUDA, the same equations elsewhere."""
+        gi2, h2 = gi.reshape(-1, gi.shape[-1]), h.reshape(-1, h.shape[-1])
+        gh = F.linear(h2, cell.weight_hh, cell.bias_hh)
+        if gi2.is_cuda:
+            out = torch.ops.aten._thnn_fused_gru_cell(gi2, gh, h2)[0]
+        else:
+            i_r, i_z, i_n = gi2.chunk(3, 1)
+            h_r, h_z, h_n = gh.chunk(3, 1)
+            r, z = torch.sigmoid(i_r + h_r), torch.sigmoid(i_z + h_z)
+            n = torch.tanh(i_n + r * h_n)
+            out = n + z * (h2 - n)
+        return out.view(*gi.shape[:-1], out.shape[-1])
+
+    def _core(self, gi, h, route):
+        """One GRU step from the input gates: ``(features for the heads, new h in agent
+        order)``."""
         if self.separate:
             hs = _take(h, route[1])
             outs = [
-                self._gru(gru, f, hs[..., off : off + n, :])
-                for gru, f, (off, n) in zip(self.grus, feat, self._spans, strict=True)
+                self._gru(gru, g, hs[..., off : off + n, :])
+                for gru, g, (off, n) in zip(self.grus, gi, self._spans, strict=True)
             ]
             return outs, _take(torch.cat(outs, -2), route[0])
-        out = self._gru(self.gru, feat, h)
+        out = self._gru(self.gru, gi, h)
         return out, out
 
     def _post(self, feat, roles, route, with_aux):
@@ -389,7 +411,7 @@ class PolicyNet(nn.Module):
         if self.recurrent:
             if h is None:
                 h = obs.new_zeros(*obs.shape[:-1], self.hidden_dim)
-            feat, h = self._core(feat, h, route)
+            feat, h = self._core(self._input_gates(feat), h, route)
         loc, scale, aux = self._post(feat, roles, route, with_aux)
         return loc, scale, aux, h
 
@@ -408,25 +430,30 @@ class PolicyNet(nn.Module):
         ``[*, A, hidden_dim]`` entering step 0.
 
         ``done[l]`` ``[*]`` (``{0, 1}``) zeroes the hidden state after step ``l``, so step
-        ``l + 1`` starts a new episode from zeros, as the rollout does. Everything but the
-        GRU runs once over the whole sequence; only the GRU steps one at a time. Returns
+        ``l + 1`` starts a new episode from zeros, as the rollout does. Everything that
+        does not read ``h``, the GRU's input projection included, runs once over the whole
+        sequence; only the hidden-to-hidden half of the GRU steps one at a time. Returns
         ``[L, ...]`` outputs and the hidden state after step ``L - 1`` (not reset).
         """
         if not self.recurrent:
             return self.step(obs, roles, h, with_aux=with_aux, comm_mask=comm_mask)
         roles = self._check(roles, with_aux)
         route = self._route(roles)
-        feat = self._pre(obs, roles, route, comm_mask)
+        gi = self._input_gates(self._pre(obs, roles, route, comm_mask))
         if h is None:
             h = obs.new_zeros(*obs.shape[1:-1], self.hidden_dim)
-        keep = None if done is None else (1.0 - done.to(obs.dtype))[..., None, None]
+        keep = None if done is None else (1.0 - done.to(obs.dtype))[..., None, None].unbind(0)
+        # unbind, not gi[i]: the backward of L selects would build L full-size gradients.
+        if self.separate:
+            steps = list(zip(*(g.unbind(0) for g in gi), strict=True))
+            routes = list(zip(route[0].unbind(0), route[1].unbind(0), strict=True))
+        else:
+            steps, routes = gi.unbind(0), [None] * obs.shape[0]
         outs = []
-        for i in range(obs.shape[0]):
+        for i, (step_feat, step_route) in enumerate(zip(steps, routes, strict=True)):
             if i and keep is not None:
                 h = h * keep[i - 1]
-            step_route = None if route is None else (route[0][i], route[1][i])
-            step_feat = [f[i] for f in feat] if self.separate else feat[i]
-            f, h = self._core(step_feat, h, step_route)
+            f, h = self._core(list(step_feat) if self.separate else step_feat, h, step_route)
             outs.append(f)
         if self.separate:
             core = [torch.stack([o[r] for o in outs]) for r in range(len(self._spans))]
