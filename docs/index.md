@@ -100,6 +100,7 @@ world
 scenarios
 differentiability
 training
+pusht-lidar
 visualization
 performance
 ```
