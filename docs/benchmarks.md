@@ -17,61 +17,93 @@ The benchmark entry points (`swarp/benchmark/`):
 
 ## Throughput
 
-`python -m swarp.benchmark.throughput` steps the full NavigationScenario hot path
-(dynamics, neighbor lists, soft collisions, obs/reward) under `torch.no_grad()` with
-random actions kept on-device. Measurement conditions: **100 timed steps per config**
-(after 10 warm-up steps), float32, `dt=0.05`, `substeps=1`, fused Warp obs/reward kernels
-and no CUDA-graph capture — run it as `python -m swarp.benchmark.throughput --no-graph`,
-which pins capture off so this table stays comparable across commits. The plain command
-leaves capture *on* (`throughput.py`'s default, matching `Environment`'s `use_graph="auto"`
-for a fused scenario on a CUDA device) and reports the faster numbers. On the
-RTX 3070 Laptop GPU:
+`python -m swarp.benchmark.throughput` steps the full NavigationScenario hot path (dynamics, neighbor lists, soft collisions, obs/reward) under `torch.no_grad()` with random actions kept on-device.
+Measurement conditions: **100 timed steps per config** (after 10 warm-up steps), float32, `dt=0.05`, `substeps=1`, fused Warp obs/reward kernels and no CUDA-graph capture.
+Run it as `python -m swarp.benchmark.throughput --no-graph`, which pins capture off so this table stays comparable across commits.
+The plain command leaves capture *on* (`throughput.py`'s default, matching `Environment`'s `use_graph="auto"` for a fused scenario on a CUDA device) and reports the faster numbers.
+On the RTX 3070 Laptop GPU:
 
 ```
   n_envs  n_agents   ms/step    env-steps/s   agent-steps/s
 -----------------------------------------------------------
-    1000         4      1.67        597,883       2,391,531
-    1000        16      1.68        594,768       9,516,284
-    1000        64      1.67        599,083      38,341,308
-    4000         4      1.62      2,461,680       9,846,719
-    4000        16      1.65      2,429,189      38,867,024
-    4000        64      1.63      2,455,776     157,169,634
-    8000         4      1.61      4,983,550      19,934,199
-    8000        16      1.62      4,923,460      78,775,364
-    8000        64      1.61      4,970,447     318,108,588
-   16000         4      1.58     10,127,806      40,511,225
-   16000        16      1.59     10,035,537     160,568,595
-   16000        64      2.06      7,781,203     497,997,017
+    1000         4      0.29      3,398,312      13,593,246
+    1000        16      0.36      2,753,071      44,049,134
+    1000        64      0.36      2,803,282     179,410,070
+    4000         4      0.29     13,747,433      54,989,730
+    4000        16      0.35     11,334,742     181,355,869
+    4000        64      0.58      6,863,382     439,256,422
+    8000         4      0.37     21,737,790      86,951,160
+    8000        16      0.36     22,375,841     358,013,457
+    8000        64      1.06      7,541,604     482,662,649
+   16000         4      0.35     45,393,422     181,573,687
+   16000        16      0.47     33,916,430     542,662,884
+   16000        64      2.14      7,490,570     479,396,449
 ```
 
-> **Reproducing these requires a cold GPU.** On this laptop the eager (graph-off) path is
-> dominated by per-step launch overhead, which makes it acutely sensitive to SM boost
-> state — a machine that has been running sustained GPU work for a while settles onto a
-> lower clock than one measured fresh, and the eager path (which never keeps the SM busy
-> enough on its own to re-boost) inherits whatever clock state it finds. The table above
-> was reproducible to within ~3% across three separate runs, cold and after other GPU work,
-> so it should be taken as this machine's current settled-clock number rather than a
-> best-case one; treat any large deviation (a former revision of this table showed rows
-> above 6 M env-steps/s at `4000×16` on a freshly-idle machine) as a clock-state difference,
-> not a code regression, and re-measure both trees **interleaved** in the same session
-> before concluding otherwise. The graph-on path does not have this problem: a step is one
-> graph replay, so it stays close to its own number (`4000×16` was ~0.15 ms/step here)
-> regardless of thermal/boost state.
+With capture on (the plain command) the same grid runs:
 
-The tape-free hot path is allocation-free at steady state (recycled scratch plus a
-ping-pong output buffer), which is what makes almost every config land on the same
-host-launch-bound floor on this run (~1.6–1.7 ms/step eager): up to 16,000 envs × 16
-agents the step is latency-bound, not throughput-bound, and env-steps/s scales
-essentially linearly with `n_envs`. Only the two largest configs (8,000–16,000 envs ×
-64 agents, i.e. ≥ 512k agents) become genuinely GPU-bound in the neighbor/force kernels
-— and those are where `agent-steps/s` peaks at ~500 M. The captured-graph path removes
-the launch floor entirely (see below): the same grid at `--graph` runs `1000×4` at
-0.08 ms/step versus 1.67 ms eager, ~21× faster, with the gap narrowing toward the
-GPU-bound configs where launch overhead was never the constraint.
+```
+  n_envs  n_agents   ms/step    env-steps/s   agent-steps/s
+-----------------------------------------------------------
+    1000         4      0.03     36,852,108     147,408,430
+    1000        16      0.06     16,372,076     261,953,211
+    1000        64      0.24      4,150,284     265,618,172
+    4000         4      0.05     82,862,931     331,451,723
+    4000        16      0.15     27,297,834     436,765,351
+    4000        64      0.62      6,475,123     414,407,887
+    8000         4      0.08    100,176,473     400,705,894
+    8000        16      0.26     30,806,414     492,902,626
+    8000        64      1.08      7,382,113     472,455,250
+   16000         4      0.11    145,785,598     583,142,392
+   16000        16      0.41     38,818,634     621,098,151
+   16000        64      1.94      8,227,839     526,581,706
+```
 
-Raising `n_agents` at fixed `n_envs` is close to free until that point, which is the
-structural difference from per-entity simulators: the step is a fixed handful of Warp
-kernels whose thread count grows with agents, not a Python loop whose *length* does.
+> **The eager table depends on the GPU's clock state.**
+> The eager (graph-off) path is dominated by per-step launch overhead, which makes it sensitive to SM boost state: the first run of the session above, on a cold GPU, read 0.22–0.27 ms/step on the rows that read 0.29–0.37 ms here, after 40 minutes of other GPU work.
+> The tables above are the settled-clock numbers; re-measure both trees **interleaved** in the same session before reading a large deviation as a code regression.
+> The graph-on path does not have this problem: a step is one graph replay, so it stays close to its own number regardless of thermal and boost state.
+
+The tape-free hot path is allocation-free at steady state (recycled scratch plus a ping-pong output buffer), which is why every config up to 16,000 envs × 16 agents lands on the same ~0.3–0.5 ms/step host-launch floor eager: the step is latency-bound, not throughput-bound, and env-steps/s scales almost linearly with `n_envs`.
+Only the 64-agent configs from 4,000 envs up become GPU-bound in the neighbor and force kernels, which is where `agent-steps/s` peaks at ~480 M.
+Capture removes the launch floor: `1000×4` runs at 0.03 ms/step against 0.29 ms eager, ~10× faster, and the 4-agent rows reach 146 M env-steps/s at 16,000 envs, with the gap closing toward the GPU-bound configs where launch overhead was never the constraint.
+
+Raising `n_agents` at fixed `n_envs` is close to free until that point, which is the structural difference from per-entity simulators: the step is a fixed handful of Warp kernels whose thread count grows with agents, not a Python loop whose *length* does.
+
+### Fused substep chain
+
+The [fused substep chain](performance.md#fused-substep-chain) and [lean launches](performance.md#lean-launches), against the commit before them.
+NavigationScenario, graph on, float32, `dt=0.05`, random actions, RTX 3070 Laptop GPU.
+Each arm ran in its own process, best of 3 timed windows of ~0.3 s, in 6 alternating pairs; the table gives the median µs/step and the range of the per-pair ratios.
+The `throughput.py` grid (one substep, `auto_reset=False`) comes first, then the shapes the `swarp.rl` recipes train at (3–5 agents, 4–8 substeps, `auto_reset=True`).
+
+| n_envs × agents × substeps | before | after | change | pair ratios |
+|---|---|---|---|---|
+| 1000 × 4 × 1 | 31.2 | 24.0 | −23% | 0.67–1.14 |
+| 1000 × 16 × 1 | 48.0 | 46.4 | −3% | 0.96–0.98 |
+| 1000 × 64 × 1 | 184.8 | 181.0 | −2% | 0.97–0.99 |
+| 4000 × 4 × 1 | 40.3 | 36.3 | −10% | 0.89–0.92 |
+| 4000 × 16 × 1 | 120.3 | 118.5 | −1% | 0.98–0.99 |
+| 4000 × 64 × 1 | 520.9 | 518.0 | −1% | 0.99–1.01 |
+| 8000 × 4 × 1 | 65.5 | 63.3 | −3% | 0.96–0.97 |
+| 8000 × 16 × 1 | 219.6 | 219.5 | 0% | 0.99–1.00 |
+| 8000 × 64 × 1 | 982.7 | 979.8 | 0% | 0.98–1.00 |
+| 16000 × 4 × 1 | 107.2 | 106.6 | −1% | 0.99–1.00 |
+| 16000 × 16 × 1 | 419.6 | 417.1 | −1% | 0.99–1.01 |
+| 16000 × 64 × 1 | 1996.9 | 1984.7 | −1% | 0.99–1.00 |
+| 512 × 4 × 4, auto-reset | 54.0 | 32.2 | −40% | 0.59–0.61 |
+| 1024 × 3 × 8, auto-reset | 82.7 | 38.3 | −54% | 0.46–0.47 |
+| 1024 × 4 × 8, auto-reset | 84.9 | 40.4 | −52% | 0.47–0.48 |
+| 1024 × 5 × 8, auto-reset | 89.0 | 44.8 | −50% | 0.50–0.51 |
+| 4096 × 4 × 4, auto-reset | 77.7 | 50.6 | −35% | 0.64–0.66 |
+| 4096 × 8 × 4, auto-reset | 122.4 | 96.5 | −21% | 0.79–0.79 |
+| 16384 × 4 × 4, auto-reset | 178.1 | 147.5 | −17% | 0.83–0.84 |
+
+The one-substep rows with 16 or more agents run the layered pipeline under `"auto"`, so they move only by the lean launches; forcing the fused chain there (`enable_fused_substeps=True`) was up to 29% *slower* in the sweep that set the routing rule.
+
+End to end the gain is small, because the simulator is a small part of a training iteration.
+`python -m swarp.rl` for 60 iterations at the recipes' sizes went from 99.5 to 98.5 ms/iteration on navigation, 193 to 192.5 on giveway and 224 to 223 on caging; the PPO update is ~90% of an iteration.
+The runs are bit-identical: every learning column of `metrics.csv` (reward, solve rate, losses, entropy) matched the previous commit's at every iteration, since the chain sums the same terms in the same order.
 
 ### Ring road
 
@@ -82,17 +114,17 @@ Every row ran captured (`graph`):
 
 | n_envs | RL cars (vehicles) | baseline (torch obs/reward, eager) | optimized (fused + graph) | speedup |
 |---|---|---|---|---|
-| 1024 | 1 (22) | 1.136 | 0.040 | 28.4× |
-| 1024 | 16 (22) | 1.141 | 0.085 | 13.4× |
-| 1024 | 64 (65) | 3.356 | 0.350 | 9.6× |
-| 4096 | 1 (22) | 1.827 | 0.059 | 31.0× |
-| 4096 | 16 (22) | 1.905 | 0.146 | 13.0× |
-| 4096 | 64 (65) | 12.461 | 0.655 | 19.0× |
-| 16000 | 1 (22) | 5.998 | 0.208 | 28.8× |
-| 16000 | 16 (22) | 6.693 | 0.629 | 10.6× |
-| 16000 | 64 (65) | 48.437 | 3.349 | 14.5× |
+| 1024 | 1 (22) | 1.138 | 0.034 | 33.6× |
+| 1024 | 16 (22) | 1.223 | 0.082 | 14.9× |
+| 1024 | 64 (65) | 3.378 | 0.341 | 9.9× |
+| 4096 | 1 (22) | 1.816 | 0.058 | 31.2× |
+| 4096 | 16 (22) | 1.914 | 0.138 | 13.9× |
+| 4096 | 64 (65) | 12.632 | 0.677 | 18.7× |
+| 16000 | 1 (22) | 6.131 | 0.208 | 29.5× |
+| 16000 | 16 (22) | 6.708 | 0.605 | 11.1× |
+| 16000 | 64 (65) | 48.524 | 3.330 | 14.6× |
 
-At the training recipe's size (1024 envs, 1 RL car among 22) the step costs 0.04 ms, about 25.6 M env-steps/s.
+At the training recipe's size (1024 envs, 1 RL car among 22) the step costs 0.034 ms, about 30 M env-steps/s.
 A whole `swarp.rl` iteration (1024 envs × 32 steps, rollout plus PPO update) takes about 94 ms, so the update, not the ring, is the cost.
 
 ## Training throughput
@@ -131,24 +163,24 @@ At the recipes' own batch sizes:
 ```
 scenario      n_envs   mb             config   ms/iter   env-steps/s vs torchrl sim share
 -----------------------------------------------------------------------------------------
-navigation       512    4            torchrl     232.0        70,621      1.00x      0.8%
-navigation       512    4      torchrl-tuned     120.5       135,967      1.93x      1.6%
-navigation       512    4 torchrl-tuned-fast     101.0       162,218      2.30x      1.9%
-navigation       512    4          benchmarl     251.5        65,145      0.92x      0.8%
-navigation       512    4             rsl_rl     162.0       101,136      1.43x      1.2%
-navigation       512    4              eager     105.5       155,299      2.20x      1.8%
-navigation       512    4             graphs      97.0       168,907      2.39x      2.0%
-navigation       512    4               fast      72.0       227,556      3.22x      2.7%
-navigation       512                     sim       1.9     8,502,622
-giveway         1024    8            torchrl     463.5        70,697      1.00x      0.8%
-giveway         1024    8      torchrl-tuned     242.0       135,405      1.92x      1.6%
-giveway         1024    8 torchrl-tuned-fast     189.5       172,918      2.45x      2.0%
-giveway         1024    8          benchmarl     479.5        68,338      0.97x      0.8%
-giveway         1024    8             rsl_rl     315.5       103,861      1.47x      1.2%
-giveway         1024    8              eager     204.0       160,627      2.27x      1.9%
-giveway         1024    8             graphs     189.0       173,376      2.45x      2.0%
-giveway         1024    8               fast     145.0       225,986      3.20x      2.6%
-giveway         1024                     sim       3.8     8,601,597
+navigation       512    4            torchrl     223.5        73,306      1.00x      0.5%
+navigation       512    4      torchrl-tuned     129.0       127,008      1.73x      0.8%
+navigation       512    4 torchrl-tuned-fast     107.0       153,121      2.09x      1.0%
+navigation       512    4          benchmarl     273.5        59,905      0.82x      0.4%
+navigation       512    4             rsl_rl     164.0        99,902      1.36x      0.6%
+navigation       512    4              eager     107.0       153,121      2.09x      1.0%
+navigation       512    4             graphs      97.0       168,907      2.30x      1.1%
+navigation       512    4               fast      72.0       227,556      3.10x      1.4%
+navigation       512                     sim       1.0    15,807,180
+giveway         1024    8            torchrl     451.5        72,576      1.00x      0.5%
+giveway         1024    8      torchrl-tuned     242.0       135,405      1.87x      0.9%
+giveway         1024    8 torchrl-tuned-fast     190.0       172,463      2.38x      1.2%
+giveway         1024    8          benchmarl     491.5        66,669      0.92x      0.5%
+giveway         1024    8             rsl_rl     315.0       104,025      1.43x      0.7%
+giveway         1024    8              eager     200.5       163,431      2.25x      1.1%
+giveway         1024    8             graphs     188.0       174,298      2.40x      1.2%
+giveway         1024    8               fast     144.0       227,556      3.14x      1.6%
+giveway         1024                     sim       2.3    14,312,670
 ```
 
 Scaling `n_envs` on navigation with the minibatch held at 4096 env-steps (`--minibatch-samples 4096`, so the minibatch count grows with the batch):
@@ -156,39 +188,41 @@ Scaling `n_envs` on navigation with the minibatch held at 4096 env-steps (`--min
 ```
 scenario      n_envs   mb             config   ms/iter   env-steps/s vs torchrl sim share
 -----------------------------------------------------------------------------------------
-navigation      1024    8            torchrl     430.5        76,116      1.00x      0.5%
-navigation      1024    8      torchrl-tuned     230.0       142,470      1.87x      1.0%
-navigation      1024    8 torchrl-tuned-fast     186.0       176,172      2.31x      1.2%
-navigation      1024    8          benchmarl     478.5        68,481      0.90x      0.5%
-navigation      1024    8             rsl_rl     316.0       103,696      1.36x      0.7%
-navigation      1024    8             graphs     192.0       170,667      2.24x      1.2%
-navigation      1024    8               fast     141.0       232,397      3.05x      1.6%
-navigation      1024                     sim       2.3    14,309,770
-navigation      4096   32            torchrl    1648.0        79,534      1.00x      0.1%
-navigation      4096   32      torchrl-tuned     842.5       155,575      1.96x      0.3%
-navigation      4096   32 torchrl-tuned-fast     638.5       205,281      2.58x      0.4%
-navigation      4096   32          benchmarl    1876.0        69,868      0.88x      0.1%
-navigation      4096   32             rsl_rl    1299.5       100,863      1.27x      0.2%
-navigation      4096   32             graphs     775.0       169,125      2.13x      0.3%
-navigation      4096   32               fast     561.0       233,640      2.94x      0.4%
-navigation      4096                     sim       2.4    53,930,683
-navigation     16384  128            torchrl    7499.5        69,910      1.00x      0.1%
-navigation     16384  128      torchrl-tuned    3606.5       145,373      2.08x      0.2%
-navigation     16384  128 torchrl-tuned-fast    2496.5       210,009      3.00x      0.2%
-navigation     16384  128          benchmarl    7049.5        74,372      1.06x      0.1%
-navigation     16384  128             rsl_rl    5010.0       104,648      1.50x      0.1%
-navigation     16384  128             graphs    3008.5       174,269      2.49x      0.2%
-navigation     16384  128               fast    2192.0       239,182      3.42x      0.3%
-navigation     16384                     sim       5.6    92,870,753
+navigation      1024    8            torchrl     428.0        76,561      1.00x      0.3%
+navigation      1024    8      torchrl-tuned     233.0       140,635      1.84x      0.6%
+navigation      1024    8 torchrl-tuned-fast     189.0       173,376      2.26x      0.7%
+navigation      1024    8          benchmarl     503.5        65,080      0.85x      0.3%
+navigation      1024    8             rsl_rl     320.0       102,400      1.34x      0.4%
+navigation      1024    8             graphs     192.0       170,667      2.23x      0.7%
+navigation      1024    8               fast     140.0       234,057      3.06x      1.0%
+navigation      1024                     sim       1.4    23,262,798
+navigation      4096   32            torchrl    1611.5        81,335      1.00x      0.1%
+navigation      4096   32      torchrl-tuned     833.5       157,255      1.93x      0.2%
+navigation      4096   32 torchrl-tuned-fast     641.0       204,480      2.51x      0.3%
+navigation      4096   32          benchmarl    1837.5        71,332      0.88x      0.1%
+navigation      4096   32             rsl_rl    1298.5       100,941      1.24x      0.1%
+navigation      4096   32             graphs     777.5       168,581      2.07x      0.2%
+navigation      4096   32               fast     559.0       234,476      2.88x      0.3%
+navigation      4096                     sim       1.6    81,093,956
+navigation     16384  128            torchrl    6251.5        83,866      1.00x      0.1%
+navigation     16384  128      torchrl-tuned    3287.5       159,479      1.90x      0.2%
+navigation     16384  128 torchrl-tuned-fast    2508.0       209,046      2.49x      0.2%
+navigation     16384  128          benchmarl    7785.5        67,342      0.80x      0.1%
+navigation     16384  128             rsl_rl    5644.0        92,893      1.11x      0.1%
+navigation     16384  128             graphs    3326.0       157,633      1.88x      0.2%
+navigation     16384  128               fast    2221.0       236,059      2.81x      0.2%
+navigation     16384                     sim       5.1   101,878,489
 ```
+
+The 16384-env row is the one the GPU's temperature moves: run on its own after a two-minute cooldown, `graphs` takes 3000–3004 ms and `fast` 2192–2195 ms, against 3326 and 2221 ms at the end of the row, after half an hour of the other trainers; the previous commit times the same (2999–3023 and 2193–2200 ms).
 
 Reading it:
 
-- **The physics is not the cost.** The simulator is at most 2.7% of any trainer's iteration, so every trainer over swarp is bounded by its own loop and its PPO update. With the overhead gone that update is GPU-bound: 8 epochs through two 256-wide MLPs, ~170 k env-steps/s in fp32 and ~235 k with TF32 matmuls and Inductor-fused elementwise ops, flat in `n_envs`.
-- **Against TorchRL as usually written, `swarp.rl` is 2.1–2.5× faster (2.9–3.4× with `--compile --tf32`); against TorchRL with its own speed features on, 1.1–1.3× (1.1–1.4×).** Most of the first gap is overhead that TorchRL's APIs can remove: capturing the update alone takes the TorchRL trainer from ~240 to ~140 ms on navigation. What the tuned trainer still pays sits in TorchRL's env-step path, which its API does not let a user own: `EnvBase.step_and_maybe_reset` builds TensorDicts and reads `done.any()` on the host every step, and `CudaGraphModule` syncs the device before every replay, so collecting a 32-step rollout takes ~18 ms around ~2 ms of physics. Per minibatch it adds a sync, host-side `ReplayBuffer` sampling and a copy into the graph's static inputs. The gap narrows as the batch grows, because the GPU-bound update dominates both.
-- **Tuning TorchRL took two non-obvious workarounds.** In TorchRL 0.13.3 with tensordict 0.13.0, `cudagraph_policy` with a `ProbabilisticActor` hands the collector the graph's static output buffers uncloned, so every step of a batch carries the last step's action and log-probability: training runs without an error and never learns. TorchRL 0.14.0 fixed this ([pytorch/rl#3002](https://github.com/pytorch/rl/issues/3002), [#4143](https://github.com/pytorch/rl/pull/4143)), as did tensordict 0.15.0 for `CudaGraphModule` itself ([pytorch/tensordict#1999](https://github.com/pytorch/tensordict/pull/1999)). `TanhNormal` with float bounds issues a host-to-device copy that a CUDA graph cannot capture, still so in TorchRL 0.14.1. `examples/train_mappo_tuned.py` documents both fixes. The tables above were measured on TorchRL 0.13.3; on 0.14.1 both TorchRL trainers time within 4% of those numbers, as does `swarp.rl` measured alongside them, so the ratios stand.
-- **BenchMARL runs at the speed of the untuned TorchRL trainer (0.9–1.1×)**, which it is built on; as shipped it uses none of TorchRL's graph or compile options.
-- **rsl_rl sits in between (1.3–1.5×).** Its loop is lean but fully eager, with `.item()` reads per minibatch, and the agents-as-envs mapping makes it evaluate the critic `n_agents` times per env.
+- **The physics is not the cost.** The simulator is at most 1.6% of any trainer's iteration, so every trainer over swarp is bounded by its own loop and its PPO update. With the overhead gone that update is GPU-bound: 8 epochs through two 256-wide MLPs, ~170 k env-steps/s in fp32 and ~230 k with TF32 matmuls and Inductor-fused elementwise ops, flat in `n_envs`.
+- **Against TorchRL as usually written, `swarp.rl` is 1.9–2.4× faster (2.8–3.1× with `--compile --tf32`); against TorchRL with its own speed features on, 1.0–1.3× (1.1–1.5×).** Most of the first gap is overhead that TorchRL's APIs can remove: capturing the update alone takes the TorchRL trainer from ~225 to ~130 ms on navigation. What the tuned trainer still pays sits in TorchRL's env-step path, which its API does not let a user own: `EnvBase.step_and_maybe_reset` builds TensorDicts and reads `done.any()` on the host every step, and `CudaGraphModule` syncs the device before every replay, so collecting a 32-step rollout takes ~18 ms around ~1 ms of physics. Per minibatch it adds a sync, host-side `ReplayBuffer` sampling and a copy into the graph's static inputs. The gap narrows as the batch grows, because the GPU-bound update dominates both.
+- **Tuning TorchRL took two non-obvious workarounds.** In TorchRL 0.13.3 with tensordict 0.13.0, `cudagraph_policy` with a `ProbabilisticActor` hands the collector the graph's static output buffers uncloned, so every step of a batch carries the last step's action and log-probability: training runs without an error and never learns. TorchRL 0.14.0 fixed this ([pytorch/rl#3002](https://github.com/pytorch/rl/issues/3002), [#4143](https://github.com/pytorch/rl/pull/4143)), as did tensordict 0.15.0 for `CudaGraphModule` itself ([pytorch/tensordict#1999](https://github.com/pytorch/tensordict/pull/1999)). `TanhNormal` with float bounds issues a host-to-device copy that a CUDA graph cannot capture, still so in TorchRL 0.14.1. `examples/train_mappo_tuned.py` documents both fixes. The tables above were measured on TorchRL 0.14.1 with tensordict 0.14.3 (BenchMARL on its pinned TorchRL 0.11.1); an earlier run on TorchRL 0.13.3 timed both TorchRL trainers within 4% of 0.14.1.
+- **BenchMARL runs a little behind the untuned TorchRL trainer (0.80–0.92×)**, which it is built on; as shipped it uses none of TorchRL's graph or compile options.
+- **rsl_rl sits in between (1.1–1.4×).** Its loop is lean but fully eager, with `.item()` reads per minibatch, and the agents-as-envs mapping makes it evaluate the critic `n_agents` times per env.
 - **TorchRL is the one that suffers under CPU contention.** With two Isaac Sim processes busy on the same laptop, the TorchRL trainer ran 1.3–1.4× slower (navigation at 512 envs: 328 ms per iteration instead of 244 ms) and ran out of GPU memory at 16,384 envs, while `swarp.rl` moved by under 5%. Its loop is host-bound; the captured one is not.
 
 Learning is unchanged by the speedup.
@@ -196,16 +230,16 @@ On `giveway` (1024 envs, the full 3000-iteration recipe, seeds 0–2) every trai
 
 | trainer | full difficulty at iteration | wall-clock to get there | whole run | greedy solve rate (2048 envs) | median solve step |
 |---|---|---|---|---|---|
-| `swarp.rl` | 413–414 | **79 s** | 581 s | 1.000 [0.998, 1.000] | 38–41 |
-| TorchRL, tuned | 414–416 | 102–103 s | 738 s | 1.000 | 38–40 |
-| rsl_rl | 413–414 | 133–134 s | 965 s | 1.000 | 38–39 |
-| TorchRL, as usually written | 415–416 | 187–188 s | 1354 s | 1.000 | 39–40 |
-| BenchMARL | 416–417 | 208–209 s | 1470 s | 1.000 | 42 |
+| `swarp.rl` | 413–414 | **78–80 s** | 587 s | 1.000 [0.998, 1.000] | 38–41 |
+| TorchRL, tuned | 414–416 | 101–115 s | 751 s | 1.000 | 39–41 |
+| rsl_rl | 413–414 | 132–133 s | 957 s | 1.000 | 38–39 |
+| TorchRL, as usually written | 414–415 | 174–176 s | 1280 s | 1.000 | 37–39 |
+| BenchMARL | 416–417 | 206–209 s | 1462 s | 1.000 | 42 |
 
 Every run reaches full difficulty with a windowed episode solve rate above 0.95 at that same iteration, and every final checkpoint solves all 2048 evaluation envs (the scripted controller: 1.000 at step 48); wall-clock excludes evaluation and is the range over the three seeds, and whole-run times are means.
 This measures speed, not sample efficiency: the recipe's curriculum raises difficulty by at most 1/400 per iteration, so no run can reach full difficulty before iteration 400, and every trainer clears the gate from about iteration 15 on.
 A comparison of sample efficiency needs a task where learning, not the curriculum, sets the pace.
-Every baseline learns `navigation` at the recipe: after 250 iterations, the greedy policy over 512 evaluation envs solves 1.000 [0.993, 1.000] for rsl_rl and for BenchMARL, and 0.982 [0.967, 0.991] for the tuned TorchRL trainer against 0.984 [0.969, 0.992] for the untuned one, from the same seed.
+Every baseline learns `navigation` at the recipe: after 250 iterations, the greedy policy over 512 evaluation envs solves 1.000 [0.993, 1.000] for rsl_rl, BenchMARL and both TorchRL trainers, from the same seed.
 The tuned trainer's update also matches the untuned one numerically on fixed batches (`tests/examples/test_mappo_tuned.py`).
 
 ## vs. VMAS
@@ -217,28 +251,22 @@ comparison deps first: `uv pip install -e '.[bench]'` (pulls in `vmas`; the scri
 also falls back to a `./VectorizedMultiAgentSimulator` clone if present). Use
 `--metric memory` for peak device memory and `--metric both` for both.
 
-env-steps/s on the RTX 3070 Laptop GPU (float32, 60 timed steps). `vmas-lidar` is
-VMAS's default navigation (collisions + 12-ray lidar); `vmas-simple` disables both as a
-lidar-free lower bound:
+env-steps/s on the RTX 3070 Laptop GPU (float32, `--steps 300 --warmup 20`, swarp with its defaults: fused kernels and whole-step capture).
+`vmas-lidar` is VMAS's default navigation (collisions + 12-ray lidar); `vmas-simple` disables both as a lidar-free lower bound:
 
 ```
- n_envs n_agents |         swarp |    vmas-lidar |   vmas-simple | swarp/lidar  swarp/simple
-   16384        4 |    18,751,408 |     2,094,070 |     8,163,160 |       8.95x         2.30x
-   16384       16 |     6,970,898 |       143,174 |     2,275,756 |      48.69x         3.06x
-    1024        4 |     1,232,014 |       186,642 |       544,501 |       6.60x         2.26x
-    1024       16 |     1,247,845 |        20,672 |       154,476 |      60.36x         8.08x
+ n_envs n_agents |         swarp |    vmas-lidar |   vmas-simple | swarp/lidar swarp/simple
+  16384        4 |   141,544,015 |     1,924,356 |     6,805,183 |      73.55x       20.80x
+   1024        4 |    51,060,511 |       157,802 |       447,798 |     323.57x      114.03x
+  16384       16 |    33,083,440 |       134,244 |     1,787,329 |     246.44x       18.51x
+   1024       16 |    17,857,796 |        17,523 |       117,271 |    1019.08x      152.28x
 ```
 
-> **Note.** The `swarp` column here predates the current hot path (it was measured before
-> whole-step CUDA-graph capture and the fused obs/reward work), so the ratios are a
-> *lower bound* on today's margin. The VMAS columns are unaffected. Re-run the script for
-> current figures.
-
-swarp is ~6–9× faster than VMAS's default navigation at 4 agents and ~40–75× at 16 agents:
-its whole step is ~3 fused Warp kernels regardless of agent count, whereas VMAS dispatches
-per-entity (and O(entities²) pairwise) PyTorch ops in Python, and its lidar raycasts every
-agent against every entity. Peak device memory is comparable to VMAS-with-lidar and small in
-absolute terms (≤ ~300 MiB across the grid), so throughput — not memory — is the constraint.
+swarp is ~70–320× faster than VMAS's default navigation at 4 agents and ~250–1000× at 16 agents, and ~20–150× faster than VMAS with collisions and lidar off.
+Its whole step is one CUDA-graph replay of a handful of Warp kernels regardless of agent count, whereas VMAS dispatches per-entity (and O(entities²) pairwise) PyTorch ops in Python, and its lidar raycasts every agent against every entity.
+The ratio is largest at small batches, where VMAS's per-step Python cost is spread over the fewest envs.
+Peak device memory (`--metric memory`, same grid) is small for both and no larger for swarp where it matters: 56 MiB against VMAS-with-lidar's 78 MiB at 16384 × 4 and 142 MiB against 334 MiB at 16384 × 16, with 32–52 MiB at 1024 envs, mostly fixed overhead.
+Throughput, not memory, is the constraint.
 
 **Parity caveat.** swarp is *API-compatible in spirit, not trajectory-compatible* with
 VMAS. The dynamics (semi-implicit Euler, no drag, force-as-velocity-contribution for the
@@ -330,31 +358,22 @@ by omitting it from `--sims`.
 
 ### swarp configurations
 
-The three `swarp` entries are hot-path *configurations* of the same simulator, so the
-benchmark doubles as an optimization ablation: `swarp-eager` (torch obs/reward, no
-CUDA graph — the baseline), `swarp-fused` (fused Warp obs/reward kernels), and `swarp`
-(fused **+** CUDA-graph capture). env-steps/s on the RTX 3070 Laptop GPU (float32,
-60 timed steps):
+The three `swarp` entries are hot-path *configurations* of the same simulator, so the benchmark doubles as an optimization ablation: `swarp-eager` (torch obs/reward, no CUDA graph — the baseline), `swarp-fused` (fused Warp obs/reward kernels), and `swarp` (fused **+** CUDA-graph capture).
+env-steps/s on the RTX 3070 Laptop GPU (float32, `--steps 300 --warmup 20`):
 
 ```
   n_envs  n_agents | swarp-eager swarp-fused       swarp |  fused/eager  opt/eager
-    4096         3 |   5,838,664   7,877,854  15,945,297 |       1.35x      2.73x
-   16384         3 |  21,772,740  30,814,526  61,718,330 |       1.42x      2.83x
-    4096        16 |   5,998,275   6,783,331  15,094,932 |       1.13x      2.52x
-   16384        16 |   6,858,433  28,191,165  35,637,271 |       4.11x      5.20x
+    4096         3 |   7,649,544  15,980,008  86,003,167 |       2.09x     11.24x
+   16384         3 |  25,962,701  47,203,892 145,339,064 |       1.82x      5.60x
+    4096        16 |   6,020,546  14,022,673  26,341,168 |       2.33x      4.38x
+   16384        16 |   6,538,976  29,355,880  32,409,682 |       4.49x      4.96x
 ```
 
-Fusing the obs/reward layer into Warp kernels is worth ~1.1–1.4× on its own; the
-CUDA graph (which elides per-step kernel-launch overhead) roughly doubles it again,
-for ~2.5–5× end-to-end over the eager baseline. The graph's win grows with batch size,
-where launch overhead is the binding constraint.
+Fusing the obs/reward layer into Warp kernels is worth ~1.8–4.5× on its own, and the CUDA graph adds another 1.1–5.4× on top, for ~4.4–11× end to end over the eager baseline.
+The graph's share is largest where the step is shortest (5.4× at 4096 × 3, where it also folds the [fused substep chain](performance.md#fused-substep-chain)'s single launch) and smallest at 16384 × 16, where the kernels themselves keep the GPU busy.
 
-These numbers are higher than the [Throughput](#throughput) table's because this task is
-obstacle-free open-field navigation (matched to what the other simulators do), and
-because the top configuration adds CUDA-graph capture. That is now `Environment`'s
-default (`use_graph="auto"` — on for a fused scenario on a CUDA device), and
-`throughput.py`'s; the [Throughput](#throughput) table above deliberately pins it off
-with `--no-graph`.
+These numbers are higher than the [Throughput](#throughput) table's because this task is obstacle-free open-field navigation (matched to what the other simulators do), and because the top configuration adds CUDA-graph capture.
+That is `Environment`'s default (`use_graph="auto"` — on for a fused scenario on a CUDA device), and `throughput.py`'s; the first [Throughput](#throughput) table deliberately pins it off with `--no-graph`.
 
 ### swarp (optimized) vs the field — matched task & observations
 
@@ -391,40 +410,32 @@ them, and JIT/XLA compile is excluded via warmup at the timed length. Both
 ```
 metric: env-steps/s
   n_envs  n_agents |        swarp  vmas-nolidar      jaxmarl        camar | vnl/s   jax/s  camar/s
-    1024         3 |    4,717,415       633,305   13,731,386   11,644,687 | 0.13x   2.91x    2.47x
-    4096         3 |   16,942,170     2,489,270   38,760,087   33,327,778 | 0.15x   2.29x    1.97x
-   16384         3 |   63,640,378     9,946,801   65,213,783   67,508,356 | 0.16x   1.02x    1.06x
-    1024        16 |    3,868,680       141,767    2,218,927    2,615,686 | 0.04x   0.57x    0.68x
-    4096        16 |   15,595,567       549,767    2,231,675    3,353,155 | 0.04x   0.14x    0.22x
-   16384        16 |   35,647,177     2,122,258    1,423,262    3,682,337 | 0.06x   0.04x    0.10x
+    1024         3 |   40,049,629       604,766   16,304,942   18,960,345 | 0.02x   0.41x    0.47x
+    4096         3 |   86,018,717     2,329,720   47,420,062   53,368,329 | 0.03x   0.55x    0.62x
+   16384         3 |  129,699,246     9,286,969   61,406,922   98,370,008 | 0.07x   0.47x    0.76x
+    1024        16 |   14,426,112       129,181    1,853,129    4,068,782 | 0.01x   0.13x    0.28x
+    4096        16 |   27,344,400       521,612    1,077,086    5,580,428 | 0.02x   0.04x    0.20x
+   16384        16 |   32,597,571     2,172,560      694,972    5,526,954 | 0.07x   0.02x    0.17x
 
 metric: agent-steps/s
   n_envs  n_agents |        swarp  vmas-nolidar      jaxmarl        camar | vnl/s   jax/s  camar/s
-    1024         3 |   14,152,244     1,899,916   41,194,157   34,934,061 | 0.13x   2.91x    2.47x
-    4096         3 |   50,826,510     7,467,809  116,280,262   99,983,333 | 0.15x   2.29x    1.97x
-   16384         3 |  190,921,134    29,840,404  195,641,349  202,525,067 | 0.16x   1.02x    1.06x
-    1024        16 |   61,898,884     2,268,278   35,502,837   41,850,981 | 0.04x   0.57x    0.68x
-    4096        16 |  249,529,074     8,796,274   35,706,801   53,650,474 | 0.04x   0.14x    0.22x
-   16384        16 |  570,354,838    33,956,129   22,772,199   58,917,397 | 0.06x   0.04x    0.10x
+    1024         3 |  120,148,888     1,814,299   48,914,827   56,881,034 | 0.02x   0.41x    0.47x
+    4096         3 |  258,056,152     6,989,161  142,260,186  160,104,986 | 0.03x   0.55x    0.62x
+   16384         3 |  389,097,738    27,860,908  184,220,765  295,110,025 | 0.07x   0.47x    0.76x
+    1024        16 |  230,817,791     2,066,903   29,650,070   65,100,512 | 0.01x   0.13x    0.28x
+    4096        16 |  437,510,402     8,345,790   17,233,372   89,286,842 | 0.02x   0.04x    0.20x
+   16384        16 |  521,561,136    34,760,961   11,119,554   88,431,259 | 0.07x   0.02x    0.17x
 ```
-(Ratios are identical in both tables — with agent counts matched across sims, the
-`×agents` factor cancels. `agent-steps/s` is there for the absolute magnitudes.)
+(Ratios are identical in both tables — with agent counts matched across sims, the `×agents` factor cancels. `agent-steps/s` is there for the absolute magnitudes.)
+`--steps 300 --warmup 20`, VMAS from `.venv-vmas`, JaxMARL from `.venv-jaxmarl`, CAMAR from `.venv-camar`.
 
 Reading it, once the task and obs are matched:
 
-- **The two JAX sims (JaxMARL, CAMAR) win at few agents + low envs** (~2–3× at 3 agents,
-  1024–4096 envs), because they run the whole rollout as one jitted `lax.scan` with no
-  per-step launch floor. **swarp is latency-bound there** — its step floors at ~0.24 ms
-  regardless of `n_envs` (1024→16384) *or* agent count (3→16), a Python-per-step-loop cost
-  the JAX fused rollout doesn't pay. This is the real reason JAX leads at low occupancy.
-- **They converge by 16384 envs** at 3 agents (all within ~6% — swarp 63.6 M, JaxMARL 65.2 M,
-  CAMAR 67.5 M) as swarp's launch floor amortizes across more work.
-- **swarp dominates at 16 agents** (JAX sims fall to 0.04–0.68×). swarp's step is a fixed
-  handful of fused Warp kernels, nearly insensitive to agent count — its `agent-steps/s`
-  climbs from ~14 M (3 agents) to ~570 M (16 agents), ~40×, doing far more work in about
-  the same wall time — whereas MPE/CAMAR per-step cost grows with agents.
-- **`vmas-nolidar` is consistently slowest** (0.04–0.16×): a Python per-entity step loop
-  that neither the JAX scan nor Warp kernels have to pay.
+- **swarp leads at every size.** At 3 agents it is 1.3–2.1× ahead of CAMAR and 1.8–2.5× ahead of JaxMARL; at 16 agents 3.5–6× ahead of CAMAR and 8–47× ahead of JaxMARL.
+- **Few agents and few envs no longer favour the JAX sims.** They run the whole rollout as one jitted `lax.scan`, which used to beat swarp's per-step floor of ~0.24 ms there; with the whole step one graph replay that floor is now ~0.026 ms (1024 × 3), and at 4096 × 3 the [fused substep chain](performance.md#fused-substep-chain) makes the physics a single launch as well.
+- **The gap is narrowest at 16384 × 3** (CAMAR at 0.76×), where every simulator has enough work per step to fill the GPU.
+- **The gap grows with the agent count.** swarp's step is a fixed handful of Warp kernels, so its `agent-steps/s` climbs from ~120–390 M at 3 agents to ~230–520 M at 16, while MPE/CAMAR per-step cost grows with agents and their `agent-steps/s` falls.
+- **`vmas-nolidar` is consistently slowest** (0.01–0.07×): a Python per-entity step loop that neither the JAX scan nor Warp kernels have to pay.
 
 **The default set is now genuinely comparable; the earlier "CAMAR is ~200× slower"
 result was almost entirely CAMAR's ~800-obstacle default map** — the same open-arena
@@ -457,14 +468,14 @@ env-steps/s on the RTX 3070 Laptop GPU, random actions over the action box, `n_a
 
 | n_envs | RL cars | swarp | swarp-fused | swarp-eager | VMAS | JaxMARL port | swarp / VMAS | swarp / JAX |
 |---|---|---|---|---|---|---|---|---|
-| 1024 | 1 | 18.8 M | 3.2 M | 0.82 M | 0.58 M | 12.4 M | 32× | 1.5× |
-| 4096 | 1 | 55.5 M | 12.4 M | 2.24 M | 1.71 M | 30.1 M | 33× | 1.8× |
-| 16384 | 1 | 61.6 M | 45.8 M | 2.62 M | 2.41 M | 41.6 M | 26× | 1.5× |
-| 1024 | 4 | 17.0 M | 2.9 M | 0.78 M | 0.31 M | 8.5 M | 55× | 2.0× |
-| 4096 | 4 | 42.2 M | 12.7 M | 2.20 M | 1.05 M | 25.3 M | 40× | 1.7× |
-| 16384 | 4 | 55.7 M | 51.2 M | 2.59 M | 1.92 M | 26.2 M | 29× | 2.1× |
+| 1024 | 1 | 18.6 M | 2.65 M | 0.76 M | 0.58 M | 12.8 M | 32× | 1.5× |
+| 4096 | 1 | 53.6 M | 11.2 M | 2.27 M | 1.75 M | 31.1 M | 31× | 1.7× |
+| 16384 | 1 | 74.8 M | 39.6 M | 2.66 M | 2.45 M | 41.2 M | 30× | 1.8× |
+| 1024 | 4 | 16.7 M | 2.75 M | 0.73 M | 0.30 M | 8.9 M | 56× | 1.9× |
+| 4096 | 4 | 48.8 M | 10.3 M | 2.24 M | 1.05 M | 24.9 M | 47× | 2.0× |
+| 16384 | 4 | 52.1 M | 43.0 M | 2.62 M | 2.00 M | 25.9 M | 26× | 2.0× |
 
-Unlike navigation, swarp leads the JAX port at every size here, including the small batches where JAX's whole-rollout `lax.scan` beat swarp on navigation.
+swarp leads the JAX port at every size here, by 1.5–2.0×, as it does on navigation.
 A likely reason, not measured here: the ring road's step is a long chain of small dependent passes (arc projection, two leader searches, IDM, obs, reward), which the whole-step CUDA graph replays as one launch of hand-written kernels while XLA has to fuse the equivalent `jnp` ops.
 VMAS pays a Python-level step per env step; its eager torch path is close to `swarp-eager`, which runs the same task in plain torch ops.
 
@@ -474,12 +485,12 @@ Past 16384 envs the GPU is full, and swarp and the JAX port both plateau at the 
 
 | n_envs | swarp | VMAS | JaxMARL port | swarp / VMAS | swarp / JAX |
 |---|---|---|---|---|---|
-| 16384 | 63.3 M | 2.51 M | 43.0 M | 25× | 1.47× |
-| 65536 | 75.9 M | 2.71 M | 52.0 M | 28× | 1.46× |
-| 262144 | 77.6 M | 2.78 M | 53.0 M | 28× | 1.46× |
-| 1048576 | 77.7 M | OOM | 52.8 M | – | 1.47× |
+| 16384 | 67.1 M | 2.44 M | 41.0 M | 27× | 1.64× |
+| 65536 | 77.3 M | 2.69 M | 51.6 M | 29× | 1.50× |
+| 262144 | 78.7 M | 2.76 M | 52.7 M | 29× | 1.49× |
+| 1048576 | 78.5 M | OOM | 52.4 M | – | 1.50× |
 
-More envs add the same work to both at the same per-env efficiency, so the ratio settles at swarp's per-env advantage, about 1.47×.
+More envs add the same work to both at the same per-env efficiency, so the ratio settles at swarp's per-env advantage, about 1.5×.
 Batch size is not where swarp's lead over JAX grows; work per env is, as in navigation, where it grew with the agent count.
 
 #### More vehicles
@@ -493,13 +504,13 @@ Batch size is not where swarp's lead over JAX grows; work per env is, as in navi
     --python vmas=.venv-vmas/bin/python --python jaxmarl=.venv-jaxmarl/bin/python
 ```
 
-env-steps/s at 16384 envs, 1 RL car (22–128 at `--steps 300`, 256 at `--steps 100`; the 64 and 128 rows were repeated within 1% for VMAS and JAX and 8% for swarp):
+env-steps/s at 16384 envs, 1 RL car (22–128 at `--steps 300`, 256 at `--steps 100`, one run; the finer sweep below repeats the swarp and JAX columns, which put the 22-vehicle row within 15% run to run):
 
 | vehicles | swarp | VMAS | JaxMARL port | swarp / VMAS | swarp / JAX |
 |---|---|---|---|---|---|
-| 22 | 61.5 M | 2.44 M | 41.8 M | 25× | 1.5× |
-| 64 | 15.2 M | 0.36 M | 5.17 M | 42× | 2.9× |
-| 128 | 4.75 M | 0.10 M | 2.19 M | 46× | 2.2× |
+| 22 | 67.1 M | 2.48 M | 47.3 M | 27× | 1.4× |
+| 64 | 16.5 M | 0.37 M | 5.15 M | 45× | 3.2× |
+| 128 | 4.94 M | 0.10 M | 2.16 M | 48× | 2.3× |
 | 256 | 1.34 M | OOM | OOM | – | – |
 
 Every simulator's step grows with the square of the vehicle count, because the leader search compares every pair of vehicles in a ring.
@@ -507,19 +518,19 @@ The ratio to JAX does not grow monotonically, so a finer sweep of swarp and the 
 
 | vehicles | swarp | JaxMARL port | swarp / JAX | swarp pairs/s | JAX pairs/s |
 |---|---|---|---|---|---|
-| 22 | 72.4 M | 40.9 M | 1.8× | 35 G | 20 G |
-| 32 | 42.5 M | 10.6 M | 4.0× | 43 G | 11 G |
-| 48 | 24.9 M | 6.64 M | 3.7× | 57 G | 15 G |
-| 64 | 15.2 M | 5.18 M | 2.9× | 62 G | 21 G |
-| 96 | 7.73 M | 2.91 M | 2.7× | 71 G | 27 G |
-| 128 | 4.72 M | 2.22 M | 2.1× | 77 G | 37 G |
-| 192 | 2.25 M | 1.05 M | 2.1× | 83 G | 39 G |
-| 256 (4096 envs) | 1.32 M | 0.75 M | 1.8× | 87 G | 49 G |
+| 22 | 78.7 M | 40.7 M | 1.9× | 38 G | 20 G |
+| 32 | 39.8 M | 10.8 M | 3.7× | 41 G | 11 G |
+| 48 | 25.9 M | 6.77 M | 3.8× | 60 G | 16 G |
+| 64 | 16.7 M | 5.27 M | 3.2× | 68 G | 22 G |
+| 96 | 8.35 M | 2.90 M | 2.9× | 77 G | 27 G |
+| 128 | 5.09 M | 2.21 M | 2.3× | 83 G | 36 G |
+| 192 | 2.33 M | 1.06 M | 2.2× | 86 G | 39 G |
+| 256 (4096 envs) | 1.38 M | 0.78 M | 1.8× | 90 G | 51 G |
 
 The compiled XLA program explains the shape.
 At 22 vehicles XLA emits each argmin of the leader search as a loop fusion, one thread per vehicle scanning the ring, which is the algorithm swarp's kernel runs.
 From 32 vehicles on it switches to its row-reduction emitter, where threads cooperate on each row; on rows this short a `(value, index)` reduction runs badly, so 2× the work costs 4× the time.
-That emitter improves as rows lengthen (JAX's pair rate rises 4.5× from 32 to 256 vehicles, swarp's 2×, since swarp's per-thread loop is already efficient and only its fixed per-step cost amortises), so the gap narrows from 4× toward 1.8×.
+That emitter improves as rows lengthen (JAX's pair rate rises 4.6× from 32 to 256 vehicles, swarp's 2.2×, since swarp's per-thread loop is already efficient and only its fixed per-step cost amortises), so the gap narrows from about 3.8× toward 1.8×.
 XLA never writes the N×N distance arrays to memory up to 192 vehicles: they stay fused into the reductions, and its scratch memory grows linearly (97 MB at 128 vehicles, where one 16384×128×128 float32 array would be 1 GiB).
 At 256 vehicles and 16384 envs it fails allocating 4 GiB, exactly one 16384×256×256 float32 array; at 4096 envs it runs.
 

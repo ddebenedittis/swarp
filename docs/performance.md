@@ -3,8 +3,8 @@
 The defaults are already the fast configuration: `Environment(fused="auto", use_graph="auto")` uses the scenario's fused Warp obs/reward kernels and captures the whole step into a CUDA graph whenever both are available.
 This page explains what those two switches do, what they cost, and how the step plugs into `torch.compile` and TorchRL.
 
-Headline: the full navigation hot path sustains **24.1 M env-steps/s** at 16,000 envs × 16 agents on one RTX 3070 Laptop GPU, peaking at 491 M agent-steps/s at 16,000 × 64.
-That figure is the fused kernels *without* capture — `use_graph=False`, the configuration `swarp.benchmark.throughput` pins — so it is the floor the graph builds on rather than the number the defaults produce; capture on top reaches 35.6 M env-steps/s at 16,384 × 16 ([table below](#whole-step-cuda-graph)).
+Headline: the full navigation hot path sustains **33.9 M env-steps/s** at 16,000 envs × 16 agents on one RTX 3070 Laptop GPU (543 M agent-steps/s).
+That figure is the fused kernels *without* capture — `use_graph=False`, the configuration `swarp.benchmark.throughput --no-graph` pins — so it is the floor the graph builds on rather than the number the defaults produce; capture on top takes the same shape to 38.8 M env-steps/s and 16,000 × 4 to 146 M ([Benchmarks](benchmarks.md#throughput)).
 Full tables and the head-to-heads against VMAS, JaxMARL and CAMAR are in [Benchmarks](benchmarks.md).
 
 ## The no-grad hot path
@@ -19,7 +19,7 @@ Two things stack on top of it.
 Each built-in scenario ships a `*_kernels.py` module that computes observations and rewards in Warp instead of torch.
 It removes a per-step chain of small torch launches, and — more importantly — makes the *whole* step capturable as one graph.
 
-Worth about 1.1–1.4× on its own, more at large batch sizes where launch overhead dominates.
+Worth about 1.8–4.5× on its own in the open-field benchmark below.
 `fused="auto"` follows the scenario's `fused_available`; grad mode always falls back to the differentiable torch path.
 
 ### Whole-step CUDA graph
@@ -27,14 +27,14 @@ Worth about 1.1–1.4× on its own, more at large batch sizes where launch overh
 `use_graph="auto"` (the default) enables persistent-buffer execution backed by a captured CUDA graph when the device is CUDA and the scenario supplies a capturable whole-step hook.
 `StepRuntime` (`swarp/interop/persistent.py`) then owns a fixed set of on-device buffers — the state, a scratch output, the substep scratch, the action buffer — plus zero-copy torch views created once. Each step copies the incoming actions into the fixed buffer and replays the graph.
 
-The graph roughly doubles the fused throughput again, for ~2.5–5× end-to-end over an eager baseline:
+The graph adds another 1.1–5.4× on top of the fused kernels, for ~4.4–11× end to end over an eager baseline (`compare_sims --sims swarp swarp-fused swarp-eager`, obstacle-free navigation, 300 timed steps):
 
 ```text
   n_envs  n_agents | swarp-eager swarp-fused       swarp |  fused/eager  opt/eager
-    4096         3 |   5,838,664   7,877,854  15,945,297 |       1.35x      2.73x
-   16384         3 |  21,772,740  30,814,526  61,718,330 |       1.42x      2.83x
-    4096        16 |   5,998,275   6,783,331  15,094,932 |       1.13x      2.52x
-   16384        16 |   6,858,433  28,191,165  35,637,271 |       4.11x      5.20x
+    4096         3 |   7,649,544  15,980,008  86,003,167 |       2.09x     11.24x
+   16384         3 |  25,962,701  47,203,892 145,339,064 |       1.82x      5.60x
+    4096        16 |   6,020,546  14,022,673  26,341,168 |       2.33x      4.38x
+   16384        16 |   6,538,976  29,355,880  32,409,682 |       4.49x      4.96x
 ```
 
 Details that matter in practice:
@@ -45,6 +45,28 @@ Details that matter in practice:
 - Capture is unavailable on CPU, and with the `wp.HashGrid` `"grid"` neighbor backend, which allocates during a build.
 
 `env.graph_mode` reports whether a graph is actually in play.
+
+### Fused substep chain
+
+Inside the graph, each launch is a node, and at the sizes RL trains at (a few agents per env, a few thousand envs, 4–8 substeps) a node costs more than the work in it.
+The layered pipeline issues a neighbor build, a force pass and an integrate pass per substep, so at 1024 envs × 4 agents × 8 substeps the physics alone was ~23 nodes.
+`swarp/core/fused_substeps.py` runs the whole chain as one kernel instead: one CUDA block owns a group of whole envs, one thread per agent, and a block barrier separates the force phase from the in-place integrate phase of every substep.
+The force phase reads the previous step's neighbor list on substep 0 and scans the env directly on later substeps, with the brute-force builder's membership test in its order, so it sums the same terms in the same order and the step is bit-identical to the layered pipeline.
+When something reads neighbor lists after the step (navigation's observations do), the kernel also writes the post-step list, and the hook's rebuild becomes a no-op.
+
+The trade is launches against occupancy: a kernel that holds the whole chain needs ~100 registers per thread where the layered kernels need 35–80, and its neighbor scans are latency-bound.
+`Stepper.enable_fused_substeps="auto"` (the default) therefore takes it only where it measured faster — at most 4 agents per env per substep, and with a single substep at most 16,384 agents in all — and falls back to the layered pipeline elsewhere.
+It also needs the CUDA device, the slim 2D Euler path, shared agent parameters, no movable obstacles and the `brute` neighbor backend.
+`True` forces it wherever it is eligible, `False` turns it off.
+
+At 1024 envs × 4 agents × 8 substeps with `auto_reset=True` the step drops from 84 to 43 µs; the full table is in [Benchmarks](benchmarks.md#fused-substep-chain).
+
+### Lean launches
+
+Every swarp kernel module sets the Warp module option `default_grid_stride=False` (Warp ≥ 1.15), and the fused chain passes `grid_stride=False` itself.
+A Warp kernel otherwise wraps its body in a grid-stride loop so that a capped block count can still cover the launch; swarp never caps it, so the loop is pure per-thread overhead.
+Dropping it measured 2–6% faster on the launch-bound shapes (small batches, and the 3–5-agent, 4–8-substep training shapes) and neutral elsewhere.
+It is set per module rather than through `wp.config`, so it does not change how a user's own kernels compile.
 
 ## `torch.compile`
 
@@ -86,16 +108,16 @@ Downstream code written against `VmasEnv` needs the flat path here.
 :::
 
 [`examples/train_mappo.py`](https://github.com/ddebenedittis/swarp/blob/main/examples/train_mappo.py) is a full MAPPO training loop on top of it.
-It is kept as the reference implementation; [`swarp.rl`](training.md) trains the same recipes 2–3× faster without TorchRL; `examples/train_mappo_tuned.py` is the same trainer with TorchRL's own speed features, 1.1–1.4× behind `swarp.rl`.
+It is kept as the reference implementation; [`swarp.rl`](training.md) trains the same recipes 2–3× faster without TorchRL; `examples/train_mappo_tuned.py` is the same trainer with TorchRL's own speed features, 1.3–1.5× behind `swarp.rl` at the recipes' sizes.
 
 ## Choosing a batch shape
 
-Almost every batch size lands on the same ~0.65–0.8 ms/step host floor, so raising `n_agents` is close to free until the neighbor and force kernels saturate the GPU.
+Every batch size up to 16,000 envs × 16 agents lands on the same ~0.3–0.5 ms/step host floor eager, so raising `n_agents` is close to free until the neighbor and force kernels saturate the GPU.
 If you have a throughput target, raise `n_agents` before `n_envs`.
 
 Two knobs with real cost:
 
-- `substeps` multiplies the physics work linearly. Only raise it for stiff contacts (Push-T derives `substeps >= 8` at `dt=0.05` in its own `make_world`).
+- `substeps` multiplies the physics work linearly. Only raise it for stiff contacts (Push-T derives `substeps >= 8` at `dt=0.05` in its own `make_world`). With few agents per env the [fused substep chain](#fused-substep-chain) makes extra substeps much cheaper than linear (8 substeps cost 1.5x one substep at 1024 envs × 4 agents, against 2.4x for the layered pipeline), because the cost there was launches rather than arithmetic.
 - `max_neighbors` sets the padded list width. Too small silently truncates — except that it does not, because `World.neighbor_overflow()` flags it; check that flag once when tuning rather than guessing.
 
 ## The cost of `auto_reset`

@@ -412,6 +412,11 @@ class World:
         if not self.stepper.collisions:
             raise RuntimeError("neighbor lists require WorldConfig.collisions=True")
         grid = self.stepper.grid(self.n_envs)
+        # From here on the fused substep chain also emits the post-step list, and when it
+        # already has for this state, an unmasked rebuild would only repeat it.
+        self.stepper.emit_post_list = True
+        if reset_mask is None and grid.post_step_version == self.stepper.state_version:
+            return
         # Scoped onto torch's current stream, so the build is ordered against the torch
         # writes to ``state.pos`` that precede it and the graph replay that reads the lists
         # on the next step. The exception is a *captured* invocation: navigation's fused
@@ -455,7 +460,9 @@ class World:
         band (a reset or an interactive drag), so the next step rebuilds instead
         of reusing a list that no longer matches the positions."""
         if self.stepper.collisions:
-            self.stepper.grid(self.n_envs).built_version = -1
+            grid = self.stepper.grid(self.n_envs)
+            grid.built_version = -1
+            grid.post_step_version = -1
 
     def neighbor_overflow(self) -> torch.Tensor:
         """Bool ``[n_envs, n_agents]`` flagging agents whose in-radius neighbor

@@ -5,9 +5,13 @@ Steps the ``NavigationScenario`` hot path under ``torch.no_grad()`` (like
 per row::
 
     baseline -> +eager-trims -> +nbr-dedupe -> +slim-2d -> +fused-obs-rew -> +cuda-graph
+             -> +fused-substeps
 
 Each variant is defined by the feature toggles it enables on top of the previous
-one. All five toggles now ship, so every row is timed on a current checkout; the
+one. ``+fused-substeps`` sets ``Stepper.enable_fused_substeps`` to its ``"auto"``
+default, so it only changes the shapes ``"auto"`` routes to the single-launch chain
+(with ``substeps=1``, at most 4 agents per env and 16384 agents in all); every
+earlier row pins it off. All six toggles now ship, so every row is timed on a current checkout; the
 feature probing behind the ``n/a`` status is kept because it costs nothing and is
 what lets this script run against an *older* checkout — bisecting a throughput
 regression is exactly when you want the stages that do not exist yet to report
@@ -57,6 +61,7 @@ class Variant:
     slim2d: bool = False
     fused: bool = False
     use_graph: bool = False
+    fused_substeps: bool = False
 
     def features(self) -> list[str]:
         """Toggle keys this variant turns on (used for availability checks)."""
@@ -71,6 +76,8 @@ class Variant:
             keys.append("fused")
         if self.use_graph:
             keys.append("use_graph")
+        if self.fused_substeps:
+            keys.append("fused_substeps")
         return keys
 
 
@@ -87,6 +94,15 @@ VARIANTS: list[Variant] = [
         slim2d=True,
         fused=True,
         use_graph=True,
+    ),
+    Variant(
+        "+fused-substeps",
+        eager_trims=True,
+        neighbor_reuse=True,
+        slim2d=True,
+        fused=True,
+        use_graph=True,
+        fused_substeps=True,
     ),
 ]
 
@@ -133,6 +149,8 @@ def _feature_available(feature: str, device: str) -> bool:
         return _env_supports("fused")
     if feature == "use_graph":
         return _env_supports("use_graph")
+    if feature == "fused_substeps":
+        return "enable_fused_substeps" in _stepper_attrs(device)
     return False
 
 
@@ -172,6 +190,8 @@ def _build_env(v: Variant, n_envs: int, n_agents: int, device: str) -> Environme
         stepper.neighbor_reuse = v.neighbor_reuse
     if hasattr(stepper, "enable_slim2d"):
         stepper.enable_slim2d = v.slim2d
+    if hasattr(stepper, "enable_fused_substeps"):
+        stepper.enable_fused_substeps = "auto" if v.fused_substeps else False
     return env
 
 

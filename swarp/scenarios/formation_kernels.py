@@ -27,6 +27,9 @@ from swarp._overloads import register
 from swarp.core.state import VEC2
 from swarp.scenarios.reset_kernels import _as
 
+# Lean launches (no grid-stride loop); see docs/performance.md.
+wp.set_module_options({"default_grid_stride": False})
+
 
 @wp.kernel
 def formation_obs_kernel(

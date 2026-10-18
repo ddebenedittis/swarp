@@ -29,6 +29,9 @@ from swarp._overloads import concrete, register
 from swarp.core.state import TORCH_DTYPE_TO_WP, VEC2
 from swarp.interop.autograd import torch_stream_scope
 
+# Lean launches (no grid-stride loop); see docs/performance.md.
+wp.set_module_options({"default_grid_stride": False})
+
 
 @wp.func
 def _ray_hit(oc: Any, d: Any, rad: Any, miss: Any):

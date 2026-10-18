@@ -37,6 +37,9 @@ from __future__ import annotations
 
 import warp as wp
 
+# Lean launches (no grid-stride loop); see docs/performance.md.
+wp.set_module_options({"default_grid_stride": False})
+
 
 @wp.kernel
 def advance_seed_kernel(seed_state: wp.array(dtype=wp.int32)):

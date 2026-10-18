@@ -124,7 +124,7 @@ Every built-in scenario implements its observations and rewards **twice**:
 1. **torch** — plain tensor ops over `world.state`, differentiable together with the Warp step and used whenever grads are enabled.
 2. **fused Warp kernels** — a `*_kernels.py` module per scenario, used on the no-grad hot path and foldable into the whole-step CUDA graph.
 
-The fused path is worth 2.5–5× (see [Benchmarks](benchmarks.md)), and `Environment(fused="auto")` picks it automatically when grads are off.
+The fused path is worth 4–11× (see [Benchmarks](benchmarks.md)), and `Environment(fused="auto")` picks it automatically when grads are off.
 
 The torch implementation is the **parity oracle** the fused kernels are tested against, which is why the two are kept independent rather than sharing code — shared helpers would let a bug cancel itself out on both sides.
 

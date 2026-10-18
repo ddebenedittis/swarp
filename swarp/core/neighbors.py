@@ -28,6 +28,9 @@ from swarp._overloads import concrete, register
 from swarp.core.cached_launch import CachedLaunch, ptr_key
 from swarp.core.state import VEC2
 
+# Lean launches (no grid-stride loop); see docs/performance.md.
+wp.set_module_options({"default_grid_stride": False})
+
 VEC3 = {wp.float32: wp.vec3f, wp.float64: wp.vec3d}
 
 
@@ -433,6 +436,10 @@ class NeighborGrid:
         # ``launch_substeps`` reuses them for substep 0 when it still matches.
         self.build_count: int = 0
         self.built_version: int = -1
+        # The ``state_version`` whose lists the fused substep chain emitted as part of the
+        # step itself (see swarp/core/fused_substeps.py). While it matches, the post-step
+        # ``World.build_neighbors()`` has nothing left to do.
+        self.post_step_version: int = -1
         # Cached, repack-once launch for the brute-force backend's eager (reset-path)
         # rebuilds — see swarp/core/cached_launch.py. The captured step-time build pays
         # this exactly once anyway (at capture); it is the eager auto_reset rebuild,

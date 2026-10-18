@@ -7,7 +7,7 @@ want it.
 1. **`Scenario`** (`swarp/scenarios/base.py`) — plain torch. Everything is differentiable
    end-to-end with the Warp dynamics step, and there is nothing else to implement.
 2. **`FusedScenario`** (`swarp/scenarios/fused.py`) — adds fused Warp obs/reward kernels for
-   the no-grad hot path, foldable into the whole-step CUDA graph. Worth 2.5–5× (see
+   the no-grad hot path, foldable into the whole-step CUDA graph. Worth 4–11× (see
    [benchmarks](benchmarks.md)); costs you a kernel module and a buffer spec.
 
 All eleven built-in scenarios are `FusedScenario`s, and they implement the *same* member
