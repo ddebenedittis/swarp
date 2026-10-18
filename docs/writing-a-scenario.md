@@ -287,6 +287,8 @@ why, because it is the shape of every such exception:
 pins it, including a `wp.ScopedCapture` case. Anything that cannot meet a bar like that
 belongs in the spec instead, where the framework allocates it once, up front.
 
+The lidar is the other ready-made capture-safe call: `Lidar.bind(world)` once outside the capture, then `Lidar.launch(world)` inside `launch_fused` ahead of the kernel that reads `lidar.wp_ranges` (see [the lidar section](world.md#inside-a-captured-step)).
+
 ### The torch reference path is the parity oracle
 
 `post_step_torch` / `reset_torch` and whatever they call (`_refresh`, `_box_contact`, …) are

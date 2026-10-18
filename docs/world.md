@@ -153,14 +153,56 @@ ranges = lidar.scan(world)                 # [n_envs, n_agents, n_rays]
 obs = torch.cat([base_obs, ranges], dim=-1)
 ```
 
-Geometry is analytic ray-circle intersection against other agents and circular obstacles; a ray that hits nothing returns `max_range`. Rays are spaced uniformly over 2π and rotate with each agent's heading when `body_frame=True`.
-Box and segment obstacles are **excluded** from the scan — `Lidar.scan` filters on `ObstacleShape` before casting, because ray-circle is the only test implemented — so they are invisible to the sensor while still acting in the collision step.
-`Lidar.scan` reads the obstacle pose from `world.obstacle_state_views()`, so a *movable* obstacle is scanned where it currently is, not where it spawned.
+Every shape in the world is scanned, with the geometry the collision step uses:
 
-Two interchangeable backends:
+| target | geometry |
+|---|---|
+| disc agent, `CIRCLE` obstacle | closed-form ray-circle |
+| box agent (`AgentShape.BOX`) | slab test against its `half_extents`, oriented by the agent's `theta` |
+| `BOX` obstacle | slab test against its `half_extents` at its live angle |
+| `SEGMENT` obstacle | the exact capsule: the rectangle `(half_len, radius)` around the core plus a circle of `radius` at each end |
+
+A ray that hits nothing returns `max_range`, an agent never sees itself, and a ray whose origin lies inside a shape misses that shape.
+A segment of radius zero is a line, hit wherever a ray crosses it.
+Ray direction components below `1e-12` are replaced by `±1e-12` in the slab test, so the ranges and their gradients stay finite for a ray parallel to a face.
+`Lidar.scan` reads obstacle poses from the engine's live arrays (`world.obstacle_state_views()` on the torch path, `stepper.obs_*` on the Warp path), so a *movable* obstacle is scanned where it currently is, not where it spawned.
+Nothing in a scan reads the device back to the host.
+
+### What each ray hit
+
+`Lidar(..., return_hits=True)` makes a scan return `(ranges, hit_class, hit_index)`, all `[n_envs, n_agents, n_rays]`:
+
+| `hit_class` (`uint8`) | meaning | `hit_index` (`int32`) |
+|---|---|---|
+| 0 | nothing within `max_range` | -1 |
+| 1 | an agent | the agent index |
+| 2 | an `IMMOVABLE` obstacle | the obstacle *shape* index |
+| 3 | a `MOVABLE` obstacle | the obstacle *shape* index |
+
+A compound body is several shapes, so a scenario that wants the body maps the shape index through its `Obstacles.body` tags.
+Ties go to agents before obstacles, and to the lower index within each.
+
+### Field of view
+
+Rays start at `angle_start` and rotate with each agent's heading when `body_frame=True`.
+Without `angle_end` they cover the full circle, `2π / n_rays` apart.
+With `angle_end` spanning less than 2π the first ray points at `angle_start` and the last at `angle_end`, `(angle_end - angle_start) / (n_rays - 1)` apart; a span of 2π or more is the full circle again.
+`Lidar.ray_offsets()` returns the ray angles, so a renderer draws exactly the rays that were cast.
+
+### Backends
 
 `"torch"` (default)
-: the pure-torch broadcast implementation. Differentiable, but materializes a dense `[E, A, R, T]` family, so memory grows with the target count.
+: the pure-torch broadcast implementation. Differentiable with respect to agent poses (including box agents' headings) and obstacle poses, but materializes a dense `[E, A, R, T]` family per shape, so memory grows with the target count.
 
 `"warp"`
-: the Warp kernel — numerically equivalent with no dense intermediate, which keeps high ray counts affordable. Inference-only: when gradients are required the scan transparently falls back to the torch path.
+: the Warp kernel, one thread per `(env, agent, ray)` keeping a running minimum, so there is no dense intermediate and high ray counts stay affordable. It returns the same ranges and the same hits (tested on randomized mixed scenes in float32 and float64). Inference-only: when gradients are required the scan transparently falls back to the torch path. Its outputs are views of buffers the `Lidar` owns, overwritten by the next scan.
+
+### Inside a captured step
+
+`Lidar.scan` is the eager convenience wrapper.
+A fused scenario that wants the scan inside the whole-step CUDA graph splits it in two:
+
+- `Lidar.bind(world)`, called once **outside** any capture (in `make_world`, or before the first step): allocates the output buffers (`lidar.ranges`, `lidar.hit_class`, `lidar.hit_index` as torch views; `lidar.wp_ranges`, `lidar.wp_hit_class`, `lidar.wp_hit_index` as Warp handles) and loads the kernel modules, because a kernel first launched inside a capture cannot be loaded there. Re-binding the same world keeps the buffers; anything else reallocates them and bumps `lidar.version`, which a scenario can fold into its recapture token.
+- `Lidar.launch(world)`, called in `launch_fused` ahead of the observation kernel that reads `lidar.wp_ranges`: a single `wp.launch` against `world.state_wp()` and the stepper's live `obs_*` arrays, with no allocation, wrap, host read or stream scope, so it follows the capture-safety rule of [Writing a scenario](writing-a-scenario.md).
+
+The Warp path reads the agent footprint from the shared parameter matrix, so a per-env parameter override of the radius or half-extents is not seen by the lidar.

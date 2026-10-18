@@ -7,6 +7,22 @@ All notable changes to `swarp`. Newest first. Nothing has been released yet — 
 
 ### Added
 
+- **The lidar sees every shape: boxes, segments as capsules, and box agents, and reports what each ray hit.**
+  `lidar_scan`, `lidar_scan_warp` and `Lidar` ray-cast against oriented boxes (a slab test in the box frame), segment obstacles as the exact capsule the collision step uses, and box agents oriented by their heading, alongside the circles they already handled.
+  The circle-only filter that made boxes and segments invisible is gone, and with it the two host syncs it cost per install.
+  `return_hits=True` adds a per-ray `hit_class` (`uint8`: none, agent, immovable obstacle, movable obstacle) and `hit_index` (`int32`: the agent or obstacle shape index); `angle_end` narrows the field of view, with its first and last rays on the endpoints.
+  The torch and Warp backends agree on ranges and hits on randomized mixed scenes in float32 and float64, and the torch path is gradchecked through boxes, capsules and box agents.
+
+- **`Lidar.bind` / `Lidar.launch` make the Warp lidar capture-safe.**
+  `bind(world)` allocates the output buffers and loads the kernels once, outside any capture; `launch(world)` is then a single `wp.launch` against the live engine arrays, so a fused scenario can scan inside its captured whole-step graph.
+  `Lidar.scan` stays the eager wrapper over the pair.
+
+- **`AgentConfig(shape=AgentShape.BOX, half_extents=(hx, hy))`, the plumbing for box agents.**
+  The footprint is appended to the parameter matrix as `P_SHAPE`, `P_HALF_X` and `P_HALF_Y` (every existing column keeps its index) and mirrored as `World.agent_shape` and `World.agent_half_extents`.
+  A box's radius is its circumscribed one, so every radius-based bound stays conservative.
+  Box-agent contact physics is not in yet, so stepping a world with a box agent raises `NotImplementedError` instead of simulating the box as a disc; building, resetting and scanning one work.
+  Disc-only worlds run the same arithmetic as before; only the parameter row grew from 17 to 20 columns.
+
 - **`ringroad`, an eleventh scenario: mixed-autonomy stop-and-go waves on the Flow / Sugiyama ring.**
   `n_agents` kinematic-bicycle RL cars (actions `(accel, steer)`) share a single-lane ring with IDM human drivers that the scenario integrates itself as 1-D state, the way `shepherding` owns its sheep.
   It is the one task here whose phenomenon needs many vehicles: at the Sugiyama density the IDM ring is stable up to 8 cars and string-unstable from 11, so a 6-car ring at the same density never grows the wave a 22-car ring does (linear growth rate −0.103/s against +0.024/s; the Scenarios page has the whole sweep).
@@ -241,6 +257,10 @@ All notable changes to `swarp`. Newest first. Nothing has been released yet — 
   host-side stream, reset alongside the generator, with no device->host round-trip.
 
 ### Breaking changes
+
+- **`NUM_PARAMS` is 20 (was 17)**: a per-env parameter array built by hand with 17 columns is rejected; `per_env_float_template` builds the right width.
+  `AgentConfig.radius` now defaults to `None`, which resolves to 0.05 for a disc as before and to the derived radius for a box.
+- **`lidar_scan_warp` returns freshly allocated tensors**; the reused-buffer convention moved to the `Lidar` object, whose Warp outputs are views of buffers it owns.
 
 - **`SamplingScenario(collision_penalty=...)` is gone.** The parameter was stored and never
   read — the reward never had a collision term. Agents still collide physically
