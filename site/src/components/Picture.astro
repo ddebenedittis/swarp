@@ -1,0 +1,43 @@
+---
+import { Image as AstroImage, Picture as AstroPicture } from "astro:assets";
+import { renderPDF } from "../lib/render-pdf";
+
+interface Props {
+  src: ImageMetadata | `${string}.pdf`;
+  alt: string;
+  priority?: boolean;
+  invertInDarkMode?: boolean;
+}
+
+const { src, alt, priority = false, invertInDarkMode = false } = Astro.props;
+
+let image: ImageMetadata;
+
+if (typeof src === "string") {
+  image = await renderPDF(src);
+} else {
+  image = src;
+}
+
+const className = `rounded-lg max-h-[calc(100svh-3rem)] max-w-full w-min mx-auto ${invertInDarkMode ? "dark:invert" : ""}`;
+---
+
+{
+  /* SVG sources are passed through unprocessed: Astro 6 refuses to rasterize SVG,
+     and the avif pipeline below would try. Vector figures stay vector. */
+}
+{
+  image.format === "svg" ? (
+    <AstroImage class={className} src={image} alt={alt} priority={priority} />
+  ) : (
+    <AstroPicture
+      class={className}
+      src={image}
+      alt={alt}
+      layout="constrained"
+      formats={["avif"]}
+      priority={priority}
+      fit="contain"
+    />
+  )
+}

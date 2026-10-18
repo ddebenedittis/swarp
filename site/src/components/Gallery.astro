@@ -1,0 +1,35 @@
+---
+import { Picture as AstroPicture } from "astro:assets";
+
+type Item = {
+  src: ImageMetadata;
+  label: string;
+  alt: string;
+};
+
+interface Props {
+  items: Item[];
+}
+
+const { items } = Astro.props;
+---
+
+{/* A labelled grid of same-size tiles: four across on wide screens, two on phones. */}
+<div class="not-prose my-8 grid grid-cols-2 gap-3 sm:grid-cols-4">
+  {
+    items.map((item) => (
+      <figure class="m-0 flex flex-col items-center gap-1.5">
+        <AstroPicture
+          class="w-full rounded-lg"
+          src={item.src}
+          alt={item.alt}
+          layout="constrained"
+          formats={["avif"]}
+        />
+        <figcaption class="text-center text-sm text-zinc-600 dark:text-zinc-400">
+          {item.label}
+        </figcaption>
+      </figure>
+    ))
+  }
+</div>
