@@ -102,7 +102,8 @@ Three things differ on purpose:
 - **The greedy action is `tanh(loc)`**, the mode of the squashed Gaussian. The TorchRL trainer's evaluator clamps the pre-tanh mean to the action box instead.
 
 A minibatch with a non-finite gradient is skipped on the device, through Adam's `found_inf` (the `GradScaler` mechanism): weights, Adam moments and step count stay exactly as they were, which is the skip the TorchRL trainer does on the host.
-The checkpoint format differs (`"format": "swarp.rl/1"`), so the two trainers' checkpoints cannot resume each other.
+The checkpoint format differs (`"format": "swarp.rl/2"`), so the two trainers' checkpoints cannot resume each other.
+A `swarp.rl/2` checkpoint keeps every `swarp.rl/1` key and adds the network classes and their constructor arguments (`actor_cls`, `actor_kwargs`, `critic_cls`, `critic_kwargs`, resolved through `swarp.rl.ARCHS`), so it still loads with `torch.load(weights_only=True)`; `swarp.rl/1` checkpoints load as before.
 
 ## Not done yet
 

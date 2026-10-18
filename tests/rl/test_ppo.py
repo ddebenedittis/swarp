@@ -96,8 +96,60 @@ def test_train_smoke_writes_metrics_and_a_loadable_checkpoint(tmp_path):
 
     actor, _, meta = load_checkpoint(path)
     assert (meta["scenario"], meta["max_steps"], meta["n_agents"]) == ("navigation", 5, 4)
+    assert meta["format"] == "swarp.rl/2"
+    assert (meta["actor_cls"], meta["critic_cls"]) == ("Actor", "Critic")
+    assert (meta["state_dim"], meta["role_counts"], meta["aux_dim"]) == (0, [], 0)
     obs = torch.randn(3, 4, actor.obs_dim)
     assert torch.equal(actor.greedy(obs), actor.greedy(obs))
+
+
+def test_a_v2_checkpoint_round_trips_a_role_aware_architecture(tmp_path):
+    torch.manual_seed(0)
+    counts = (1, 2)
+    actor = PolicyNet(
+        5, 2, 8, role_counts=counts, role_params="separate", aux_dim=2,
+        low=[-2.0, -1.0], high=[2.0, 1.0],
+    )
+    critic = StateCritic(4, 5, 3, 8, use_obs=True, role_counts=counts, per_agent=True)
+    path = tmp_path / "v2.pt"
+    torch.save(
+        {
+            "format": "swarp.rl/2", "actor_cls": "PolicyNet", "actor_kwargs": actor.config,
+            "critic_cls": "StateCritic", "critic_kwargs": critic.config,
+            "actor": actor.state_dict(), "critic": critic.state_dict(),
+            "state_dim": 4, "role_counts": list(counts), "aux_dim": 2,
+        },
+        path,
+    )
+    a, c, meta = load_checkpoint(path)
+    assert isinstance(a, PolicyNet) and isinstance(c, StateCritic)
+    assert a.role_counts == counts and a.role_params == "separate" and not a.unit_box
+    obs, state, roles = torch.randn(6, 3, 5), torch.randn(6, 4), torch.tensor([[1, 0, 1]] * 6)
+    assert torch.equal(a.greedy(obs, roles), actor.greedy(obs, roles))
+    aux = [net.step(obs, roles, with_aux=True)[2] for net in (a, actor)]
+    assert torch.equal(*aux)
+    assert torch.equal(c(obs, state, roles), critic(obs, state, roles))
+
+
+def test_a_hand_built_v1_checkpoint_still_loads(tmp_path):
+    """The exact key set ``swarp.rl/1`` wrote: no class names, rebuilt from its dims."""
+    torch.manual_seed(0)
+    actor, critic = Actor(5, 2, 8, low=torch.tensor([-2.0, -1.0])), Critic(5, 3, 8)
+    path = tmp_path / "v1.pt"
+    torch.save(
+        {
+            "format": "swarp.rl/1", "actor": actor.state_dict(), "critic": critic.state_dict(),
+            "obs_dim": 5, "act_dim": 2, "n_agents": 3, "num_cells": 8,
+            "act_low": [-2.0, -1.0], "act_high": [1.0, 1.0], "scenario": "navigation",
+            "scen_kwargs": {}, "dt": 0.05, "substeps": 4, "max_steps": 200, "difficulty": 1.0,
+        },
+        path,
+    )
+    a, c, meta = load_checkpoint(path)
+    assert type(a) is Actor and type(c) is Critic and meta["format"] == "swarp.rl/1"
+    obs = torch.randn(6, 3, 5)
+    assert torch.equal(a.greedy(obs), actor.greedy(obs))
+    assert torch.equal(c(obs), critic(obs))
 
 
 def test_eval_mappo_reads_a_swarp_rl_checkpoint(tmp_path, monkeypatch):
@@ -111,7 +163,7 @@ def test_eval_mappo_reads_a_swarp_rl_checkpoint(tmp_path, monkeypatch):
     cfg = parse_args(["--scenario", "navigation", *SMOKE, "--checkpoint-dir", str(tmp_path)])
     arm, ckpt = eval_mappo._load_arm(str(train(cfg)), "cpu")
     assert ckpt["scenario"] == "navigation"
-    act = arm(3, "cpu", None, None)(torch.zeros(3, 4, ckpt["obs_dim"]))
+    act = arm["policy"](3, "cpu", None, None)(torch.zeros(3, 4, ckpt["obs_dim"]))
     assert act.shape == (3, 4, ckpt["act_dim"]) and act.abs().max() <= 1.0
     sys.modules.pop("eval_mappo", None)
 

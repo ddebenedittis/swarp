@@ -730,6 +730,7 @@ def score(
     scenario: str,
     *,
     policy: PolicyArm | None = None,
+    policy_from_env: Callable[[Environment], ActionFn] | None = None,
     n_agents: int,
     n_envs: int = 2048,
     steps: int = 400,
@@ -751,14 +752,19 @@ def score(
     counts. (Looks like a bug otherwise, hence this note.)
 
     ``max_steps=None`` and ``auto_reset=False``, so the episode is genuinely single and
-    ``truncated`` never fires. ``policy`` builds the policy arm (see :data:`PolicyArm`).
+    ``truncated`` never fires. ``policy`` builds the policy arm (see :data:`PolicyArm`);
+    ``policy_from_env`` builds it from the arm's env instead, for a policy that reads more
+    than the observation each call (the roles in ``env.agent_roles()``, a hidden state).
+    Pass one of the two.
     Each arm gets a **fresh env on the same seed**, and the policy arm consumes no RNG, so
     the arms are paired: differences are attributable to the controller, not to the
     initial conditions. ``tests/examples`` pins that.
     """
+    if policy is not None and policy_from_env is not None:
+        raise ValueError("pass policy or policy_from_env, not both")
     out: dict[str, ArmResult] = {}
     for name in arms:
-        if name == "policy" and policy is None:
+        if name == "policy" and policy is None and policy_from_env is None:
             continue
         if name == "scripted" and baseline is None:
             continue
@@ -779,7 +785,7 @@ def score(
         lo, hi = env.action_bounds
         act_dim = env.world.act_dim
         if name == "policy":
-            act = policy(n_envs, device, lo, hi)
+            act = policy_from_env(env) if policy is None else policy(n_envs, device, lo, hi)
         elif name == "random":
             act = random_actions(n_envs, n_agents, act_dim, device, seed, lo, hi)
         elif name == "zero":

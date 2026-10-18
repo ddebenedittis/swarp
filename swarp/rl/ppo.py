@@ -50,6 +50,7 @@ from swarp import Environment
 from swarp.rl.networks import Actor, Critic, PolicyNet, StateCritic, tanh_normal_log_prob
 from swarp.rl.recipes import (
     SPECS,
+    ActionFn,
     PolicyArm,
     SolveRateWindow,
     TrainSpec,
@@ -59,7 +60,9 @@ from swarp.rl.recipes import (
     wilson_ci,
 )
 
-CHECKPOINT_FORMAT = "swarp.rl/1"
+#: The format :func:`train` writes. ``swarp.rl/2`` keeps every ``swarp.rl/1`` key and adds
+#: the network classes and constructor arguments, so any architecture reloads.
+CHECKPOINT_FORMAT = "swarp.rl/2"
 #: Every format :func:`load_checkpoint` reads.
 CHECKPOINT_FORMATS = ("swarp.rl/1", "swarp.rl/2")
 #: The per-iteration statistics a default run returns from :meth:`MAPPO.update`, in order,
@@ -641,31 +644,81 @@ def _shape(x: torch.Tensor | None) -> object:
 # ------------------------------------------------------------------------- checkpoints
 
 
+#: The network classes a ``swarp.rl/2`` checkpoint names. A checkpoint stores the name and
+#: the constructor's keyword arguments as primitives, never a pickled class, so
+#: ``torch.load(weights_only=True)`` still reads it.
+ARCHS: dict[str, type[torch.nn.Module]] = {
+    "Actor": Actor,
+    "Critic": Critic,
+    "PolicyNet": PolicyNet,
+    "StateCritic": StateCritic,
+}
+
+
+def build_arch(name: str, kwargs: Mapping[str, Any]) -> torch.nn.Module:
+    """``ARCHS[name](**kwargs)``, with a legible error for an unknown name."""
+    if name not in ARCHS:
+        raise ValueError(f"unknown network class {name!r}; known: {sorted(ARCHS)}")
+    return ARCHS[name](**kwargs)
+
+
 def load_checkpoint(
     path: str | Path, device: str = "cpu"
-) -> tuple[Actor, Critic, dict[str, Any]]:
-    """Actor, critic and metadata from a :func:`train` checkpoint."""
+) -> tuple[torch.nn.Module, torch.nn.Module, dict[str, Any]]:
+    """Actor, critic and metadata from a :func:`train` checkpoint.
+
+    A ``swarp.rl/1`` checkpoint is always an :class:`Actor` and a :class:`Critic`, rebuilt
+    from its dims; a ``swarp.rl/2`` one names its classes (see :data:`ARCHS`).
+    """
     ckpt = torch.load(path, map_location=device, weights_only=True)
-    if ckpt.get("format") not in CHECKPOINT_FORMATS:
+    fmt = ckpt.get("format")
+    if fmt not in CHECKPOINT_FORMATS:
         raise ValueError(f"{path} is not a swarp.rl checkpoint (one of {CHECKPOINT_FORMATS})")
-    actor = Actor(
-        ckpt["obs_dim"], ckpt["act_dim"], ckpt["num_cells"],
-        low=ckpt.get("act_low"), high=ckpt.get("act_high"),
-    ).to(device)
-    critic = Critic(ckpt["obs_dim"], ckpt["n_agents"], ckpt["num_cells"]).to(device)
+    if fmt == "swarp.rl/1":
+        actor = Actor(
+            ckpt["obs_dim"], ckpt["act_dim"], ckpt["num_cells"],
+            low=ckpt.get("act_low"), high=ckpt.get("act_high"),
+        )
+        critic = Critic(ckpt["obs_dim"], ckpt["n_agents"], ckpt["num_cells"])
+    else:
+        actor = build_arch(ckpt["actor_cls"], ckpt["actor_kwargs"])
+        critic = build_arch(ckpt["critic_cls"], ckpt["critic_kwargs"])
+    actor, critic = actor.to(device), critic.to(device)
     actor.load_state_dict(ckpt["actor"])
     critic.load_state_dict(ckpt["critic"])
     return actor.eval(), critic.eval(), ckpt
 
 
-def load_policy(path: str | Path, device: str = "cpu") -> Actor:
-    """The actor of a :func:`train` checkpoint; ``actor.greedy(obs)`` is the eval action."""
+def load_policy(path: str | Path, device: str = "cpu") -> torch.nn.Module:
+    """The actor of a :func:`train` checkpoint; ``actor.greedy(obs)`` is the eval action
+    (``actor.greedy(obs, roles)`` for a role-aware :class:`PolicyNet`)."""
     return load_checkpoint(path, device)[0]
 
 
 def greedy_arm(actor: Actor) -> PolicyArm:
     """The policy arm of :func:`swarp.rl.recipes.score` for a :class:`Actor`."""
     return lambda n_envs, device, lo, hi: actor.greedy
+
+
+def greedy_env_arm(actor: torch.nn.Module) -> Callable[[Environment], ActionFn]:
+    """The env-reading policy arm of :func:`~swarp.rl.recipes.score`: the greedy action
+    of ``actor`` with the roles ``env.agent_roles()`` holds at each call, for an actor
+    that reads roles (a stateful actor would keep its hidden state here)."""
+
+    def make(env: Environment) -> ActionFn:
+        if getattr(actor, "uses_roles", False):
+            return lambda obs: actor.greedy(obs, env.agent_roles())
+        return actor.greedy
+
+    return make
+
+
+def greedy_score_kwargs(actor: torch.nn.Module) -> dict[str, Any]:
+    """The keyword :func:`~swarp.rl.recipes.score` takes for ``actor``'s greedy policy:
+    ``policy`` for an obs-only actor, ``policy_from_env`` for one that reads roles."""
+    if getattr(actor, "uses_roles", False):
+        return {"policy_from_env": greedy_env_arm(actor)}
+    return {"policy": greedy_arm(actor)}
 
 
 # ----------------------------------------------------------------------------- the CLI
@@ -681,6 +734,8 @@ class TrainConfig:
     device: str
     checkpoint_dir: Path
     resume: str | None = None
+    resume_critic_only: bool = False
+    """With ``resume``: load only the critic's weights and start a fresh actor."""
     start_difficulty: float = 0.0
     checkpoint_every: int = 250
     eval_every: int = 500
@@ -741,6 +796,8 @@ def parse_args(argv: list[str] | None = None) -> TrainConfig:
     p.add_argument("--start-difficulty", type=float, default=0.0)
     p.add_argument("--checkpoint-dir")
     p.add_argument("--resume", help="checkpoint to continue from (actor + critic weights)")
+    p.add_argument("--resume-critic-only", action="store_true",
+                   help="with --resume: load only the critic, start a fresh actor")
     p.add_argument("--checkpoint-every", type=int, default=250, help="0 disables")
     p.add_argument("--eval-every", type=int, default=500, help="0 disables")
     p.add_argument("--eval-envs", type=int, default=512)
@@ -769,6 +826,8 @@ def parse_args(argv: list[str] | None = None) -> TrainConfig:
     spec = replace(spec, **overrides)
     if spec.n_agents < 1:
         p.error("--n-agents must be >= 1")
+    if a.resume_critic_only and not a.resume:
+        p.error("--resume-critic-only needs --resume")
     scen_kwargs = dict(spec.scen_kwargs)
     try:
         scen_kwargs.update(coerce_scen_kwargs(a.scenario, a.scen_kwarg))
@@ -778,6 +837,7 @@ def parse_args(argv: list[str] | None = None) -> TrainConfig:
     return TrainConfig(
         scenario=a.scenario, spec=spec, scen_kwargs=scen_kwargs, device=a.device,
         checkpoint_dir=Path(a.checkpoint_dir or f"runs/{a.scenario}"), resume=a.resume,
+        resume_critic_only=a.resume_critic_only,
         start_difficulty=a.start_difficulty, checkpoint_every=a.checkpoint_every,
         eval_every=a.eval_every, eval_envs=a.eval_envs, seed=a.seed,
         gate_window=a.gate_window, max_skip_frac=a.max_skip_frac,
@@ -849,13 +909,22 @@ def train(cfg: TrainConfig) -> Path:
     }
     metric_cols = metric_names(metrics)
 
-    actor = Actor(obs_dim, act_dim, spec.num_cells, low=act_low, high=act_high).to(device)
-    critic = Critic(obs_dim, n_agents, spec.num_cells).to(device)
+    actor_cls, actor_kwargs = "Actor", {
+        "obs_dim": obs_dim, "act_dim": act_dim, "num_cells": spec.num_cells,
+        "low": act_low.tolist(), "high": act_high.tolist(),
+    }
+    critic_cls, critic_kwargs = "Critic", {
+        "obs_dim": obs_dim, "n_agents": n_agents, "num_cells": spec.num_cells,
+    }
+    actor = build_arch(actor_cls, actor_kwargs).to(device)
+    critic = build_arch(critic_cls, critic_kwargs).to(device)
     if cfg.resume:
         a, c, _ = load_checkpoint(cfg.resume, device)
-        actor.load_state_dict(a.state_dict())
+        if not cfg.resume_critic_only:
+            actor.load_state_dict(a.state_dict())
         critic.load_state_dict(c.state_dict())
-        print(f"resumed actor + critic from {cfg.resume}")
+        what = "critic" if cfg.resume_critic_only else "actor + critic"
+        print(f"resumed {what} from {cfg.resume}")
     actor.train()
     critic.train()
 
@@ -897,6 +966,13 @@ def train(cfg: TrainConfig) -> Path:
         torch.save(
             {
                 "format": CHECKPOINT_FORMAT,
+                "actor_cls": actor_cls,
+                "actor_kwargs": actor_kwargs,
+                "critic_cls": critic_cls,
+                "critic_kwargs": critic_kwargs,
+                "state_dim": env.state_dim,
+                "role_counts": list(env.role_counts),
+                "aux_dim": env.aux_dim,
                 "actor": actor.state_dict(),
                 "critic": critic.state_dict(),
                 "obs_dim": obs_dim,
@@ -968,7 +1044,7 @@ def train(cfg: TrainConfig) -> Path:
         eval_rate = eval_lo = eval_hi = None
         if cfg.eval_every and (it + 1) % cfg.eval_every == 0:
             res = score(
-                cfg.scenario, policy=greedy_arm(actor), n_agents=n_agents,
+                cfg.scenario, **greedy_score_kwargs(actor), n_agents=n_agents,
                 n_envs=cfg.eval_envs, steps=spec.max_steps, device=device,
                 seed=cfg.seed + 1_000, dt=spec.dt, substeps=spec.substeps,
                 scen_kwargs=cfg.scen_kwargs, arms=("policy",),
