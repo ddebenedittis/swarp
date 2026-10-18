@@ -654,10 +654,17 @@ class Stepper:
         above it up to 29% slower (a single substep with 16+ agents per env). A single
         substep saves only two launches, so there the batch decides too: 4 agents were 15%
         faster at 1k envs and 5% slower at 16k, so it fuses up to
-        :data:`FUSE_MAX_AGENTS_ONE_SUBSTEP` agents in total."""
+        :data:`FUSE_MAX_AGENTS_ONE_SUBSTEP` agents in total.
+
+        A world holding box agents runs the chain's ``boxes`` variant when asked for it
+        (``True``), but ``"auto"`` keeps it on the layered pipeline: that variant carries
+        the oriented-box contact on top of the disc chain's register budget, and its
+        crossover has not been measured yet, so the thresholds above are not evidence for
+        it."""
         mode = self.enable_fused_substeps
         if mode == "auto" and (
-            self.n_agents > FUSE_AGENTS_PER_SUBSTEP * self.substeps
+            self.has_box_agents
+            or self.n_agents > FUSE_AGENTS_PER_SUBSTEP * self.substeps
             or (
                 self.substeps == 1
                 and state_in.pos.shape[0] * self.n_agents > FUSE_MAX_AGENTS_ONE_SUBSTEP
@@ -671,7 +678,6 @@ class Stepper:
             and not buffers.taped
             and self.world.integrator == Integrator.EULER
             and not self.any_movable
-            and not self.has_box_agents
             and self.params.floats_per_env is None
             and state_in.pos.device.is_cuda
             and self.n_agents <= FUSED_MAX_AGENTS

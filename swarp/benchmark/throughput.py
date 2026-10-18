@@ -18,6 +18,10 @@ path a regression matters most on. ``--no-graph`` pins it off — that is the
 configuration the ``docs/benchmarks.md`` throughput table reports. On CPU there is no
 capture to enable, so the graph is forced off whatever the flag says.
 ``swarp.benchmark.scenarios`` reports both side by side.
+
+``--agent-shape box`` makes every agent a box (navigation's default half-extents), which
+routes the step through the box-agent contact kernels; the default ``disc`` is the
+configuration every published number was measured on.
 """
 
 from __future__ import annotations
@@ -34,9 +38,17 @@ AGENT_COUNTS = (4, 16, 64)
 
 
 def bench_one(
-    n_envs: int, n_agents: int, device: str, steps: int, warmup: int = 10, use_graph: bool = False
+    n_envs: int,
+    n_agents: int,
+    device: str,
+    steps: int,
+    warmup: int = 10,
+    use_graph: bool = False,
+    agent_shape: str = "disc",
 ) -> dict:
-    scenario = NavigationScenario(n_agents=n_agents, world_size=max(1.0, n_agents**0.5 / 4))
+    scenario = NavigationScenario(
+        n_agents=n_agents, world_size=max(1.0, n_agents**0.5 / 4), agent_shape=agent_shape
+    )
     env = Environment(
         scenario, n_envs=n_envs, device=device, dt=0.05, substeps=1, seed=0, use_graph=use_graph
     )
@@ -83,6 +95,13 @@ def main() -> None:
         "and the fastest configuration). --no-graph pins it off, which is what the "
         "docs/benchmarks.md throughput table reports.",
     )
+    parser.add_argument(
+        "--agent-shape",
+        choices=("disc", "box"),
+        default="disc",
+        help="agent footprint: disc (the published configuration) or box, which steps the "
+        "oriented-box contact kernels.",
+    )
     args = parser.parse_args()
     # Capture needs CUDA; asking for it on CPU only buys a fallback warning.
     use_graph = args.graph and args.device.startswith("cuda")
@@ -93,7 +112,8 @@ def main() -> None:
     else:
         print("device: cpu (no GPU in use — throughput will be far below GPU numbers)")
     print(f"timed steps per config: {args.steps}")
-    print(f"whole-step CUDA graph: {'on' if use_graph else 'off'}\n")
+    print(f"whole-step CUDA graph: {'on' if use_graph else 'off'}")
+    print(f"agent shape: {args.agent_shape}\n")
 
     header = (
         f"{'n_envs':>8} {'n_agents':>9} {'ms/step':>9} {'env-steps/s':>14} {'agent-steps/s':>15}"
@@ -103,7 +123,14 @@ def main() -> None:
     for n_envs in ENV_COUNTS:
         for n_agents in AGENT_COUNTS:
             try:
-                r = bench_one(n_envs, n_agents, args.device, args.steps, use_graph=use_graph)
+                r = bench_one(
+                    n_envs,
+                    n_agents,
+                    args.device,
+                    args.steps,
+                    use_graph=use_graph,
+                    agent_shape=args.agent_shape,
+                )
             except torch.cuda.OutOfMemoryError:
                 print(f"{n_envs:>8} {n_agents:>9} {'OOM':>9}")
                 torch.cuda.empty_cache()

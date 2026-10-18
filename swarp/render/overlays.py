@@ -20,7 +20,7 @@ import numpy as np
 import pygame
 
 from swarp.core.config import ObstacleKind, ObstacleShape
-from swarp.dynamics.base import P_LF, P_LR, P_MAX_STEER, P_THRUST_MAX
+from swarp.dynamics.base import P_HALF_X, P_HALF_Y, P_LF, P_LR, P_MAX_STEER, P_SHAPE, P_THRUST_MAX
 from swarp.render.camera import Camera
 from swarp.render.geometry import RenderGeometry
 from swarp.render.style import Style
@@ -329,8 +329,21 @@ def _chevron_factors(hx: float) -> np.ndarray:
 _CHEVRONS: dict[int, np.ndarray] = {tag: _chevron_factors(box[0]) for tag, box in _BODY_BOX.items()}
 
 
+def _box_half_extents(g, i: int) -> tuple[float, float] | None:
+    """``(hx, hy)`` of agent ``i`` when it is a box agent (``AgentShape.BOX``), else None."""
+    if g.agent_params is None or g.agent_params[i, P_SHAPE] < 0.5:
+        return None
+    return float(g.agent_params[i, P_HALF_X]), float(g.agent_params[i, P_HALF_Y])
+
+
 def _body_polygon(g, i: int) -> np.ndarray | None:
-    """World-space silhouette of agent ``i``, or None when it is drawn as a plain circle."""
+    """World-space silhouette of agent ``i``, or None when it is drawn as a plain circle.
+
+    A box agent is drawn as the rotated rectangle it collides as, at its true half-extents
+    (not a model sprite scaled by its circumscribed radius)."""
+    half = _box_half_extents(g, i)
+    if half is not None:
+        return _rotated_rect(g.pos[i], float(g.theta[i]), *half)
     shape = _BODY_SHAPES.get(int(g.model[i]))
     if shape is None:
         return None

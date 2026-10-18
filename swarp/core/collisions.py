@@ -52,6 +52,11 @@ SHAPE_CIRCLE = wp.constant(int(ObstacleShape.CIRCLE))
 SHAPE_BOX = wp.constant(int(ObstacleShape.BOX))
 SHAPE_SEGMENT = wp.constant(int(ObstacleShape.SEGMENT))
 
+#: Compile options of every box-world kernel: no floating-point contraction (FMA), so
+#: the layered and fused paths, and the agent and body sides of a contact, round each
+#: operation alike whatever nvcc inlines where. See docs/performance.md.
+BOX_MODULE_OPTIONS = {"fuse_fp": False}
+
 
 @wp.func
 def _normal_coeff(overlap: Any, vn: Any, k: Any, c: Any, damp_denom: Any, max_overlap: Any):
@@ -957,7 +962,7 @@ def _static_forces_shaped(
     return f
 
 
-@wp.kernel
+@wp.kernel(module="unique", module_options=BOX_MODULE_OPTIONS, grid_stride=False)
 def collision_forces_box_kernel(
     pos: wp.array2d(dtype=Any),
     theta: wp.array2d(dtype=Any),
@@ -989,7 +994,8 @@ def collision_forces_box_kernel(
     Same gather, same contact law, but every pair dispatches on the two agents'
     :data:`~swarp.dynamics.base.P_SHAPE` (see :func:`_agent_pair_force`), and it reads the
     headings and angular velocities a box contact needs. Only launched when the world
-    has a box agent, so the disc kernel never pays for the extra loads."""
+    has a box agent, so the disc kernel never pays for the extra loads. Compiled without
+    FP contraction (:data:`BOX_MODULE_OPTIONS`), like every kernel a box world runs."""
     e, a = wp.tid()
     p = pos[e, a]
     th = theta[e, a]
@@ -1019,7 +1025,7 @@ def collision_forces_box_kernel(
     forces[e, a] = f
 
 
-@wp.kernel
+@wp.kernel(module="unique", module_options=BOX_MODULE_OPTIONS, grid_stride=False)
 def collision_forces_box_kernel_per_env(
     pos: wp.array2d(dtype=Any),
     theta: wp.array2d(dtype=Any),

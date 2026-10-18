@@ -745,3 +745,21 @@ def test_save_video_rejects_gif(tmp_path):
     env, _ = make_env(n_agents=2)
     with pytest.raises(ValueError, match="mp4|webm"):
         save_video(env, tmp_path / "roll.gif", n_steps=1, size=(80, 80))
+
+
+def test_box_agent_is_drawn_as_its_rotated_rectangle():
+    """A box agent's silhouette is the rectangle it collides as, at its heading, not a
+    model sprite scaled by its circumscribed radius; a disc agent stays a circle."""
+    from swarp.render.overlays import _body_polygon
+
+    scenario = NavigationScenario(n_agents=2, agent_shape="box", agent_half_extents=(0.1, 0.04))
+    env = Environment(scenario, n_envs=1, device="cpu", dt=0.1, seed=0)
+    env.reset()
+    g = extract_geometry(env.world, env_idx=0)
+    th = float(g.theta[0])
+    u, n = np.array([np.cos(th), np.sin(th)]), np.array([-np.sin(th), np.cos(th)])
+    corners = [0.1 * u + 0.04 * n, -0.1 * u + 0.04 * n, -0.1 * u - 0.04 * n, 0.1 * u - 0.04 * n]
+    np.testing.assert_allclose(_body_polygon(g, 0), g.pos[0] + np.array(corners), atol=1e-6)
+    assert render_frame(g, size=(120, 120), overlays={"agents"}).shape == (120, 120, 3)
+    env_disc, _ = make_env(n_agents=2, n_obstacles=0)
+    assert _body_polygon(extract_geometry(env_disc.world, env_idx=0), 0) is None

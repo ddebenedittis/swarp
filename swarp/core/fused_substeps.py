@@ -43,9 +43,19 @@ from typing import Any
 
 import warp as wp
 
-from swarp.core.collisions import _obstacle_forces, _wall_forces, pair_force
+from swarp.core.collisions import (
+    BOX_MODULE_OPTIONS,
+    _agent_pair_force,
+    _obstacle_forces,
+    _obstacle_forces_box,
+    _wall_forces,
+    _wall_forces_box,
+    pair_force,
+)
 from swarp.core.state import VEC2
 from swarp.dynamics.base import (
+    P_HALF_X,
+    P_HALF_Y,
     P_LF,
     P_LR,
     P_MASS,
@@ -56,8 +66,9 @@ from swarp.dynamics.base import (
     P_MAX_STEER,
     P_MIN_SPEED,
     P_RADIUS,
+    P_SHAPE,
 )
-from swarp.dynamics.kernels import _step_2d
+from swarp.dynamics.kernels import _step_2d, clamp_footprint
 
 #: Thread budget a block aims for; an env never straddles two blocks.
 TARGET_BLOCK = 128
@@ -94,6 +105,7 @@ def _make_kernel(
     emit: bool,
     reuse: bool,
     max_neighbors: int,
+    boxes: bool = False,
 ):
     """The chain specialized at compile time to what a world uses.
 
@@ -106,10 +118,25 @@ def _make_kernel(
     ``reuse`` reads substep 0's neighbors from the grid's list, which the caller vouches
     was built on the input state (the previous step's emitted list); every other substep
     scans. ``max_neighbors`` sizes the per-thread list a scan collects into.
+
+    ``boxes`` compiles in the box-agent contacts of
+    :func:`~swarp.core.collisions.collision_forces_box_kernel` (every pair dispatched on
+    the two agents' ``P_SHAPE``, box obstacles and walls, the footprint clamp), summed in
+    the layered kernel's order. The box variant compiles without FP contraction, as every
+    kernel of a box world does (the layered force pass and the box-world integrate
+    included): inlined into this much larger kernel, nvcc contracted the box contact
+    differently than in the layered one, a 1-ulp drift. With ``boxes=False`` every box
+    branch is a ``wp.static`` that compiles out and the options are the default, so the
+    disc variants generate the code they always did.
     """
     nbr_vec = wp.types.vector(length=max(1, max_neighbors), dtype=wp.int32)
 
-    @wp.kernel(enable_backward=False, module="unique", grid_stride=False)
+    @wp.kernel(
+        enable_backward=False,
+        module="unique",
+        grid_stride=False,
+        module_options=BOX_MODULE_OPTIONS if boxes else None,
+    )
     def fused_substeps_kernel(
         # 2D state in
         pos: wp.array2d(dtype=Any),
@@ -186,6 +213,11 @@ def _make_kernel(
                 if wp.static(collisions or obstacles or walls):
                     ra = params[a, P_RADIUS]
                     damp_denom = type(sub_dt)(1.0) + c * sub_dt / params[a, P_MASS]
+                    if wp.static(boxes):
+                        th = theta_out[e, a]
+                        w = ang_vel_out[e, a]
+                        sha = params[a, P_SHAPE]
+                        ha = type(p)(params[a, P_HALF_X], params[a, P_HALF_Y])
                 if wp.static(collisions):
                     # The same neighbors in the same order as the list the layered force
                     # pass reads, so the same sum. Collected first, then summed: a contact
@@ -207,50 +239,149 @@ def _make_kernel(
                                 count += wp.int32(1)
                     for i in range(count):
                         b = nbr[i]
-                        f += pair_force(
-                            p - pos_out[e, b],
-                            v - vel_out[e, b],
-                            ra + params[b, P_RADIUS] + margin,
-                            k,
-                            c,
-                            damp_denom,
-                            max_overlap,
-                        )
+                        if wp.static(boxes):
+                            f += _agent_pair_force(
+                                a,
+                                b,
+                                sha,
+                                params[b, P_SHAPE],
+                                p,
+                                th,
+                                v,
+                                w,
+                                ra,
+                                ha,
+                                pos_out[e, b],
+                                theta_out[e, b],
+                                vel_out[e, b],
+                                ang_vel_out[e, b],
+                                params[b, P_RADIUS],
+                                type(p)(params[b, P_HALF_X], params[b, P_HALF_Y]),
+                                margin,
+                                k,
+                                c,
+                                damp_denom,
+                                max_overlap,
+                            )
+                        else:
+                            f += pair_force(
+                                p - pos_out[e, b],
+                                v - vel_out[e, b],
+                                ra + params[b, P_RADIUS] + margin,
+                                k,
+                                c,
+                                damp_denom,
+                                max_overlap,
+                            )
                 if wp.static(obstacles or walls):
                     fs = type(p)(zero, zero)
                     if wp.static(obstacles):
-                        fs = _obstacle_forces(
-                            e,
-                            p,
-                            v,
-                            ra,
-                            obs_pos,
-                            obs_radius,
-                            obs_type,
-                            obs_angle,
-                            obs_half,
-                            obs_vel,
-                            obs_ang_vel,
-                            n_obstacles,
-                            k,
-                            c,
-                            margin,
-                            damp_denom,
-                            max_overlap,
-                        )
+                        if wp.static(boxes):
+                            if sha < type(sub_dt)(0.5):
+                                fs = _obstacle_forces(
+                                    e,
+                                    p,
+                                    v,
+                                    ra,
+                                    obs_pos,
+                                    obs_radius,
+                                    obs_type,
+                                    obs_angle,
+                                    obs_half,
+                                    obs_vel,
+                                    obs_ang_vel,
+                                    n_obstacles,
+                                    k,
+                                    c,
+                                    margin,
+                                    damp_denom,
+                                    max_overlap,
+                                )
+                            else:
+                                fs = _obstacle_forces_box(
+                                    e,
+                                    p,
+                                    th,
+                                    v,
+                                    w,
+                                    ha,
+                                    obs_pos,
+                                    obs_radius,
+                                    obs_type,
+                                    obs_angle,
+                                    obs_half,
+                                    obs_vel,
+                                    obs_ang_vel,
+                                    n_obstacles,
+                                    k,
+                                    c,
+                                    margin,
+                                    damp_denom,
+                                    max_overlap,
+                                )
+                        else:
+                            fs = _obstacle_forces(
+                                e,
+                                p,
+                                v,
+                                ra,
+                                obs_pos,
+                                obs_radius,
+                                obs_type,
+                                obs_angle,
+                                obs_half,
+                                obs_vel,
+                                obs_ang_vel,
+                                n_obstacles,
+                                k,
+                                c,
+                                margin,
+                                damp_denom,
+                                max_overlap,
+                            )
                     if wp.static(walls):
-                        fs += _wall_forces(
-                            p,
-                            v,
-                            ra,
-                            k,
-                            c,
-                            margin,
-                            damp_denom,
-                            max_overlap,
-                            bounds_min,
-                            bounds_max,
-                        )
+                        if wp.static(boxes):
+                            if sha < type(sub_dt)(0.5):
+                                fs += _wall_forces(
+                                    p,
+                                    v,
+                                    ra,
+                                    k,
+                                    c,
+                                    margin,
+                                    damp_denom,
+                                    max_overlap,
+                                    bounds_min,
+                                    bounds_max,
+                                )
+                            else:
+                                fs += _wall_forces_box(
+                                    p,
+                                    th,
+                                    v,
+                                    w,
+                                    ha,
+                                    k,
+                                    c,
+                                    margin,
+                                    damp_denom,
+                                    max_overlap,
+                                    bounds_min,
+                                    bounds_max,
+                                )
+                        else:
+                            fs += _wall_forces(
+                                p,
+                                v,
+                                ra,
+                                k,
+                                c,
+                                margin,
+                                damp_denom,
+                                max_overlap,
+                                bounds_min,
+                                bounds_max,
+                            )
                     f += fs
             block_sync()
             if active:
@@ -277,11 +408,23 @@ def _make_kernel(
                     sub_dt,
                 )
                 if wp.static(clamp):
-                    r = params[a, P_RADIUS]
-                    p_new = type(p_new)(
-                        wp.clamp(p_new[0], clamp_min[0] + r, clamp_max[0] - r),
-                        wp.clamp(p_new[1], clamp_min[1] + r, clamp_max[1] - r),
-                    )
+                    if wp.static(boxes):
+                        p_new = clamp_footprint(
+                            p_new,
+                            th_new,
+                            params[a, P_RADIUS],
+                            params[a, P_SHAPE],
+                            params[a, P_HALF_X],
+                            params[a, P_HALF_Y],
+                            clamp_min,
+                            clamp_max,
+                        )
+                    else:
+                        r = params[a, P_RADIUS]
+                        p_new = type(p_new)(
+                            wp.clamp(p_new[0], clamp_min[0] + r, clamp_max[0] - r),
+                            wp.clamp(p_new[1], clamp_min[1] + r, clamp_max[1] - r),
+                        )
                 pos_out[e, a] = p_new
                 theta_out[e, a] = th_new
                 vel_out[e, a] = v_new
@@ -350,7 +493,7 @@ def _signature(dtype) -> list:
     ]
 
 
-#: (collisions, obstacles, walls, clamp, emit, reuse, max_neighbors, dtype) -> kernel.
+#: (collisions, obstacles, walls, clamp, emit, reuse, max_neighbors, boxes, dtype) -> kernel.
 _KERNELS: dict[tuple, wp.Kernel] = {}
 
 
@@ -366,10 +509,10 @@ def fused_kernel(dtype, *flags, device=None, block_dim: int | None = None) -> wp
     key = (*flags, dtype)
     kernel = _KERNELS.get(key)
     if kernel is None:
-        collisions, obstacles, walls, clamp, _, _, max_neighbors = flags
+        collisions, obstacles, walls, clamp, _, _, max_neighbors, boxes = flags
         for emit in (False, True):
             for reuse in (False, True):
-                sib = (collisions, obstacles, walls, clamp, emit, reuse, max_neighbors)
+                sib = (collisions, obstacles, walls, clamp, emit, reuse, max_neighbors, boxes)
                 k = wp.overload(_make_kernel(*sib), _signature(dtype))
                 if device is not None:
                     wp.load_module(k.module, device=device, block_dim=block_dim)
@@ -417,6 +560,7 @@ def launch_fused_substeps(
         emit_list and collisions,
         reuse and collisions,
         max_neighbors,
+        stepper.has_box_agents,
     )
     wp.launch(
         fused_kernel(dtype, *flags, device=state_in.pos.device, block_dim=block_dim),

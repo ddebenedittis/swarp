@@ -1224,6 +1224,18 @@ def integrate2d_kernel_per_env(
     ang_vel_out[e, a] = w_out
 
 
+#: Box-world copies of the slim kernels: the same functions compiled without FP
+#: contraction (see ``swarp.core.collisions.BOX_MODULE_OPTIONS``), so a box world's
+#: layered step rounds exactly like its fused one. Disc worlds launch the originals.
+_BOX_OPTS = {"fuse_fp": False}
+integrate2d_box_kernel = wp.kernel(
+    integrate2d_kernel.func, module="unique", module_options=_BOX_OPTS, grid_stride=False
+)
+integrate2d_box_kernel_per_env = wp.kernel(
+    integrate2d_kernel_per_env.func, module="unique", module_options=_BOX_OPTS, grid_stride=False
+)
+
+
 def _signature2d(dtype, per_env: bool = False) -> list:
     vec2 = VEC2[dtype]
     a2v = wp.array2d(dtype=vec2)
@@ -1280,6 +1292,8 @@ for _T in (wp.float32, wp.float64):
     register(integrate_kernel_per_env, _T, _signature(_T, per_env=True))
     register(integrate2d_kernel, _T, _signature2d(_T))
     register(integrate2d_kernel_per_env, _T, _signature2d(_T, per_env=True))
+    register(integrate2d_box_kernel, _T, _signature2d(_T))
+    register(integrate2d_box_kernel_per_env, _T, _signature2d(_T, per_env=True))
 
 
 #: Integrator enum value -> kernel tag (must match the INT_* constants above).
@@ -1327,7 +1341,10 @@ def launch_integrate(
     per_env = params.floats_per_env is not None
     floats = params.floats_per_env if per_env else params.floats
     if slim:
-        kernel2d = integrate2d_kernel_per_env if per_env else integrate2d_kernel
+        if footprint:
+            kernel2d = integrate2d_box_kernel_per_env if per_env else integrate2d_box_kernel
+        else:
+            kernel2d = integrate2d_kernel_per_env if per_env else integrate2d_kernel
         wp.launch(
             concrete(kernel2d, dtype),
             dim=(n_envs, n_agents),

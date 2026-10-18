@@ -44,6 +44,7 @@ import warp as wp
 
 from swarp._overloads import concrete, register
 from swarp.core.collisions import (
+    BOX_MODULE_OPTIONS,
     SHAPE_BOX,
     SHAPE_SEGMENT,
     _box_obstacle_force,
@@ -287,10 +288,17 @@ def _make_obstacle_dynamics(boxes: bool) -> wp.Kernel:
     The disc variant is the historical kernel verbatim (``theta``/``ang_vel`` are in its
     signature only so both variants launch the same way, and it never reads them), so a
     disc-only world integrates its bodies exactly as before. The box variant dispatches
-    each agent on its :data:`~swarp.dynamics.base.P_SHAPE`.
+    each agent on its :data:`~swarp.dynamics.base.P_SHAPE` and, like every box-world
+    kernel, compiles without FP contraction, so its reaction is bit for bit the negated
+    force the agent side applied.
     """
 
-    @wp.kernel(module="unique", enable_backward=False, grid_stride=False)
+    @wp.kernel(
+        module="unique",
+        enable_backward=False,
+        grid_stride=False,
+        module_options=BOX_MODULE_OPTIONS if boxes else None,
+    )
     def obstacle_dynamics_kernel(
         pos: wp.array2d(dtype=Any),
         vel: wp.array2d(dtype=Any),
