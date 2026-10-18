@@ -99,6 +99,7 @@ Each defaults to "not provided", and `Environment` forwards each one under the s
 | `aux_dim: int`, `aux_targets()` | `0`, `None` | `[n_envs, n_agents, aux_dim]` float | an auxiliary regression loss on the actor's features |
 
 `role_counts` is fixed for the run and sums to `n_agents`: which agent holds which role may change every episode, but each env always has exactly `role_counts[r]` agents in role `r`.
+`swarp.rl` checks this once, on every env, when it resets, and raises on a row that breaks it, since a per-role network would otherwise silently run on the wrong agents.
 
 With roles, `critic_state()` is written in **role-sorted agent order**: any per-agent block lists role 0's agents by ascending agent index, then role 1's, and so on, not agents by index.
 The critic reads the state as it comes and adds no role one-hot, so the order is the only role information it gets; with `per_agent_value` its output slot `k` is the agent at role-sorted rank `k`, so per-agent block `k` of the state must describe that same agent.

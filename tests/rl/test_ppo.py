@@ -263,10 +263,15 @@ def _patch_training_hooks(env) -> None:
 
 
 def _algo(
-    graphs: bool, seed: int = 0, device: str = "cuda:0", features: bool = False, **spec_kw
+    graphs: bool,
+    seed: int = 0,
+    device: str = "cuda:0",
+    features: bool = False,
+    patch=_patch_training_hooks,
+    **spec_kw,
 ) -> MAPPO:
     """Navigation at test size; ``features`` turns on the state critic (state + obs, per
-    agent), role heads and the aux loss over :func:`_patch_training_hooks`."""
+    agent), role heads and the aux loss over ``patch`` (:func:`_patch_training_hooks`)."""
     # A previous test's MAPPO holds captured torch graphs in reference cycles (bound
     # methods); collected during this env's Warp capture, their teardown would invalidate
     # it. ``torch.cuda.graph`` collects before its own captures for the same reason.
@@ -285,9 +290,10 @@ def _algo(
     torch.manual_seed(seed)
     Ob, A = env.obs_dim, env.n_agents
     if features:
-        _patch_training_hooks(env)
+        patch(env)
         actor = PolicyNet(
-            Ob, env.act_dim, spec.num_cells, role_counts=ROLE_COUNTS, aux_dim=AUX_DIM
+            Ob, env.act_dim, spec.num_cells, role_counts=ROLE_COUNTS,
+            aux_dim=AUX_DIM,
         )
         critic = StateCritic(
             env.state_dim, Ob, A, spec.num_cells, use_obs=True, role_counts=ROLE_COUNTS,
@@ -331,6 +337,17 @@ def test_a_scenario_with_roles_gets_a_role_ordered_obs_critic():
     assert (kw["use_obs"], kw["state_dim"], kw["per_agent"]) == (True, 0, False)
     assert kw["role_counts"] == list(ROLE_COUNTS)
     assert StateCritic(**kw).uses_roles
+
+
+def test_reset_rejects_roles_that_break_role_counts():
+    def bad_row(env):
+        _patch_training_hooks(env)
+        roles = env.scenario.agent_roles()
+        roles[2] = 0  # every agent in role 0
+        env.scenario.agent_roles = lambda: roles
+
+    with pytest.raises(ValueError, match=r"breaks role_counts \(1, 3\) in 1/64 envs; env 2"):
+        _algo(graphs=False, device="cpu", features=True, patch=bad_row)
 
 
 def test_features_add_their_buffers_and_the_aux_stat():

@@ -483,6 +483,27 @@ class MAPPO:
                     obs = self.env.reset_at(offset == t)
         self._out = (obs, None, None, None, None)
         self._fetch_sources()
+        if self.use_roles:
+            self._check_role_counts(self._src[1])
+
+    def _check_role_counts(self, roles: torch.Tensor) -> None:
+        """Raise unless every env's roles honour ``role_counts`` (one host read, at reset).
+
+        :class:`PolicyNet`'s ``"separate"`` slices and the per-slot statistics assume the
+        counts; a row that breaks them would be silently misrouted, not rejected.
+        """
+        ids = torch.arange(len(self.role_counts), device=roles.device)
+        counts = (roles.long().unsqueeze(-1) == ids).sum(-2)  # [E, R]
+        want = torch.tensor(self.role_counts, device=roles.device)
+        bad = (counts != want).any(-1)
+        if bad.any():
+            e = int(bad.nonzero()[0, 0])
+            raise ValueError(
+                f"agent_roles() breaks role_counts {self.role_counts} in "
+                f"{int(bad.sum())}/{self.E} envs; env {e} has roles {roles[e].tolist()} "
+                f"(per-role counts {counts[e].tolist()}). Every env must hold exactly "
+                "role_counts[r] agents in role r, with roles in [0, n_roles)."
+            )
 
     def _signature(self, out: tuple[Any, ...]) -> tuple[int, ...]:
         _, rew, term, trunc, info = out
