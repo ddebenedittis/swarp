@@ -730,6 +730,33 @@ class PushTLidarScenario(PushTScenario):
             return self.fb["aux"]
         return self._lcache["aux"]
 
+    def render_extras(self, env_idx: int) -> dict[str, Any]:
+        """Push-T's extras plus the observers' rays for the viewer's ``lidar`` overlay, from
+        the newest scan in the ring (current on the fused and the torch path alike): rim to
+        hit, or to the full range on a miss, with the end dot only where the ray hit
+        something."""
+        out = super().render_extras(env_idx)
+        nr = self.n_rays
+        with torch.no_grad():
+            frame = self._ring[env_idx, :, -3 * nr :]
+            ranges = frame[:, :nr] * self.lidar_max_range  # [A, R]
+            pos = self.world.state.pos[env_idx]
+            ang = self._ray_angles()[env_idx]
+            dirs = torch.stack((torch.cos(ang), torch.sin(ang)), dim=-1)  # [A, R, 2]
+            starts = pos.unsqueeze(1) + self.world.agent_radius.view(-1, 1, 1) * dirs
+            ends = pos.unsqueeze(1) + ranges.unsqueeze(-1) * dirs
+            observers = torch.nonzero(self.roles[env_idx] == 1).squeeze(-1)
+            rays = torch.stack((starts, ends), dim=2)[observers]  # [O, R, 2, 2]
+            hit = (frame[:, nr:] > 0.5).reshape(-1, 2, nr).any(dim=1)[observers]
+        rays = rays.cpu().numpy()
+        out.update(
+            lidar=rays.reshape(-1, 2, 2),
+            lidar_by_agent=rays,
+            lidar_agents=observers.cpu().numpy(),
+            lidar_hit=hit.cpu().numpy(),
+        )
+        return out
+
     def info(self) -> dict[str, Any]:
         out = super().info()
         if self.fused_active:

@@ -743,6 +743,10 @@ def _draw_lidar(surface, g, camera, style):
 
     Expected (tentative) format: an array of world-space segments with shape
     ``(n_rays, 2, 2)`` — ``[start_xy, end_xy]`` per ray. Absent/empty -> no-op.
+    ``lidar_by_agent`` groups them per agent, ``(n, n_rays, 2, 2)``; ``lidar_agents``
+    (``(n,)`` agent indices, default ``0..n-1``) says whose bundle each group is, so a
+    scenario can draw a subset of its agents, and ``lidar_hit`` (``(n, n_rays)`` bool)
+    puts the end dot only on rays that hit something.
     """
     if style.lidar_mode == "none":
         return
@@ -751,8 +755,8 @@ def _draw_lidar(surface, g, camera, style):
         grouped = np.asarray(by_agent, dtype=np.float64)
         if grouped.size:
             overlay = _alpha_layer("lidar", surface.get_size())
-            for i in range(min(g.n_agents, grouped.shape[0])):
-                endpoints = grouped[i, :, 1, :]
+            for k, i in _lidar_owners(g, grouped):
+                endpoints = grouped[k, :, 1, :]
                 if endpoints.shape[0] < 2:
                     continue
                 color = style.agent_color(i, g.model[i])
@@ -770,20 +774,32 @@ def _draw_lidar(surface, g, camera, style):
     if rays.size == 0:
         return
     grouped = np.asarray(by_agent, dtype=np.float64) if by_agent is not None else None
+    hit = g.extras.get("lidar_hit")
     if grouped is not None and grouped.size:
-        for i in range(min(g.n_agents, grouped.shape[0])):
+        for k, i in _lidar_owners(g, grouped):
             color = style.agent_color(i, g.model[i])
-            _draw_rays(surface, camera, style, grouped[i].reshape(-1, 2, 2), color)
+            dots = None if hit is None else np.asarray(hit)[k]
+            _draw_rays(surface, camera, style, grouped[k].reshape(-1, 2, 2), color, dots)
         return
     _draw_rays(surface, camera, style, rays.reshape(-1, 2, 2), style.lidar_color)
 
 
-def _draw_rays(surface, camera, style, segs, color) -> None:
-    """One batch transform for a whole ray bundle, then a line + hit dot per ray."""
+def _lidar_owners(g, grouped) -> list[tuple[int, int]]:
+    """``(group, agent)`` pairs for the per-agent ray bundles (see :func:`_draw_lidar`)."""
+    owners = g.extras.get("lidar_agents")
+    if owners is None:
+        return [(k, k) for k in range(min(g.n_agents, grouped.shape[0]))]
+    return [(k, int(i)) for k, i in enumerate(owners) if 0 <= int(i) < g.n_agents]
+
+
+def _draw_rays(surface, camera, style, segs, color, dots=None) -> None:
+    """One batch transform for a whole ray bundle, then a line + hit dot per ray (only
+    where ``dots`` is true, when given)."""
     pts = to_px_batch(camera, segs.reshape(-1, 2))
     for k in range(0, len(pts), 2):
         pygame.draw.line(surface, color, pts[k], pts[k + 1], style.lidar_ray_width)
-        pygame.draw.circle(surface, color, pts[k + 1], style.lidar_hit_px)
+        if dots is None or dots[k // 2]:
+            pygame.draw.circle(surface, color, pts[k + 1], style.lidar_hit_px)
 
 
 _FONT_CACHE: dict[int, pygame.font.Font] = {}
