@@ -76,6 +76,10 @@ Knowing where the gradient stops matters more than the headline.
 
 **Neighbor membership.** The neighbor set is a discrete structure and is built with `record_tape=False`. Gradients flow through contact *geometry* (how deep the overlap is, how fast the closing velocity), not through *which* pairs are in contact.
 
+**Box contact features.** A [box agent's](world.md#box-agents) contacts are taped like a disc's, and the gradient reaches positions, velocities, actions and the **headings** of both boxes through the depth, the normal, the contact point and the spin terms of the closing velocity (`gradcheck`ed at a face-vertex pose in `tests/unit/test_box_agents.py`).
+Which feature is in contact (the separating axis, the winning vertex) is chosen per evaluation, like neighbor membership: the gradient is that of the current feature, and it jumps where the feature switches, for instance where a vertex-face contact turns into a face-face one.
+Box agents feel no contact torque, so a contact never enters the heading update: a heading influences the contact force, but the contact does not turn the box.
+
 **Movable rigid bodies.** `swarp/core/bodies.py` advances body state with `record_tape=False`, so no gradient flows through a body's motion. A scenario that needs one keeps its own torch-side copy and integrates it there:
 
 - `TransportScenario` always does, staggered by one step.

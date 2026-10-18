@@ -451,8 +451,8 @@ class Stepper:
             and str(floats.device) == str(self.device)
         )
         if not in_place:
-            # The shape column is structural, like the model tag: the lidar and (once box
-            # contacts land) the force kernels pick their branch from the shared row. This is
+            # The shape column is structural, like the model tag: the lidar and the box-agent
+            # kernel routing (has_box_agents) are decided from the configs. This is
             # the first-install / reallocation path, never the per-reset in-place refresh, so
             # its host read stays off the hot loop (and out of any capture).
             shared = np.array([float(c.shape) for c in self.configs])

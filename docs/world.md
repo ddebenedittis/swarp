@@ -62,6 +62,33 @@ Contacts are **frictionless** everywhere in the engine: normal spring plus norma
 
 Forces are **gather-based** — each thread sums the forces on its own agent from its own neighbor list, obstacles and walls. Symmetric pairs are computed twice, which buys a deterministic, race-free result with no atomics.
 
+### Box agents
+
+A box agent (`AgentShape.BOX`, see [Agent shape](dynamics.md#agent-shape)) collides as the oriented rectangle it is, with the same normal law and the same constants as a disc.
+Every contact it takes part in is a signed distance `s`, a unit normal `n` and a contact point `x`, from `obb_contact` in `swarp/core/collisions.py`:
+
+- A separating-axis test over the four face normals runs first. The largest projection gap is a lower bound on the distance, so when it exceeds the contact reach the pair is skipped.
+- Disjoint but within reach, `s` is the exact Euclidean gap. The closest pair of two disjoint rectangles always involves a vertex, so `s` is the minimum of the eight vertex-versus-other-box distances, and `n` and `x` come from the winning vertex (`x` midway across the gap).
+- Overlapping, `s` is minus the smallest overlap over the four axes, `n` is that axis, and `x` sits on its reference face at the centre of the interval where the two projections onto the face overlap. A centred face-on push therefore has its contact point on the line through both centres.
+
+Both branches reach zero at touching, so `s` is continuous through contact, and a `+` crossing of two thin boxes, where no corner lies inside the other box, is still caught by the axis test.
+The force is `f = max(0, (k*overlap - c*v_n) / (1 + c*sub_dt/m)) * n` with `overlap = reach - s`, where `v_n` is the closing velocity of the two *material points* at `x`, `v + ω × r` on both sides.
+
+| pair | geometry | reach |
+|---|---|---|
+| box agent – box agent | `obb_contact` | `collision_margin` |
+| disc agent – box agent | `box_force` with the disc as the point | disc radius + margin |
+| box agent – `BOX` obstacle | `obb_contact` | margin |
+| box agent – `SEGMENT` obstacle | `obb_contact` against the degenerate box `(half_len, 0)` | capsule radius + margin, so the end caps are exactly round |
+| box agent – `CIRCLE` obstacle | `box_force` with the circle centre as the point | circle radius + margin |
+
+A box-box pair is evaluated with the lower agent index as box A on both threads, so the two threads compute one contact and the pair's forces cancel exactly for equal masses.
+Contacts push a box agent's centre only: a box agent feels **no contact torque** yet.
+Its heading is its own, driven by its dynamics model, so a diff-drive or bicycle box turns as it steers and a holonomic box keeps the heading it was reset with.
+
+Every kernel a box world runs compiles without floating-point contraction (`fuse_fp=False`), which keeps the layered and fused paths bit-identical (see [Performance](performance.md#fused-substep-chain)).
+A world without a box agent never launches them, so its step is the disc step unchanged.
+
 ## Bounds
 
 `bounds=(x_min, x_max, y_min, y_max)`, or `None` for an unbounded world.
@@ -71,6 +98,9 @@ Forces are **gather-based** — each thread sums the forces on its own agent fro
 
 `bounds_mode="clamp"`
 : positions are hard-clamped inside. Differentiable as a subgradient.
+
+A box agent at heading `θ` reaches `ex = hx|cos θ| + hy|sin θ|` along x and `ey = hx|sin θ| + hy|cos θ|` along y from its centre, and both modes use those support extents in place of a disc's radius.
+A soft wall damps the velocity of the support vertex touching it (on a face flush with the wall, the face centre), and the clamp insets each box by its extents at its *new* heading, so a box turned 45 degrees is held off the wall by its corner rather than by its circumscribed radius.
 
 ## Obstacles
 
@@ -111,9 +141,11 @@ Several shapes that share a `body` id form one **compound** rigid body with a si
 
 `obstacle_linear_damping` and `obstacle_angular_damping` stand in for table friction: a pushed body settles at `Σf / (m·damping)` instead of accelerating without limit. Set them to 0 for a frictionless puck that coasts.
 
+A **box agent** pushes a body through the same oriented-box contact it feels itself: the body pass calls the very function the agent side summed and negates it, so action equals reaction to the bit, and the reaction acts at the contact point, so a box agent pushing a box body off-centre spins it.
+
 Two limits worth knowing:
 
-- **Box-box obstacle-obstacle contacts are not modelled.** Obstacles collide with each other for every pair in which at least one body is round; two boxes pass through one another, since that needs a polygon contact manifold rather than an SDF evaluated against a disc. Agent-vs-box is exact for every shape.
+- **Box-box obstacle-obstacle contacts are not modelled.** Obstacles collide with each other for every pair in which at least one body is round; two boxes pass through one another, since the body-body pass evaluates an SDF against a round body. Agent-vs-box is exact for every shape, box agents included.
 - **Body integration is not taped** (`record_tape=False`), so no gradient flows through a body's motion. A scenario that needs one keeps its own torch-side copy — see [Differentiability](differentiability.md).
 
 ## Neighbor search
