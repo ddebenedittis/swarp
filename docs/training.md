@@ -122,10 +122,11 @@ The scenario side is three optional hooks, `critic_state()`, `agent_roles()` and
 Roles may move between agents every episode; the role counts are fixed for the run, which is what keeps the slices fixed-size.
 
 **Critic.**
-`"obs"` with one value per team is the default `Critic`.
-Anything else is a `StateCritic`, which reads the scenario's privileged `critic_state()` (`"state"`), every agent's observation (`"obs"`), or both (`"state+obs"`).
+`"obs"` with one value per team is the default `Critic` on a scenario without roles.
+Anything else, and the obs critic of a scenario with roles, is a `StateCritic`, which reads the scenario's privileged `critic_state()` (`"state"`), every agent's observation (`"obs"`), or both (`"state+obs"`).
 With roles, the observations enter in role-sorted order, so the critic sees the team in a fixed layout however the roles were drawn.
 `per_agent_value` gives each role-sorted slot its own value instead of one team value, which matters once the roles are rewarded differently.
+The privileged state is not reordered: a scenario with roles writes it in role-sorted agent order (see [Writing a scenario](writing-a-scenario.md#training-hooks-optional)).
 The critic only shapes the advantages, so a privileged state helps training and never reaches the deployed policy.
 
 **Auxiliary loss.**

@@ -303,6 +303,12 @@ class StateCritic(nn.Module):
     One value broadcast to every agent by default. With ``per_agent`` it outputs one value
     per role-sorted slot (per agent index without roles), mapped back to agent order: the
     per-role rewards then get a value each instead of sharing the team's.
+
+    ``state`` is read as it comes, never reordered: with roles, slot ``k`` of the output is
+    the agent holding role-sorted rank ``k``, so a per-agent part of ``critic_state()``
+    must already be in role-sorted agent order (role 0's agents by ascending index, then
+    role 1's, ...), the contract in ``docs/writing-a-scenario.md``. No role one-hot is
+    added; the order is the role information.
     """
 
     def __init__(

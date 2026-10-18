@@ -730,8 +730,11 @@ def network_archs(
     """``(actor_cls, actor_kwargs, critic_cls, critic_kwargs)`` for a spec on an env, as
     :data:`ARCHS` names and primitive keywords (what a checkpoint stores).
 
-    The defaults give :class:`Actor` and :class:`Critic`. Raises when the spec asks for a
-    hook the scenario does not provide.
+    The defaults give :class:`Actor` and :class:`Critic`, except on a scenario with roles,
+    where the obs critic is a :class:`StateCritic` over the role-sorted observations: the
+    plain :class:`Critic` flattens them in agent order, a layout that changes whenever
+    the roles move between agents. Raises when the spec asks for a hook the scenario does
+    not provide.
     """
     obs_dim, n_agents, cells = env.obs_dim, env.n_agents, spec.num_cells
     roles = list(env.role_counts)
@@ -756,7 +759,7 @@ def network_archs(
         raise ValueError(
             f"critic_input={spec.critic_input!r}, but the scenario provides no critic_state()"
         )
-    if spec.critic_input == "obs" and not spec.per_agent_value:
+    if spec.critic_input == "obs" and not spec.per_agent_value and not roles:
         critic = "Critic", {"obs_dim": obs_dim, "n_agents": n_agents, "num_cells": cells}
     else:
         critic = "StateCritic", {

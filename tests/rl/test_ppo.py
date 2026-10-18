@@ -12,7 +12,7 @@ import torch
 
 from swarp.rl import MAPPO, Actor, Critic, load_checkpoint, parse_args, train
 from swarp.rl.networks import PolicyNet, StateCritic, tanh_normal_log_prob
-from swarp.rl.ppo import LEGACY_STAT_NAMES, gae
+from swarp.rl.ppo import LEGACY_STAT_NAMES, gae, network_archs
 from swarp.rl.recipes import SPECS, build_env
 
 SMOKE = [
@@ -292,6 +292,24 @@ def test_defaults_allocate_no_new_buffers_and_keep_the_legacy_stats():
     assert algo._act_ptrs == (algo._out[0].data_ptr(),)  # only the obs is watched
     stats = algo.update(algo.spec.entropy_coeff)
     assert list(stats) == algo.stat_names
+
+
+def test_a_scenario_with_roles_gets_a_role_ordered_obs_critic():
+    """The default obs critic flattens obs in agent order, blind to roles; with roles it is
+    a StateCritic that orders them by role."""
+    env = build_env(
+        "navigation", n_envs=4, n_agents=4, device="cpu", dt=0.05, substeps=1,
+        max_steps=5, seed=0,
+    )
+    box = (-torch.ones(env.act_dim), torch.ones(env.act_dim))
+    spec = SPECS["navigation"]
+    assert network_archs(spec, env, *box)[2] == "Critic"
+    _patch_training_hooks(env)
+    _, _, cls, kw = network_archs(spec, env, *box)
+    assert cls == "StateCritic"
+    assert (kw["use_obs"], kw["state_dim"], kw["per_agent"]) == (True, 0, False)
+    assert kw["role_counts"] == list(ROLE_COUNTS)
+    assert StateCritic(**kw).uses_roles
 
 
 def test_features_add_their_buffers_and_the_aux_stat():

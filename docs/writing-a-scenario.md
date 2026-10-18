@@ -100,6 +100,10 @@ Each defaults to "not provided", and `Environment` forwards each one under the s
 
 `role_counts` is fixed for the run and sums to `n_agents`: which agent holds which role may change every episode, but each env always has exactly `role_counts[r]` agents in role `r`.
 
+With roles, `critic_state()` is written in **role-sorted agent order**: any per-agent block lists role 0's agents by ascending agent index, then role 1's, and so on, not agents by index.
+The critic reads the state as it comes and adds no role one-hot, so the order is the only role information it gets; with `per_agent_value` its output slot `k` is the agent at role-sorted rank `k`, so per-agent block `k` of the state must describe that same agent.
+`swarp.rl.networks.role_permutation(roles, role_counts)` gives that order without a sort (`x.gather(-1, perm)` lists `x` role-sorted), and is capturable.
+
 The contract is the one the trainer's CUDA graphs rely on:
 
 - **Fixed address.**

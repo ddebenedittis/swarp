@@ -84,7 +84,12 @@ class Scenario(ABC):
 
     def critic_state(self) -> torch.Tensor | None:
         """Privileged per-env state for a centralised critic, ``[n_envs, state_dim]``, or
-        ``None``. Never shown to the actor."""
+        ``None``. Never shown to the actor.
+
+        With roles, any per-agent part of the state is laid out in role-sorted agent order
+        (role 0's agents by ascending index, then role 1's, ...), not by agent index: the
+        critic reads it as-is and its per-agent value slot ``k`` is the agent at
+        role-sorted rank ``k``."""
         return None
 
     def agent_roles(self) -> torch.Tensor | None:
