@@ -656,15 +656,15 @@ class Stepper:
         faster at 1k envs and 5% slower at 16k, so it fuses up to
         :data:`FUSE_MAX_AGENTS_ONE_SUBSTEP` agents in total.
 
-        A world holding box agents runs the chain's ``boxes`` variant when asked for it
-        (``True``), but ``"auto"`` keeps it on the layered pipeline: that variant carries
-        the oriented-box contact on top of the disc chain's register budget, and its
-        crossover has not been measured yet, so the thresholds above are not evidence for
-        it."""
+        A world holding box agents runs the chain's ``boxes`` variant under the same rule.
+        That variant needs 213-255 registers, but the same graph-mode sweep with box agents
+        (RTX 4070 Ti SUPER, 1k-16k envs, 4-16 agents, 1 and 4 substeps) crossed over in the
+        same place: at 4 substeps the chain was 1-48% faster, a single substep above the
+        limits 2-12% slower, and only 1k envs x 8 agents x 1 substep (4% faster fused) fell
+        on the wrong side."""
         mode = self.enable_fused_substeps
         if mode == "auto" and (
-            self.has_box_agents
-            or self.n_agents > FUSE_AGENTS_PER_SUBSTEP * self.substeps
+            self.n_agents > FUSE_AGENTS_PER_SUBSTEP * self.substeps
             or (
                 self.substeps == 1
                 and state_in.pos.shape[0] * self.n_agents > FUSE_MAX_AGENTS_ONE_SUBSTEP

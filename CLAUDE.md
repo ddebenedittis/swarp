@@ -113,7 +113,7 @@ TorchRL `EnvBase` wrapper).
   It is bit-identical to the layered pipeline by construction (same neighbor membership and order, same `pair_force`/`_step_2d`), which `tests/interop/test_fused_substeps.py` checks for every scenario.
   `Stepper.enable_fused_substeps="auto"` routes to it only where it measured faster (≤ 4 agents per env per substep; with one substep, ≤ 16,384 agents in all): it trades ~3 launches per substep for ~100 registers per thread, and loses on large single-substep batches.
   Kernel variants are compiled per world (`wp.static` flags) and their `(emit, reuse)` siblings are loaded together, because a variant first launched inside a capture cannot be loaded there.
-  The `boxes` flag adds the box-agent contacts (per-pair dispatch on `P_SHAPE`); with it off the generated code is the disc chain's. `"auto"` keeps box worlds layered (crossover unmeasured).
+  The `boxes` flag adds the box-agent contacts (per-pair dispatch on `P_SHAPE`); with it off the generated code is the disc chain's. `"auto"` routes box worlds by the disc thresholds (measured: same crossover, `docs/performance.md`).
 - `swarp/dynamics/base.py` — `DynamicsModel`/`ControlMode`/`Integrator` enums, `AgentConfig`
   (per-agent, mixable in one world), and `build_agent_params`. Four models: holonomic point,
   diff-drive, kinematic bicycle (all 2D), and a 6-DOF `+`-config quadrotor whose `AgentConfig`

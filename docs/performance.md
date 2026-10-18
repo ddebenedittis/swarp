@@ -61,9 +61,19 @@ It also needs the CUDA device, the slim 2D Euler path, shared agent parameters, 
 
 The chain is compiled per world from `wp.static` flags, and `boxes` is one of them: a world holding a [box agent](world.md#box-agents) runs a variant that dispatches every pair on the two agents' shapes and adds the oriented-box obstacle, wall and clamp terms, summed in the layered box kernel's order.
 With `boxes=False` the box branches compile out and the generated code is the disc chain's, line for line.
-`"auto"` keeps box worlds on the layered pipeline: the variant carries the box contact on top of the disc chain's register budget and its crossover has not been measured, so the thresholds above say nothing about it.
-It takes 213–255 registers per thread against the disc chain's 119–150 (float32, RTX 3070 Laptop), the occupancy cost that crossover has to be measured against.
-`True` runs it.
+It takes 213–255 registers per thread against the disc chain's 119–150 (float32, RTX 3070 Laptop), yet its crossover sits where the disc chain's does, so `"auto"` applies the same thresholds to box worlds.
+A graph-mode sweep of box-agent navigation (RTX 4070 Ti SUPER, median of 3 interleaved runs) timed it against the layered pipeline:
+
+| envs | agents | substeps | fused vs layered |
+|---|---|---|---|
+| 1,000 / 4,000 / 16,000 | 4 | 1 | +6.0% / +5.6% / −3.3% |
+| 1,000 / 4,000 / 16,000 | 8 | 1 | +3.9% / −2.2% / −7.5% |
+| 1,000 / 4,000 / 16,000 | 16 | 1 | +1.0% / −10.0% / −12.2% |
+| 1,000 / 4,000 / 16,000 | 4 | 4 | +47.7% / +38.6% / +14.5% |
+| 1,000 / 4,000 / 16,000 | 8 | 4 | +38.7% / +18.4% / +4.6% |
+| 1,000 / 4,000 / 16,000 | 16 | 4 | +25.9% / +2.6% / +1.0% |
+
+The rule picks the faster path in every cell but 1,000 envs × 8 agents × 1 substep, where it leaves 4% on the table.
 
 Every kernel of a box world (the layered box force pass, the box-world copy of the slim integrator, the box variants of the chain and of the body pass) compiles without floating-point contraction (`fuse_fp=False`).
 With contraction on, nvcc fused the box contact into FMAs differently inside the large chain than inside the layered kernel, a 1-ulp drift; without it each operation rounds alone, so the two paths are bit-identical again (`tests/interop/test_fused_substeps.py`).

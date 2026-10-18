@@ -196,10 +196,11 @@ def test_box_agents_bit_identical(use_graph, substeps, n_obstacles, bounds_mode)
     _assert_same(lambda: _mixed_env(substeps, use_graph, n_obstacles, bounds_mode))
 
 
-def test_auto_keeps_box_worlds_layered():
-    env = _mixed_env(4, True, 0, "soft", n_agents=2)
+@pytest.mark.parametrize(("substeps", "n_agents", "fuses"), [(4, 2, True), (1, 6, False)])
+def test_auto_routes_box_worlds_by_the_disc_rule(substeps, n_agents, fuses):
+    env = _mixed_env(substeps, True, 0, "soft", n_agents=n_agents)
     stepper = env.world.stepper
     state = stepper.alloc_state(env.n_envs)
-    assert not stepper._can_fuse_substeps(state, stepper.cached_buffers(env.n_envs))
+    assert stepper._can_fuse_substeps(state, stepper.cached_buffers(env.n_envs)) == fuses
     stepper.enable_fused_substeps = True
     assert stepper._can_fuse_substeps(state, stepper.cached_buffers(env.n_envs))
