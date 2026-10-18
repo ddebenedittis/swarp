@@ -71,7 +71,7 @@ def test_checkpoint_acts_like_benchmarl(tmp_path):
             expected = experiment.policy(td.clone()).get((GROUP, "action"))
         arm, ckpt = eval_mappo._load_arm(str(path), "cpu")
         lo, hi = env._env.action_bounds
-        got = arm(4, "cpu", lo, hi)(td.get((GROUP, "observation")))
+        got = arm["policy"](4, "cpu", lo, hi)(td.get((GROUP, "observation")))
     finally:
         experiment.close()
     assert ckpt["format"] == "benchmarl/1"

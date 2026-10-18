@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import gc
 import math
 from dataclasses import replace
 
@@ -10,8 +11,8 @@ import pytest
 import torch
 
 from swarp.rl import MAPPO, Actor, Critic, load_checkpoint, parse_args, train
-from swarp.rl.networks import tanh_normal_log_prob
-from swarp.rl.ppo import gae
+from swarp.rl.networks import PolicyNet, StateCritic, tanh_normal_log_prob
+from swarp.rl.ppo import LEGACY_STAT_NAMES, gae
 from swarp.rl.recipes import SPECS, build_env
 
 SMOKE = [
@@ -95,8 +96,109 @@ def test_train_smoke_writes_metrics_and_a_loadable_checkpoint(tmp_path):
 
     actor, _, meta = load_checkpoint(path)
     assert (meta["scenario"], meta["max_steps"], meta["n_agents"]) == ("navigation", 5, 4)
+    assert meta["format"] == "swarp.rl/2"
+    assert (meta["actor_cls"], meta["critic_cls"]) == ("Actor", "Critic")
+    assert (meta["state_dim"], meta["role_counts"], meta["aux_dim"]) == (0, [], 0)
     obs = torch.randn(3, 4, actor.obs_dim)
     assert torch.equal(actor.greedy(obs), actor.greedy(obs))
+
+
+def test_train_with_a_policynet_and_a_per_agent_critic_round_trips(tmp_path):
+    """Navigation has no roles, state or aux targets, so this is PolicyNet's plain path and
+    an obs-reading per-agent StateCritic, through train(), its checkpoint and the resume."""
+    flags = ["--scenario", "navigation", *SMOKE, "--checkpoint-dir", str(tmp_path),
+             "--actor", "policynet", "--critic-input", "obs", "--per-agent-value"]
+    path = train(parse_args(flags))
+    actor, critic, meta = load_checkpoint(path)
+    assert isinstance(actor, PolicyNet) and isinstance(critic, StateCritic)
+    assert (meta["actor_cls"], meta["critic_cls"]) == ("PolicyNet", "StateCritic")
+    assert critic.per_agent and critic.use_obs and critic.state_dim == 0
+    obs = torch.randn(3, 4, actor.obs_dim)
+    assert critic(obs).shape == (3, 4) and actor.greedy(obs).shape == (3, 4, 2)
+    resumed = parse_args([*flags, "--resume", str(path), "--resume-critic-only"])
+    assert resumed.resume_critic_only
+    train(resumed)
+
+
+@pytest.mark.parametrize(
+    ("flags", "match"),
+    [
+        (["--critic-input", "state"], "no critic_state"),
+        (["--aux-coef", "0.1"], "needs actor='policynet'"),
+        (["--actor", "policynet", "--aux-coef", "0.1"], "no aux_targets"),
+    ],
+)
+def test_train_refuses_options_the_scenario_cannot_feed(tmp_path, flags, match, capsys):
+    argv = ["--scenario", "navigation", *SMOKE, "--checkpoint-dir", str(tmp_path), *flags]
+    try:
+        cfg = parse_args(argv)
+    except SystemExit:  # rejected by the spec itself, as a CLI error
+        assert match in capsys.readouterr().err
+        return
+    with pytest.raises(ValueError, match=match):
+        train(cfg)
+
+
+def test_spec_network_defaults_reproduce_the_plain_trainer():
+    from swarp.rl.recipes import TrainSpec
+
+    spec = TrainSpec()
+    assert (spec.actor, spec.critic_input, spec.per_agent_value, spec.aux_coef) == (
+        "mlp", "obs", False, 0.0,
+    )
+    assert all(
+        (s.actor, s.critic_input, s.per_agent_value, s.aux_coef) == ("mlp", "obs", False, 0.0)
+        for s in SPECS.values()
+    )
+
+
+def test_a_v2_checkpoint_round_trips_a_role_aware_architecture(tmp_path):
+    torch.manual_seed(0)
+    counts = (1, 2)
+    actor = PolicyNet(
+        5, 2, 8, role_counts=counts, role_params="separate", aux_dim=2,
+        low=[-2.0, -1.0], high=[2.0, 1.0],
+    )
+    critic = StateCritic(4, 5, 3, 8, use_obs=True, role_counts=counts, per_agent=True)
+    path = tmp_path / "v2.pt"
+    torch.save(
+        {
+            "format": "swarp.rl/2", "actor_cls": "PolicyNet", "actor_kwargs": actor.config,
+            "critic_cls": "StateCritic", "critic_kwargs": critic.config,
+            "actor": actor.state_dict(), "critic": critic.state_dict(),
+            "state_dim": 4, "role_counts": list(counts), "aux_dim": 2,
+        },
+        path,
+    )
+    a, c, meta = load_checkpoint(path)
+    assert isinstance(a, PolicyNet) and isinstance(c, StateCritic)
+    assert a.role_counts == counts and a.role_params == "separate" and not a.unit_box
+    obs, state, roles = torch.randn(6, 3, 5), torch.randn(6, 4), torch.tensor([[1, 0, 1]] * 6)
+    assert torch.equal(a.greedy(obs, roles), actor.greedy(obs, roles))
+    aux = [net.step(obs, roles, with_aux=True)[2] for net in (a, actor)]
+    assert torch.equal(*aux)
+    assert torch.equal(c(obs, state, roles), critic(obs, state, roles))
+
+
+def test_a_hand_built_v1_checkpoint_still_loads(tmp_path):
+    """The exact key set ``swarp.rl/1`` wrote: no class names, rebuilt from its dims."""
+    torch.manual_seed(0)
+    actor, critic = Actor(5, 2, 8, low=torch.tensor([-2.0, -1.0])), Critic(5, 3, 8)
+    path = tmp_path / "v1.pt"
+    torch.save(
+        {
+            "format": "swarp.rl/1", "actor": actor.state_dict(), "critic": critic.state_dict(),
+            "obs_dim": 5, "act_dim": 2, "n_agents": 3, "num_cells": 8,
+            "act_low": [-2.0, -1.0], "act_high": [1.0, 1.0], "scenario": "navigation",
+            "scen_kwargs": {}, "dt": 0.05, "substeps": 4, "max_steps": 200, "difficulty": 1.0,
+        },
+        path,
+    )
+    a, c, meta = load_checkpoint(path)
+    assert type(a) is Actor and type(c) is Critic and meta["format"] == "swarp.rl/1"
+    obs = torch.randn(6, 3, 5)
+    assert torch.equal(a.greedy(obs), actor.greedy(obs))
+    assert torch.equal(c(obs), critic(obs))
 
 
 def test_eval_mappo_reads_a_swarp_rl_checkpoint(tmp_path, monkeypatch):
@@ -110,7 +212,7 @@ def test_eval_mappo_reads_a_swarp_rl_checkpoint(tmp_path, monkeypatch):
     cfg = parse_args(["--scenario", "navigation", *SMOKE, "--checkpoint-dir", str(tmp_path)])
     arm, ckpt = eval_mappo._load_arm(str(train(cfg)), "cpu")
     assert ckpt["scenario"] == "navigation"
-    act = arm(3, "cpu", None, None)(torch.zeros(3, 4, ckpt["obs_dim"]))
+    act = arm["policy"](3, "cpu", None, None)(torch.zeros(3, 4, ckpt["obs_dim"]))
     assert act.shape == (3, 4, ckpt["act_dim"]) and act.abs().max() <= 1.0
     sys.modules.pop("eval_mappo", None)
 
@@ -118,22 +220,90 @@ def test_eval_mappo_reads_a_swarp_rl_checkpoint(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------- CUDA graphs
 
 
-def _algo(graphs: bool, seed: int = 0, **spec_kw) -> MAPPO:
+ROLE_COUNTS = (1, 3)
+AUX_DIM = 3
+
+
+def _patch_training_hooks(env) -> None:
+    """Give navigation the three training hooks, all fixed-address: the state is the obs
+    buffer flattened, the roles a constant per-env buffer (shuffled, so the role sort is
+    not the identity), the aux targets a slice of the obs buffer."""
+    scen, E, A = env.scenario, env.n_envs, env.n_agents
+    gen = torch.Generator().manual_seed(7)
+    base = torch.tensor([r for r, c in enumerate(ROLE_COUNTS) for _ in range(c)])
+    roles = torch.stack([base[torch.randperm(A, generator=gen)] for _ in range(E)])
+    roles = roles.to(env.device, torch.int32)
+    scen.state_dim = A * env.obs_dim
+    scen.critic_state = lambda: scen.observations().flatten(-2)
+    scen.n_roles, scen.role_counts = len(ROLE_COUNTS), ROLE_COUNTS
+    scen.agent_roles = lambda: roles
+    scen.aux_dim = AUX_DIM
+    scen.aux_targets = lambda: scen.observations()[..., :AUX_DIM]
+
+
+def _algo(
+    graphs: bool, seed: int = 0, device: str = "cuda:0", features: bool = False, **spec_kw
+) -> MAPPO:
+    """Navigation at test size; ``features`` turns on the state critic (state + obs, per
+    agent), role heads and the aux loss over :func:`_patch_training_hooks`."""
+    # A previous test's MAPPO holds captured torch graphs in reference cycles (bound
+    # methods); collected during this env's Warp capture, their teardown would invalidate
+    # it. ``torch.cuda.graph`` collects before its own captures for the same reason.
+    gc.collect()
+    if features:
+        spec_kw = {"actor": "policynet", "aux_coef": 0.5, **spec_kw}
     spec = replace(
         SPECS["navigation"], n_envs=64, steps_per_batch=8, epochs=2, minibatches=4,
         num_cells=32, **spec_kw,
     )
     env = build_env(
-        "navigation", n_envs=spec.n_envs, n_agents=spec.n_agents, device="cuda:0",
+        "navigation", n_envs=spec.n_envs, n_agents=spec.n_agents, device=device,
         dt=spec.dt, substeps=spec.substeps, max_steps=spec.max_steps, seed=seed,
         env_kwargs={"auto_reset": True},
     )
     torch.manual_seed(seed)
-    actor = Actor(env.obs_dim, env.act_dim, spec.num_cells).cuda()
-    critic = Critic(env.obs_dim, env.n_agents, spec.num_cells).cuda()
-    algo = MAPPO(env, actor, critic, spec, graphs=graphs)
+    Ob, A = env.obs_dim, env.n_agents
+    if features:
+        _patch_training_hooks(env)
+        actor = PolicyNet(
+            Ob, env.act_dim, spec.num_cells, role_counts=ROLE_COUNTS, aux_dim=AUX_DIM
+        )
+        critic = StateCritic(
+            env.state_dim, Ob, A, spec.num_cells, use_obs=True, role_counts=ROLE_COUNTS,
+            per_agent=True,
+        )
+    else:
+        actor = Actor(Ob, env.act_dim, spec.num_cells)
+        critic = Critic(Ob, A, spec.num_cells)
+    algo = MAPPO(env, actor.to(device), critic.to(device), spec, graphs=graphs)
     algo.reset()
     return algo
+
+
+def test_defaults_allocate_no_new_buffers_and_keep_the_legacy_stats():
+    algo = _algo(graphs=False, device="cpu")
+    assert algo.state_buf is None and algo.role_buf is None and algo.aux_buf is None
+    assert algo.mb_stats.numel() == 4
+    assert algo.stat_names == list(LEGACY_STAT_NAMES) == [
+        "mean_reward", "n_terminated", "n_done", "loss_objective", "loss_critic", "entropy",
+        "grad_skips",
+    ]
+    algo.rollout()
+    assert algo._act_ptrs == (algo._out[0].data_ptr(),)  # only the obs is watched
+    stats = algo.update(algo.spec.entropy_coeff)
+    assert list(stats) == algo.stat_names
+
+
+def test_features_add_their_buffers_and_the_aux_stat():
+    algo = _algo(graphs=False, device="cpu", features=True)
+    T, E, A, S = algo.T, algo.E, algo.A, algo.env.state_dim
+    assert algo.state_buf.shape == (T + 1, E, S)
+    assert algo.role_buf.shape == (T + 1, E, A) and algo.role_buf.dtype == torch.long
+    assert algo.aux_buf.shape == (T, E, A, AUX_DIM)
+    assert algo.stat_names == [*LEGACY_STAT_NAMES[:6], "loss_aux", "grad_skips"]
+    algo.rollout()
+    stats = algo.update(algo.spec.entropy_coeff)
+    assert stats["loss_aux"] > 0 and stats["grad_skips"] == 0
 
 
 @pytest.mark.gpu
@@ -150,16 +320,42 @@ def test_captured_rollout_fills_consistent_slots():
     assert torch.equal(algo.obs_buf[algo.T], algo._out[0])
 
 
+@pytest.mark.gpu
+def test_captured_rollout_records_state_roles_and_aux_with_their_obs():
+    """Each slot's state, roles and aux targets are the ones written with that slot's obs
+    (the patched hooks are views of the obs buffer, so the rows must agree exactly)."""
+    algo = _algo(graphs=True, features=True)
+    for _ in range(2):
+        algo.rollout()
+    T = algo.T
+    assert torch.equal(algo.state_buf, algo.obs_buf.flatten(-2))
+    assert torch.equal(algo.aux_buf, algo.obs_buf[:T, ..., :AUX_DIM])
+    roles = algo.env.agent_roles().long()
+    assert torch.equal(algo.role_buf, roles.expand_as(algo.role_buf))
+    with torch.no_grad():
+        loc, scale = algo.actor(algo.obs_buf[:T], algo.role_buf[:T])
+        ref = tanh_normal_log_prob(algo.u_buf, loc, scale)
+    assert torch.allclose(algo.logp_buf, ref, atol=1e-4)
+
+
+_ROLLOUT = ("obs_buf", "u_buf", "logp_buf", "rew_buf", "term_buf", "trunc_buf",
+            "state_buf", "role_buf", "aux_buf")
+
+
 def _copy_rollout(dst: MAPPO, src: MAPPO) -> None:
-    for name in ("obs_buf", "u_buf", "logp_buf", "rew_buf", "term_buf", "trunc_buf"):
-        getattr(dst, name).copy_(getattr(src, name))
+    for name in _ROLLOUT:
+        if getattr(src, name) is not None:
+            getattr(dst, name).copy_(getattr(src, name))
 
 
 @pytest.mark.gpu
-def test_captured_update_matches_eager_update():
+@pytest.mark.parametrize("features", [False, True], ids=["default", "features"])
+def test_captured_update_matches_eager_update(features):
     """Same weights, same rollout, same permutations: the graphed update lands where the
-    eager one does. Entropy is off, since its sample is the one draw the two cannot share."""
-    eager, graphed = _algo(graphs=False), _algo(graphs=True)
+    eager one does. Entropy is off, since its sample is the one draw the two cannot share.
+    ``features`` runs it with the state critic, role heads and aux loss all on."""
+    eager = _algo(graphs=False, features=features)
+    graphed = _algo(graphs=True, features=features)
     graphed.actor.load_state_dict(eager.actor.state_dict())
     graphed.critic.load_state_dict(eager.critic.state_dict())
     eager.rollout()
@@ -173,7 +369,7 @@ def test_captured_update_matches_eager_update():
         graphed._minibatch()
     for a, b in zip(eager.params, graphed.params, strict=True):
         assert torch.allclose(a, b, atol=1e-5, rtol=1e-4)
-    assert graphed.mb_stats[3].item() == 0.0
+    assert graphed.mb_stats[-1].item() == 0.0
 
 
 @pytest.mark.gpu

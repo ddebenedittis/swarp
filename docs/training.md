@@ -65,6 +65,8 @@ Three are its own:
 `--compile`
 : `torch.compile` the minibatch loss (needs triton). Adds tens of seconds of startup; the compiled code is still captured by the minibatch graph.
 
+The network options (`--actor`, `--role-params`, `--critic-input`, `--per-agent-value`, `--aux-coef`, `--resume-critic-only`) are described in [Roles, privileged critics and auxiliary losses](#roles-privileged-critics-and-auxiliary-losses).
+
 ## Using it from Python
 
 `swarp.rl.train(swarp.rl.parse_args([...]))` is the CLI as a function.
@@ -84,12 +86,63 @@ algo = MAPPO(env, actor, critic, spec)
 algo.reset()
 for it in range(spec.iters):
     algo.rollout()
-    mean_reward, n_terminated, n_done, *_ = algo.update(spec.entropy_coeff)
+    stats = algo.update(spec.entropy_coeff)   # {name: float}, keys in algo.stat_names
+    print(it, stats["mean_reward"], stats["n_done"])
 ```
 
 The environment must be built with `auto_reset=True` and `clone_outputs=False` (the default): the graphs read its output buffers by address.
 `Actor` samples in a `[-1, 1]` tanh box and maps it affinely onto the env's per-slot action box, which `swarp.rl.check_action_box(env, name)` returns (it raises if agents' boxes disagree, since the weights are shared); `train` runs it for you and stores the box in the checkpoint.
 The map's Jacobian is constant, so it cancels in the PPO ratio and the loss is the unit-box loss.
+
+## Roles, privileged critics and auxiliary losses
+
+Five `TrainSpec` fields, each with a CLI flag, change the networks.
+Their defaults are the plain trainer: with all five at their default the same kernels run in the same order with the same random draws, and no buffer is added.
+
+| field | flag | values (default first) | needs from the scenario |
+|---|---|---|---|
+| `actor` | `--actor` | `"mlp"`, `"policynet"` | nothing |
+| `role_params` | `--role-params` | `"heads"`, `"shared"`, `"separate"` | `agent_roles()` |
+| `critic_input` | `--critic-input` | `"obs"`, `"state"`, `"state+obs"` | `critic_state()` for `state` |
+| `per_agent_value` | `--per-agent-value` | `False`, `True` | nothing |
+| `aux_coef` | `--aux-coef` | `0.0`, any positive weight | `aux_targets()` |
+
+The scenario side is three optional hooks, `critic_state()`, `agent_roles()` and `aux_targets()`, described in [Writing a scenario](writing-a-scenario.md#training-hooks-optional).
+`train` refuses an option whose hook the scenario does not provide, rather than training without it.
+
+**Actor.**
+`"mlp"` is `Actor`, the obs-only shared-weight network.
+`"policynet"` is `PolicyNet`, the same tanh-Gaussian (same squash, same greedy action), which also reads each agent's role when the scenario has roles.
+`role_params` sets where the role enters:
+
+- `"shared"`: one trunk and one head over the observation concatenated with a one-hot of the role.
+- `"heads"`: the same trunk, and a final layer with one head per role, gathered by role, so a role's head only learns from that role's agents.
+- `"separate"`: one network per role. Agents are put in role-sorted order with `role_permutation` (a one-hot cumulative sum, no sort), and each role's network runs on its fixed-size slice, so the cost is one plain GEMM per role rather than a per-sample weight gather.
+
+Roles may move between agents every episode; the role counts are fixed for the run, which is what keeps the slices fixed-size.
+
+**Critic.**
+`"obs"` with one value per team is the default `Critic`.
+Anything else is a `StateCritic`, which reads the scenario's privileged `critic_state()` (`"state"`), every agent's observation (`"obs"`), or both (`"state+obs"`).
+With roles, the observations enter in role-sorted order, so the critic sees the team in a fixed layout however the roles were drawn.
+`per_agent_value` gives each role-sorted slot its own value instead of one team value, which matters once the roles are rewarded differently.
+The critic only shapes the advantages, so a privileged state helps training and never reaches the deployed policy.
+
+**Auxiliary loss.**
+With `aux_coef > 0` the `PolicyNet` carries a linear `aux_head` on its last hidden layer, and the minibatch loss gains `aux_coef * mse(aux_head(features), aux_targets)`.
+Its use is to make the policy's features encode something the observation only implies, such as a hidden object pose behind a lidar scan.
+The mean auxiliary MSE is logged as a `loss_aux` column, which `metrics.csv` has only when the loss is on.
+
+The rollout records the critic state, the roles and the auxiliary targets next to the observation, inside the same captured act graph, and reads them back by address, as it reads the observation.
+That is why the scenario has to write them in the observation pass.
+
+`--resume-critic-only` with `--resume` loads only the critic from a checkpoint and starts a fresh actor.
+A checkpoint of a role-aware policy evaluates through `examples/eval_mappo.py` as any other: the evaluator reads the roles from the env at every step.
+
+```bash
+python -m swarp.rl --scenario <name> --actor policynet --role-params heads \
+    --critic-input state+obs --per-agent-value --aux-coef 0.1
+```
 
 ## What differs from the TorchRL trainer
 
@@ -101,7 +154,8 @@ Three things differ on purpose:
 - **The greedy action is `tanh(loc)`**, the mode of the squashed Gaussian. The TorchRL trainer's evaluator clamps the pre-tanh mean to the action box instead.
 
 A minibatch with a non-finite gradient is skipped on the device, through Adam's `found_inf` (the `GradScaler` mechanism): weights, Adam moments and step count stay exactly as they were, which is the skip the TorchRL trainer does on the host.
-The checkpoint format differs (`"format": "swarp.rl/1"`), so the two trainers' checkpoints cannot resume each other.
+The checkpoint format differs (`"format": "swarp.rl/2"`), so the two trainers' checkpoints cannot resume each other.
+A `swarp.rl/2` checkpoint keeps every `swarp.rl/1` key and adds the network classes and their constructor arguments (`actor_cls`, `actor_kwargs`, `critic_cls`, `critic_kwargs`, resolved through `swarp.rl.ARCHS`), so it still loads with `torch.load(weights_only=True)`; `swarp.rl/1` checkpoints load as before.
 
 ## Not done yet
 

@@ -65,6 +65,38 @@ class Scenario(ABC):
     parity_rtol: float = 1e-5
     parity_atol: float = 1e-6
 
+    # Training hooks: optional, and "not provided" by default. A trainer reads them to
+    # build a privileged critic, role-specific policy heads or an auxiliary loss. Each
+    # tensor they return must be a fixed-address buffer written by the same pass as
+    # ``observations()``, including the obs-only pass after an auto-reset, so that at
+    # every step it describes the same state the observation does (see
+    # ``docs/writing-a-scenario.md``).
+
+    #: Width of :meth:`critic_state`; 0 means the scenario provides none.
+    state_dim: int = 0
+    #: Number of agent roles. 1 means a single role, and :meth:`agent_roles` is ``None``.
+    n_roles: int = 1
+    #: Agents per role, summing to ``n_agents`` and fixed for the run; empty when the
+    #: scenario has no roles. Which agent holds which role may change per episode.
+    role_counts: tuple[int, ...] = ()
+    #: Width of :meth:`aux_targets`; 0 means the scenario provides none.
+    aux_dim: int = 0
+
+    def critic_state(self) -> torch.Tensor | None:
+        """Privileged per-env state for a centralised critic, ``[n_envs, state_dim]``, or
+        ``None``. Never shown to the actor."""
+        return None
+
+    def agent_roles(self) -> torch.Tensor | None:
+        """Each agent's role index, ``[n_envs, n_agents]`` integer in ``[0, n_roles)``,
+        with exactly ``role_counts[r]`` agents in role ``r`` per env; or ``None``."""
+        return None
+
+    def aux_targets(self) -> torch.Tensor | None:
+        """Per-agent auxiliary regression targets, ``[n_envs, n_agents, aux_dim]`` (e.g. a
+        hidden pose in the agent's frame), or ``None``."""
+        return None
+
     @property
     @abstractmethod
     def obs_dim(self) -> int:

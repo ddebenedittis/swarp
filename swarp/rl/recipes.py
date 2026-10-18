@@ -26,6 +26,7 @@ import torch
 
 import swarp
 from swarp import Environment
+from swarp.rl.networks import ROLE_PARAMS
 from swarp.scenarios import scenario_class
 from swarp.scenarios.base import Scenario
 
@@ -58,6 +59,12 @@ class CurriculumKnob:
         if f >= 1.0 and self.none_at_full:
             return None
         return self.lo + (self.hi - self.lo) * f ** self.exponent
+
+
+#: ``TrainSpec.actor`` values: the obs-only Actor or the role-aware PolicyNet.
+ACTORS = ("mlp", "policynet")
+#: ``TrainSpec.critic_input`` values.
+CRITIC_INPUTS = ("obs", "state", "state+obs")
 
 
 @dataclass(frozen=True)
@@ -123,6 +130,39 @@ class TrainSpec:
     """Desynchronise episode starts before the first rollout (see ``MAPPO.reset``). For a
     scenario whose episodes mostly run to ``max_steps``: without it every env truncates on
     the same step and each batch is one slice of the episode, in phase across all envs."""
+    # --- networks -----------------------------------------------------------------
+    # The defaults are the plain shared-weight Actor and obs-only Critic. The rest needs
+    # the scenario's training hooks (``Scenario.critic_state`` / ``agent_roles`` /
+    # ``aux_targets``); see docs/training.md.
+    actor: str = "mlp"
+    """``"mlp"``: :class:`~swarp.rl.networks.Actor`, obs only. ``"policynet"``:
+    :class:`~swarp.rl.networks.PolicyNet`, which reads the scenario's roles (if it has
+    any) through ``role_params`` and carries the aux head when ``aux_coef > 0``."""
+    role_params: str = "heads"
+    """How a ``"policynet"`` actor's parameters depend on the role: ``"shared"`` (role as an
+    input only), ``"heads"`` (one output head per role) or ``"separate"`` (one network per
+    role). Ignored for ``"mlp"`` and for a scenario without roles."""
+    critic_input: str = "obs"
+    """``"obs"`` (every agent's observation), ``"state"`` (the scenario's privileged
+    ``critic_state()``) or ``"state+obs"``."""
+    per_agent_value: bool = False
+    """One value per agent (per role-sorted slot when the scenario has roles) instead of
+    one team value broadcast to every agent."""
+    aux_coef: float = 0.0
+    """Weight of the auxiliary loss ``mse(aux_head(features), scenario.aux_targets())``;
+    0 disables it. Above 0 it needs ``actor="policynet"`` and a scenario with
+    ``aux_dim > 0``."""
+
+    def __post_init__(self) -> None:
+        for name, allowed in (
+            ("actor", ACTORS), ("role_params", ROLE_PARAMS), ("critic_input", CRITIC_INPUTS),
+        ):
+            if getattr(self, name) not in allowed:
+                raise ValueError(f"{name} must be one of {allowed}, got {getattr(self, name)!r}")
+        if self.aux_coef < 0:
+            raise ValueError(f"aux_coef must be >= 0, got {self.aux_coef}")
+        if self.aux_coef > 0 and self.actor != "policynet":
+            raise ValueError("aux_coef > 0 needs actor='policynet' (the aux head lives there)")
 
 
 # Scenarios with no success criterion: both inherit the all-False ``Scenario.done``, so an
@@ -727,6 +767,7 @@ def score(
     scenario: str,
     *,
     policy: PolicyArm | None = None,
+    policy_from_env: Callable[[Environment], ActionFn] | None = None,
     n_agents: int,
     n_envs: int = 2048,
     steps: int = 400,
@@ -748,14 +789,19 @@ def score(
     counts. (Looks like a bug otherwise, hence this note.)
 
     ``max_steps=None`` and ``auto_reset=False``, so the episode is genuinely single and
-    ``truncated`` never fires. ``policy`` builds the policy arm (see :data:`PolicyArm`).
+    ``truncated`` never fires. ``policy`` builds the policy arm (see :data:`PolicyArm`);
+    ``policy_from_env`` builds it from the arm's env instead, for a policy that reads more
+    than the observation each call (the roles in ``env.agent_roles()``, a hidden state).
+    Pass one of the two.
     Each arm gets a **fresh env on the same seed**, and the policy arm consumes no RNG, so
     the arms are paired: differences are attributable to the controller, not to the
     initial conditions. ``tests/examples`` pins that.
     """
+    if policy is not None and policy_from_env is not None:
+        raise ValueError("pass policy or policy_from_env, not both")
     out: dict[str, ArmResult] = {}
     for name in arms:
-        if name == "policy" and policy is None:
+        if name == "policy" and policy is None and policy_from_env is None:
             continue
         if name == "scripted" and baseline is None:
             continue
@@ -776,7 +822,7 @@ def score(
         lo, hi = env.action_bounds
         act_dim = env.world.act_dim
         if name == "policy":
-            act = policy(n_envs, device, lo, hi)
+            act = policy_from_env(env) if policy is None else policy(n_envs, device, lo, hi)
         elif name == "random":
             act = random_actions(n_envs, n_agents, act_dim, device, seed, lo, hi)
         elif name == "zero":

@@ -58,6 +58,7 @@ from __future__ import annotations
 import argparse
 import sys
 from functools import partial
+from typing import Any
 
 import torch
 from mappo import (
@@ -71,8 +72,8 @@ from mappo import (
 )
 
 import swarp
-from swarp.rl.ppo import CHECKPOINT_FORMAT, greedy_arm, load_checkpoint
-from swarp.rl.recipes import PolicyArm, coerce_scen_kwargs, score
+from swarp.rl.ppo import CHECKPOINT_FORMATS, greedy_arm, greedy_score_kwargs, load_checkpoint
+from swarp.rl.recipes import ActionFn, coerce_scen_kwargs, score
 
 
 def _load(path: str, device: str):
@@ -92,21 +93,24 @@ def _load(path: str, device: str):
     return policy, ckpt
 
 
-def _load_arm(path: str, device: str) -> tuple[PolicyArm, dict]:
+def _load_arm(path: str, device: str) -> tuple[dict[str, Any], dict]:
     """The greedy policy arm and metadata of either trainer's checkpoint.
 
-    A ``swarp.rl`` checkpoint acts with ``tanh(loc)``; a ``train_mappo.py`` one keeps its
-    historical ``loc.clamp(lo, hi)`` (see :func:`mappo.greedy_actions`).
+    The arm is the keyword :func:`score` takes it as: ``{"policy": PolicyArm}``, or
+    ``{"policy_from_env": ...}`` for a role-aware ``swarp.rl`` policy, which reads the
+    roles from the env at every call. A ``swarp.rl`` checkpoint acts with ``tanh(loc)``;
+    a ``train_mappo.py`` one keeps its historical ``loc.clamp(lo, hi)`` (see
+    :func:`mappo.greedy_actions`).
     """
     ckpt = torch.load(path, map_location=device, weights_only=True)
-    if ckpt.get("format") == CHECKPOINT_FORMAT:
+    if ckpt.get("format") in CHECKPOINT_FORMATS:
         actor, _, ckpt = load_checkpoint(path, device)
-        return greedy_arm(actor), ckpt
+        return greedy_score_kwargs(actor), ckpt
     if ckpt.get("format") == "rsl_rl/1":  # examples/train_rsl_rl.py: acts with clamp(mean)
         import train_rsl_rl
 
         actor, ckpt = train_rsl_rl.load_checkpoint(path, device)
-        return train_rsl_rl.greedy_arm(actor), ckpt
+        return {"policy": train_rsl_rl.greedy_arm(actor)}, ckpt
     if ckpt.get("format") == "benchmarl/1":
         # train_benchmarl.py saves its actor in swarp.rl's layout; tanh(loc) is BenchMARL's
         # deterministic action too. No benchmarl import needed.
@@ -117,9 +121,17 @@ def _load_arm(path: str, device: str) -> tuple[PolicyArm, dict]:
             low=ckpt.get("act_low"), high=ckpt.get("act_high"),
         ).to(device)
         actor.load_state_dict(ckpt["actor"])
-        return greedy_arm(actor.eval()), ckpt
+        return {"policy": greedy_arm(actor.eval())}, ckpt
     policy, ckpt = _load(path, device)
-    return partial(greedy_actions, policy), ckpt
+    return {"policy": partial(greedy_actions, policy)}, ckpt
+
+
+def _action_fn(arm: dict[str, Any], env: swarp.Environment, device: str) -> ActionFn:
+    """The arm's action function on ``env``, whichever keyword it came as."""
+    if "policy_from_env" in arm:
+        return arm["policy_from_env"](env)
+    lo, hi = env.action_bounds
+    return arm["policy"](env.n_envs, device, lo, hi)
 
 
 def main() -> int:
@@ -190,7 +202,7 @@ def main() -> int:
 
     res = score(
         scenario,
-        policy=arm,
+        **arm,
         n_agents=n_agents,
         n_envs=args.n_envs,
         steps=steps,
@@ -251,8 +263,7 @@ def main() -> int:
             n_agents=n_agents, **scen_kwargs,
         )
         env.reset(seed=args.seed)
-        lo, hi = env.action_bounds
-        act = arm(1, args.device, lo, hi)
+        act = _action_fn(arm, env, args.device)
         n = args.render_steps
         step_rate = args.speed / dt  # sim steps per second of wall clock
         print(
