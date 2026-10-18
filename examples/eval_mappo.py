@@ -71,7 +71,7 @@ from mappo import (
 )
 
 import swarp
-from swarp.rl.ppo import CHECKPOINT_FORMAT, greedy_arm, load_checkpoint
+from swarp.rl.ppo import CHECKPOINT_FORMATS, greedy_arm, load_checkpoint
 from swarp.rl.recipes import PolicyArm, coerce_scen_kwargs, score
 
 
@@ -99,7 +99,7 @@ def _load_arm(path: str, device: str) -> tuple[PolicyArm, dict]:
     historical ``loc.clamp(lo, hi)`` (see :func:`mappo.greedy_actions`).
     """
     ckpt = torch.load(path, map_location=device, weights_only=True)
-    if ckpt.get("format") == CHECKPOINT_FORMAT:
+    if ckpt.get("format") in CHECKPOINT_FORMATS:
         actor, _, ckpt = load_checkpoint(path, device)
         return greedy_arm(actor), ckpt
     if ckpt.get("format") == "rsl_rl/1":  # examples/train_rsl_rl.py: acts with clamp(mean)

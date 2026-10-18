@@ -84,7 +84,8 @@ algo = MAPPO(env, actor, critic, spec)
 algo.reset()
 for it in range(spec.iters):
     algo.rollout()
-    mean_reward, n_terminated, n_done, *_ = algo.update(spec.entropy_coeff)
+    stats = algo.update(spec.entropy_coeff)   # {name: float}, keys in algo.stat_names
+    print(it, stats["mean_reward"], stats["n_done"])
 ```
 
 The environment must be built with `auto_reset=True` and `clone_outputs=False` (the default): the graphs read its output buffers by address.

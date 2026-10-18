@@ -60,6 +60,14 @@ from swarp.rl.recipes import (
 )
 
 CHECKPOINT_FORMAT = "swarp.rl/1"
+#: Every format :func:`load_checkpoint` reads.
+CHECKPOINT_FORMATS = ("swarp.rl/1", "swarp.rl/2")
+#: The per-iteration statistics a default run returns from :meth:`MAPPO.update`, in order,
+#: before the logged ``info()`` metrics.
+LEGACY_STAT_NAMES = (
+    "mean_reward", "n_terminated", "n_done", "loss_objective", "loss_critic", "entropy",
+    "grad_skips",
+)
 _CLIP_EPS = 0.2
 _MAX_GRAD_NORM = 1.0
 # torchrl's ``_standardize`` default: float32 resolution.
@@ -164,6 +172,35 @@ def gae(
 # ------------------------------------------------------------------------------ the loss
 
 
+def standardize_advantage(adv: torch.Tensor) -> torch.Tensor:
+    """Per agent: statistics over the minibatch (dim 0), agent dim excluded."""
+    return (adv - adv.mean(0)) / adv.std(0).clamp_min(_ADV_EPS)
+
+
+def ppo_terms(
+    loc: torch.Tensor,
+    scale: torch.Tensor,
+    u: torch.Tensor,
+    logp_old: torch.Tensor,
+    adv: torch.Tensor,
+    noise: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The policy half of the loss from the actor's outputs: ``(objective, entropy)``.
+
+    ``loc``/``scale`` are the actor's Gaussian over the pre-tanh sample, ``u`` the stored
+    sample and ``noise`` a standard normal draw for the entropy's reparametrized sample,
+    all ``[B, A, act_dim]``; ``logp_old`` and ``adv`` (already normalized, if at all) are
+    ``[B, A]``. Network-free, so any actor (role heads, a recurrent core) reuses it.
+    """
+    log_w = tanh_normal_log_prob(u, loc, scale) - logp_old
+    gain = torch.minimum(
+        log_w.exp() * adv,
+        log_w.clamp(math.log1p(-_CLIP_EPS), math.log1p(_CLIP_EPS)).exp() * adv,
+    )
+    entropy = -tanh_normal_log_prob(loc + scale * noise, loc, scale).mean()
+    return -gain.mean(), entropy
+
+
 def ppo_loss(
     actor: Actor,
     critic: Critic,
@@ -179,22 +216,32 @@ def ppo_loss(
 
     ``obs`` is ``[B, A, obs_dim]``; ``u`` (the stored pre-tanh sample) and ``noise`` (a
     standard normal draw for the entropy's reparametrized sample) are ``[B, A, act_dim]``;
-    the rest are ``[B, A]``. Returns ``(objective, critic, entropy)``.
+    the rest are ``[B, A]``. Returns ``(objective, critic, entropy)``. A thin wrapper over
+    :func:`ppo_terms` that keeps the original op order (advantages, actor, policy terms,
+    critic), so a default run launches the same kernels in the same sequence.
     """
     if normalize_advantage:
-        # Per agent: statistics over the minibatch, agent dim excluded.
-        adv = (adv - adv.mean(0)) / adv.std(0).clamp_min(_ADV_EPS)
+        adv = standardize_advantage(adv)
     loc, scale = actor(obs)
-    log_w = tanh_normal_log_prob(u, loc, scale) - logp_old
-    gain = torch.minimum(
-        log_w.exp() * adv,
-        log_w.clamp(math.log1p(-_CLIP_EPS), math.log1p(_CLIP_EPS)).exp() * adv,
-    )
-    entropy = -tanh_normal_log_prob(loc + scale * noise, loc, scale).mean()
-    return -gain.mean(), F.smooth_l1_loss(critic(obs), ret), entropy
+    objective, entropy = ppo_terms(loc, scale, u, logp_old, adv, noise)
+    return objective, F.smooth_l1_loss(critic(obs), ret), entropy
 
 
 # ------------------------------------------------------------------------------ the core
+
+
+def metric_names(metrics: Mapping[str, int]) -> list[str]:
+    """One column name per logged value: the key for a scalar metric; ``rew_term{i}`` for
+    each term of ``multiobj_reward``, ``{key}_{i}`` for any other multi-wide one."""
+    names: list[str] = []
+    for key, width in metrics.items():
+        if width == 1:
+            names.append(key)
+        elif key == "multiobj_reward":
+            names += [f"rew_term{i}" for i in range(width)]
+        else:
+            names += [f"{key}_{i}" for i in range(width)]
+    return names
 
 
 class MAPPO:
@@ -223,6 +270,7 @@ class MAPPO:
         self.cuda = dev.type == "cuda"
         self.graphs = graphs and self.cuda
         self.metrics = dict(metrics)  # info key -> width
+        self.metric_names = metric_names(self.metrics)
         T, E, A = spec.steps_per_batch, env.n_envs, env.n_agents
         Ob, D = env.obs_dim, env.act_dim
         self.T, self.E, self.A = T, E, A
@@ -258,6 +306,8 @@ class MAPPO:
         self.mb_stats = z(4)
         self.found_inf = z(())
         self.force_skip = z(())
+        #: The keys of :meth:`update`'s result, in the order the stats buffers hold them.
+        self.stat_names = [*LEGACY_STAT_NAMES, *self.metric_names]
 
         params = [*actor.parameters(), *critic.parameters()]
         self.params = params
@@ -275,7 +325,7 @@ class MAPPO:
             self.optim = torch.optim.Adam(params, lr=spec.lr)
 
         self._out: tuple[Any, ...] | None = None
-        self._obs_ptr = 0  # the obs buffer the act graph reads
+        self._act_ptrs: tuple[int, ...] = ()  # the buffers the act graph reads
         self._sig: tuple[int, ...] | None = None  # the buffers the store graph reads
         self._act = _Graphed(self._act_body, self.graphs, carries=(self.t,))
         self._store = _Graphed(
@@ -319,6 +369,10 @@ class MAPPO:
             *(info[k].data_ptr() for k in self.metrics),
         )
 
+    def _act_inputs(self) -> tuple[torch.Tensor, ...]:
+        """The env-owned buffers the act graph reads by address."""
+        return (self._out[0],)
+
     def _act_body(self) -> None:
         obs = self._out[0]
         self.obs_buf.index_copy_(0, self.t, obs.unsqueeze(0))
@@ -351,10 +405,10 @@ class MAPPO:
         for _ in range(self.T):
             # The graphs read the env's output buffers by address. They are fixed in
             # steady state, but a first step or a reallocated buffer means a recapture.
-            ptr = self._out[0].data_ptr()
-            if ptr != self._obs_ptr:
+            ptrs = tuple(t.data_ptr() for t in self._act_inputs())
+            if ptrs != self._act_ptrs:
                 self._act.invalidate()
-                self._obs_ptr = ptr
+                self._act_ptrs = ptrs
             self._act()
             out = env.step(actions)
             sig = self._signature(out)
@@ -419,16 +473,17 @@ class MAPPO:
         self.mb_stats[3] += found
         self.k.add_(1)
 
-    def update(self, entropy_coeff: float) -> list[float]:
-        """One PPO update over the last rollout. Returns the per-iteration statistics:
-        ``[mean reward, n_terminated, n_done, objective, critic, entropy, skips,
-        *metric means]``, sums over minibatches for the losses. One host sync."""
+    def update(self, entropy_coeff: float) -> dict[str, float]:
+        """One PPO update over the last rollout. Returns the per-iteration statistics
+        keyed by :attr:`stat_names`: the rollout's mean reward and episode-end counts, the
+        losses and the skipped-minibatch count summed over minibatches, and the logged
+        ``info()`` means. One host sync."""
         self.ent_coef.fill_(entropy_coeff)
         self._prepare()
         for _ in range(self.spec.epochs * self.M):
             self._minibatch()
         stats = torch.cat([self.prep_stats, self.mb_stats, self.metric_acc / self.T])
-        return stats.tolist()
+        return dict(zip(self.stat_names, stats.tolist(), strict=True))
 
 
 # ------------------------------------------------------------------------- checkpoints
@@ -439,8 +494,8 @@ def load_checkpoint(
 ) -> tuple[Actor, Critic, dict[str, Any]]:
     """Actor, critic and metadata from a :func:`train` checkpoint."""
     ckpt = torch.load(path, map_location=device, weights_only=True)
-    if ckpt.get("format") != CHECKPOINT_FORMAT:
-        raise ValueError(f"{path} is not a {CHECKPOINT_FORMAT} checkpoint")
+    if ckpt.get("format") not in CHECKPOINT_FORMATS:
+        raise ValueError(f"{path} is not a swarp.rl checkpoint (one of {CHECKPOINT_FORMATS})")
     actor = Actor(
         ckpt["obs_dim"], ckpt["act_dim"], ckpt["num_cells"],
         low=ckpt.get("act_low"), high=ckpt.get("act_high"),
@@ -640,9 +695,7 @@ def train(cfg: TrainConfig) -> Path:
     metrics = {
         k: (info0[k].shape[-1] if k == "multiobj_reward" else 1) for k in spec.metrics
     }
-    metric_cols: list[str] = []
-    for k, w in metrics.items():
-        metric_cols += [f"rew_term{i}" for i in range(w)] if k == "multiobj_reward" else [k]
+    metric_cols = metric_names(metrics)
 
     actor = Actor(obs_dim, act_dim, spec.num_cells, low=act_low, high=act_high).to(device)
     critic = Critic(obs_dim, n_agents, spec.num_cells).to(device)
@@ -741,8 +794,9 @@ def train(cfg: TrainConfig) -> Path:
         if it == 0:
             print(f"  env graph_mode {env.graph_mode}")
 
-        mean_reward, n_term, n_done, obj, crit, ent, skips = stats[:7]
-        skips = int(skips)
+        mean_reward, n_term, n_done = stats["mean_reward"], stats["n_terminated"], stats["n_done"]
+        obj, crit, ent = stats["loss_objective"], stats["loss_critic"], stats["entropy"]
+        skips = int(stats["grad_skips"])
         updates = max(n_mb - skips, 1)
         window.update_counts(int(n_term), int(n_done), frames_per_batch)
         total_skips += skips
@@ -782,7 +836,7 @@ def train(cfg: TrainConfig) -> Path:
              "" if eval_rate is None else f"{eval_rate:.4f}",
              "" if eval_lo is None else f"{eval_lo:.4f}",
              "" if eval_hi is None else f"{eval_hi:.4f}"]
-            + [f"{x:.6f}" for x in stats[7:]]
+            + [f"{stats[k]:.6f}" for k in metric_cols]
         )
         csv_file.flush()
         rate_txt = "  --  " if rate is None else f"{rate:.3f}"
