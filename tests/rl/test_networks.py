@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from swarp.rl.networks import StateCritic, role_permutation, role_slots
+from swarp.rl.networks import Actor, PolicyNet, StateCritic, role_permutation, role_slots
 
 COUNTS = (2, 3, 1)  # three roles over six agents
 
@@ -68,3 +68,103 @@ def test_state_critic_broadcasts_one_value_by_default():
 def test_state_critic_rejects_an_empty_input():
     with pytest.raises(ValueError, match="state_dim > 0 or use_obs"):
         StateCritic(0, 3, 4)
+
+
+# ------------------------------------------------------------------------------ PolicyNet
+
+
+def _joint_permutation(obs, roles, seed: int = 3):
+    """A random per-row permutation of the agents, applied to obs and roles together."""
+    gen = torch.Generator().manual_seed(seed)
+    sigma = torch.stack([torch.randperm(roles.shape[-1], generator=gen) for _ in roles])
+    return sigma, _take_rows(obs, sigma), roles.gather(-1, sigma)
+
+
+def _take_rows(x, index):
+    return x.gather(1, index[..., None].expand(*index.shape, x.shape[-1]))
+
+
+@pytest.mark.parametrize("role_params", ["shared", "heads", "separate"])
+def test_policy_routing_is_equivariant_under_a_joint_permutation(role_params):
+    """An agent's action depends on its own obs and role only, not on its index."""
+    torch.manual_seed(0)
+    net = PolicyNet(4, 2, 16, role_counts=COUNTS, role_params=role_params, aux_dim=3)
+    obs, roles = torch.randn(10, 6, 4), _random_roles(10)
+    loc, scale, aux, _ = net.step(obs, roles, with_aux=True)
+    sigma, obs_p, roles_p = _joint_permutation(obs, roles)
+    loc_p, scale_p, aux_p, _ = net.step(obs_p, roles_p, with_aux=True)
+    assert torch.allclose(loc_p, _take_rows(loc, sigma), atol=1e-6)
+    assert torch.allclose(scale_p, _take_rows(scale, sigma), atol=1e-6)
+    assert torch.allclose(aux_p, _take_rows(aux, sigma), atol=1e-6)
+
+
+@pytest.mark.parametrize("role_params", ["heads", "separate"])
+def test_role_specific_parameters_get_gradient_only_from_their_role(role_params):
+    torch.manual_seed(0)
+    net = PolicyNet(4, 2, 16, role_counts=COUNTS, role_params=role_params)
+    obs, roles = torch.randn(10, 6, 4), _random_roles(10)
+    loc, scale = net(obs, roles)
+    ((loc.square() + scale) * (roles == 0).unsqueeze(-1)).sum().backward()
+    if role_params == "heads":
+        g = net.head.weight.grad.view(len(COUNTS), 4, 16)  # [R, 2 * act_dim, F]
+        assert g[0].abs().sum() > 0
+        assert torch.equal(g[1:], torch.zeros_like(g[1:]))
+    else:
+        for r, (trunk, head) in enumerate(zip(net.trunks, net.heads, strict=True)):
+            grads = [p.grad for p in (*trunk.parameters(), *head.parameters())]
+            if r == 0:
+                assert all(g is not None and g.abs().sum() > 0 for g in grads)
+            else:
+                assert all(g is None or torch.equal(g, torch.zeros_like(g)) for g in grads)
+
+
+def test_policy_without_roles_is_an_actor_with_an_aux_head():
+    """No roles: the same layer shapes and the same tanh-Gaussian maths as ``Actor``."""
+    torch.manual_seed(0)
+    net = PolicyNet(3, 2, 8, aux_dim=2, low=[-2.0, -0.5], high=[2.0, 0.5])
+    actor = Actor(3, 2, 8, low=torch.tensor([-2.0, -0.5]), high=torch.tensor([2.0, 0.5]))
+    for dst, src in zip((*net.trunk, net.head), actor.net, strict=True):
+        dst.load_state_dict(src.state_dict())
+    obs = torch.randn(5, 4, 3)
+    for a, b in zip(net(obs), actor(obs), strict=True):
+        assert torch.equal(a, b)
+    assert torch.equal(net.greedy(obs), actor.greedy(obs))
+    u = torch.randn(5, 4, 2) * 5
+    assert torch.equal(net.squash(u), actor.squash(u))
+    assert "act_mid" not in net.state_dict()
+
+
+def test_aux_loss_trains_the_head_and_coef_zero_leaves_the_policy_gradient_alone():
+    from swarp.rl.ppo import ppo_terms
+
+    torch.manual_seed(0)
+    net = PolicyNet(4, 2, 16, role_counts=COUNTS, aux_dim=3)
+    obs, roles = torch.randn(10, 6, 4), _random_roles(10)
+    u, noise = torch.randn(10, 6, 2), torch.randn(10, 6, 2)
+    logp_old, adv, target = torch.randn(10, 6), torch.randn(10, 6), torch.randn(10, 6, 3)
+
+    def grads(coef: float | None) -> list[torch.Tensor]:
+        net.zero_grad(set_to_none=False)
+        loc, scale, aux, _ = net.step(obs, roles, with_aux=coef is not None)
+        obj, ent = ppo_terms(loc, scale, u, logp_old, adv, noise)
+        loss = obj - 1e-2 * ent
+        if coef is not None:
+            loss = loss + coef * torch.nn.functional.mse_loss(aux, target)
+        loss.backward()
+        return [torch.zeros_like(p) if p.grad is None else p.grad.clone() for p in net.parameters()]
+
+    plain, zero, on = grads(None), grads(0.0), grads(1.0)
+    for a, b in zip(plain, zero, strict=True):
+        assert torch.equal(a, b)
+    assert net.aux_head.weight.grad.abs().sum() > 0  # the last call, coef 1.0
+    trunk_w = net.trunk[0].weight
+    i = [p is trunk_w for p in net.parameters()].index(True)
+    assert not torch.equal(on[i], plain[i])  # the aux loss shapes the shared features
+
+
+def test_policy_needs_roles_when_it_has_them():
+    net = PolicyNet(4, 2, 8, role_counts=(1, 1))
+    with pytest.raises(ValueError, match="pass roles"):
+        net(torch.zeros(2, 2, 4))
+    with pytest.raises(ValueError, match="role_params"):
+        PolicyNet(4, 2, 8, role_counts=(1, 1), role_params="mixture")

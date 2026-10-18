@@ -99,6 +99,9 @@ class TrainSpec:
     """When set, ``entropy_coeff`` decays linearly to this over the run. Apt for
     deadlock-prone tasks that want broad early exploration and committed late behaviour."""
     num_cells: int = 256
+    aux_coef: float = 0.0
+    """Weight of the auxiliary loss ``mse(aux_head(features), scenario.aux_targets())``;
+    0 disables it, and any value above needs a scenario with ``aux_dim > 0``."""
     normalize_advantage: bool = True
     """torchrl's ``ClipPPOLoss`` defaults this to ``False``. With a large sparse terminal
     bonus on top of small dense shaping -- which is every scenario here -- unnormalized

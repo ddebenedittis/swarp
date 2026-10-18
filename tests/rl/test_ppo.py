@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import gc
 import math
 from dataclasses import replace
 
@@ -10,8 +11,8 @@ import pytest
 import torch
 
 from swarp.rl import MAPPO, Actor, Critic, load_checkpoint, parse_args, train
-from swarp.rl.networks import tanh_normal_log_prob
-from swarp.rl.ppo import gae
+from swarp.rl.networks import PolicyNet, StateCritic, tanh_normal_log_prob
+from swarp.rl.ppo import LEGACY_STAT_NAMES, gae
 from swarp.rl.recipes import SPECS, build_env
 
 SMOKE = [
@@ -118,22 +119,90 @@ def test_eval_mappo_reads_a_swarp_rl_checkpoint(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------- CUDA graphs
 
 
-def _algo(graphs: bool, seed: int = 0, **spec_kw) -> MAPPO:
+ROLE_COUNTS = (1, 3)
+AUX_DIM = 3
+
+
+def _patch_training_hooks(env) -> None:
+    """Give navigation the three training hooks, all fixed-address: the state is the obs
+    buffer flattened, the roles a constant per-env buffer (shuffled, so the role sort is
+    not the identity), the aux targets a slice of the obs buffer."""
+    scen, E, A = env.scenario, env.n_envs, env.n_agents
+    gen = torch.Generator().manual_seed(7)
+    base = torch.tensor([r for r, c in enumerate(ROLE_COUNTS) for _ in range(c)])
+    roles = torch.stack([base[torch.randperm(A, generator=gen)] for _ in range(E)])
+    roles = roles.to(env.device, torch.int32)
+    scen.state_dim = A * env.obs_dim
+    scen.critic_state = lambda: scen.observations().flatten(-2)
+    scen.n_roles, scen.role_counts = len(ROLE_COUNTS), ROLE_COUNTS
+    scen.agent_roles = lambda: roles
+    scen.aux_dim = AUX_DIM
+    scen.aux_targets = lambda: scen.observations()[..., :AUX_DIM]
+
+
+def _algo(
+    graphs: bool, seed: int = 0, device: str = "cuda:0", features: bool = False, **spec_kw
+) -> MAPPO:
+    """Navigation at test size; ``features`` turns on the state critic (state + obs, per
+    agent), role heads and the aux loss over :func:`_patch_training_hooks`."""
+    # A previous test's MAPPO holds captured torch graphs in reference cycles (bound
+    # methods); collected during this env's Warp capture, their teardown would invalidate
+    # it. ``torch.cuda.graph`` collects before its own captures for the same reason.
+    gc.collect()
+    if features:
+        spec_kw.setdefault("aux_coef", 0.5)
     spec = replace(
         SPECS["navigation"], n_envs=64, steps_per_batch=8, epochs=2, minibatches=4,
         num_cells=32, **spec_kw,
     )
     env = build_env(
-        "navigation", n_envs=spec.n_envs, n_agents=spec.n_agents, device="cuda:0",
+        "navigation", n_envs=spec.n_envs, n_agents=spec.n_agents, device=device,
         dt=spec.dt, substeps=spec.substeps, max_steps=spec.max_steps, seed=seed,
         env_kwargs={"auto_reset": True},
     )
     torch.manual_seed(seed)
-    actor = Actor(env.obs_dim, env.act_dim, spec.num_cells).cuda()
-    critic = Critic(env.obs_dim, env.n_agents, spec.num_cells).cuda()
-    algo = MAPPO(env, actor, critic, spec, graphs=graphs)
+    Ob, A = env.obs_dim, env.n_agents
+    if features:
+        _patch_training_hooks(env)
+        actor = PolicyNet(
+            Ob, env.act_dim, spec.num_cells, role_counts=ROLE_COUNTS, aux_dim=AUX_DIM
+        )
+        critic = StateCritic(
+            env.state_dim, Ob, A, spec.num_cells, use_obs=True, role_counts=ROLE_COUNTS,
+            per_agent=True,
+        )
+    else:
+        actor = Actor(Ob, env.act_dim, spec.num_cells)
+        critic = Critic(Ob, A, spec.num_cells)
+    algo = MAPPO(env, actor.to(device), critic.to(device), spec, graphs=graphs)
     algo.reset()
     return algo
+
+
+def test_defaults_allocate_no_new_buffers_and_keep_the_legacy_stats():
+    algo = _algo(graphs=False, device="cpu")
+    assert algo.state_buf is None and algo.role_buf is None and algo.aux_buf is None
+    assert algo.mb_stats.numel() == 4
+    assert algo.stat_names == list(LEGACY_STAT_NAMES) == [
+        "mean_reward", "n_terminated", "n_done", "loss_objective", "loss_critic", "entropy",
+        "grad_skips",
+    ]
+    algo.rollout()
+    assert algo._act_ptrs == (algo._out[0].data_ptr(),)  # only the obs is watched
+    stats = algo.update(algo.spec.entropy_coeff)
+    assert list(stats) == algo.stat_names
+
+
+def test_features_add_their_buffers_and_the_aux_stat():
+    algo = _algo(graphs=False, device="cpu", features=True)
+    T, E, A, S = algo.T, algo.E, algo.A, algo.env.state_dim
+    assert algo.state_buf.shape == (T + 1, E, S)
+    assert algo.role_buf.shape == (T + 1, E, A) and algo.role_buf.dtype == torch.long
+    assert algo.aux_buf.shape == (T, E, A, AUX_DIM)
+    assert algo.stat_names == [*LEGACY_STAT_NAMES[:6], "loss_aux", "grad_skips"]
+    algo.rollout()
+    stats = algo.update(algo.spec.entropy_coeff)
+    assert stats["loss_aux"] > 0 and stats["grad_skips"] == 0
 
 
 @pytest.mark.gpu
@@ -150,16 +219,42 @@ def test_captured_rollout_fills_consistent_slots():
     assert torch.equal(algo.obs_buf[algo.T], algo._out[0])
 
 
+@pytest.mark.gpu
+def test_captured_rollout_records_state_roles_and_aux_with_their_obs():
+    """Each slot's state, roles and aux targets are the ones written with that slot's obs
+    (the patched hooks are views of the obs buffer, so the rows must agree exactly)."""
+    algo = _algo(graphs=True, features=True)
+    for _ in range(2):
+        algo.rollout()
+    T = algo.T
+    assert torch.equal(algo.state_buf, algo.obs_buf.flatten(-2))
+    assert torch.equal(algo.aux_buf, algo.obs_buf[:T, ..., :AUX_DIM])
+    roles = algo.env.agent_roles().long()
+    assert torch.equal(algo.role_buf, roles.expand_as(algo.role_buf))
+    with torch.no_grad():
+        loc, scale = algo.actor(algo.obs_buf[:T], algo.role_buf[:T])
+        ref = tanh_normal_log_prob(algo.u_buf, loc, scale)
+    assert torch.allclose(algo.logp_buf, ref, atol=1e-4)
+
+
+_ROLLOUT = ("obs_buf", "u_buf", "logp_buf", "rew_buf", "term_buf", "trunc_buf",
+            "state_buf", "role_buf", "aux_buf")
+
+
 def _copy_rollout(dst: MAPPO, src: MAPPO) -> None:
-    for name in ("obs_buf", "u_buf", "logp_buf", "rew_buf", "term_buf", "trunc_buf"):
-        getattr(dst, name).copy_(getattr(src, name))
+    for name in _ROLLOUT:
+        if getattr(src, name) is not None:
+            getattr(dst, name).copy_(getattr(src, name))
 
 
 @pytest.mark.gpu
-def test_captured_update_matches_eager_update():
+@pytest.mark.parametrize("features", [False, True], ids=["default", "features"])
+def test_captured_update_matches_eager_update(features):
     """Same weights, same rollout, same permutations: the graphed update lands where the
-    eager one does. Entropy is off, since its sample is the one draw the two cannot share."""
-    eager, graphed = _algo(graphs=False), _algo(graphs=True)
+    eager one does. Entropy is off, since its sample is the one draw the two cannot share.
+    ``features`` runs it with the state critic, role heads and aux loss all on."""
+    eager = _algo(graphs=False, features=features)
+    graphed = _algo(graphs=True, features=features)
     graphed.actor.load_state_dict(eager.actor.state_dict())
     graphed.critic.load_state_dict(eager.critic.state_dict())
     eager.rollout()
@@ -173,7 +268,7 @@ def test_captured_update_matches_eager_update():
         graphed._minibatch()
     for a, b in zip(eager.params, graphed.params, strict=True):
         assert torch.allclose(a, b, atol=1e-5, rtol=1e-4)
-    assert graphed.mb_stats[3].item() == 0.0
+    assert graphed.mb_stats[-1].item() == 0.0
 
 
 @pytest.mark.gpu

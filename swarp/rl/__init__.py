@@ -4,7 +4,7 @@
 :data:`swarp.rl.recipes.SPECS`; :func:`train` is the same loop as a function.
 """
 
-from swarp.rl.networks import Actor, Critic, StateCritic, role_permutation
+from swarp.rl.networks import Actor, Critic, PolicyNet, StateCritic, role_permutation
 from swarp.rl.ppo import (
     MAPPO,
     NonFiniteGradients,
@@ -24,6 +24,7 @@ __all__ = [
     "Actor",
     "Critic",
     "NonFiniteGradients",
+    "PolicyNet",
     "StateCritic",
     "TrainConfig",
     "TrainSpec",
