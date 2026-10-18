@@ -173,6 +173,7 @@ Each env's `steps_per_batch` steps are cut into chunks of `seq_len` consecutive 
 The recomputed log-probs are then the ones the rollout sampled with, which is what makes the PPO ratio start at one.
 A minibatch holds as many env steps as without memory; only the GRU steps one at a time, while the trunk, the heads and the critic run over the whole minibatch at once.
 A shorter `seq_len` gives more, shorter chunks per minibatch: cheaper gradients that cannot reach as far back.
+`python -m swarp.benchmark.train_throughput --configs policynet recurrent comm recurrent-comm` measures what each option costs per iteration.
 
 **Communication.**
 `comm="attn"` adds one round of learned communication before the trunk.
