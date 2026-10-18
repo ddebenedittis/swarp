@@ -78,8 +78,8 @@ class AgentShape(IntEnum):
     ``AgentConfig.half_extents`` centred on the agent and rotated by its heading
     ``theta``; its ``radius`` is the circumscribed one, so every radius-based bound in the
     engine (neighbor reach, spawn spacing, ``World.agent_radius``) stays conservative.
-    The lidar sees the box; box-agent contact physics has not landed yet, so stepping a
-    world that holds a box agent raises ``NotImplementedError``.
+    The lidar sees the box, and the contact step collides it as the oriented rectangle it
+    is (:func:`swarp.core.collisions.obb_contact`) against agents, obstacles and walls.
     """
 
     DISC = 0

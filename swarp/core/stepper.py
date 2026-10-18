@@ -203,8 +203,9 @@ class Stepper:
         self.has_drone: bool = any(c.model == DynamicsModel.DRONE for c in configs)
         # Host-side, static for the life of the stepper (the shape column is structural;
         # set_agent_params_per_env refuses to change it). Read by the lidar to compile its
-        # box-agent branch in or out, and by launch_substeps to refuse a step it would get
-        # wrong: every contact kernel still treats an agent as a disc of its radius.
+        # box-agent branch in or out, and by launch_substeps to route the force pass, the
+        # movable-body reactions and the bounds clamp to their box-aware kernels. A
+        # disc-only world never launches those, so its step is the disc step unchanged.
         self.has_box_agents: bool = any(c.shape == AgentShape.BOX for c in configs)
         self.enable_slim2d: bool = True
         # The single-launch substep chain (swarp/core/fused_substeps.py): ``"auto"`` takes
@@ -670,6 +671,7 @@ class Stepper:
             and not buffers.taped
             and self.world.integrator == Integrator.EULER
             and not self.any_movable
+            and not self.has_box_agents
             and self.params.floats_per_env is None
             and state_in.pos.device.is_cuda
             and self.n_agents <= FUSED_MAX_AGENTS
@@ -713,13 +715,10 @@ class Stepper:
         the recorded neighbor lists survive until backward (the grid's own lists
         get overwritten by the next build before then).
         """
-        if self.has_box_agents:
+        if self.has_box_agents and self.any_movable:
             raise NotImplementedError(
-                "stepping a world with box agents (AgentShape.BOX) is not supported yet: "
-                "box-agent contact physics (box-agent vs agent, obstacle and wall "
-                "contacts) has not landed, and every contact kernel would treat the box as "
-                "a disc of its circumscribed radius. Such a world can be built, reset and "
-                "scanned by the lidar, but not stepped."
+                "movable obstacles in a world with box agents are not supported yet: the "
+                "body pass would take the reaction of a box agent as a disc's."
             )
         n_envs = state_in.pos.shape[0]
         world = self.world
@@ -808,6 +807,10 @@ class Stepper:
                     bounds_min=self._bounds_min,
                     bounds_max=self._bounds_max,
                     dtype=self.dtype,
+                    # Box contacts read the headings and spins; a disc world passes None
+                    # and keeps the disc kernel.
+                    theta=st.theta if self.has_box_agents else None,
+                    ang_vel=st.ang_vel if self.has_box_agents else None,
                 )
                 if self.any_movable and not buffers.taped:
                     # Same state the force pass just used, so action and reaction match;
@@ -847,6 +850,7 @@ class Stepper:
                 integrator=world.integrator,
                 slim=slim,
                 skip_drone=skip_drone and slim,
+                footprint=self.has_box_agents,
             )
         # State has advanced; the grid's lists no longer match this generation.
         self.state_version += 1
