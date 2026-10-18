@@ -715,11 +715,6 @@ class Stepper:
         the recorded neighbor lists survive until backward (the grid's own lists
         get overwritten by the next build before then).
         """
-        if self.has_box_agents and self.any_movable:
-            raise NotImplementedError(
-                "movable obstacles in a world with box agents are not supported yet: the "
-                "body pass would take the reaction of a box agent as a disc's."
-            )
         n_envs = state_in.pos.shape[0]
         world = self.world
         if self._can_fuse_substeps(state_in, buffers):
@@ -838,6 +833,9 @@ class Stepper:
                         bounds_max=self._bounds_max,
                         clamp_bounds=world.bounds is not None,
                         dtype=self.dtype,
+                        theta=st.theta,
+                        ang_vel=st.ang_vel,
+                        boxes=self.has_box_agents,
                     )
             launch_integrate(
                 st,

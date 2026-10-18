@@ -13,8 +13,9 @@ import torch
 import warp as wp
 from conftest import DEVICES, _core
 
-from swarp.core.config import Obstacles, ObstacleShape, WorldConfig
+from swarp.core.config import ObstacleKind, Obstacles, ObstacleShape, WorldConfig
 from swarp.core.stepper import Stepper
+from swarp.core.world import World
 from swarp.dynamics.base import AgentConfig, ControlMode, DynamicsModel
 from swarp.interop.autograd import TorchState, warp_step
 
@@ -354,3 +355,85 @@ def test_box_world_is_deterministic(device):
     first = run()
     assert torch.isfinite(first).all()
     assert torch.equal(first, run())
+
+
+# ------------------------------------------------------------------ movable bodies
+
+
+def _movable(device, agent, shape=ObstacleShape.BOX, half=(0.15, 0.15), radius=0.1, **kw):
+    cfg = WorldConfig(
+        collisions=True,
+        collision_k=1000.0,
+        collision_c=kw.pop("c", 20.0),
+        collision_margin=0.01,
+        bounds=(-2.0, 2.0, -2.0, 2.0),
+        obstacle_linear_damping=0.0,
+        obstacle_angular_damping=0.0,
+    )
+    w = World([agent], cfg, n_envs=1, device=device, dt=0.05, dtype=F64, **kw)
+    w.set_obstacles(
+        Obstacles(
+            torch.zeros(1, 1, 2, dtype=F64, device=device),
+            torch.full((1,), radius, dtype=F64, device=device),
+            shape=torch.full((1,), int(shape), dtype=torch.int32, device=device),
+            angle=torch.zeros(1, 1, dtype=F64, device=device),
+            half_extents=torch.tensor([half], dtype=F64, device=device),
+            kind=torch.full((1,), int(ObstacleKind.MOVABLE), dtype=torch.int32, device=device),
+            mass=torch.full((1,), 2.0, dtype=F64, device=device),
+            inertia=torch.full((1,), 0.03, dtype=F64, device=device),
+        )
+    )
+    return w
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("y, spin", [(0.1, -1.0), (-0.1, 1.0)])
+def test_box_agent_spins_a_movable_box_off_centre(device, y, spin):
+    """Pushing +x above the centre turns the body clockwise, below it anticlockwise."""
+    w = _movable(device, box(0.05, 0.05, max_speed=1.0), substeps=4)
+    w.write_state(pos=torch.tensor([[[-0.4, y]]], dtype=F64, device=device))
+    act = torch.tensor([[[1.0, 0.0]]], dtype=F64, device=device)
+    with torch.no_grad():
+        for _ in range(30):
+            w.step(act)
+    pos, angle, _, _ = w.obstacle_state_views()
+    assert pos[0, 0, 0] > 0.05, "the body was not pushed"
+    assert spin * angle[0, 0] > 1e-3, f"wrong spin sign: angle {float(angle[0, 0])}"
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("shape", [ObstacleShape.BOX, ObstacleShape.SEGMENT, ObstacleShape.CIRCLE])
+def test_newtons_third_law_agent_body(device, shape):
+    """One substep from rest, no body damping: the body's momentum change is exactly the
+    negative of the agent's contact impulse, and its torque is ``r x F`` about the body
+    centre through the contact point (here the middle of the corner-to-face gap)."""
+    g, cy = 0.004, 0.07
+    corner = 0.05 * math.sqrt(2.0)
+    face = {ObstacleShape.BOX: -0.15, ObstacleShape.SEGMENT: -0.3 - 0.05,
+            ObstacleShape.CIRCLE: -0.1}[shape]  # fmt: skip
+    if shape != ObstacleShape.BOX:
+        cy = 0.0  # a round face is only flat at its pole
+    half = (0.3, 0.0) if shape == ObstacleShape.SEGMENT else (0.15, 0.15)
+    radius = 0.05 if shape == ObstacleShape.SEGMENT else 0.1
+    agent = box(0.05, 0.05, mass=1.5)
+    w = _movable(device, agent, shape=shape, half=half, radius=radius, substeps=1)
+    w.write_state(
+        pos=torch.tensor([[[face - g - corner, cy]]], dtype=F64, device=device),
+        theta=torch.full((1, 1), math.pi / 4, dtype=F64, device=device),
+        vel=torch.tensor([[[0.3, 0.1]]], dtype=F64, device=device),
+        ang_vel=torch.full((1, 1), 0.5, dtype=F64, device=device),
+    )
+    with torch.no_grad():
+        w.step(torch.zeros(1, 1, 2, dtype=F64, device=device))
+    dt = 0.05
+    f_agent = (w.state.vel[0, 0] * 1.5 / dt).cpu().numpy()
+    _, _, b_vel, b_om = w.obstacle_state_views()
+    f_body = (b_vel[0, 0] * 2.0 / dt).cpu().numpy()
+    tau = float(b_om[0, 0]) * 0.03 / dt
+    assert f_body[0] > 1.0
+    close(f_body, -f_agent, atol=1e-9)
+    if shape == ObstacleShape.CIRCLE:
+        assert tau == 0.0
+    elif shape == ObstacleShape.BOX:
+        r = np.array([face - g / 2, cy])
+        close(tau, r[0] * f_body[1] - r[1] * f_body[0], atol=1e-9)
