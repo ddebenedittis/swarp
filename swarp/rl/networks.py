@@ -11,6 +11,7 @@ trainers are not interchangeable; :func:`swarp.rl.ppo.load_checkpoint` reads thi
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 
 import torch
 from torch import nn
@@ -98,6 +99,101 @@ class Critic(nn.Module):
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
         v = self.net(obs.flatten(-2))
         return v.expand(*v.shape[:-1], self.n_agents)
+
+
+# ------------------------------------------------------------------------------- roles
+
+
+def role_slots(roles: torch.Tensor, n_roles: int) -> torch.Tensor:
+    """Each agent's slot in role-sorted order, ``[*, A]`` long.
+
+    Role-sorted order lists role 0's agents first, then role 1's, and so on, ties by agent
+    index (a stable sort). Built from a one-hot cumulative sum, with no sort, no host read
+    and no data-dependent shape, so it is CUDA-graph capturable. The role offsets come
+    from the data, so a batch need not honour ``role_counts`` for this to be a valid
+    permutation; the fixed-size slicing in :class:`PolicyNet` does need it.
+    """
+    roles = roles.long()
+    onehot = (roles.unsqueeze(-1) == torch.arange(n_roles, device=roles.device)).long()
+    rank = ((onehot.cumsum(-2) - 1) * onehot).sum(-1)  # index within the agent's role
+    count = onehot.sum(-2)  # [*, R]
+    offset = (count.cumsum(-1) - count).gather(-1, roles)  # first slot of the agent's role
+    return offset + rank
+
+
+def invert_permutation(perm: torch.Tensor) -> torch.Tensor:
+    """The inverse of a batch of permutations over the last dim (a scatter, no sort)."""
+    ar = torch.arange(perm.shape[-1], device=perm.device).expand_as(perm)
+    return torch.empty_like(perm).scatter_(-1, perm, ar)
+
+
+def role_permutation(roles: torch.Tensor, counts: Sequence[int]) -> torch.Tensor:
+    """The agent at each role-sorted slot, ``[*, A]`` long: ``x.gather(-1, perm)`` lists
+    ``x`` in role-sorted order. Equal to ``torch.argsort(roles, stable=True)``, without the
+    sort (see :func:`role_slots`)."""
+    return invert_permutation(role_slots(roles, len(counts)))
+
+
+def _take(x: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
+    """``x[..., index[k], :]`` along the agent dim (-2) of ``x`` ``[*, A, F]``."""
+    return x.gather(-2, index.unsqueeze(-1).expand(*index.shape, x.shape[-1]))
+
+
+# ----------------------------------------------------------------------------- critics
+
+
+class StateCritic(nn.Module):
+    """Centralised critic over a privileged state, the agents' observations, or both.
+
+    ``forward(obs [*, A, obs_dim], state [*, state_dim], roles [*, A]) -> [*, A]``. The
+    input is ``state`` (if ``state_dim > 0``) followed, with ``use_obs``, by every agent's
+    observation flattened in role-sorted order when the scenario has roles (agent order
+    otherwise), so the critic sees the team in a fixed layout however roles were drawn.
+
+    One value broadcast to every agent by default. With ``per_agent`` it outputs one value
+    per role-sorted slot (per agent index without roles), mapped back to agent order: the
+    per-role rewards then get a value each instead of sharing the team's.
+    """
+
+    def __init__(
+        self,
+        state_dim: int,
+        obs_dim: int,
+        n_agents: int,
+        num_cells: int = 256,
+        *,
+        use_obs: bool = False,
+        role_counts: Sequence[int] = (),
+        per_agent: bool = False,
+    ) -> None:
+        super().__init__()
+        n_in = state_dim + (n_agents * obs_dim if use_obs else 0)
+        if n_in == 0:
+            raise ValueError("StateCritic needs state_dim > 0 or use_obs=True")
+        if role_counts and sum(role_counts) != n_agents:
+            raise ValueError(f"role_counts {tuple(role_counts)} do not sum to {n_agents} agents")
+        self.state_dim, self.obs_dim, self.n_agents = state_dim, obs_dim, n_agents
+        self.use_obs, self.per_agent = use_obs, per_agent
+        self.role_counts = tuple(int(c) for c in role_counts)
+        #: Whether ``forward`` reads ``roles``: only to order the obs or the per-slot values.
+        self.uses_roles = bool(self.role_counts) and (use_obs or per_agent)
+        self.net = mlp(n_in, n_agents if per_agent else 1, num_cells)
+
+    def forward(
+        self,
+        obs: torch.Tensor,
+        state: torch.Tensor | None = None,
+        roles: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        slots = role_slots(roles, len(self.role_counts)) if self.uses_roles else None
+        parts = [state] if self.state_dim else []
+        if self.use_obs:
+            o = obs if slots is None else _take(obs, invert_permutation(slots))
+            parts.append(o.flatten(-2))
+        v = self.net(parts[0] if len(parts) == 1 else torch.cat(parts, -1))
+        if not self.per_agent:
+            return v.expand(*v.shape[:-1], self.n_agents)
+        return v if slots is None else v.gather(-1, slots)
 
 
 def tanh_normal_log_prob(

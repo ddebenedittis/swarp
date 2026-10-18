@@ -47,7 +47,7 @@ import torch
 from torch.nn import functional as F
 
 from swarp import Environment
-from swarp.rl.networks import Actor, Critic, tanh_normal_log_prob
+from swarp.rl.networks import Actor, Critic, StateCritic, tanh_normal_log_prob
 from swarp.rl.recipes import (
     SPECS,
     PolicyArm,
@@ -201,9 +201,21 @@ def ppo_terms(
     return -gain.mean(), entropy
 
 
+def critic_values(
+    critic: torch.nn.Module,
+    obs: torch.Tensor,
+    state: torch.Tensor | None = None,
+    roles: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """``[*, A]`` values from either critic: :class:`Critic` reads only ``obs``."""
+    if isinstance(critic, StateCritic):
+        return critic(obs, state, roles)
+    return critic(obs)
+
+
 def ppo_loss(
     actor: Actor,
-    critic: Critic,
+    critic: torch.nn.Module,
     obs: torch.Tensor,
     u: torch.Tensor,
     logp_old: torch.Tensor,
@@ -211,20 +223,26 @@ def ppo_loss(
     ret: torch.Tensor,
     noise: torch.Tensor,
     normalize_advantage: bool,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    state: torch.Tensor | None = None,
+    roles: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, ...]:
     """Clipped surrogate, smooth-L1 value loss and MC entropy for one minibatch.
 
     ``obs`` is ``[B, A, obs_dim]``; ``u`` (the stored pre-tanh sample) and ``noise`` (a
     standard normal draw for the entropy's reparametrized sample) are ``[B, A, act_dim]``;
-    the rest are ``[B, A]``. Returns ``(objective, critic, entropy)``. A thin wrapper over
-    :func:`ppo_terms` that keeps the original op order (advantages, actor, policy terms,
-    critic), so a default run launches the same kernels in the same sequence.
+    the rest are ``[B, A]``, and the optional ``state``/``roles`` are ``[B, state_dim]`` /
+    ``[B, A]`` for a :class:`StateCritic`. Returns ``(objective, critic, entropy)``.
+
+    A thin wrapper over :func:`ppo_terms` that keeps the original op order (advantages,
+    actor, policy terms, critic), so a default run launches the same kernels in the same
+    sequence.
     """
     if normalize_advantage:
         adv = standardize_advantage(adv)
     loc, scale = actor(obs)
     objective, entropy = ppo_terms(loc, scale, u, logp_old, adv, noise)
-    return objective, F.smooth_l1_loss(critic(obs), ret), entropy
+    value = critic_values(critic, obs, state, roles)
+    return objective, F.smooth_l1_loss(value, ret), entropy
 
 
 # ------------------------------------------------------------------------------ the core
@@ -250,13 +268,19 @@ class MAPPO:
     No logging, no checkpoints, no curriculum: :func:`train` owns those. ``env`` must
     have ``auto_reset=True`` and ``clone_outputs=False``: the captured graphs read the
     env's output buffers by address, which is what makes them fixed.
+
+    The networks decide what else is recorded, once, here: a :class:`StateCritic` with a
+    ``state_dim`` adds a ``[T + 1, E, state_dim]`` buffer of ``env.critic_state()``, and a
+    role-reading network a ``[T + 1, E, A]`` buffer of ``env.agent_roles()``, each written
+    next to the observation by the act graph. With :class:`Actor` and :class:`Critic`
+    neither exists and the graphs are the plain ones.
     """
 
     def __init__(
         self,
         env: Environment,
         actor: Actor,
-        critic: Critic,
+        critic: torch.nn.Module,
         spec: TrainSpec,
         metrics: Mapping[str, int] = (),
         graphs: bool = True,
@@ -293,6 +317,24 @@ class MAPPO:
         self.actions = z(E, A, D)
         self.t = z(1, dtype=torch.long)
         self.metric_acc = z(sum(self.metrics.values()))
+        # Optional inputs, Python flags read at capture time. Each buffer is ``None`` unless
+        # a network reads it.
+        self.state_critic = isinstance(critic, StateCritic)
+        self.use_state = self.state_critic and critic.state_dim > 0
+        self.use_roles = self.state_critic and critic.uses_roles
+        if self.use_state and env.state_dim != critic.state_dim:
+            raise ValueError(
+                f"the critic reads a {critic.state_dim}-wide state; the env provides "
+                f"state_dim={env.state_dim}"
+            )
+        if self.use_roles and env.role_counts != critic.role_counts:
+            raise ValueError(
+                f"the critic expects role_counts {critic.role_counts}; the env has "
+                f"{env.role_counts}"
+            )
+        self.state_buf = z(T + 1, E, env.state_dim) if self.use_state else None
+        self.role_buf = z(T + 1, E, A, dtype=torch.long) if self.use_roles else None
+        self._src: tuple[torch.Tensor | None, torch.Tensor | None] = (None, None)
         # Update.
         self.v_buf = z(T + 1, E, A)
         self.adv_buf = z(T, E, A)
@@ -361,6 +403,7 @@ class MAPPO:
                     obs = self.env.step(self.actor.greedy(obs))[0]
                     obs = self.env.reset_at(offset == t)
         self._out = (obs, None, None, None, None)
+        self._fetch_sources()
 
     def _signature(self, out: tuple[Any, ...]) -> tuple[int, ...]:
         _, rew, term, trunc, info = out
@@ -369,13 +412,37 @@ class MAPPO:
             *(info[k].data_ptr() for k in self.metrics),
         )
 
+    def _fetch_sources(self) -> None:
+        """Point at the env's state/role buffers for the current observation (host only)."""
+        if not (self.use_state or self.use_roles):
+            return
+        E, A = self.E, self.A
+        state = roles = None
+        if self.use_state:
+            state = self.env.critic_state()
+            want = (E, self.env.state_dim)
+            if state is None or tuple(state.shape) != want:
+                raise ValueError(f"critic_state() must be a {want} tensor, got {_shape(state)}")
+        if self.use_roles:
+            roles = self.env.agent_roles()
+            if roles is None or tuple(roles.shape) != (E, A) or roles.is_floating_point():
+                raise ValueError(
+                    f"agent_roles() must be an integer {(E, A)} tensor, got {_shape(roles)}"
+                )
+        self._src = (state, roles)
+
     def _act_inputs(self) -> tuple[torch.Tensor, ...]:
         """The env-owned buffers the act graph reads by address."""
-        return (self._out[0],)
+        return (self._out[0], *(x for x in self._src if x is not None))
 
     def _act_body(self) -> None:
         obs = self._out[0]
         self.obs_buf.index_copy_(0, self.t, obs.unsqueeze(0))
+        state, roles = self._src
+        if self.state_buf is not None:
+            self.state_buf.index_copy_(0, self.t, state.unsqueeze(0))
+        if self.role_buf is not None:
+            self.role_buf.index_copy_(0, self.t, roles.long().unsqueeze(0))
         loc, scale = self.actor(obs)
         u = loc + scale * torch.randn_like(loc)
         self.actions.copy_(self.actor.squash(u))
@@ -416,8 +483,14 @@ class MAPPO:
                 self._store.invalidate()
                 self._sig = sig
             self._out = out
+            self._fetch_sources()
             self._store()
         self.obs_buf[self.T].copy_(self._out[0])
+        state, roles = self._src
+        if self.state_buf is not None:
+            self.state_buf[self.T].copy_(state)
+        if self.role_buf is not None:
+            self.role_buf[self.T].copy_(roles)
 
     # ---------------------------------------------------------------------- update
 
@@ -426,7 +499,7 @@ class MAPPO:
         gamma, lmbda = spec.gamma, spec.lmbda
         with torch.no_grad():
             for t in range(T + 1):  # per step, so peak memory is one step's activations
-                self.v_buf[t] = self.critic(self.obs_buf[t])
+                self.v_buf[t] = self._value(t)
             term = self.term_buf
             gae(self.rew_buf, self.v_buf, term, self.trunc_buf, gamma, lmbda, out=self.adv_buf)
             torch.add(self.adv_buf, self.v_buf[:T], out=self.ret_buf)
@@ -440,6 +513,14 @@ class MAPPO:
             self.mb_stats.zero_()
             self.k.zero_()
 
+    def _value(self, t: int) -> torch.Tensor:
+        """The critic over rollout row ``t``, ``[E, A]``."""
+        if not self.state_critic:
+            return self.critic(self.obs_buf[t])
+        state = None if self.state_buf is None else self.state_buf[t]
+        roles = None if self.role_buf is None else self.role_buf[t]
+        return self.critic(self.obs_buf[t], state, roles)
+
     def _minibatch_body(self) -> None:
         A = self.A
         idx = self.perms.index_select(0, self.k).view(-1)
@@ -448,10 +529,15 @@ class MAPPO:
         logp_old = self.logp_buf.reshape(self.N, A).index_select(0, idx)
         adv = self.adv_buf.reshape(self.N, A).index_select(0, idx)
         ret = self.ret_buf.reshape(self.N, A).index_select(0, idx)
+        extra = {}
+        if self.state_buf is not None:
+            extra["state"] = self.state_buf[: self.T].reshape(self.N, -1).index_select(0, idx)
+        if self.role_buf is not None:
+            extra["roles"] = self.role_buf[: self.T].reshape(self.N, A).index_select(0, idx)
         noise = torch.randn_like(u)  # drawn here, not in the (possibly compiled) loss
         loss_obj, loss_crit, entropy = self._loss(
             self.actor, self.critic, obs, u, logp_old, adv, ret, noise,
-            self.spec.normalize_advantage,
+            self.spec.normalize_advantage, **extra,
         )
         loss_ent = -self.ent_coef * entropy
 
@@ -484,6 +570,10 @@ class MAPPO:
             self._minibatch()
         stats = torch.cat([self.prep_stats, self.mb_stats, self.metric_acc / self.T])
         return dict(zip(self.stat_names, stats.tolist(), strict=True))
+
+
+def _shape(x: torch.Tensor | None) -> object:
+    return None if x is None else tuple(x.shape)
 
 
 # ------------------------------------------------------------------------- checkpoints
