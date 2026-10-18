@@ -1,0 +1,64 @@
+---
+/**
+ * Wraps the BibTeX code fence and adds an always-visible copy button.
+ * Expressive Code ships its own copy button, but it only fades in on hover,
+ * which is easy to miss on the one block a reader actually wants to copy.
+ *
+ * Usage in MDX (the blank lines around the fence are required):
+ *
+ *   <Bibtex>
+ *
+ *   ```bibtex
+ *   @article{...}
+ *   ```
+ *
+ *   </Bibtex>
+ */
+---
+
+<div class="relative" data-bibtex>
+  <button
+    type="button"
+    data-bibtex-copy
+    class="not-prose absolute top-3 right-3 z-10 rounded-md bg-zinc-800 px-3 py-1.5 text-sm font-medium text-white shadow transition hover:bg-black dark:bg-zinc-200 dark:text-zinc-900 dark:hover:bg-white"
+  >
+    <span data-bibtex-label>Copy</span>
+  </button>
+  <slot />
+</div>
+
+<script>
+  document.querySelectorAll<HTMLElement>("[data-bibtex]").forEach((wrapper) => {
+    const button = wrapper.querySelector<HTMLButtonElement>("[data-bibtex-copy]");
+    const label = wrapper.querySelector<HTMLElement>("[data-bibtex-label]");
+    const code = wrapper.querySelector("code");
+    if (!button || !label || !code) return;
+
+    /* Expressive Code splits the block into one <div class="ec-line"> per
+       line, so join those rather than trusting whitespace in textContent. */
+    const read = () => {
+      const lines = code.querySelectorAll(".ec-line");
+      return lines.length
+        ? Array.from(lines)
+            .map((line) => line.textContent ?? "")
+            .join("\n")
+            .trim()
+        : (code.textContent ?? "").trim();
+    };
+
+    let reset: ReturnType<typeof setTimeout>;
+
+    button.addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(read());
+        label.textContent = "Copied";
+      } catch {
+        label.textContent = "Copy failed";
+      }
+      clearTimeout(reset);
+      reset = setTimeout(() => {
+        label.textContent = "Copy";
+      }, 2000);
+    });
+  });
+</script>
