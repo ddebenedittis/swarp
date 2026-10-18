@@ -35,6 +35,11 @@ Configurations (``--configs``):
     pins ``torchrl < 0.12``, so it runs from its own venv:
     ``--python benchmarl=.venv-benchmarl/bin/python``.
 
+``policynet``, ``recurrent``, ``comm``, ``recurrent-comm``
+    ``graphs`` with a ``--actor policynet`` actor, plain, with ``--recurrent`` (a GRU
+    trained by BPTT over whole rollouts), with ``--comm attn``, and with both: the cost
+    of the actor's memory and communication. Opt-in; not in the default ``--configs``.
+
 ``sim`` is the simulator alone over the same rollout (``steps_per_batch`` steps of random
 actions at the same ``n_envs``, ``auto_reset=True``): the ceiling no trainer can beat, and
 the share of an iteration that is physics.
@@ -89,8 +94,17 @@ TRAINERS: dict[str, Trainer] = {
     "fast": Trainer(("-m", "swarp.rl", "--compile", "--tf32")),
     "rsl_rl": Trainer((str(REPO / "examples" / "train_rsl_rl.py"),), "rsl_rl"),
     "benchmarl": Trainer((str(REPO / "examples" / "train_benchmarl.py"),), "benchmarl"),
+    # The cost of the actor's options: opt-in, not part of the default comparison.
+    "policynet": Trainer(("-m", "swarp.rl", "--actor", "policynet")),
+    "recurrent": Trainer(("-m", "swarp.rl", "--actor", "policynet", "--recurrent")),
+    "comm": Trainer(("-m", "swarp.rl", "--actor", "policynet", "--comm", "attn")),
+    "recurrent-comm": Trainer(
+        ("-m", "swarp.rl", "--actor", "policynet", "--recurrent", "--comm", "attn")
+    ),
 }
 CONFIGS = tuple(TRAINERS)
+#: The configs that measure an actor option rather than a trainer.
+ACTOR_CONFIGS = ("policynet", "recurrent", "comm", "recurrent-comm")
 
 
 def _config_path(s: str) -> tuple[str, str]:
@@ -161,7 +175,8 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--n-envs", nargs="+", type=int, help="default: each spec's n_envs")
     p.add_argument("--minibatch-samples", type=int,
                    help="fix the minibatch size (env-steps) instead of the minibatch count")
-    p.add_argument("--configs", nargs="+", default=list(CONFIGS), choices=CONFIGS)
+    p.add_argument("--configs", nargs="+", choices=CONFIGS,
+                   default=[c for c in CONFIGS if c not in ACTOR_CONFIGS])
     p.add_argument("--iters", type=int, default=25)
     p.add_argument("--warmup", type=int, default=5)
     p.add_argument(

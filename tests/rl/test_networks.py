@@ -168,3 +168,109 @@ def test_policy_needs_roles_when_it_has_them():
         net(torch.zeros(2, 2, 4))
     with pytest.raises(ValueError, match="role_params"):
         PolicyNet(4, 2, 8, role_counts=(1, 1), role_params="mixture")
+
+
+# ---------------------------------------------------------------- memory and communication
+
+
+@pytest.mark.parametrize("role_params", ["heads", "separate"])
+def test_unroll_equals_stepping_with_the_hidden_state_reset_at_dones(role_params):
+    """unroll runs the trunk once over the sequence and only the GRU step by step; it must
+    equal L calls of step, with h zeroed after each done, including roles that change at
+    a done (separate GRUs then swap agents)."""
+    torch.manual_seed(0)
+    net = PolicyNet(4, 2, 16, role_counts=COUNTS, role_params=role_params, aux_dim=3,
+                    recurrent=True, hidden_dim=8)
+    L, S = 5, 7
+    obs = torch.randn(L, S, 6, 4)
+    roles = torch.stack([_random_roles(S, seed=s) for s in range(L)])
+    done = (torch.rand(L, S) < 0.3).float()
+    h0 = torch.randn(S, 6, 8)
+    loc, scale, aux, h_last = net.unroll(obs, roles, h0, done, with_aux=True)
+    h, ref = h0, []
+    for i in range(L):
+        if i:
+            h = h * (1 - done[i - 1])[:, None, None]
+        out = net.step(obs[i], roles[i], h, with_aux=True)
+        h = out[3]
+        ref.append(out[:3])
+    for got, want in zip((loc, scale, aux), zip(*ref, strict=True), strict=True):
+        assert torch.allclose(got, torch.stack(want), atol=1e-6)
+    assert torch.allclose(h_last, h, atol=1e-6)
+    assert loc.shape == (L, S, 6, 2) and h_last.shape == (S, 6, 8)
+
+
+def test_recurrent_policy_carries_its_hidden_state():
+    torch.manual_seed(0)
+    net = PolicyNet(3, 2, 8, recurrent=True, hidden_dim=5)
+    obs = torch.randn(4, 2, 3)
+    loc0, _, _, h1 = net.step(obs)  # from zeros
+    assert torch.equal(loc0, net.step(obs, h=torch.zeros(4, 2, 5))[0])
+    loc1, _, _, h2 = net.step(obs, h=h1)
+    assert h1.shape == (4, 2, 5) and not torch.allclose(loc0, loc1)
+    assert torch.equal(net.greedy(obs, h=h1), net.squash(loc1))
+    assert net.stateful and net.config["recurrent"] and net.config["hidden_dim"] == 5
+    assert "recurrent" not in PolicyNet(3, 2, 8).config  # absent when off
+
+
+def test_attention_never_attends_to_self_and_respects_the_mask():
+    torch.manual_seed(0)
+    net = PolicyNet(4, 2, 16, role_counts=COUNTS, comm="attn", comm_dim=8)
+    B, A = 9, 6
+    obs, roles = torch.randn(B, A, 4), _random_roles(B)
+    mask = torch.rand(B, A, A) < 0.5
+    mask[0, 1] = torch.tensor([True, True, False, False, True, False])  # 1 hears 0 and 4
+    mask[0, 2] = False  # agent 2 of row 0 hears nobody
+    eye = torch.eye(A, dtype=torch.bool)
+    for m in (None, mask):
+        w = net.comm_weights(obs, roles, m)
+        allowed = (~eye if m is None else m & ~eye).expand(B, A, A)
+        assert torch.equal(w.diagonal(dim1=-2, dim2=-1), torch.zeros(B, A))
+        assert torch.equal(w[~allowed], torch.zeros(int((~allowed).sum())))
+        heard = allowed.any(-1)
+        assert torch.allclose(w.sum(-1)[heard], torch.ones(int(heard.sum())), atol=1e-6)
+        assert torch.equal(w.sum(-1)[~heard], torch.zeros(int((~heard).sum())))
+    # What a masked-off teammate sees cannot reach the listener; what a heard one sees can.
+    loc = net.step(obs, roles, comm_mask=mask)[0]
+    for j, reaches in ((3, False), (4, True)):
+        obs2 = obs.clone()
+        obs2[0, j] += 1.0
+        loc2 = net.step(obs2, roles, comm_mask=mask)[0]
+        assert torch.equal(loc2[0, 1], loc[0, 1]) is not reaches
+    alone = PolicyNet(4, 2, 16, comm="attn", comm_dim=8)
+    assert torch.isfinite(alone.step(obs[:, :1])[0]).all()  # one agent: a zero message
+
+
+def test_attention_gradients_are_finite_for_an_isolated_agent():
+    torch.manual_seed(0)
+    net = PolicyNet(4, 2, 16, comm="attn", comm_dim=8, recurrent=True, hidden_dim=8)
+    obs = torch.randn(3, 4, 4)
+    mask = torch.zeros(3, 4, 4, dtype=torch.bool)  # nobody hears anybody
+    loc, scale, _, _ = net.step(obs, comm_mask=mask)
+    (loc.sum() + scale.sum()).backward()
+    assert all(torch.isfinite(p.grad).all() for p in net.parameters() if p.grad is not None)
+
+
+def test_communication_needs_a_shared_trunk():
+    with pytest.raises(ValueError, match="not 'separate'"):
+        PolicyNet(4, 2, 8, role_counts=(1, 1), role_params="separate", comm="attn")
+    with pytest.raises(ValueError, match="comm must be one of"):
+        PolicyNet(4, 2, 8, comm="radio")
+    PolicyNet(4, 2, 8, role_params="separate", comm="attn")  # no roles: one trunk anyway
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda:0", marks=pytest.mark.gpu)])
+def test_the_hoisted_gru_step_is_torchs_gru_cell(device):
+    """PolicyNet runs the GRU's input projection once per sequence and the rest per step;
+    composed, the two halves are ``nn.GRUCell``, values and gradients."""
+    torch.manual_seed(0)
+    net = PolicyNet(3, 2, 8, recurrent=True, hidden_dim=5).to(device)
+    x = torch.randn(6, 4, 8, device=device, requires_grad=True)
+    h = torch.randn(6, 4, 5, device=device, requires_grad=True)
+    out = net._gru(net.gru, net._input_gates(x), h)
+    ref = net.gru(x.reshape(-1, 8), h.reshape(-1, 5)).view(6, 4, 5)
+    assert torch.allclose(out, ref, atol=1e-6)
+    g = torch.autograd.grad(out.square().sum(), (x, h, net.gru.weight_hh))
+    g_ref = torch.autograd.grad(ref.square().sum(), (x, h, net.gru.weight_hh))
+    for a, b in zip(g, g_ref, strict=True):
+        assert torch.allclose(a, b, atol=1e-5)

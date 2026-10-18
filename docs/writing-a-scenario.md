@@ -89,7 +89,7 @@ everything, so `info()` is populated.
 
 ### Training hooks (optional)
 
-Three optional hooks hand a trainer what the observation does not carry.
+Four optional hooks hand a trainer what the observation does not carry.
 Each defaults to "not provided", and `Environment` forwards each one under the same name, as it does `obs_dim`:
 
 | member | default | shape | read by `swarp.rl` for |
@@ -97,6 +97,7 @@ Each defaults to "not provided", and `Environment` forwards each one under the s
 | `state_dim: int`, `critic_state()` | `0`, `None` | `[n_envs, state_dim]` float | a privileged centralised critic (`critic_input="state"`) |
 | `n_roles: int`, `role_counts: tuple[int, ...]`, `agent_roles()` | `1`, `()`, `None` | `[n_envs, n_agents]` integer | role-specific policy heads and a role-ordered critic |
 | `aux_dim: int`, `aux_targets()` | `0`, `None` | `[n_envs, n_agents, aux_dim]` float | an auxiliary regression loss on the actor's features |
+| `comm_mask()` | `None` (everyone hears everyone) | `[n_envs, n_agents, n_agents]` bool, `[e, i, j]`: `i` hears `j` | who a communicating actor (`comm="attn"`) may attend to |
 
 `role_counts` is fixed for the run and sums to `n_agents`: which agent holds which role may change every episode, but each env always has exactly `role_counts[r]` agents in role `r`.
 `swarp.rl` checks this once, on every env, when it resets, and raises on a row that breaks it, since a per-role network would otherwise silently run on the wrong agents.
@@ -112,7 +113,7 @@ The contract is the one the trainer's CUDA graphs rely on:
   The rollout graph reads it by address, as it reads the observation.
 - **Written by the observation pass.**
   The values describe the state the current observation describes, so they are written by the same pass that writes `observations()`, including the obs-only pass after an auto-reset.
-  With `auto_reset=True` the observation returned at an episode's last step already belongs to the next episode, and so must the state, the roles and the auxiliary targets.
+  With `auto_reset=True` the observation returned at an episode's last step already belongs to the next episode, and so must the state, the roles, the auxiliary targets and the comm mask.
   A role drawn in `reset_world` before the obs pass meets this; a critic state recomputed lazily in `info()` does not.
 - **Host-sync-free**, like `reset_world`, since the obs pass runs inside the step.
 
