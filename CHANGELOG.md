@@ -7,6 +7,13 @@ All notable changes to `swarp`. Newest first. Nothing has been released yet — 
 
 ### Added
 
+- **`pusht_lidar`, a twelfth scenario: multi-robot Push-T observed through lidar, with pusher and observer roles.**
+  Five identical robots, two pushers and three observers by default, with the roles redrawn per env per episode at fixed counts; every robot can push, and the roles differ only in their rewards.
+  From `obs_level=1` on a robot does not observe the T pose: it sees its own pose, the goal, its teammates and its own 32-ray lidar (range, object mask, robot mask per ray), optionally a ring of past scans and, at level 2, every teammate's object-hit points pooled in the world frame.
+  Observers earn only penalty and potential terms (standoff, visibility, sector coverage, occlusion, contact), kept per term in `info()["multiobj_reward"]`.
+  It is the first scenario with the trainer hooks: a role-sorted `critic_state()`, `agent_roles()` and `aux_targets()` (the T in each robot's frame), all written by the observation pass; `SPECS["pusht_lidar"]` is the oracle stage that trains with role heads and a state critic.
+  The fused path launches the capture-safe Warp lidar inside the whole-step graph; the torch path scans with the `lidar_scan` oracle.
+
 - **The lidar sees every shape: boxes, segments as capsules, and box agents, and reports what each ray hit.**
   `lidar_scan`, `lidar_scan_warp` and `Lidar` ray-cast against oriented boxes (a slab test in the box frame), segment obstacles as the exact capsule the collision step uses, and box agents oriented by their heading, alongside the circles they already handled.
   The circle-only filter that made boxes and segments invisible is gone, and with it the two host syncs it cost per install.

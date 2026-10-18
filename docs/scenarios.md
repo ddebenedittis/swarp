@@ -3,7 +3,7 @@
 A scenario defines the task: what the world is made of, how it resets, and what the agents observe and are rewarded for.
 The engine knows nothing about tasks — every built-in scenario is written against the same public `Scenario` ABC you would use for your own.
 
-## The eleven built-ins
+## The twelve built-ins
 
 | name | task | agents | `obs_dim` | notable |
 |---|---|---|---|---|
@@ -18,6 +18,7 @@ The engine knows nothing about tasks — every built-in scenario is written agai
 | `shepherding` | drive non-cooperative sheep into a pen | 3 dogs + 5 sheep | 34 | the environment pushes back: sheep flee the dogs and cohere, so a dog must herd rather than chase |
 | `caging` | surround an evasive disc so it cannot escape | 5 | 23 | a *topological* objective — the maximum angular gap between agents, not any distance |
 | `ringroad` | damp stop-and-go waves on a single-lane ring of IDM drivers | 1 car + 21 IDM humans | 9 | kinematic-bicycle RL cars among scenario-owned IDM traffic; the wave only exists on a ring of about 11 or more cars at this density |
+| `pusht_lidar` | push the T to a target pose, observed only through each robot's lidar | 2 pushers + 3 observers | 117 | per-episode random roles with fixed counts; `obs_level` 0 adds the oracle T pose, 2 adds teammates' pooled object hits; the only scenario with the trainer's `critic_state`/`agent_roles`/`aux_targets` hooks ([Lidar Push-T](pusht-lidar.md)) |
 
 Defaults shown; every scenario takes constructor keywords (`n_agents`, `world_size`, shaping factors, penalties, tolerances).
 `navigation`, `flocking` and `giveway` size their observation from `neighbor_obs`, so their `obs_dim` moves with it;
@@ -28,6 +29,7 @@ The last three are newer and break assumptions the first seven share.
 Every one of the original seven rewards monotone progress toward a goal, so a greedy "reduce the distance" controller does well on all of them;
 `giveway` cannot be solved that way (the greedy policy deadlocks nose-to-nose in the corridor), `caging` scores an angular property rather than a distance, and `shepherding` is the only one whose environment reacts to what the agents do.
 `ringroad` has no goal at all, and its difficulty comes from the number of vehicles, as the next section explains.
+`pusht_lidar` is Push-T without the object pose: the team must infer the T from its lidars, and the observers are rewarded for keeping it in view rather than for moving it.
 
 ## Ring road: a task that needs many vehicles
 

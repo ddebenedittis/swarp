@@ -66,3 +66,80 @@ The levers the related work points to, and which the training stages add one at 
 - one output head per role on a shared trunk;
 - observer rewards that are all penalties or potential-based, so that an observer cannot earn reward by prolonging the episode;
 - distillation from a teacher whose privileged view is restricted, if the stages above plateau.
+
+## Scenario
+
+`swarp.make("pusht_lidar", n_envs=..., device=...)` builds the task on top of `pusht`: the same T, contact law and pose shaping (it needs `substeps >= 8` at `dt = 0.05`), with five robots by default.
+Every `PushTScenario` keyword passes through, and `shape=` takes any compound from `swarp.scenarios.shapes`.
+
+### Robots and roles
+
+The robots are identical holonomic discs, and any of them can push the T.
+`n_pushers` of them (default 2) are pushers, role 0, and the rest are observers, role 1.
+Each reset draws a fresh assignment per env with a masked Fisher-Yates kernel on its own seed, launched after Push-T's spawn kernel, so the counts are exact in every env and an env the reset does not select keeps its roles.
+`agent_roles()` is that `[n_envs, n_agents]` int32 tensor, at a fixed address.
+
+### Lidar
+
+Every robot carries a 32-ray lidar over the full circle, in the world frame because a holonomic robot's heading never changes.
+Its range defaults to `0.8 * world_size`: a robot sees the T from about three T radii away but not from across the arena, and the T's narrowest silhouette (about 0.4 m) still spans two to three ray spacings at the edge of the range.
+Each ray reports its range and what it hit, so the observation carries an object mask and a robot mask next to the ranges.
+The fused path launches the capture-safe Warp lidar inside the whole-step CUDA graph; the torch path scans with the `lidar_scan` oracle against boxes it rebuilds from the body pose, which keeps it differentiable in the T pose.
+
+### Observation levels
+
+`obs_level` sets what a robot observes about the T, and `obs_layout()` returns the slice of every block.
+The widths below are for the defaults (`n_agents = 5`, `n_rays = 32`, `frame_stack = 1`, `n_comm_pts = 6`).
+
+| block | levels | width | content |
+|---|---|---|---|
+| self | all | 9 | own position and velocity, role sign (+1 observer, −1 pusher), goal position relative to the robot, cos and sin of the goal heading |
+| teammates | all | 12 | per teammate in ascending index, self skipped: relative position and role sign |
+| T | 0 | 8 | Push-T's eight numbers: T relative to the robot, goal relative to the T, cos and sin of the T heading and of its heading error |
+| lidar | all | 96 per frame | range / max range, object mask and robot mask per ray; `frame_stack` keeps a ring of the last scans, oldest first, zeroed at reset |
+| pooled hits | 2 | 90 | per robot (self included, ascending index), `n_comm_pts` of its object-hit points relative to the observer, each with a valid flag |
+
+That makes 125 at level 0, 117 at level 1 and 207 at level 2.
+Level 0 is the oracle stage; level 1 is a robot's own sensing; level 2 adds the engineered communication of the design list above.
+A pooled point is `j`'s object hit number `floor((k + 0.5) n_hit / K)` in ray order, placed in the world frame, which every robot can do because it knows its own pose; it is invalid when `j` sees no part of the T or is farther than `comm_range` (default unlimited).
+
+### Rewards
+
+Every term is reported per robot in `info()["multiobj_reward"]` (`[n_envs, n_agents, 7]`, zero where a role does not apply), and the columns sum to the reward.
+
+| term | who | definition | default |
+|---|---|---|---|
+| `team` | everyone | Push-T's pose shaping plus its goal bonus | Push-T's weights |
+| `approach` | pushers | Push-T's per-robot approach to the push point | `agent_dist_shaping = 1.0` |
+| `standoff` | observers | potential difference of `−abs(‖p − T‖ − d*)` | `standoff_shaping = 1.0`, `standoff_dist = 0.5` |
+| `visibility` | observers | `−w_v (1 − min(n_obj / (f* R), 1))`, `n_obj` the rays that hit the T | `w_v = 0.02`, `f* = 0.1` |
+| `coverage` | observers | `−w_c (1 − c)`, `c` the share of 8 sectors around the T centroid (T frame) holding an observer's object hit | `w_c = 0.02` |
+| `occlusion` | observers | `−w_o` times the share of the observer's rays inside the T's angular cone (its bounding disc) that hit a robot first | `w_o = 0.1` |
+| `contact` | observers | `−contact_penalty` while an object ray is shorter than two robot radii | `0` |
+
+The observer terms are penalties or potential differences, so an observer never earns reward by prolonging an episode.
+`info()` also carries `team_coverage`, `observer_visibility` and `occlusion` per env and `tee_seen` per robot, next to Push-T's `tee_dist_to_goal` and `tee_angle_error`.
+
+The weights were set from a random-policy rollout (512 envs, 400 steps, the recipe's Push-T shaping), per robot-step:
+
+| term | role | mean | mean of the magnitude |
+|---|---|---|---|
+| `team` | both | −0.0015 | 0.0031 |
+| `approach` | pushers | −0.0001 | 0.0232 |
+| `standoff` | observers | −0.0001 | 0.0228 |
+| `visibility` | observers | −0.0106 | 0.0106 |
+| `coverage` | observers | −0.0119 | 0.0119 |
+| `occlusion` | observers | −0.0035 | 0.0035 |
+
+An observer's terms total about −0.028 per step against −0.0016 for a pusher's, and each is within a factor of seven of the pushers' approach term.
+Occlusion is rare under a random policy (11% of observer steps, covering a third of the cone when it happens), so its weight is five times the others': a blocked view then costs about 0.033 per step, the size of the approach term's 0.023.
+
+### Training hooks
+
+The observation kernel writes the three trainer buffers on every pass, the obs-only pass after an auto-reset included, so they always describe the state the observation does.
+
+- `critic_state()`, `[n_envs, 15 + 5 n_agents]`: the T's position, the goal relative to it, cos and sin of its heading and heading error, its velocity and angular velocity, the goal pose, then per robot in role-sorted order its position, velocity and role sign.
+- `agent_roles()` with `role_counts = (n_pushers, n_agents − n_pushers)` and `n_roles = 2`.
+- `aux_targets()`, `[n_envs, n_agents, 4]`: the T's position relative to each robot divided by the lidar range, and cos and sin of its heading.
+
+`SPECS["pusht_lidar"]` is stage T0: Push-T's recipe with five robots at `obs_level=0`, a `PolicyNet` with one head per role, and a per-slot `StateCritic` on `critic_state()`, with the auxiliary loss off.

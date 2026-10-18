@@ -141,7 +141,7 @@ class Scenario(ABC):
         ``bounds_mode``, ``neighbor_reuse``, ``grid_dim``, ``uniform_bins``, the
         obstacle damping) reachable without subclassing. See
         :meth:`~swarp.core.config.WorldConfig.override_with` for the merge rule; a test
-        pins that all eleven built-ins honour it.
+        pins that all twelve built-ins honour it.
         """
 
     @abstractmethod

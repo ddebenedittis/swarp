@@ -39,7 +39,7 @@ The whole step — dynamics, soft collisions, walls — also runs under Warp's a
 - **Four dynamics models** — holonomic point, differential drive, kinematic bicycle and a 6-DOF quadrotor, mixable per agent in one world. [→](https://ddebenedittis.github.io/swarp/docs/dynamics.html)
 - **Soft contacts and rigid bodies** — spring-damper interactions against agents, circle/box/segment obstacles and walls, plus movable compound rigid bodies pushed by the reaction of those same contacts. [→](https://ddebenedittis.github.io/swarp/docs/world.html)
 - **Neighbor search without a sync** — padded within-radius lists, an explicit overflow flag, a COO radius graph for GNN policies, and three interchangeable backends tested to agree exactly. [→](https://ddebenedittis.github.io/swarp/docs/world.html#neighbor-search)
-- **Eleven scenarios** — navigation, flocking, formation, discovery, sampling, transport, Push-T, give-way, shepherding, caging and a mixed-autonomy ring road, each with fused Warp obs/reward kernels alongside the torch reference they are parity-tested against. [→](https://ddebenedittis.github.io/swarp/docs/scenarios.html)
+- **Twelve scenarios** — navigation, flocking, formation, discovery, sampling, transport, Push-T, give-way, shepherding, caging, a mixed-autonomy ring road and Push-T from lidar with pusher and observer roles, each with fused Warp obs/reward kernels alongside the torch reference they are parity-tested against. [→](https://ddebenedittis.github.io/swarp/docs/scenarios.html)
 - **Fast by default** — **33.9 M env-steps/s** at 16,000 envs × 16 agents on one RTX 3070 Laptop GPU from the fused Warp obs/reward kernels alone, with whole-step CUDA-graph capture (on by default) taking the same shape to 38.8 M. [→](https://ddebenedittis.github.io/swarp/docs/performance.html)
 - **Fast training built in** — `python -m swarp.rl` trains MAPPO with the rollout and the update CUDA-graph captured, 2.3–2.4× faster end to end than the same recipes on TorchRL as usually written and 1.3–1.5× faster than TorchRL with its own CUDA-graph and compile options, with torch as the only dependency. [→](https://ddebenedittis.github.io/swarp/docs/training.html)
 - **Interactive viewer** — an optional pygame renderer with headless frames, mp4/webm export, notebook embedding, a batch mosaic and live overlay toggles. [→](https://ddebenedittis.github.io/swarp/docs/visualization.html)
@@ -89,7 +89,7 @@ The [quickstart](https://ddebenedittis.github.io/swarp/docs/quickstart.html) wal
 | [Environment](https://ddebenedittis.github.io/swarp/docs/environment.html) | actions, returns, reset semantics, determinism |
 | [Dynamics models](https://ddebenedittis.github.io/swarp/docs/dynamics.html) | the four models, heterogeneous fleets, domain randomization |
 | [World and contacts](https://ddebenedittis.github.io/swarp/docs/world.html) | the contact law, obstacles, rigid bodies, neighbors, lidar |
-| [Scenarios](https://ddebenedittis.github.io/swarp/docs/scenarios.html) | the eleven built-in tasks |
+| [Scenarios](https://ddebenedittis.github.io/swarp/docs/scenarios.html) | the twelve built-in tasks |
 | [Writing a scenario](https://ddebenedittis.github.io/swarp/docs/writing-a-scenario.html) | your own task, in torch and fused Warp kernels |
 | [Differentiability](https://ddebenedittis.github.io/swarp/docs/differentiability.html) | gradients through the physics, and where they stop |
 | [Visualization](https://ddebenedittis.github.io/swarp/docs/visualization.html) | viewer, overlays, video, notebooks |

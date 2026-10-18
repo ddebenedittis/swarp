@@ -10,7 +10,7 @@ want it.
    the no-grad hot path, foldable into the whole-step CUDA graph. Worth 4–11× (see
    [benchmarks](benchmarks.md)); costs you a kernel module and a buffer spec.
 
-All eleven built-in scenarios are `FusedScenario`s, and they implement the *same* member
+All twelve built-in scenarios are `FusedScenario`s, and they implement the *same* member
 set — there are no opt-outs to copy from.
 
 ---
@@ -57,7 +57,7 @@ constructor does not expose (`integrator`, `bounds_mode`, `neighbor_reuse`, `gri
 `uniform_bins`, the obstacle damping) via `swarp.make(..., world_config=...)` without
 subclassing, while your computed `bounds` and `neighbor_radius` survive — only the fields
 set away from the `WorldConfig()` defaults are taken. `tests/scenarios/test_scenarios.py`
-pins that all eleven built-ins do this.
+pins that all twelve built-ins do this.
 
 ### `reset_world` must be host-sync-free
 
@@ -293,7 +293,7 @@ The lidar is the other ready-made capture-safe call: `Lidar.bind(world)` once ou
 
 `post_step_torch` / `reset_torch` and whatever they call (`_refresh`, `_box_contact`, …) are
 what the fused kernels are *tested against*. Keep them independent — sharing code with the
-fused path would weaken the exact property the eleven `tests/scenarios/test_*_fused.py`
+fused path would weaken the exact property the twelve `tests/scenarios/test_*_fused.py`
 suites exist to test. For the same reason the `_launch_*` wrappers are deliberately not
 unified: their `wp.launch` signatures are bespoke, and a launch DSL would be a worse
 `wp.launch` with none of Warp's type checking.
