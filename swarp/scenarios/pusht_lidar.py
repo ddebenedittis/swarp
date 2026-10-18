@@ -142,6 +142,14 @@ class PushTLidarScenario(PushTScenario):
         self.n_comm_pts = n_comm_pts
         self.comm_range = float(comm_range)
         self.frame_stack = frame_stack
+        # An observer resting at the standoff must clear the body's farthest corner, or the
+        # shaping parks it against the body and it jams the rotation the pushers need
+        # (a 0.22 standoff against the T's 0.265 corner radius left the angle error flat).
+        if self.n_agents > self.n_pushers and standoff_dist < self.tee_radius + self.agent_radius:
+            raise ValueError(
+                f"standoff_dist {standoff_dist} puts observers inside the body: it must be at "
+                f"least tee_radius + agent_radius = {self.tee_radius + self.agent_radius:.3f}"
+            )
         self.standoff_dist = standoff_dist
         self.standoff_shaping = standoff_shaping
         self.visibility_target = visibility_target

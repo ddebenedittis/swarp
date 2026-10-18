@@ -252,3 +252,12 @@ def test_pooled_hits_respect_comm_range(device):
     own = valid[:, eye].view(env.n_envs, env.n_agents, scen.n_comm_pts)
     assert torch.equal(own.amax(-1) > 0, seen)
     assert seen.any()
+
+
+def test_standoff_inside_the_body_is_rejected():
+    s = PushTLidarScenario()
+    floor = s.tee_radius + s.agent_radius
+    with pytest.raises(ValueError, match="inside the body"):
+        PushTLidarScenario(standoff_dist=0.9 * floor)
+    # Without observers the standoff is never used.
+    PushTLidarScenario(n_agents=2, n_pushers=2, standoff_dist=0.9 * floor)
