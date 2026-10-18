@@ -135,9 +135,18 @@ class World:
         # arithmetic -- see that module for why the two are numerically identical.
         self._seed_state_t = torch.zeros(2, dtype=torch.int32, device=self.device)
         self.seed_state = wp.from_torch(self._seed_state_t)
+        # Per-agent footprint, mirroring the P_RADIUS / P_SHAPE / P_HALF_* columns. A box
+        # agent's radius is its circumscribed one (see AgentConfig), so code that only
+        # reads agent_radius stays conservative.
         self.agent_radius = torch.tensor(
             [c.radius for c in agent_configs], device=device, dtype=dtype
         )
+        self.agent_shape = torch.tensor(
+            [int(c.shape) for c in agent_configs], device=device, dtype=torch.int32
+        )  # [n_agents] AgentShape tags
+        self.agent_half_extents = torch.tensor(
+            [c.half_extents for c in agent_configs], device=device, dtype=dtype
+        )  # [n_agents, 2], zero for a disc
 
     # ------------------------------------------------------------------ state
 

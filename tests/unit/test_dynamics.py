@@ -414,7 +414,12 @@ COLUMN_FIELDS = {
     "P_KAPPA": "torque_coeff",
     "P_GRAVITY": "gravity",
     "P_MIN_SPEED": "min_speed",
+    "P_SHAPE": "shape",
+    "P_HALF_X": "half_x",
+    "P_HALF_Y": "half_y",
 }
+#: The footprint columns, which take derived values rather than free sentinels.
+_FOOTPRINT = ("radius", "shape", "half_x", "half_y")
 
 
 def test_every_column_constant_points_at_the_field_to_row_packs_there():
@@ -426,12 +431,24 @@ def test_every_column_constant_points_at_the_field_to_row_packs_there():
     here. Getting this wrong is otherwise silent: right shape, wrong physics.
     """
     assert len(COLUMN_FIELDS) == NUM_PARAMS
-    sentinels = {name: float(i + 1) for i, name in enumerate(COLUMN_FIELDS.values())}
+    free = [name for name in COLUMN_FIELDS.values() if name not in _FOOTPRINT]
+    # Offset past the footprint values below (1, 3, 4, 5), so all twenty stay distinct.
+    sentinels = {name: float(i + 10) for i, name in enumerate(free)}
     # min_speed is validated against max_speed, so its sentinel is the one negative value.
     sentinels["min_speed"] = -0.5 * sentinels["max_speed"]
-    cfg = AgentConfig(model=DynamicsModel.DRONE, **sentinels)
+    # A box footprint gives the four footprint columns four distinct values too (a box's
+    # radius is derived, hypot(3, 4) = 5; shape BOX packs as 1.0). Box and drone are
+    # mutually exclusive, so the drone columns are checked as plain sentinels on a bicycle.
+    cfg = AgentConfig(
+        model=DynamicsModel.KINEMATIC_BICYCLE,
+        shape=base.AgentShape.BOX,
+        half_extents=(3.0, 4.0),
+        **sentinels,
+    )
     row = cfg.to_row()
     assert len(row) == NUM_PARAMS
+    assert (row[base.P_RADIUS], row[base.P_SHAPE]) == (5.0, 1.0)
+    assert (row[base.P_HALF_X], row[base.P_HALF_Y]) == (3.0, 4.0)
     for const, field in COLUMN_FIELDS.items():
         col = getattr(base, const)
         assert row[col] == getattr(cfg, field), f"{const} does not name {field}"

@@ -71,6 +71,21 @@ class ControlMode(IntEnum):
     ACCELERATION = 1
 
 
+class AgentShape(IntEnum):
+    """Agent footprint tags, packed into the :data:`P_SHAPE` parameter column.
+
+    ``DISC`` is a circle of ``AgentConfig.radius``. ``BOX`` is a rectangle of
+    ``AgentConfig.half_extents`` centred on the agent and rotated by its heading
+    ``theta``; its ``radius`` is the circumscribed one, so every radius-based bound in the
+    engine (neighbor reach, spawn spacing, ``World.agent_radius``) stays conservative.
+    The lidar sees the box; box-agent contact physics has not landed yet, so stepping a
+    world that holds a box agent raises ``NotImplementedError``.
+    """
+
+    DISC = 0
+    BOX = 1
+
+
 class Integrator(Enum):
     """Time integrator for the dynamics: semi-implicit Euler, or classical RK4."""
 
@@ -108,6 +123,10 @@ PARAM_FIELDS: tuple[str, ...] = (
     "gravity",
     # Appended last so every existing column keeps its index.
     "min_speed",
+    # Agent footprint: the AgentShape tag (as a float) and the box half-extents.
+    "shape",
+    "half_x",
+    "half_y",
 )
 NUM_PARAMS = len(PARAM_FIELDS)
 _COL = {name: i for i, name in enumerate(PARAM_FIELDS)}
@@ -132,6 +151,9 @@ P_IZZ = _COL["inertia_zz"]
 P_KAPPA = _COL["torque_coeff"]  # yaw reaction torque per unit rotor thrust
 P_GRAVITY = _COL["gravity"]  # gravitational acceleration (m/s^2)
 P_MIN_SPEED = _COL["min_speed"]  # bicycle's lower speed clamp (-max_speed if unset)
+P_SHAPE = _COL["shape"]  # AgentShape tag, stored as a float (0.0 disc, 1.0 box)
+P_HALF_X = _COL["half_x"]  # box half-extent along the heading (0 for a disc)
+P_HALF_Y = _COL["half_y"]  # box half-extent across the heading (0 for a disc)
 
 
 @dataclass
@@ -144,7 +166,11 @@ class AgentConfig:
     #: coercing here is what makes ``swarp.make("navigation", model="drone")`` work.
     model: DynamicsModel | str | int = DynamicsModel.HOLONOMIC
     ctrl_mode: ControlMode | str | int = ControlMode.VELOCITY
-    radius: float = 0.05
+    #: Disc radius; ``None`` means 0.05 for a disc. For a box it is *derived*: ``None``
+    #: resolves to the circumscribed radius ``hypot(*half_extents)``, and any other value
+    #: raises. Resolved in ``__post_init__``, so a ``dataclasses.replace`` that changes a
+    #: box's ``half_extents`` has to pass ``radius=None`` along with it.
+    radius: float | None = None
     mass: float = 1.0
     max_speed: float = 1.0
     max_accel: float = 1.0
@@ -166,10 +192,43 @@ class AgentConfig:
     inertia_zz: float = 0.02
     torque_coeff: float = 0.02  # yaw reaction torque per unit rotor thrust
     gravity: float = 9.81
+    #: Footprint, :class:`AgentShape` (member, name or value). Appended last, after the
+    #: drone block, so positional construction keeps working.
+    shape: AgentShape | str | int = AgentShape.DISC
+    #: Box half-extents ``(along, across)`` the heading; must be ``(0, 0)`` for a disc.
+    half_extents: tuple[float, float] = (0.0, 0.0)
 
     def __post_init__(self) -> None:
         self.model = _coerce(DynamicsModel, self.model, "model")
         self.ctrl_mode = _coerce(ControlMode, self.ctrl_mode, "ctrl_mode")
+        self.shape = _coerce(AgentShape, self.shape, "shape")
+        self.half_extents = tuple(float(h) for h in self.half_extents)
+        if len(self.half_extents) != 2:
+            raise ValueError("AgentConfig.half_extents must be a pair (hx, hy).")
+        if self.shape == AgentShape.BOX:
+            hx, hy = self.half_extents
+            if hx <= 0.0 or hy <= 0.0:
+                raise ValueError("A box agent needs positive half_extents (hx, hy).")
+            if self.model == DynamicsModel.DRONE:
+                raise ValueError("A drone cannot be a box agent; its footprint is a disc.")
+            circumscribed = math.hypot(hx, hy)
+            if self.radius is not None and not math.isclose(
+                self.radius, circumscribed, rel_tol=1e-9, abs_tol=1e-12
+            ):
+                raise ValueError(
+                    f"A box agent's radius is derived from its half_extents (the "
+                    f"circumscribed radius {circumscribed}); got radius={self.radius}. "
+                    "Leave radius unset (None)."
+                )
+            self.radius = circumscribed
+        else:
+            if self.half_extents != (0.0, 0.0):
+                raise ValueError(
+                    "AgentConfig.half_extents is only meaningful for shape=AgentShape.BOX; "
+                    "a disc's footprint is its radius."
+                )
+            if self.radius is None:
+                self.radius = 0.05
         if self.l_f + self.l_r <= 0.0:
             raise ValueError("Bicycle wheelbase l_f + l_r must be positive.")
         for name in ("radius", "mass", "max_speed", "max_accel", "max_ang_vel", "max_ang_accel"):
@@ -181,6 +240,16 @@ class AgentConfig:
             for name in ("thrust_max", "arm_length", "inertia_xx", "inertia_yy", "inertia_zz"):
                 if getattr(self, name) <= 0.0:
                     raise ValueError(f"AgentConfig.{name} must be positive for a drone.")
+
+    @property
+    def half_x(self) -> float:
+        """``half_extents[0]``, the value packed into :data:`P_HALF_X`."""
+        return self.half_extents[0]
+
+    @property
+    def half_y(self) -> float:
+        """``half_extents[1]``, the value packed into :data:`P_HALF_Y`."""
+        return self.half_extents[1]
 
     def to_row(self) -> list[float]:
         """This config as one ``[NUM_PARAMS]`` kernel row, in :data:`PARAM_FIELDS` order.

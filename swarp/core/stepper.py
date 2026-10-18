@@ -35,8 +35,10 @@ from swarp.core.state import VEC2, WorldState
 from swarp.dynamics.base import (
     NUM_PARAMS,
     P_RADIUS,
+    P_SHAPE,
     AgentConfig,
     AgentParams,
+    AgentShape,
     DynamicsModel,
     Integrator,
     build_agent_params,
@@ -199,6 +201,11 @@ class Stepper:
         # kernel, whose drone passthrough carries the identity adjoints the slim
         # kernel would drop). ``enable_slim2d`` lets the ablation disable it.
         self.has_drone: bool = any(c.model == DynamicsModel.DRONE for c in configs)
+        # Host-side, static for the life of the stepper (the shape column is structural;
+        # set_agent_params_per_env refuses to change it). Read by the lidar to compile its
+        # box-agent branch in or out, and by launch_substeps to refuse a step it would get
+        # wrong: every contact kernel still treats an agent as a disc of its radius.
+        self.has_box_agents: bool = any(c.shape == AgentShape.BOX for c in configs)
         self.enable_slim2d: bool = True
         # The single-launch substep chain (swarp/core/fused_substeps.py): ``"auto"`` takes
         # it where it measured faster (see _can_fuse_substeps), ``True`` wherever it is
@@ -412,7 +419,9 @@ class Stepper:
         graph-mode loop — is trusted against the bound validated then: a stall per reset
         is exactly what that path exists to avoid. Widening the radius range past what the
         first install validated therefore needs a reinstall (a differently shaped or typed
-        array, or a fresh Stepper) for it to be re-checked.
+        array, or a fresh Stepper) for it to be re-checked. The same goes for the second
+        host-side check, that the ``P_SHAPE`` column equals the shared one: an agent's
+        :class:`~swarp.dynamics.base.AgentShape` is structural and never randomized.
 
         Args:
             floats: ``[n_envs, n_agents, NUM_PARAMS]`` array (torch.Tensor or
@@ -440,6 +449,21 @@ class Stepper:
             and floats.dtype == torch_dt
             and str(floats.device) == str(self.device)
         )
+        if not in_place:
+            # The shape column is structural, like the model tag: the lidar and (once box
+            # contacts land) the force kernels pick their branch from the shared row. This is
+            # the first-install / reallocation path, never the per-reset in-place refresh, so
+            # its host read stays off the hot loop (and out of any capture).
+            shared = np.array([float(c.shape) for c in self.configs])
+            if is_torch:
+                given = floats[..., P_SHAPE].detach().cpu().double().numpy()
+            else:
+                given = np.asarray(floats, dtype=np.float64)[..., P_SHAPE]
+            if not np.array_equal(given, np.broadcast_to(shared, given.shape)):
+                raise ValueError(
+                    "per-env params must not change the P_SHAPE column: an agent's "
+                    "AgentShape is structural and fixed by its AgentConfig."
+                )
         if self.collisions and not in_place:
             if is_torch:
                 max_r = float(floats[..., P_RADIUS].max())
@@ -689,6 +713,14 @@ class Stepper:
         the recorded neighbor lists survive until backward (the grid's own lists
         get overwritten by the next build before then).
         """
+        if self.has_box_agents:
+            raise NotImplementedError(
+                "stepping a world with box agents (AgentShape.BOX) is not supported yet: "
+                "box-agent contact physics (box-agent vs agent, obstacle and wall "
+                "contacts) has not landed, and every contact kernel would treat the box as "
+                "a disc of its circumscribed radius. Such a world can be built, reset and "
+                "scanned by the lidar, but not stepped."
+            )
         n_envs = state_in.pos.shape[0]
         world = self.world
         if self._can_fuse_substeps(state_in, buffers):
