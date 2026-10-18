@@ -222,6 +222,10 @@ All notable changes to `swarp`. Newest first. Nothing has been released yet — 
 
 ### Changed
 
+- **The docs moved to `ddebenedittis.github.io/swarp/docs/`; the root is now the paper's project page.**
+  `site/` is an Astro project page (abstract, scenario gallery, the paper's figures and tables, the commands that reproduce them, BibTeX), built by the same Pages workflow as the docs into one artifact.
+  Every old top-level docs URL gets a redirect stub to its new address that keeps the `#fragment`, so existing links still land.
+
 - **The lockfile resolves TorchRL 0.14.1 and tensordict 0.14.3** (was 0.13.3 and 0.13.0) for the `torchrl` extra; BenchMARL's venv keeps TorchRL 0.11.1.
   The test suite passes on both, and the TorchRL trainers learn and time the same.
 
@@ -442,7 +446,7 @@ All notable changes to `swarp`. Newest first. Nothing has been released yet — 
   `ablation.parity_ok` / `sync_device` and `compare_vmas.make_vmas`.
 - Cross-simulator throughput benchmark (`swarp.benchmark.compare_sims`: swarp vs VMAS vs
   JaxMARL vs CAMAR, one subprocess per simulator) and a VMAS head-to-head
-  (`swarp.benchmark.compare_vmas`). See the [benchmarks](https://ddebenedittis.github.io/swarp/benchmarks.html) page.
+  (`swarp.benchmark.compare_vmas`). See the [benchmarks](https://ddebenedittis.github.io/swarp/docs/benchmarks.html) page.
 
 ### Repo
 
@@ -461,4 +465,4 @@ All notable changes to `swarp`. Newest first. Nothing has been released yet — 
 - MIT `LICENSE`, GitHub Actions CI (ruff + the CPU test suite on Python 3.12), a tracked
   `uv.lock`, and `docs/` split out of the README.
 
-What is planned next lives in the docs' [Roadmap](https://ddebenedittis.github.io/swarp/architecture.html#roadmap) section.
+What is planned next lives in the docs' [Roadmap](https://ddebenedittis.github.io/swarp/docs/architecture.html#roadmap) section.

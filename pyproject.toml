@@ -26,8 +26,8 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://ddebenedittis.github.io/swarp"
-Documentation = "https://ddebenedittis.github.io/swarp"
+Homepage = "https://ddebenedittis.github.io/swarp/"
+Documentation = "https://ddebenedittis.github.io/swarp/docs/"
 Repository = "https://github.com/ddebenedittis/swarp"
 Issues = "https://github.com/ddebenedittis/swarp/issues"
 

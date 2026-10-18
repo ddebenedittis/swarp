@@ -1,0 +1,308 @@
+---
+title: "swarp: A GPU-Resident Differentiable Simulator for High-Throughput Multi-Robot Learning"
+theme: device
+favicon: favicon.svg
+description: "An open-source, GPU-resident, differentiable simulator for planar multi-robot learning built on NVIDIA Warp, scaling to a million parallel environments and to hundreds of robots per environment on one GPU."
+thumbnail: cover_pic.png
+---
+
+import Header from "./components/Header.astro";
+import HighlightedSection from "./components/HighlightedSection.astro";
+import Figure from "./components/Figure.astro";
+import Picture from "./components/Picture.astro";
+import Video from "./components/Video.astro";
+import Gallery from "./components/Gallery.astro";
+import Bibtex from "./components/Bibtex.astro";
+
+import teaser from "./assets/teaser.webm";
+import ringroadScaling from "./assets/ringroad_scaling.svg";
+import ringroadTransfer from "./assets/ringroad_transfer.svg";
+import ringroadVideo from "./assets/ringroad_transfer.webm";
+import navigation from "./assets/scenes/navigation.png";
+import mixed from "./assets/scenes/mixed.png";
+import flocking from "./assets/scenes/flocking.png";
+import pusht from "./assets/scenes/pusht.png";
+import giveway from "./assets/scenes/giveway.png";
+import shepherding from "./assets/scenes/shepherding.png";
+import caging from "./assets/scenes/caging.png";
+import ringroad from "./assets/scenes/ringroad.png";
+
+export const docs = "https://ddebenedittis.github.io/swarp/docs";
+export const repo = "https://github.com/ddebenedittis/swarp";
+
+<Header
+  title="swarp: A GPU-Resident Differentiable Simulator for High-Throughput Multi-Robot Learning"
+  authors={[
+    {
+      name: "Davide De Benedittis",
+      url: "https://ddebenedittis.github.io/",
+      notes: ["1", "*"],
+    },
+    { name: "Federico Iadarola", notes: ["1"] },
+    { name: "Lucia Pallottino", notes: ["1"] },
+  ]}
+  notes={[
+    {
+      symbol: "1",
+      text: "Centro di Ricerca “E. Piaggio” and Dipartimento di Ingegneria dell'Informazione, Università di Pisa, Pisa 56122, Italy",
+    },
+    { symbol: "*", text: "Corresponding author: davide.debenedittis@phd.unipi.it" },
+  ]}
+  links={[
+    /* Add once the paper is out, together with a `conference` prop:
+    { name: "Paper", url: "https://doi.org/10.1109/...", icon: "ri:file-pdf-2-line" },
+    { name: "arXiv", url: "https://arxiv.org/abs/...", icon: "academicons:arxiv" }, */
+    { name: "Code", url: repo, icon: "ri:github-line" },
+    { name: "Docs", url: `${docs}/`, icon: "ri:book-open-line" },
+    { name: "Cite", url: "#bibtex-citation", icon: "ri:double-quotes-l" },
+  ]}
+>
+  <Video slot="background" src={teaser} controls={false} />
+</Header>
+
+<HighlightedSection>
+
+## Abstract
+
+Reinforcement learning for multi-robot systems is throughput-bound along two axes: parallel environments and robots per environment.
+Both matter, because robot-learning pipelines benefit from training across thousands of environments, and some multi-robot phenomena exist only above a minimum population.
+We present swarp, an open-source, GPU-resident, differentiable simulator for planar multi-robot learning built on NVIDIA Warp.
+Dynamics, neighbor search, soft contacts, observations, and rewards run as compiled kernels captured into one CUDA graph; multiple robot models mix per agent, and several tasks ship with the library, including give-way, shepherding, caging, and mixed-autonomy traffic.
+The presented library achieves high throughput along both axes, surpassing state-of-the-art GPU simulators and providing better scalability and lower memory usage.
+We validate swarp across a wide range of tasks including heterogeneous robots, mixed-autonomy traffic, and contacts both in simulation and in real-world experiments.
+
+</HighlightedSection>
+
+## Two axes of throughput
+
+Massively parallel simulation reduced the training of legged locomotion policies to minutes, and GPU simulators now scale to millions of parallel environments.
+For multi-robot learning that is only half of the problem: policies for large fleets must be trained with enough robots, and some phenomena only exist above a minimum population.
+On the ring road of Sugiyama et al., the standard mixed-autonomy benchmark, a stop-and-go wave forms only from about eleven vehicles on, even at fixed density.
+
+Existing tools compromise on the second axis.
+VMAS batches planar worlds in PyTorch but dispatches operations per entity, so its step cost grows with the number of agents.
+JaxMARL and CAMAR compile whole rollouts with XLA and are fast at small populations, but simulate particles rather than robot models.
+swarp keeps every environment on the GPU, compiles the entire step, robot models included, into Warp kernels, and replays it as a single CUDA graph, so it scales along both axes at once.
+
+<Gallery
+  items={[
+    { src: navigation, label: "navigation", alt: "Eight holonomic agents navigating around obstacles to their goals, with lidar rays drawn." },
+    { src: mixed, label: "mixed fleet", alt: "Holonomic, differential-drive, and car-like robots navigating in the same world." },
+    { src: flocking, label: "flocking", alt: "A flock of agents with their neighbor graph drawn." },
+    { src: pusht, label: "push-T", alt: "Four agents pushing a T-shaped rigid body toward a target pose." },
+    { src: giveway, label: "give-way", alt: "Four robots at a junction whose corridors fit only one robot." },
+    { src: shepherding, label: "shepherding", alt: "Three dog robots herding five sheep toward a goal region." },
+    { src: caging, label: "caging", alt: "Five robots surrounding an evasive disc." },
+    { src: ringroad, label: "ring road", alt: "A stop-and-go wave on a 22-vehicle single-lane ring road." },
+  ]}
+/>
+
+Eight of the eleven built-in scenarios in the interactive viewer.
+The full list, with observations, rewards and success criteria, is in the [scenario documentation](https://ddebenedittis.github.io/swarp/docs/scenarios.html).
+
+## What is inside
+
+- **One CUDA graph per step.**
+  All state lives on the device as `[n_envs, n_agents]` arrays.
+  Neighbor search, frictionless spring-damper contacts, movable rigid bodies, dynamics, observations, rewards, and auto-resets are Warp kernels captured into one graph, so a step is one graph replay with no host synchronization.
+  Forces are gathered per agent, without atomics, so the step is deterministic.
+  [Architecture →](https://ddebenedittis.github.io/swarp/docs/architecture.html)
+- **Heterogeneous robots in one launch.**
+  Holonomic point mass, differential drive, kinematic bicycle, and a 6-DOF quadrotor, each agent with its own model, limits, radius, and mass.
+  The integration kernel branches per agent on a model tag, so a mixed fleet steps in a single kernel launch.
+  [Dynamics →](https://ddebenedittis.github.io/swarp/docs/dynamics.html)
+- **Differentiable through contact.**
+  A `torch.autograd.Function` replays Warp's adjoint tape in the backward pass, and a `rollout` helper chains steps for backpropagation through time.
+  The test suite runs strict float64 `gradcheck` across models, integrators, multi-step rollouts, and active collisions.
+  [Differentiability →](https://ddebenedittis.github.io/swarp/docs/differentiability.html)
+- **Two independent implementations of every task.**
+  Each scenario computes observations and rewards both in PyTorch, the differentiable path and parity oracle, and as fused Warp kernels, the hot path.
+  The two share no code, so a bug cannot cancel itself in the parity tests that gate every benchmark.
+  [Writing a scenario →](https://ddebenedittis.github.io/swarp/docs/writing-a-scenario.html)
+- **A CUDA-graph MAPPO trainer.**
+  `python -m swarp.rl --scenario <name>` trains a published recipe with the rollout and the update captured as CUDA graphs, with PyTorch as the only dependency.
+  [Training →](https://ddebenedittis.github.io/swarp/docs/training.html)
+
+## Tasks beyond going to a goal
+
+The first seven scenarios reward monotone progress toward a goal, as most multi-robot suites do.
+The last four break that assumption, each on a problem met in deployment.
+
+- **Give-way** is deadlock resolution: four robots cross a junction whose corridors fit one robot, so some robot must move away from its own goal.
+- **Shepherding** drives five sheep that flee the three dog robots and cohere, so the environment reacts and a dog must herd rather than chase.
+- **Caging** scores the largest angular gap between five robots around an evasive disc, a topological property rather than a distance.
+- **Ring road** reproduces Flow's 230 m single-lane ring: one RL car, a kinematic bicycle, among 21 IDM human drivers.
+  The observation has the same width at any ring size, so one policy can be evaluated on any ring.
+
+These tasks report each reward term separately, so a shaping imbalance shows on the first training iteration rather than after an hour.
+
+## Results
+
+All measurements were taken on one NVIDIA RTX 3070 Laptop GPU (8 GB) in float32, with swarp in its fastest configuration: fused kernels, whole-step CUDA graph, no gradients.
+Cross-simulator runs place each simulator in its own virtual environment and subprocess, and time the simulator step alone with random actions on the device.
+The full tables behind every number are in the [benchmark documentation](https://ddebenedittis.github.io/swarp/docs/benchmarks.html).
+
+### Navigation against VMAS, JaxMARL, and CAMAR
+
+All four simulators run obstacle-free navigation with relative-position observations.
+At 3 agents and small batches the JAX simulators lead, because they compile the whole rollout into one `lax.scan` while swarp pays a ~0.24 ms per-step floor.
+At 16 agents the order inverts: their per-step cost grows with the population, while swarp's kernels absorb it as occupancy, reaching 35.6 M env-steps/s and 570 M agent-steps/s.
+
+| envs | agents | swarp | VMAS | JaxMARL | CAMAR |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1,024 | 3 | 4.72 | 0.63 | **13.7** | 11.6 |
+| 16,384 | 3 | 63.6 | 9.95 | 65.2 | **67.5** |
+| 1,024 | 16 | **3.87** | 0.14 | 2.22 | 2.62 |
+| 16,384 | 16 | **35.6** | 2.12 | 1.42 | 3.68 |
+
+Matched navigation throughput in millions of env-steps/s; best per row in bold.
+
+### Scaling the ring road along both axes
+
+Neither VMAS nor JaxMARL ships the ring road, so we ported it to both, each written the efficient way for its simulator.
+Driven by the same IDM controller, all three reproduce the same physics: the wave dies on 6 cars and persists on 22.
+At $2^{20}$ parallel environments swarp steps 77.7 M env-steps/s, where VMAS runs out of memory.
+Along the other axis, both baselines run out of memory at 256 vehicles per ring, where swarp still steps 1.34 M env-steps/s.
+
+<Figure>
+  <div slot="figure" class="rounded-lg bg-white p-3">
+    <Picture src={ringroadScaling} alt="Two log-scale plots of ring-road throughput. Left: env-steps per second against vehicles per ring at 16,384 envs, with swarp above the JaxMARL port and VMAS, both of which run out of memory at 256 vehicles. Right: env-steps per second against parallel envs from 2^10 to 2^20 with 22 vehicles, with swarp highest and VMAS out of memory at 2^20." />
+  </div>
+  <Fragment slot="caption">Ring-road throughput with one RL car. (a) Vehicles per ring at 16,384 envs. (b) Parallel envs with 22 vehicles, up to 2<sup>20</sup>.</Fragment>
+</Figure>
+
+### End-to-end training speed
+
+At the recipes' batch sizes, simulation is at most 2.7% of a training iteration, so the trainer's loop is what matters.
+`swarp.rl` captures the rollout and the PPO update as CUDA graphs around the environment's own graph.
+On give-way every trainer reaches full curriculum difficulty at the same iteration, 413–417 over three seeds, so the speed-up carries through to wall-clock time-to-solve without changing what is learned.
+
+| trainer | navigation (ms) | speed-up | give-way (ms) | speed-up | solve (s) |
+| :--- | ---: | ---: | ---: | ---: | ---: |
+| TorchRL | 232 | 1.0× | 464 | 1.0× | 187–188 |
+| TorchRL tuned | 121 | 1.9× | 242 | 1.9× | 102–103 |
+| TorchRL tuned + compile | 101 | 2.3× | 190 | 2.4× | – |
+| BenchMARL | 252 | 0.9× | 480 | 1.0× | 208–209 |
+| rsl_rl | 162 | 1.4× | 316 | 1.5× | 133–134 |
+| `swarp.rl` | 97 | 2.4× | 189 | 2.5× | 79 |
+| `swarp.rl` + compile | **72** | **3.2×** | **145** | **3.2×** | – |
+
+MAPPO iteration time (rollout plus update) at the recipes' batch sizes, navigation at 512 envs and give-way at 1,024, and wall-clock to full curriculum difficulty on give-way.
+
+### Why many robots: wave damping does not transfer up
+
+We trained two ring-road policies identical except for the ring: 22 cars, or 6 at the same density.
+On an $N$-car ring the slowest traffic mode only grows from about 11 cars on, so the 6-car ring never shows a wave to damp.
+The 22-car policy dissipates the wave on every ring that has one, leaving a speed spread of 0.03 m/s at $N = 22$, where the humans alone sustain 2.9 m/s.
+The 6-car policy fails from 14 cars on, and from 18 cars it rear-ends its leader in 31–43% of environments.
+
+<Figure>
+  <div slot="figure" class="rounded-lg bg-white p-3">
+    <Picture src={ringroadTransfer} alt="Left: growth rate of the slowest traffic mode against ring size, negative below 11 cars and positive above. Right: greedy solve rate against ring size, where the policy trained on 22 cars solves every ring, while the policy trained on 6 cars and the humans-only ring drop to zero from about 11 to 14 cars." />
+  </div>
+  <Fragment slot="caption">(a) Linear growth rate of the slowest traffic mode on an N-car ring at fixed density: a stop-and-go wave exists only from N ≈ 11 (shaded). (b) Greedy solve rate on rings of N cars for the humans-only ring and for policies trained on 22 and on 6 cars.</Fragment>
+</Figure>
+
+<Figure>
+  <video slot="figure" class="h-auto w-full rounded-lg" src={ringroadVideo} autoplay loop muted playsinline controls />
+  <Fragment slot="caption">The same 22-car ring from the same start, 150 s at 5×: humans only, the policy trained on 22 cars, and the policy trained on 6 cars.</Fragment>
+</Figure>
+
+Shrinking each environment to fit more of them on the GPU can delete the phenomenon the policy must learn.
+Size each environment for the phenomenon, not for the batch.
+
+{/* Real-world deployment: add once Sec. V-E of the paper has results (video S2, overhead
+    frames with trajectories beside the simulated rollout, success rate vs. scripted baseline). */}
+
+## Reproducing the paper
+
+Every figure and table above comes from a command in the repository.
+The cross-simulator benchmarks run each simulator in its own virtual environment; the [setup instructions](https://ddebenedittis.github.io/swarp/docs/benchmarks.html#setting-up-the-venvs) cover the VMAS, JaxMARL and CAMAR environments.
+
+**Navigation table**
+
+```bash
+python -m swarp.benchmark.compare_sims --envs 1024 4096 16384 --agents 3 16 \
+  --python jaxmarl=.venv-jaxmarl/bin/python --python camar=.venv-camar/bin/python
+```
+
+**Ring-road scaling**, parallel envs, then vehicles per ring.
+The VMAS and JaxMARL ports are `swarp/benchmark/_adapters/ringroad_{vmas,jax}.py`.
+
+```bash
+python -m swarp.benchmark.compare_sims --scenarios ringroad --sims swarp vmas jaxmarl \
+  --envs 1024 4096 16384 --agents 1 4 --steps 300 --warmup 20 \
+  --python vmas=.venv-vmas/bin/python --python jaxmarl=.venv-jaxmarl/bin/python
+python -m swarp.benchmark.compare_sims --scenarios ringroad --sims swarp vmas jaxmarl \
+  --envs 16384 --agents 1 --vehicles 22 64 128 256 \
+  --python vmas=.venv-vmas/bin/python --python jaxmarl=.venv-jaxmarl/bin/python
+```
+
+**Training table**, which runs each trainer's own command line and reports the median iteration time.
+
+```bash
+python -m swarp.benchmark.train_throughput \
+  --configs torchrl torchrl-tuned torchrl-tuned-fast benchmarl rsl_rl eager graphs fast \
+  --python benchmarl=.venv-benchmarl/bin/python
+```
+
+**Ring-road transfer**: train on 22 and on 6 cars, then score each checkpoint on any ring size.
+
+```bash
+python -m swarp.rl --scenario ringroad
+python -m swarp.rl --scenario ringroad --scen-kwarg n_vehicles=6
+python examples/eval_mappo.py <checkpoint> --scen-kwarg n_vehicles=22
+```
+
+{/* TODO at camera-ready: pin the tagged release and its Zenodo DOI here, and link the hosted
+    checkpoints and per-run metrics.csv once they are uploaded. */}
+
+## Getting started
+
+```bash
+git clone https://github.com/ddebenedittis/swarp.git && cd swarp
+uv venv && uv pip install -e .
+```
+
+```python
+import torch
+import swarp
+
+env = swarp.make("navigation", n_envs=4096, n_agents=8, device="cuda:0")
+obs = env.reset()
+for _ in range(100):
+    actions = torch.rand(4096, 8, env.act_dim, device="cuda:0") * 2 - 1
+    obs, reward, term, trunc, info = env.step(actions)  # everything stays on the GPU
+```
+
+The [installation guide](https://ddebenedittis.github.io/swarp/docs/installation.html) covers the optional extras (viewer, TorchRL wrapper, benchmarks) and CPU-only installs, and the [quickstart](https://ddebenedittis.github.io/swarp/docs/quickstart.html) walks through the loop above.
+
+## Limitations
+
+swarp is planar except for its quadrotor model, and contact-rich 3-D manipulation is out of scope.
+There is no camera sensing, movable bodies are integrated off the adjoint tape, and adding a dynamics model requires an in-tree edit.
+Benchmark absolutes come from one laptop GPU and should be read as ratios.
+The ring-road baselines are ports we wrote, verified to reproduce the same physics, but not maintained by the VMAS or JaxMARL authors.
+
+## BibTeX citation
+
+<Bibtex>
+
+```bibtex
+@misc{debenedittis2026swarp,
+  author       = {De Benedittis, Davide and Iadarola, Federico and Pallottino, Lucia},
+  title        = {swarp: A GPU-Resident Differentiable Simulator for High-Throughput Multi-Robot Learning},
+  year         = {2026},
+  howpublished = {\url{https://github.com/ddebenedittis/swarp}}
+}
+```
+
+</Bibtex>
+
+{/* The venue stays off the page while the paper is under double-anonymous review. At
+    acceptance, replace this with the @article entry (journal, volume, pages, doi). */}
+
+{/* Deliberately left off this page, all of which have a source in the paper but do not
+    belong on a project page: the related-work survey, the per-kernel design details, the
+    XLA row-reduction analysis of the ring-road leader search, and the 4096-env benchmark
+    rows. They live in the documentation, which tracks main; this page tracks the paper. */}

@@ -1,0 +1,25 @@
+---
+interface Props {
+  src: string;
+  alt?: string;
+}
+const { src, alt } = Astro.props;
+
+// Files in public/ are NOT base-prefixed by Vite, so an absolute src such as
+// "/model.glb" 404s on a project page served under https://user.github.io/repo/.
+// Resolve public-relative paths against BASE_URL here; leave full URLs alone.
+const baseUrl = import.meta.env.BASE_URL;
+const prefix = baseUrl.endsWith("/") ? baseUrl : baseUrl + "/";
+const resolvedSrc = /^(https?:)?\/\//.test(src)
+  ? src
+  : prefix + src.replace(/^\//, "");
+---
+
+<model-viewer
+  class="my-6 overflow-hidden rounded-lg bg-zinc-200 dark:bg-zinc-800"
+  alt={alt}
+  src={resolvedSrc}
+  camera-controls></model-viewer>
+<script>
+  import "@google/model-viewer";
+</script>
