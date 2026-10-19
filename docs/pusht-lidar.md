@@ -170,7 +170,7 @@ On the Coulomb floor swarp gives 60, 142 and 48°/m (glancing push; reference 48
 
 `SPECS["pusht_lidar_limo_dr_wheel"]` adds wheel-faithful contacts (`wheel_contacts`, see [World](world.md#box-agents)): a robot's contact torque turns it only past the 3.5 N·m its drive holds, and its wheels grip sideways with μ 0.2.
 A policy trained without them (L3b, 0.99 greedy in swarp) solved 0.35 in Gazebo: its two robots squeezed the T head-on from opposite faces and spun in place, which a Limo cannot do, because its flush front corner would have to swing through a face the other robot holds.
-With wheel contacts, two robots pressing the T from opposite faces hold their yaw as in Gazebo (−4° and −5° of a commanded +258°; Gazebo 0°), and a robot turning against the free T still turns (+199°; Gazebo +198°).
+With wheel contacts, two robots pressing the T from opposite faces hold their yaw as in Gazebo (−1° and −2° of a commanded +258°; Gazebo 0°), and a robot turning against the free T still turns (+199°; Gazebo +198°).
 Trained from scratch the recipe reaches 0.96 greedy at 16000 iterations; resumed from the Coulomb policy it reaches 0.99 in 8000.
 Its comment in `swarp/rl/recipes.py` derives every value that differs from U-H1's.
 A recipe keyed by a name other than its scenario's sets `TrainSpec.scenario`, which `scenario_name` resolves wherever a scenario is built from a `SPECS` key.
@@ -230,3 +230,20 @@ The same recipe with `model="diff_drive"` and `agent_shape="box"` (5 × 2.5 cm r
 Two unicycle pushers learn the task as fast as holonomic ones.
 With observers the team gets there about 1000 iterations later than the holonomic team and ends four to five points lower, still rising.
 The observers keep the T in view better than holonomic ones do (visibility 0.85–0.96 against 0.67–0.75 at iterations 500–1500), while the team reward lags at a third of the holonomic run's: in rollouts the observers bunch on one side of the T, often between it and its goal, and a unicycle cannot sidestep out of a pusher's way.
+
+### Gazebo transfer
+
+Each Limo-scale policy was also run greedy in Gazebo Harmonic on simulated Limo robots, with the observation rebuilt from the Gazebo lidar scan and robot poses (`swarp_gz_test`, results and method in its `docs/results.md`).
+
+| policy | recipe | Gazebo | swarp |
+|---|---|---|---|
+| L2 | `pusht_lidar_limo` | 0.567 | 0.857 |
+| L3b | `pusht_lidar_limo_dr` (robot mass 6.7) | 0.350 | 0.986 |
+| L4 | `pusht_lidar_limo_dr_coulomb` | 0.883 | 0.973 |
+| L5 | `pusht_lidar_limo_dr_wheel`, from scratch | 0.800 | 0.959 |
+| L5r | `pusht_lidar_limo_dr_wheel`, resumed from L4 | 0.867 | 0.992 |
+| L5s | `pusht_lidar_limo_dr_wheel` with the turn stall, resumed from L5r | 0.917 | 0.986 |
+
+L3b fails mostly by the two-robot squeeze: in 32 of its 60 Gazebo episodes the robots lock each other's yaw against the T, which swarp let them spin out of before wheel-faithful contacts.
+L5s sampled solves 0.917 in Gazebo and 0.998 in swarp; four of its five sampled failures are the T leaving the ±2 m arena, which swarp clamps inside and Gazebo does not wall.
+The deployment recipe is `pusht_lidar_limo_dr_wheel`, and the deployment checkpoint is L5s (`runs/L5s-wheelstall-limo-s0-fromL5r/pusht_lidar_limo_dr_wheel_best.pt` on davide-cf, pulled to `runs/remote-davide-cf/`).
