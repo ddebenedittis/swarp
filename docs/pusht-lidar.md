@@ -247,3 +247,27 @@ Each Limo-scale policy was also run greedy in Gazebo Harmonic on simulated Limo 
 L3b fails mostly by the two-robot squeeze: in 32 of its 60 Gazebo episodes the robots lock each other's yaw against the T, which swarp let them spin out of before wheel-faithful contacts.
 L5s sampled solves 0.917 in Gazebo and 0.998 in swarp; four of its five sampled failures are the T leaving the ±2 m arena, which swarp clamps inside and Gazebo does not wall.
 The deployment recipe is `pusht_lidar_limo_dr_wheel`, and the deployment checkpoint is L5s (`runs/L5s-wheelstall-limo-s0-fromL5r/pusht_lidar_limo_dr_wheel_best.pt` on davide-cf, pulled to `runs/remote-davide-cf/`).
+
+### Real Limo recipe
+
+`SPECS["pusht_lidar_limo_real"]` prepares `pusht_lidar_limo_dr_wheel` for the real AgileX Limos (EAI T-mini Pro lidar, localised by Qualisys mocap or by nav2 AMCL); every knob is opt-in and leaves the default worlds bit-identical.
+The lidar returns from 0.02 m of its mount (`lidar_min_range`), with range noise drawn per env and robot from 5–20 mm (`lidar_noise` as a range) and a field of view drawn per env and robot from 240–360° (`lidar_fov` as a range).
+The field of view keeps body-frame ray `r` iff its offset `r · 2π/32`, wrapped to (−π, π], is within half the field of view plus 1e-4 rad, whatever the heading: 240° keeps rays −10…10 (21 rays), 270° keeps −12…12, and a deployment blanks the same rays for its measured field of view.
+`pose_noise` adds a localisation error to the observation only: a per-episode bias per robot (3 cm per axis and 0.03 rad at scale 1, `pose_bias_std`), per-step jitter (2 cm and 0.02 rad, `pose_jitter_std`) and the velocity turned by the heading error plus 2 cm/s (`vel_noise_std`), all times a scale drawn per env from 0–1, so mocap (scale 0) and AMCL (scale 1) are both in the distribution.
+The self block, the goal offset and the teammate offsets read each robot's own reported pose, so a teammate offset carries both robots' errors, while the lidar stays in the true body frame (the sensor is bolted to the body, so a heading error shows up as a mismatch between the scan and the goal direction, not as a rotated scan); reward, success, the critic and the auxiliary targets read the true state.
+`cmd_latency` (0–125 ms, drawn per env and robot) applies the previous command for that many of the step's 32 substeps (`Stepper.enable_command_delay`), standing in for WiFi and processing delay.
+Fine-tuned from L5s for 8000 iterations (L6, fresh Adam, full difficulty), the greedy solve rate climbed from 0.73 at iteration 500 to 0.91 at 3500 and stayed at 0.92 to 8000.
+
+| condition | L5s greedy | L5s sampled | L6 greedy | L6 sampled |
+|---|---|---|---|---|
+| training distribution | 0.506 | 0.568 | 0.949 | 0.980 |
+| mocap-like (no pose noise, 360°, σ 1 cm, no latency) | 0.961 | 1.000 | 0.926 | 0.990 |
+| AMCL-like (pose scale 1, 240°, σ 2 cm, 100 ms) | 0.119 | 0.113 | 0.896 | 0.916 |
+| AMCL pose noise only | 0.969 | 1.000 | 0.924 | 0.984 |
+| 240° field of view only | 0.094 | 0.113 | 0.826 | 0.936 |
+| 100 ms latency only | 0.980 | 0.992 | 0.967 | 0.988 |
+
+All rows are 512 envs at full difficulty with L6's `_best.pt`; the remaining knobs are the recipe's (`lidar_min_range` 0.02, the rest at the values listed).
+L5s ignores AMCL-scale pose noise and 100 ms of latency, but a 240° field of view breaks it, so the rear blind sector is what the real robots needed training for.
+L6 pays about 0.035 greedy in the mocap-like condition for it, while its sampled policy holds 0.99.
+The checkpoint is `runs/L6-real-limo-s0-fromL5s/pusht_lidar_limo_real_best.pt` on davide-cf, pulled to `runs/remote-davide-cf/`.
