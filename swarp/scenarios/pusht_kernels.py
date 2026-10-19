@@ -30,6 +30,7 @@ import warp as wp
 
 from swarp._overloads import register
 from swarp.core.state import VEC2
+from swarp.dynamics.base import P_CMD_GAIN_V, P_CMD_GAIN_W, P_MAX_ACCEL, P_MAX_ANG_ACCEL
 from swarp.scenarios.reset_kernels import _as
 
 # Lean launches (no grid-stride loop); see docs/performance.md.
@@ -344,6 +345,58 @@ def pusht_heading_reset_kernel(
     ang_vel[e, a] = _as(0.0, th)
 
 
+@wp.func
+def _draw(u: float, lo: Any, hi: Any, old: Any):
+    """``u`` in ``[0, 1)`` mapped onto ``[lo, hi]``, or ``old`` for a fixed (``lo == hi``)
+    knob, whose value may be infinite."""
+    out = old
+    if hi > lo:
+        out = lo + (hi - lo) * _as(u, lo)
+    return out
+
+
+@wp.kernel
+def pusht_actuation_reset_kernel(
+    reset_mask: wp.array(dtype=wp.uint8),
+    use_mask: wp.int32,
+    seed: wp.int32,
+    acc_lo: Any,
+    acc_hi: Any,
+    ang_lo: Any,
+    ang_hi: Any,
+    gv_lo: Any,
+    gv_hi: Any,
+    gw_lo: Any,
+    gw_hi: Any,
+    params: wp.array3d(dtype=Any),
+):
+    """Thread per (env, robot): fresh ``SERVO`` accelerations and command gains in the
+    per-env parameter rows of the respawned envs, each uniform in its range. Its own
+    seed, so the spawn and heading draws are the same with or without it."""
+    e, a = wp.tid()
+    if use_mask == 1 and reset_mask[e] == wp.uint8(0):
+        return
+    rng = wp.rand_init(seed, e * params.shape[1] + a)
+    u0 = wp.randf(rng)
+    u1 = wp.randf(rng)
+    u2 = wp.randf(rng)
+    u3 = wp.randf(rng)
+    params[e, a, P_MAX_ACCEL] = _draw(u0, acc_lo, acc_hi, params[e, a, P_MAX_ACCEL])
+    params[e, a, P_MAX_ANG_ACCEL] = _draw(u1, ang_lo, ang_hi, params[e, a, P_MAX_ANG_ACCEL])
+    params[e, a, P_CMD_GAIN_V] = _draw(u2, gv_lo, gv_hi, params[e, a, P_CMD_GAIN_V])
+    params[e, a, P_CMD_GAIN_W] = _draw(u3, gw_lo, gw_hi, params[e, a, P_CMD_GAIN_W])
+
+
+def _actuation_reset_signature(dtype) -> list:
+    return [
+        wp.array(dtype=wp.uint8),
+        wp.int32,
+        wp.int32,
+        *([dtype] * 8),
+        wp.array3d(dtype=dtype),
+    ]
+
+
 def _heading_reset_signature(dtype) -> list:
     a2s = wp.array2d(dtype=dtype)
     return [wp.array(dtype=wp.uint8), wp.int32, wp.int32, a2s, a2s, a2s]
@@ -380,3 +433,4 @@ for _T in (wp.float32, wp.float64):
     register(pusht_reward_kernel, _T, _reward_signature(_T))
     register(pusht_reset_kernel, _T, _reset_signature(_T))
     register(pusht_heading_reset_kernel, _T, _heading_reset_signature(_T))
+    register(pusht_actuation_reset_kernel, _T, _actuation_reset_signature(_T))

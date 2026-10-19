@@ -62,13 +62,21 @@ class ControlMode(IntEnum):
     """Interpretation of the 2D action vector.
 
     HOLONOMIC: VELOCITY -> (vx, vy), ACCELERATION -> (ax, ay).
-    DIFF_DRIVE: VELOCITY -> (v, omega), ACCELERATION -> (a, alpha).
+    DIFF_DRIVE: VELOCITY -> (v, omega), ACCELERATION -> (a, alpha), SERVO -> (v, omega).
     KINEMATIC_BICYCLE: always (acceleration, steering angle); the flag is ignored.
     DRONE: always four per-rotor thrusts; the flag is ignored.
+
+    ``SERVO`` (diff-drive only) is a velocity command tracked by a rate-limited servo,
+    the way a wheeled robot's motor controller tracks ``cmd_vel``: each substep the
+    speed and turn rate move toward ``cmd_gain_v * v`` and ``cmd_gain_w * omega`` by at
+    most ``max_accel * dt`` and ``max_ang_accel * dt``, and are then clamped to
+    ``max_speed`` / ``max_ang_vel`` as in ``VELOCITY``. The gains model a drive that
+    under- or over-delivers (a skid-steer base turns slower than commanded).
     """
 
     VELOCITY = 0
     ACCELERATION = 1
+    SERVO = 2
 
 
 class AgentShape(IntEnum):
@@ -127,6 +135,9 @@ PARAM_FIELDS: tuple[str, ...] = (
     "shape",
     "half_x",
     "half_y",
+    # ControlMode.SERVO's command gains (read by no other mode).
+    "cmd_gain_v",
+    "cmd_gain_w",
 )
 NUM_PARAMS = len(PARAM_FIELDS)
 _COL = {name: i for i, name in enumerate(PARAM_FIELDS)}
@@ -154,6 +165,8 @@ P_MIN_SPEED = _COL["min_speed"]  # bicycle's lower speed clamp (-max_speed if un
 P_SHAPE = _COL["shape"]  # AgentShape tag, stored as a float (0.0 disc, 1.0 box)
 P_HALF_X = _COL["half_x"]  # box half-extent along the heading (0 for a disc)
 P_HALF_Y = _COL["half_y"]  # box half-extent across the heading (0 for a disc)
+P_CMD_GAIN_V = _COL["cmd_gain_v"]  # SERVO: delivered / commanded speed
+P_CMD_GAIN_W = _COL["cmd_gain_w"]  # SERVO: delivered / commanded turn rate
 
 
 @dataclass
@@ -197,6 +210,10 @@ class AgentConfig:
     shape: AgentShape | str | int = AgentShape.DISC
     #: Box half-extents ``(along, across)`` the heading; must be ``(0, 0)`` for a disc.
     half_extents: tuple[float, float] = (0.0, 0.0)
+    #: ``ControlMode.SERVO`` only: the speed and turn rate the drive delivers per unit
+    #: commanded, before the ``max_speed`` / ``max_ang_vel`` clamp.
+    cmd_gain_v: float = 1.0
+    cmd_gain_w: float = 1.0
 
     def __post_init__(self) -> None:
         self.model = _coerce(DynamicsModel, self.model, "model")
@@ -231,9 +248,15 @@ class AgentConfig:
                 self.radius = 0.05
         if self.l_f + self.l_r <= 0.0:
             raise ValueError("Bicycle wheelbase l_f + l_r must be positive.")
-        for name in ("radius", "mass", "max_speed", "max_accel", "max_ang_vel", "max_ang_accel"):
+        for name in (
+            "radius", "mass", "max_speed", "max_accel", "max_ang_vel", "max_ang_accel",
+            "cmd_gain_v", "cmd_gain_w",
+        ):
             if getattr(self, name) <= 0.0:
                 raise ValueError(f"AgentConfig.{name} must be positive.")
+        if self.ctrl_mode == ControlMode.SERVO and self.model != DynamicsModel.DIFF_DRIVE:
+            raise ValueError("ControlMode.SERVO is a diff-drive mode; got model "
+                             f"{self.model.name}.")
         if self.min_speed is not None and not -self.max_speed <= self.min_speed <= self.max_speed:
             raise ValueError("AgentConfig.min_speed must lie in [-max_speed, max_speed].")
         if self.model == DynamicsModel.DRONE:
@@ -274,6 +297,7 @@ _ACTION_LIMITS: dict[tuple[str, str], tuple[tuple[float | None, str], ...]] = {
     ("HOLONOMIC", "ACCELERATION"): ((None, "max_accel"), (None, "max_accel")),
     ("DIFF_DRIVE", "VELOCITY"): ((None, "max_speed"), (None, "max_ang_vel")),
     ("DIFF_DRIVE", "ACCELERATION"): ((None, "max_accel"), (None, "max_ang_accel")),
+    ("DIFF_DRIVE", "SERVO"): ((None, "max_speed"), (None, "max_ang_vel")),
     # the bicycle and drone ignore ctrl_mode, so both modes map to one row
     ("KINEMATIC_BICYCLE", "VELOCITY"): ((None, "max_accel"), (None, "max_steer")),
     ("KINEMATIC_BICYCLE", "ACCELERATION"): ((None, "max_accel"), (None, "max_steer")),

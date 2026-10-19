@@ -57,7 +57,8 @@ def test_existing_column_indices_are_unchanged():
     ]  # fmt: skip
     assert [getattr(base, c) for c in before] == list(range(17))
     assert (base.P_SHAPE, base.P_HALF_X, base.P_HALF_Y) == (17, 18, 19)
-    assert base.NUM_PARAMS == 20
+    assert (base.P_CMD_GAIN_V, base.P_CMD_GAIN_W) == (20, 21)
+    assert base.NUM_PARAMS == 22
 
 
 def _world(configs, device="cpu", collisions=True):

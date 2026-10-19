@@ -19,7 +19,7 @@ import inspect
 import math
 from collections import deque
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import torch
@@ -527,6 +527,37 @@ SPECS: dict[str, TrainSpec] = {
         stagger_starts=True,
     ),
 }
+
+# The Limo recipe with the gaps a Gazebo sysid (swarp_gz_test/out/sysid/report.md) found
+# between swarp and the velocity-servoed Limo, which Gazebo stands in for:
+#
+# - Drag 6/s instead of 40/s on the T. A velocity-mode pusher gives up
+#   T mass * drag * sub_dt / robot mass of its speed to the contact, 25% at 40: the T
+#   moved at 0.75 of the command where Gazebo's moves at 1.00, and the robot slid 0.02 m/s
+#   sideways on an off-centre push. At 6 the T moves at 0.96 of the command with 0.003 m/s
+#   of slip and coasts 1-3 cm further than Gazebo's once the push stops (4: 0.98, 3-5 cm;
+#   8: 0.95, 0-1 cm). Linear and angular drag drop together, so the rotation per metre of
+#   an off-centre push stays where it was (-39 deg/m at a 0.2 m offset, under study).
+# - A rate-limited drive (ControlMode.SERVO), drawn per env and robot on every reset.
+#   Gazebo's Limo accelerates at 1 m/s^2 and 3 rad/s^2 (0.4 s to 0.4 m/s, stopping in
+#   8 cm) and turns at 0.79 of the commanded rate (skid-steer). At those values swarp
+#   reproduces every robot-alone row of the sysid (steady rates, rise times, stopping
+#   distances, arc radii, reversal time) to within one 0.1 s sample; the ranges bracket
+#   them, with Gazebo's numbers between the two ends on every row.
+# - The lidar 0.103 m ahead of the centre with nothing returned within 0.10 m of it: a
+#   face touching the bumper is invisible to the forward rays, as on the real sensor
+#   (sysid: 8 T rays where Gazebo has 7, against 13 without the blind zone), plus the
+#   Gaussian range noise of Gazebo's sensor model, 0.01 m.
+SPECS["pusht_lidar_limo_dr"] = replace(
+    SPECS["pusht_lidar_limo"],
+    scen_kwargs={
+        **SPECS["pusht_lidar_limo"].scen_kwargs,
+        "linear_damping": 6.0, "angular_damping": 6.0,
+        "servo_accel": (0.6, 2.0), "servo_ang_accel": (2.0, 6.0),
+        "cmd_gain_v": (0.9, 1.05), "cmd_gain_w": (0.7, 1.0),
+        "lidar_mount_offset": 0.103, "lidar_min_range": 0.10, "lidar_noise": 0.01,
+    },
+)
 
 
 def scenario_name(name: str) -> str:

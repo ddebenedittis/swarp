@@ -109,8 +109,16 @@ def test_fused_matches_torch(device, n_agents, obs_level):
         {"model": "diff_drive"},
         {"agent_shape": "box"},
         {"model": "diff_drive", "agent_shape": "box"},
+        # A drive drawn per env and robot, a lidar blind zone ahead and a rear blind
+        # sector: the per-env reset draws and the sensor model match the torch twin. The
+        # accelerations are stiff enough for the robots to reach the T in four steps.
+        {
+            "model": "diff_drive", "agent_shape": "box", "servo_accel": (8.0, 20.0),
+            "servo_ang_accel": (20.0, 60.0), "cmd_gain_w": (0.7, 1.0),
+            "lidar_mount_offset": 0.03, "lidar_min_range": 0.06, "lidar_fov": 4.5,
+        },
     ],
-    ids=["unicycle", "box", "unicycle-box"],
+    ids=["unicycle", "box", "unicycle-box", "drive-sensor"],
 )
 def test_fleet_fused_matches_torch(device, fleet, obs_level):
     """Unicycles and boxes: heading in the obs and critic, body-frame rays, box hits."""

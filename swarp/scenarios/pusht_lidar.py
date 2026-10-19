@@ -26,6 +26,7 @@ from swarp.scenarios.pusht_lidar_kernels import (
     STATE_AGENT,
     STATE_HEAD,
     TEE_DIM,
+    lidar_sensor_kernel,
     pusht_lidar_obs_kernel,
     pusht_lidar_reward_kernel,
     pusht_lidar_roles_kernel,
@@ -93,6 +94,16 @@ class PushTLidarScenario(PushTScenario):
     never pays. Training hooks: :meth:`critic_state` (role-sorted), :meth:`agent_roles`,
     :meth:`aux_targets` (the T in each robot's frame), all written by the observation
     pass.
+
+    Sensor model (all off by default). The rays are cast from the robot's centre; a real
+    lidar sits ``lidar_mount_offset`` ahead of it and returns nothing closer than
+    ``lidar_min_range`` to itself, so a hit within that distance of the mount reads as a
+    miss (range ``lidar_max_range``, no class). ``lidar_fov`` below ``2 pi`` also blanks
+    the rays more than half of it off the heading (a body blocking the rear), and
+    ``lidar_noise`` adds Gaussian noise of that standard deviation to every remaining
+    hit's range (clamped to ``[0, lidar_max_range]``). These edit the scan itself, so the
+    observation, the auxiliary targets' visibility statistics and the reward inputs all
+    see the sensor's scan.
     """
 
     #: Two roles: pushers (0) and observers (1).
@@ -124,6 +135,10 @@ class PushTLidarScenario(PushTScenario):
         contact_penalty: float = 0.0,
         contact_dist: float | None = None,
         lidar_body_frame: bool | None = None,
+        lidar_mount_offset: float = 0.0,
+        lidar_min_range: float = 0.0,
+        lidar_fov: float = 2.0 * math.pi,
+        lidar_noise: float = 0.0,
         **kwargs: Any,
     ) -> None:
         super().__init__(n_agents=n_agents, shape=shape, **kwargs)
@@ -173,6 +188,18 @@ class PushTLidarScenario(PushTScenario):
         self.contact_dist = 2.0 * self.agent_radius if contact_dist is None else contact_dist
         # The auxiliary T offset is scaled by the lidar range, so an in-range T is in [-1, 1].
         self.aux_scale = 1.0 / self.lidar_max_range
+        if lidar_min_range < 0.0 or lidar_noise < 0.0:
+            raise ValueError("lidar_min_range and lidar_noise must be >= 0")
+        if not 0.0 < lidar_fov <= 2.0 * math.pi:
+            raise ValueError(f"lidar_fov must lie in (0, 2 pi], got {lidar_fov}")
+        self.lidar_mount_offset = float(lidar_mount_offset)
+        self.lidar_min_range = float(lidar_min_range)
+        self.lidar_fov = float(lidar_fov)
+        self.lidar_noise = float(lidar_noise)
+        #: Whether the scan goes through :func:`lidar_sensor_kernel` (and its torch twin).
+        self.sensor_model = (
+            self.lidar_min_range > 0.0 or self.lidar_noise > 0.0 or self.lidar_fov < 2.0 * math.pi
+        )
 
     # ------------------------------------------------------------- dimensions
 
@@ -253,6 +280,13 @@ class PushTLidarScenario(PushTScenario):
             backend="warp",
         )
         self.lidar.bind(world)
+        if self.sensor_model:
+            # One RNG stream per robot for the range noise, advanced in place by the sensor
+            # kernel (so it draws fresh noise on every replay of a captured step).
+            gen = torch.Generator().manual_seed(world.next_kernel_seed())
+            seeds = torch.randint(0, 2**31 - 1, (n_envs, na), generator=gen, dtype=torch.int64)
+            self._lidar_rng = wp.array(seeds.numpy().astype("uint32"), dtype=wp.uint32,
+                                       device=world.device)
         self._lidar_obs_launch = CachedLaunch()
         self._lidar_reward_launch = CachedLaunch()
         self._lcache: dict[str, torch.Tensor] | None = None
@@ -289,6 +323,28 @@ class PushTLidarScenario(PushTScenario):
         super().reset_torch(env_mask)
         self._prev_standoff = None
         self._refresh_lidar(env_mask, reset=True)
+
+    def _sensor_torch(
+        self, ranges: torch.Tensor, hit_class: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The torch twin of :func:`lidar_sensor_kernel`: the blind zone and field of view
+        exactly, the range noise from torch's generator (so a noisy scan is not bit-equal
+        across the two paths)."""
+        th = self.world.state.theta.unsqueeze(-1)  # [E, A, 1]
+        ang = self._ray_angles()
+        hx = ranges * torch.cos(ang) - self.lidar_mount_offset * torch.cos(th)
+        hy = ranges * torch.sin(ang) - self.lidar_mount_offset * torch.sin(th)
+        rel = torch.atan2(torch.sin(ang - th), torch.cos(ang - th))
+        blind = (hit_class != 0) & (
+            (hx * hx + hy * hy < self.lidar_min_range**2) | (rel.abs() > 0.5 * self.lidar_fov)
+        )
+        mr = self.lidar_max_range
+        ranges = torch.where(blind, torch.full_like(ranges, mr), ranges)
+        hit_class = torch.where(blind, torch.zeros_like(hit_class), hit_class)
+        if self.lidar_noise > 0.0:
+            noisy = (ranges + self.lidar_noise * torch.randn_like(ranges)).clamp(0.0, mr)
+            ranges = torch.where(hit_class != 0, noisy, ranges)
+        return ranges, hit_class
 
     def _ray_angles(self) -> torch.Tensor:
         """``[E, A, R]`` world-frame ray angles, as :func:`lidar_scan` builds them."""
@@ -343,6 +399,8 @@ class PushTLidarScenario(PushTScenario):
             agent_half=w.agent_half_extents,
             return_hits=True,
         )
+        if self.sensor_model:
+            ranges, hit_class = self._sensor_torch(ranges, hit_class)
         is_obj = hit_class == HIT_MOVABLE  # [E, A, R]
         is_ag = hit_class == HIT_AGENT
         ang = self._ray_angles()  # [E, A, R]
@@ -572,8 +630,36 @@ class PushTLidarScenario(PushTScenario):
         if pass_.is_step:
             self._launch_body_sync()
         self.lidar.launch(self.world, st)
+        if self.sensor_model:
+            self._launch_sensor(st)
         self._launch_obs(st, pass_.advance_prev)
         self._launch_reward(st, pass_.advance_prev, pass_.full_pass)
+
+    def _launch_sensor(self, st) -> None:
+        """The sensor model over the lidar's own scan buffers, in place."""
+        w = self.world
+        scalar = w.wp_dtype
+        lid = self.lidar
+        wp.launch(
+            concrete(lidar_sensor_kernel, scalar),
+            dim=(w.n_envs, self.n_agents),
+            inputs=[
+                st.theta,
+                scalar(lid.max_range),
+                scalar(lid.ray_step),
+                scalar(lid.angle_start),
+                wp.int32(int(lid.body_frame)),
+                scalar(self.lidar_mount_offset),
+                scalar(self.lidar_min_range),
+                scalar(0.5 * self.lidar_fov),
+                scalar(self.lidar_noise),
+                self._lidar_rng,
+                lid.wp_ranges,
+                lid.wp_hit_class,
+            ],
+            device=w.device,
+            record_tape=False,
+        )
 
     def _launch_obs(self, st, advance_prev: int = 1) -> None:
         w = self.world

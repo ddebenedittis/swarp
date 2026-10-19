@@ -17,6 +17,11 @@ body sync on a step:
 * ``pusht_lidar_roles_kernel`` (thread per env, reset only) — a masked Fisher-Yates
   shuffle of the fixed role multiset, on its own kernel seed.
 
+``lidar_sensor_kernel`` (thread per ``(env, agent)``) runs between the lidar and the
+observation kernel only when the scenario enables a sensor effect (a blind zone around
+the mount, a field of view, range noise): it edits the scan in place, so every consumer
+downstream sees the scan a real sensor would return. Without one it is never launched.
+
 The torch reference in :mod:`swarp.scenarios.pusht_lidar` recomputes all of it from the
 torch lidar oracle (:func:`swarp.sensors.lidar.lidar_scan`) and shares no code with this
 module.
@@ -630,6 +635,67 @@ def _reward_signature(dtype) -> list:
     ]
 
 
+@wp.kernel
+def lidar_sensor_kernel(
+    theta: wp.array2d(dtype=Any),
+    max_range: Any,
+    ray_step: Any,
+    angle_start: Any,
+    body_frame: wp.int32,
+    mount_offset: Any,
+    min_range: Any,
+    half_fov: Any,
+    noise_std: Any,
+    rng_state: wp.array2d(dtype=wp.uint32),
+    ranges: wp.array3d(dtype=Any),
+    hit_class: wp.array3d(dtype=wp.uint8),
+):
+    """Thread per (env, agent): turn the centre-ray scan into what the mounted sensor
+    returns, in place. A hit within ``min_range`` of the mount (``mount_offset`` ahead of
+    the centre along the heading) or on a ray more than ``half_fov`` off the heading
+    reads as a miss (``max_range``, class 0); the remaining hits get Gaussian range noise
+    of ``noise_std``, clamped to ``[0, max_range]``, from this thread's own RNG stream."""
+    e, a = wp.tid()
+    n_rays = ranges.shape[2]
+    zero = type(max_range)(0.0)
+    th = theta[e, a]
+    base = zero
+    if body_frame != 0:
+        base = th
+    mx = mount_offset * wp.cos(th)
+    my = mount_offset * wp.sin(th)
+    rng = rng_state[e, a]
+    for r in range(n_rays):
+        if hit_class[e, a, r] != wp.uint8(0):
+            ang = base + angle_start + type(max_range)(r) * ray_step
+            t = ranges[e, a, r]
+            hx = t * wp.cos(ang) - mx
+            hy = t * wp.sin(ang) - my
+            blind = hx * hx + hy * hy < min_range * min_range
+            if wp.abs(_wrap(ang - th)) > half_fov:
+                blind = True
+            if blind:
+                ranges[e, a, r] = max_range
+                hit_class[e, a, r] = wp.uint8(0)
+            elif noise_std > zero:
+                n = type(max_range)(wp.randn(rng))
+                ranges[e, a, r] = wp.clamp(t + noise_std * n, zero, max_range)
+    rng_state[e, a] = rng
+
+
+def _sensor_signature(dtype) -> list:
+    return [
+        wp.array2d(dtype=dtype),  # theta
+        *([dtype] * 3),  # max_range, ray_step, angle_start
+        wp.int32,  # body_frame
+        *([dtype] * 4),  # mount_offset, min_range, half_fov, noise_std
+        wp.array2d(dtype=wp.uint32),  # rng_state
+        wp.array3d(dtype=dtype),  # ranges
+        wp.array3d(dtype=wp.uint8),  # hit_class
+    ]
+
+
 for _T in (wp.float32, wp.float64):
+    register(lidar_sensor_kernel, _T, _sensor_signature(_T))
     register(pusht_lidar_obs_kernel, _T, _obs_signature(_T))
     register(pusht_lidar_reward_kernel, _T, _reward_signature(_T))

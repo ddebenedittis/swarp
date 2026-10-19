@@ -50,12 +50,26 @@ from swarp.dynamics.base import AgentConfig, AgentShape, ControlMode, DynamicsMo
 from swarp.interop.autograd import torch_stream_scope
 from swarp.scenarios.fused import Buf, FusedPass, FusedScenario
 from swarp.scenarios.pusht_kernels import (
+    pusht_actuation_reset_kernel,
     pusht_heading_reset_kernel,
     pusht_obs_kernel,
     pusht_reset_kernel,
     pusht_reward_kernel,
 )
 from swarp.scenarios.shapes import SHAPES, CompoundShape, tee
+
+
+def _as_range(
+    v: float | tuple[float, float] | None, default: float, name: str
+) -> tuple[float, float]:
+    """``(low, high)`` of an actuation knob: a value is its own range, ``None`` the
+    default's."""
+    if v is None:
+        return (default, default)
+    lo, hi = (float(v), float(v)) if isinstance(v, int | float) else (float(v[0]), float(v[1]))
+    if not 0.0 < lo <= hi:
+        raise ValueError(f"{name} must be positive with low <= high, got {v!r}")
+    return (lo, hi)
 
 
 class PushTScenario(FusedScenario):
@@ -95,6 +109,10 @@ class PushTScenario(FusedScenario):
         agent_shape: AgentShape | str = AgentShape.DISC,
         agent_half_extents: tuple[float, float] | None = None,
         max_ang_vel: float = 2.0 * math.pi,
+        servo_accel: float | tuple[float, float] | None = None,
+        servo_ang_accel: float | tuple[float, float] | None = None,
+        cmd_gain_v: float | tuple[float, float] | None = None,
+        cmd_gain_w: float | tuple[float, float] | None = None,
     ) -> None:
         """``model="diff_drive"`` makes the robots unicycles commanded by ``(v, omega)``,
         with turn rates up to ``max_ang_vel``; ``agent_shape="box"`` makes them rectangles
@@ -103,7 +121,15 @@ class PushTScenario(FusedScenario):
         on reset and observed as its cos and sin (:attr:`heading_obs`). A box's radius is
         its circumscribed one and replaces ``agent_radius`` wherever the scenario reads it
         as a bound (spawn clearance, the lidar's ``contact_dist``); the contact margin
-        keeps the nominal ``agent_radius``."""
+        keeps the nominal ``agent_radius``.
+
+        ``servo_accel``, ``servo_ang_accel``, ``cmd_gain_v`` and ``cmd_gain_w`` give
+        ``diff_drive`` robots a drive (:attr:`ControlMode.SERVO
+        <swarp.dynamics.base.ControlMode.SERVO>`): the commanded speed and turn rate are
+        scaled by the gains and reached at most at the accelerations, instead of at once.
+        Each is a value, or a ``(low, high)`` range drawn uniformly per env and robot on
+        every reset. Setting any one of them turns the drive on; the others then default
+        to no limit and unit gain. All ``None`` keeps the instantaneous velocity command."""
         self.n_agents = n_agents
         self.model = _coerce(DynamicsModel, model, "model")
         if self.model not in self.supported_models:
@@ -118,6 +144,22 @@ class PushTScenario(FusedScenario):
         self.agent_shape = footprint.shape
         self.agent_half_extents = footprint.half_extents
         self.max_ang_vel = max_ang_vel
+        self._actuation = (servo_accel, servo_ang_accel, cmd_gain_v, cmd_gain_w)
+        #: Whether the robots drive through ``ControlMode.SERVO``.
+        self.servo = any(v is not None for v in self._actuation)
+        if self.servo and self.model != DynamicsModel.DIFF_DRIVE:
+            raise ValueError("servo_accel/servo_ang_accel/cmd_gain_* need model='diff_drive'")
+        defaults = (math.inf, math.inf, 1.0, 1.0)
+        #: ``(low, high)`` per actuation column: accel, ang accel, speed gain, rate gain.
+        self._actuation_ranges = tuple(
+            _as_range(v, d, name)
+            for v, d, name in zip(
+                self._actuation, defaults,
+                ("servo_accel", "servo_ang_accel", "cmd_gain_v", "cmd_gain_w"), strict=True,
+            )
+        )
+        #: Whether any actuation value is drawn per env on reset.
+        self.actuation_dr = any(lo != hi for lo, hi in self._actuation_ranges)
         # The contact margin stays a fraction of the nominal size, not of a box's
         # circumscribed radius, which would widen the box contact's reach.
         self._margin_radius = agent_radius
@@ -211,16 +253,24 @@ class PushTScenario(FusedScenario):
         vary the fleet without reimplementing ``make_world``. The contact derivation in
         ``make_world`` assumes velocity control at ``self.max_speed``.
         """
+        if self.servo:
+            # The ranges' low ends; an actuation_dr world redraws them on every reset.
+            (acc, _), (ang_acc, _), (gv, _), (gw, _) = self._actuation_ranges
+            drive = {
+                "ctrl_mode": ControlMode.SERVO, "max_accel": acc, "max_ang_accel": ang_acc,
+                "cmd_gain_v": gv, "cmd_gain_w": gw,
+            }
+        else:
+            drive = {"ctrl_mode": ControlMode.VELOCITY, "max_accel": 2.0 * self.max_speed}
         return [
             AgentConfig(
                 model=self.model,
-                ctrl_mode=ControlMode.VELOCITY,
                 radius=None if self.agent_shape == AgentShape.BOX else self.agent_radius,
                 max_speed=self.max_speed,
-                max_accel=2.0 * self.max_speed,
                 max_ang_vel=self.max_ang_vel,
                 shape=self.agent_shape,
                 half_extents=self.agent_half_extents,
+                **drive,
             )
             for _ in range(self.n_agents)
         ]
@@ -331,6 +381,13 @@ class PushTScenario(FusedScenario):
         # runs on the STEP pass, i.e. inside capture, where it is paid exactly once.
         self._reset_launch = CachedLaunch()
         self._heading_launch = CachedLaunch()
+        self._actuation_launch = CachedLaunch()
+        if self.actuation_dr:
+            # Per-env parameter rows, installed once here (outside any capture) and then
+            # redrawn in place by the reset kernel, so the step's kernels keep one pointer.
+            stepper = self.world.stepper
+            rows = wp.to_torch(stepper.params.floats)
+            stepper.set_agent_params_per_env(rows.unsqueeze(0).expand(n_envs, -1, -1).clone())
         self._obs_launch = CachedLaunch()
         self._reward_launch = CachedLaunch()
         return self.world
@@ -468,6 +525,8 @@ class PushTScenario(FusedScenario):
             launch.launch()
             if self.heading_obs:
                 self._launch_heading_reset(st, mask, use_mask)
+            if self.actuation_dr:
+                self._launch_actuation_reset(mask, use_mask)
 
     def _launch_heading_reset(self, st, mask, use_mask) -> None:
         """Random headings, zero speed and spin for the respawned robots (only launched
@@ -486,6 +545,24 @@ class PushTScenario(FusedScenario):
                 ptr_key(st.speed),
                 ptr_key(st.ang_vel),
             ),
+        )
+        launch.set_param_by_name("use_mask", use_mask)
+        launch.set_param_by_name("seed", seed)
+        launch.launch()
+
+    def _launch_actuation_reset(self, mask, use_mask) -> None:
+        """Redraw the respawned envs' drive accelerations and gains (``actuation_dr``)."""
+        w = self.world
+        scalar = w.wp_dtype
+        seed = wp.int32(w.next_kernel_seed())
+        params = w.stepper.params.floats_per_env
+        bounds = [scalar(x) for lo_hi in self._actuation_ranges for x in lo_hi]
+        launch = self._actuation_launch.get(
+            concrete(pusht_actuation_reset_kernel, scalar),
+            dim=(w.n_envs, self.n_agents),
+            inputs=[mask, use_mask, seed, *bounds, params],
+            device=w.device,
+            key=(w.n_envs, ptr_key(mask), ptr_key(params)),
         )
         launch.set_param_by_name("use_mask", use_mask)
         launch.set_param_by_name("seed", seed)

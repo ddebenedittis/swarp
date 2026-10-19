@@ -41,6 +41,11 @@ All four are differentiable and integrate with either semi-implicit Euler or cla
 
 Every slot is clamped inside the kernel against that agent's limits (`max_speed`, `max_accel`, `max_ang_vel`, `max_ang_accel`, `max_steer`, `thrust_max`).
 
+`DIFF_DRIVE` has a third mode, `SERVO`: the action is still `(v, ω)`, but a drive tracks it the way a wheeled robot's motor controller tracks `cmd_vel`.
+Each substep the speed and turn rate move toward `cmd_gain_v · v` and `cmd_gain_w · ω` by at most `max_accel · dt` and `max_ang_accel · dt`, then are clamped to `max_speed` and `max_ang_vel` as in `VELOCITY`.
+The gains model a drive that under- or over-delivers, such as a skid-steer base that turns slower than commanded.
+The integrate kernels turn a `SERVO` command into the `VELOCITY` command it amounts to that substep, so no other mode reads the gain or limit columns.
+
 ### Per-slot action bounds
 
 Those limits *are* the action space — actions are physical and nothing rescales them:
@@ -51,6 +56,7 @@ Those limits *are* the action space — actions are physical and nothing rescale
 | `HOLONOMIC`, `ACCELERATION` | `±max_accel` | `±max_accel` | — |
 | `DIFF_DRIVE`, `VELOCITY` | `±max_speed` | `±max_ang_vel` | — |
 | `DIFF_DRIVE`, `ACCELERATION` | `±max_accel` | `±max_ang_accel` | — |
+| `DIFF_DRIVE`, `SERVO` | `±max_speed` | `±max_ang_vel` | — |
 | `KINEMATIC_BICYCLE` | `±max_accel` | `±max_steer` (an angle) | — |
 | `DRONE` | `[0, thrust_max]` | `[0, thrust_max]` | `[0, thrust_max]` |
 
@@ -91,6 +97,7 @@ With inertia ~1e-2 kg·m² a 10 Hz control step diverges — substep the physics
 | `l_f`, `l_r`, `max_steer`, `min_speed` | 0.1, 0.1, π/4, `None` (= `-max_speed`) | kinematic bicycle |
 | `thrust_max`, `arm_length`, `inertia_xx/yy/zz`, `torque_coeff`, `gravity` | see `drone_config` | drone |
 | `shape`, `half_extents` | `AgentShape.DISC`, `(0, 0)` | the footprint; see below |
+| `cmd_gain_v`, `cmd_gain_w` | 1.0, 1.0 | diff-drive `SERVO` |
 
 ### Agent shape
 

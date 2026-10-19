@@ -196,6 +196,23 @@ def test_box_agents_bit_identical(use_graph, substeps, n_obstacles, bounds_mode)
     _assert_same(lambda: _mixed_env(substeps, use_graph, n_obstacles, bounds_mode))
 
 
+@pytest.mark.parametrize("use_graph", [False, True])
+def test_servo_drive_bit_identical(use_graph):
+    """``ControlMode.SERVO`` robots (Push-T's fixed-value drive, shared parameters, so
+    the chain is eligible): the fused chain rate-limits and gains like the layered one."""
+
+    def make():
+        scen = make_scenario(
+            "pusht", n_agents=3, model="diff_drive", agent_shape="box", servo_accel=1.0,
+            servo_ang_accel=3.0, cmd_gain_v=0.95, cmd_gain_w=0.8,
+        )
+        return Environment(scen, n_envs=17, device="cuda:0", dt=0.05, substeps=8, seed=0,
+                           use_graph=use_graph, auto_reset=True, max_steps=5)
+
+    assert make().world.stepper.params.floats_per_env is None
+    _assert_same(make)
+
+
 @pytest.mark.parametrize(("substeps", "n_agents", "fuses"), [(4, 2, True), (1, 6, False)])
 def test_auto_routes_box_worlds_by_the_disc_rule(substeps, n_agents, fuses):
     env = _mixed_env(substeps, True, 0, "soft", n_agents=n_agents)

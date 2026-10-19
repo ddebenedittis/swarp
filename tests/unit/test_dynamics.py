@@ -51,6 +51,14 @@ def ref_diff_drive(pos, theta, speed, ang_vel, actions, cfg: AgentConfig, dt: fl
         if cfg.ctrl_mode == ControlMode.VELOCITY:
             s_new = np.clip(a[0], -cfg.max_speed, cfg.max_speed)
             w_new = np.clip(a[1], -cfg.max_ang_vel, cfg.max_ang_vel)
+        elif cfg.ctrl_mode == ControlMode.SERVO:
+            tv = np.clip(a[0], -cfg.max_speed, cfg.max_speed) * cfg.cmd_gain_v
+            tw = np.clip(a[1], -cfg.max_ang_vel, cfg.max_ang_vel) * cfg.cmd_gain_w
+            dv, dw = cfg.max_accel * dt, cfg.max_ang_accel * dt
+            s_new = np.clip(speed + np.clip(tv - speed, -dv, dv), -cfg.max_speed, cfg.max_speed)
+            w_new = np.clip(
+                ang_vel + np.clip(tw - ang_vel, -dw, dw), -cfg.max_ang_vel, cfg.max_ang_vel
+            )
         else:
             acc = np.clip(a[0], -cfg.max_accel, cfg.max_accel)
             alp = np.clip(a[1], -cfg.max_ang_accel, cfg.max_ang_accel)
@@ -151,8 +159,9 @@ def test_holonomic(device, ctrl_mode):
 
 
 @pytest.mark.parametrize("device", DEVICES)
-@pytest.mark.parametrize("ctrl_mode", [ControlMode.VELOCITY, ControlMode.ACCELERATION])
+@pytest.mark.parametrize("ctrl_mode", list(ControlMode))
 def test_diff_drive(device, ctrl_mode):
+    # The gains are SERVO's alone; the other modes must ignore them.
     cfg = AgentConfig(
         model=DynamicsModel.DIFF_DRIVE,
         ctrl_mode=ctrl_mode,
@@ -160,6 +169,8 @@ def test_diff_drive(device, ctrl_mode):
         max_accel=1.5,
         max_ang_vel=2.0,
         max_ang_accel=4.0,
+        cmd_gain_v=1.1,
+        cmd_gain_w=0.8,
     )
     rng = np.random.default_rng(1)
     T, dt = 100, 0.05
@@ -280,6 +291,11 @@ def test_bicycle_min_speed_brakes_to_a_stop(device, integrator):
     reversing = replace(cfg, min_speed=None)
     rev = rollout_warp([reversing], init, actions, dt, device, integrator=integrator)
     assert rev[-1]["speed"][0] < 0.0
+
+
+def test_servo_is_a_diff_drive_mode():
+    with pytest.raises(ValueError, match="diff-drive mode"):
+        AgentConfig(model=DynamicsModel.HOLONOMIC, ctrl_mode=ControlMode.SERVO)
 
 
 def test_min_speed_must_lie_within_max_speed():
@@ -417,6 +433,8 @@ COLUMN_FIELDS = {
     "P_SHAPE": "shape",
     "P_HALF_X": "half_x",
     "P_HALF_Y": "half_y",
+    "P_CMD_GAIN_V": "cmd_gain_v",
+    "P_CMD_GAIN_W": "cmd_gain_w",
 }
 #: The footprint columns, which take derived values rather than free sentinels.
 _FOOTPRINT = ("radius", "shape", "half_x", "half_y")

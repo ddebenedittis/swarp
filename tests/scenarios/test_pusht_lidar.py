@@ -261,3 +261,36 @@ def test_standoff_inside_the_body_is_rejected():
         PushTLidarScenario(standoff_dist=0.9 * floor)
     # Without observers the standoff is never used.
     PushTLidarScenario(n_agents=2, n_pushers=2, standoff_dist=0.9 * floor)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("fused", [True, False])
+def test_lidar_blind_zone_hides_a_touching_face(device, fused):
+    """A face 5 mm off the bumper is within ``lidar_min_range`` of the mount: the forward
+    ray reads a miss with the sensor model and the face without it. The rear ray, outside
+    ``lidar_fov``, misses the second robot parked behind."""
+    seen = {}
+    for sensor in (False, True):
+        kw = {}
+        if sensor:
+            kw = {"lidar_mount_offset": 0.04, "lidar_min_range": 0.05, "lidar_fov": 5.0}
+        env = _env(device, n_envs=1, fused=fused, n_agents=2, n_pushers=2, model="diff_drive",
+                   agent_shape="box", agent_half_extents=(0.05, 0.03), **kw)
+        env.reset(seed=0)
+        scen = env.scenario
+        with torch.no_grad():
+            scen.tee_pos.zero_()
+            scen.tee_theta.zero_()
+            scen.tee_vel.zero_()
+            scen.tee_ang_vel.zero_()
+            scen._install_obstacles()
+            top = scen.box_off[0][1] + scen.box_half[0][1]  # the crossbar's top face
+            pos = torch.tensor([[[0.0, top + 0.055], [0.0, top + 0.25]]], device=device)
+            theta = torch.full((1, 2), -torch.pi / 2, device=device)
+            env.world.write_state(pos=pos, theta=theta, speed=0.0, ang_vel=0.0)
+            obs, *_ = env.step(torch.zeros(1, 2, 2, device=device))
+        newest = obs[0, 0, scen.obs_layout()["lidar_newest"]]
+        r = scen.n_rays
+        seen[sensor] = (newest[r].item(), newest[2 * r + r // 2].item())  # T ray 0, robot ray 16
+    assert seen[False] == (1.0, 1.0)
+    assert seen[True] == (0.0, 0.0)

@@ -54,6 +54,8 @@ from swarp.core.collisions import (
 )
 from swarp.core.state import VEC2
 from swarp.dynamics.base import (
+    P_CMD_GAIN_V,
+    P_CMD_GAIN_W,
     P_HALF_X,
     P_HALF_Y,
     P_LF,
@@ -68,7 +70,13 @@ from swarp.dynamics.base import (
     P_RADIUS,
     P_SHAPE,
 )
-from swarp.dynamics.kernels import _step_2d, clamp_footprint
+from swarp.dynamics.kernels import (
+    MODE_SERVO,
+    MODE_VELOCITY,
+    _step_2d,
+    clamp_footprint,
+    servo_command,
+)
 
 #: Thread budget a block aims for; an env never straddles two blocks.
 TARGET_BLOCK = 128
@@ -385,16 +393,36 @@ def _make_kernel(
                     f += fs
             block_sync()
             if active:
+                s_cur = speed_out[e, a]
+                w_cur = ang_vel_out[e, a]
+                c0 = actions[e, a, 0]
+                c1 = actions[e, a, 1]
+                mode = ctrl_mode[a]
+                if mode == MODE_SERVO:
+                    c0, c1 = servo_command(
+                        c0,
+                        c1,
+                        s_cur,
+                        w_cur,
+                        params[a, P_MAX_SPEED],
+                        params[a, P_MAX_ANG_VEL],
+                        params[a, P_MAX_ACCEL],
+                        params[a, P_MAX_ANG_ACCEL],
+                        params[a, P_CMD_GAIN_V],
+                        params[a, P_CMD_GAIN_W],
+                        sub_dt,
+                    )
+                    mode = MODE_VELOCITY
                 p_new, th_new, v_new, s_new, w_new = _step_2d(
                     p,
                     theta_out[e, a],
                     v,
-                    speed_out[e, a],
-                    ang_vel_out[e, a],
-                    actions[e, a, 0],
-                    actions[e, a, 1],
+                    s_cur,
+                    w_cur,
+                    c0,
+                    c1,
                     model_tag[a],
-                    ctrl_mode[a],
+                    mode,
                     f,
                     params[a, P_MAX_SPEED],
                     params[a, P_MIN_SPEED],

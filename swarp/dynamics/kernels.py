@@ -23,6 +23,8 @@ from swarp._overloads import concrete, register
 from swarp.core.state import QUAT, VEC2, VEC3, WorldState
 from swarp.dynamics.base import (
     P_ARM,
+    P_CMD_GAIN_V,
+    P_CMD_GAIN_W,
     P_GRAVITY,
     P_HALF_X,
     P_HALF_Y,
@@ -43,6 +45,7 @@ from swarp.dynamics.base import (
     P_SHAPE,
     P_THRUST_MAX,
     AgentParams,
+    ControlMode,
     DynamicsModel,
     Integrator,
 )
@@ -55,6 +58,7 @@ TAG_DIFF_DRIVE = wp.constant(int(DynamicsModel.DIFF_DRIVE))
 TAG_BICYCLE = wp.constant(int(DynamicsModel.KINEMATIC_BICYCLE))
 TAG_DRONE = wp.constant(int(DynamicsModel.DRONE))
 MODE_VELOCITY = wp.constant(0)
+MODE_SERVO = wp.constant(int(ControlMode.SERVO))
 
 # Integrator tags (must match Integrator enum order in swarp.dynamics.base).
 INT_EULER = wp.constant(0)
@@ -157,6 +161,34 @@ def _drone_rates(
     ay = (ty - (ixx - izz) * br[2] * br[0]) / iyy
     az = (tz - (iyy - ixx) * br[0] * br[1]) / izz
     return accel, type(br)(ax, ay, az)
+
+
+@wp.func
+def servo_command(
+    a0: Any,
+    a1: Any,
+    s: Any,
+    w: Any,
+    max_speed: Any,
+    max_ang_vel: Any,
+    max_accel: Any,
+    max_ang_accel: Any,
+    gain_v: Any,
+    gain_w: Any,
+    dt: Any,
+):
+    """``ControlMode.SERVO`` as the ``VELOCITY`` command it amounts to this substep.
+
+    The diff-drive's speed ``s`` and turn rate ``w`` (the drive's own state, which the
+    contact kick never enters) move toward the gained command by at most
+    ``max_accel * dt`` and ``max_ang_accel * dt``. The integrate kernels call this on a
+    ``SERVO`` agent only and then run the ``VELOCITY`` branch on the result, so no other
+    mode loads the gain or limit columns."""
+    tv = wp.clamp(a0, -max_speed, max_speed) * gain_v
+    tw = wp.clamp(a1, -max_ang_vel, max_ang_vel) * gain_w
+    dv = max_accel * dt
+    dw = max_ang_accel * dt
+    return s + wp.clamp(tv - s, -dv, dv), w + wp.clamp(tw - w, -dw, dw)
 
 
 @wp.func
@@ -813,6 +845,22 @@ def integrate_kernel(
 ):
     e, a = wp.tid()
     a0, a1, a2, a3 = _load_actions(actions, e, a)
+    mode = ctrl_mode[a]
+    if mode == MODE_SERVO:
+        a0, a1 = servo_command(
+            a0,
+            a1,
+            speed[e, a],
+            ang_vel[e, a],
+            params[a, P_MAX_SPEED],
+            params[a, P_MAX_ANG_VEL],
+            params[a, P_MAX_ACCEL],
+            params[a, P_MAX_ANG_ACCEL],
+            params[a, P_CMD_GAIN_V],
+            params[a, P_CMD_GAIN_W],
+            dt,
+        )
+        mode = MODE_VELOCITY
     if integrator == INT_RK4:
         _integrate_rk4(
             e,
@@ -831,7 +879,7 @@ def integrate_kernel(
             a2,
             a3,
             model_tag[a],
-            ctrl_mode[a],
+            mode,
             forces[e, a],
             params[a, P_MASS],
             params[a, P_MAX_SPEED],
@@ -885,7 +933,7 @@ def integrate_kernel(
             a2,
             a3,
             model_tag[a],
-            ctrl_mode[a],
+            mode,
             forces[e, a],
             params[a, P_MASS],
             params[a, P_MAX_SPEED],
@@ -969,6 +1017,22 @@ def integrate_kernel_per_env(
 ):
     e, a = wp.tid()
     a0, a1, a2, a3 = _load_actions(actions, e, a)
+    mode = ctrl_mode[a]
+    if mode == MODE_SERVO:
+        a0, a1 = servo_command(
+            a0,
+            a1,
+            speed[e, a],
+            ang_vel[e, a],
+            params[e, a, P_MAX_SPEED],
+            params[e, a, P_MAX_ANG_VEL],
+            params[e, a, P_MAX_ACCEL],
+            params[e, a, P_MAX_ANG_ACCEL],
+            params[e, a, P_CMD_GAIN_V],
+            params[e, a, P_CMD_GAIN_W],
+            dt,
+        )
+        mode = MODE_VELOCITY
     if integrator == INT_RK4:
         _integrate_rk4(
             e,
@@ -987,7 +1051,7 @@ def integrate_kernel_per_env(
             a2,
             a3,
             model_tag[a],
-            ctrl_mode[a],
+            mode,
             forces[e, a],
             params[e, a, P_MASS],
             params[e, a, P_MAX_SPEED],
@@ -1041,7 +1105,7 @@ def integrate_kernel_per_env(
             a2,
             a3,
             model_tag[a],
-            ctrl_mode[a],
+            mode,
             forces[e, a],
             params[e, a, P_MASS],
             params[e, a, P_MAX_SPEED],
@@ -1108,16 +1172,34 @@ def integrate2d_kernel(
     and writes five state arrays instead of nine. Uses :func:`_step_2d`, so the
     live fields are bit-identical to the full kernel."""
     e, a = wp.tid()
+    a0 = actions[e, a, 0]
+    a1 = actions[e, a, 1]
+    mode = ctrl_mode[a]
+    if mode == MODE_SERVO:
+        a0, a1 = servo_command(
+            a0,
+            a1,
+            speed[e, a],
+            ang_vel[e, a],
+            params[a, P_MAX_SPEED],
+            params[a, P_MAX_ANG_VEL],
+            params[a, P_MAX_ACCEL],
+            params[a, P_MAX_ANG_ACCEL],
+            params[a, P_CMD_GAIN_V],
+            params[a, P_CMD_GAIN_W],
+            dt,
+        )
+        mode = MODE_VELOCITY
     p_new, th_new, v_out, s_out, w_out = _step_2d(
         pos[e, a],
         theta[e, a],
         vel[e, a],
         speed[e, a],
         ang_vel[e, a],
-        actions[e, a, 0],
-        actions[e, a, 1],
+        a0,
+        a1,
         model_tag[a],
-        ctrl_mode[a],
+        mode,
         forces[e, a],
         params[a, P_MAX_SPEED],
         params[a, P_MIN_SPEED],
@@ -1178,16 +1260,34 @@ def integrate2d_kernel_per_env(
 ):
     """Per-env-parameter variant of :func:`integrate2d_kernel`."""
     e, a = wp.tid()
+    a0 = actions[e, a, 0]
+    a1 = actions[e, a, 1]
+    mode = ctrl_mode[a]
+    if mode == MODE_SERVO:
+        a0, a1 = servo_command(
+            a0,
+            a1,
+            speed[e, a],
+            ang_vel[e, a],
+            params[e, a, P_MAX_SPEED],
+            params[e, a, P_MAX_ANG_VEL],
+            params[e, a, P_MAX_ACCEL],
+            params[e, a, P_MAX_ANG_ACCEL],
+            params[e, a, P_CMD_GAIN_V],
+            params[e, a, P_CMD_GAIN_W],
+            dt,
+        )
+        mode = MODE_VELOCITY
     p_new, th_new, v_out, s_out, w_out = _step_2d(
         pos[e, a],
         theta[e, a],
         vel[e, a],
         speed[e, a],
         ang_vel[e, a],
-        actions[e, a, 0],
-        actions[e, a, 1],
+        a0,
+        a1,
         model_tag[a],
-        ctrl_mode[a],
+        mode,
         forces[e, a],
         params[e, a, P_MAX_SPEED],
         params[e, a, P_MIN_SPEED],
