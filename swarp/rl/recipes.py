@@ -308,16 +308,27 @@ SPECS: dict[str, TrainSpec] = {
     ),
     # Lidar Push-T at the physical scale of two AgileX Limo robots, in metres and seconds,
     # for deployment in Gazebo: 0.322 x 0.220 m unicycle boxes at up to 0.4 m/s and
-    # 1.5 rad/s, a 1 m T in a 4 x 4 m arena, a 1.5 m lidar, and a 10 Hz policy matching the
-    # lidar. Otherwise the U-H1 run (two pushers, own lidar, frame_stack 4, aux 0.1), which
-    # reached 0.99 greedy at the default scale.
+    # 1.5 rad/s, a 1 m T in a 4 x 4 m arena, a 1.5 m lidar, and a 5 Hz policy acting on the
+    # latest 10 Hz scan. Otherwise the U-H1 run (two pushers, own lidar, frame_stack 4, aux
+    # 0.1), which reached 0.99 greedy at the default scale.
     #
-    # substeps=16 keeps Push-T's validated sub_dt of 6.25 ms, so the contact law (k 8000,
-    # c 100, unit robot and T masses, drag 40/s) is the same per second as there. At 8
-    # substeps (12.5 ms, k sub_dt^2 / m = 1.25) a straight push chatters: the robot's
-    # speed swings 0.1-0.3 m/s and the T crawls at half speed. At 16 the T follows a
-    # centred push at 0.30 m/s (two pushers: 0.34), the robot sits ~2 mm inside the
-    # 12.5 mm contact margin, and the T stops within a step of contact ending.
+    # dt=0.2, not the lidar's 0.1. At 10 Hz one action moves a robot 0.04 m (4% of the T)
+    # and turns it 0.15 rad, against 12.5% of the T and 0.31 rad per action in U-H1, and
+    # PPO kept a near-random policy for thousands of iterations: greedy solve 0.04 at
+    # iteration 1000, 0.36 at 6000, 0.54 after 12000, with the greedy robots stalled
+    # (|v| < 0.04 m/s) in 63% of robot-steps while the sampled policy solved 0.93 in
+    # 1800 steps. Neither entropy_coeff 1e-3, normalized advantages, the per-step discount
+    # (gamma 0.99) nor a 0.8 m/s robot helped (0.06-0.15 greedy at iteration 2000). At
+    # dt=0.2 the same recipe reaches 0.56 greedy at iteration 1000 and 0.85 at 2000. The
+    # deployed policy holds each command for 0.2 s, and its frame stack advances once per
+    # policy step, so the four frames span 0.8 s.
+    #
+    # substeps=32 keeps Push-T's validated sub_dt of 6.25 ms, so the contact law (k 8000,
+    # c 100, unit robot and T masses, drag 40/s) is the same per second as there. At
+    # 12.5 ms (k sub_dt^2 / m = 1.25) a straight push chatters: the robot's speed swings
+    # 0.1-0.3 m/s and the T crawls at half speed. At 6.25 ms the T follows a centred push
+    # at 0.30 m/s (two pushers: 0.34), the robot sits ~2 mm inside the 12.5 mm contact
+    # margin, and the T stops within 0.1 s of contact ending.
     #
     # The masses stay at 1, not 4.2 kg and ~0.5 kg: a velocity-mode robot has no inertia
     # in contact, so its mass only sets the contact depth, and the T's response is set by
@@ -325,25 +336,24 @@ SPECS: dict[str, TrainSpec] = {
     # m/s against the robot's 0.4 at tee_mass 0.12-0.3) and pushes in bounces.
     #
     # Lengths are 2x (arena) to 2.5x (T) Push-T's and the robot 2.5x slower, so a task
-    # takes ~4.5x as long: max_steps 900 (90 s) is Push-T's 400 x 0.05 s scaled by that.
-    # gamma 0.995 and lmbda 0.97 stretch the 10 s / 2 s credit horizons of 0.99 / 0.95 at
-    # this dt to 20 s / 3.3 s, about the time one push of the T across the arena takes;
-    # stagger_starts because untrained episodes all run the full 900 steps. The length-
-    # based shaping weights are halved (pos 2.5, approach 0.5) so a whole episode's
-    # shaping keeps Push-T's ratio to the dimensionless goal bonus and joint crater
-    # (pos 2.5 x 1.43 m mean goal distance = 3.6, U-H1 5 x 0.79 = 3.9). Measured over
-    # 512 envs with robots driving at the T, the per-step position shaping (0.023) and
-    # turn-away cost (0.0089) match U-H1's (0.024, 0.0083).
+    # takes ~4.5x as long: max_steps 450 (90 s) is Push-T's 400 x 0.05 s scaled by that.
+    # gamma 0.99 and lmbda 0.95 at this dt are 20 s / 4 s credit horizons, about the time
+    # one push of the T across the arena takes; stagger_starts because untrained episodes
+    # all run the full 450 steps. The length-based shaping weights are halved (pos 2.5,
+    # approach 0.5) so a whole episode's shaping keeps Push-T's ratio to the dimensionless
+    # goal bonus and joint crater (pos 2.5 x 1.43 m mean goal distance = 3.6, U-H1
+    # 5 x 0.79 = 3.9). Measured at dt 0.1 over 512 envs with robots driving at the T, the
+    # per-step position shaping (0.023) and turn-away cost (0.0089) matched U-H1's (0.024,
+    # 0.0083).
     # Curriculum: the goal radius starts at 0.4 (Push-T's 2.5 goal tolerances) and ramps
-    # to the 3.8 m diagonal of the T's spawn square; 500 iterations, because each env sees
-    # ~2.5x fewer episodes per iteration than Push-T's 250. 6000 iterations, not U-H1's
-    # 4000 (0.98 greedy by 2000), for the same reason.
+    # to the 3.8 m diagonal of the T's spawn square, over 500 iterations rather than 250
+    # because an episode is longer in steps than Push-T's.
     #
     # standoff_dist 1.0 is H2b's 1.5 T corner radii, so the same recipe with observers
     # (--n-agents 5) clears the scenario's standoff check; two pushers never read it.
     "pusht_lidar_limo": TrainSpec(
         scenario="pusht_lidar",
-        dt=0.1, substeps=16, max_steps=900, n_agents=2,
+        dt=0.2, substeps=32, max_steps=450, n_agents=2,
         scen_kwargs={
             "n_pushers": 2, "model": "diff_drive", "agent_shape": "box",
             "agent_half_extents": (0.161, 0.110), "max_speed": 0.4, "max_ang_vel": 1.5,
@@ -353,8 +363,8 @@ SPECS: dict[str, TrainSpec] = {
             "pos_shaping_factor": 2.5, "rot_shaping_factor": 0.5, "rot_away_penalty": 1.0,
             "agent_dist_shaping": 0.5,
         },
-        iters=6000, n_envs=512, steps_per_batch=32, epochs=8, minibatches=4,
-        lr=5e-4, gamma=0.995, lmbda=0.97, entropy_coeff=3e-3, num_cells=256,
+        iters=4000, n_envs=512, steps_per_batch=32, epochs=8, minibatches=4,
+        lr=5e-4, gamma=0.99, lmbda=0.95, entropy_coeff=3e-3, num_cells=256,
         normalize_advantage=False,
         curriculum=(
             CurriculumKnob("goal_spawn_radius", 0.4, 3.8),

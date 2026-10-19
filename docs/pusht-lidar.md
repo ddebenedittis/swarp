@@ -150,7 +150,11 @@ The observation kernel writes the three trainer buffers on every pass, the obs-o
 
 `SPECS["pusht_lidar"]` is stage T0: Push-T's recipe with five robots at `obs_level=0`, a `PolicyNet` with one head per role, and a per-slot `StateCritic` on `critic_state()`, with the auxiliary loss off.
 
-`SPECS["pusht_lidar_limo"]` (`python -m swarp.rl --scenario pusht_lidar_limo`) builds the same scenario at the physical scale of two AgileX Limo robots, in metres and seconds, for deployment in Gazebo: 0.322 × 0.220 m unicycle boxes at up to 0.4 m/s and 1.5 rad/s, a 1 m T in a 4 × 4 m arena, a 1.5 m lidar, a 10 Hz policy (`dt = 0.1`, 16 substeps to keep Push-T's contact sub-step) and 900-step episodes.
+`SPECS["pusht_lidar_limo"]` (`python -m swarp.rl --scenario pusht_lidar_limo`) builds the same scenario at the physical scale of two AgileX Limo robots, in metres and seconds, for deployment in Gazebo: 0.322 × 0.220 m unicycle boxes at up to 0.4 m/s and 1.5 rad/s, a 1 m T in a 4 × 4 m arena, a 1.5 m lidar, a 5 Hz policy acting on the latest 10 Hz scan (`dt = 0.2`, 32 substeps to keep Push-T's contact sub-step) and 450-step (90 s) episodes.
+The policy runs at 5 Hz rather than at the lidar's 10 Hz because a 10 Hz action moves a Limo only 0.04 m (4% of the T), against 12.5% of the T per action in U-H1, and the credit per action was too small to learn from.
+At `dt = 0.1` (16 substeps, 900 steps, gamma 0.995) seed 0 reached a greedy solve of 0.04 at iteration 1000, 0.36 at 6000 and 0.54 after 12000, and its greedy robots stood still in 63% of robot-steps while the sampled policy solved 0.93 within 1800 steps.
+Lowering the entropy coefficient to 1e-3, normalizing advantages, a per-step gamma of 0.99 and a 0.8 m/s robot each stayed between 0.06 and 0.15 greedy at iteration 2000, while `dt = 0.2` reached 0.56 at iteration 1000 and 0.85 at 2000.
+A deployment holds each command for 0.2 s and advances the frame stack once per policy step, so four frames span 0.8 s.
 Its comment in `swarp/rl/recipes.py` derives every value that differs from U-H1's.
 A recipe keyed by a name other than its scenario's sets `TrainSpec.scenario`, which `scenario_name` resolves wherever a scenario is built from a `SPECS` key.
 
