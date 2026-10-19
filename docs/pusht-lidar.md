@@ -163,6 +163,10 @@ The robots drive through `ControlMode.SERVO` with accelerations and command gain
 The lidar takes a sensor model: rays are still cast from the robot's centre, but a hit within `lidar_min_range` (0.10 m) of a mount `lidar_mount_offset` (0.103 m) ahead of the centre reads as a miss, and the remaining hits carry Gaussian range noise of `lidar_noise` (0.01 m).
 `lidar_fov` below 2π would also blank the rays behind the robot; the recipe leaves it at 2π.
 A deployment that bins the real scan into the 32 centre rays needs no change for any of this, because the real scan already lacks the returns inside the blind zone and already carries its noise.
+
+`SPECS["pusht_lidar_limo_dr_coulomb"]` puts the T on a Coulomb floor (`floor_friction`, μ drawn per env from 0.2–0.5) with no viscous drag, and robots of mass 2.
+A viscous drag under-rotates an off-centre push: the quasi-static pushing reference turns the bar 64°/m at a 0.2 m offset and 145°/m at 0.4 m, and 39 and 113°/m on a viscous floor.
+On the Coulomb floor swarp gives 60, 142 and 48°/m (glancing push; reference 48), and the T stops where Gazebo's does.
 Its comment in `swarp/rl/recipes.py` derives every value that differs from U-H1's.
 A recipe keyed by a name other than its scenario's sets `TrainSpec.scenario`, which `scenario_name` resolves wherever a scenario is built from a `SPECS` key.
 

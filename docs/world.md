@@ -140,6 +140,10 @@ Like the agent side, this is gather-based — one thread per `(env, obstacle)`, 
 Several shapes that share a `body` id form one **compound** rigid body with a single pose, placed by their `body_offset` in the body frame. That is what makes Push-T's T work: a crossbar and a stem, one rigid pose, mass split by area and inertia from the parallel-axis theorem about the area centroid — which is what gives a contact above the centroid the torque that makes the orientation half of the task solvable.
 
 `obstacle_linear_damping` and `obstacle_angular_damping` stand in for table friction: a pushed body settles at `Σf / (m·damping)` instead of accelerating without limit. Set them to 0 for a frictionless puck that coasts.
+`obstacle_friction` (a Coulomb coefficient μ, 0 by default) instead puts movable bodies on a Coulomb floor: the weight `m·obstacle_gravity` is spread uniformly over each shape's footprint on an `obstacle_friction_grid` × `obstacle_friction_grid` lattice, and every lattice point resists its own sliding velocity with its share of μ·m·g, regularised below `obstacle_friction_speed` (5 mm/s).
+Summed, that is the footprint's limit surface, so a body pushed off-centre turns about the pivot a real one would, and a sliding body stops within `v² / (2μg)`.
+An impulse that would reverse a body's motion or spin sticks it instead (static friction), which keeps the stiff law stable at any substep.
+`Stepper.set_body_friction` overrides μ·g per env.
 
 A **box agent** pushes a body through the same oriented-box contact it feels itself: the body pass calls the very function the agent side summed and negates it, so action equals reaction to the bit, and the reaction acts at the contact point, so a box agent pushing a box body off-centre spins it.
 

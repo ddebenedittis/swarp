@@ -563,6 +563,29 @@ SPECS["pusht_lidar_limo_dr"] = replace(
 )
 
 
+# pusht_lidar_limo_dr with the T on a Coulomb floor instead of a viscous one: the
+# quasi-static pushing reference (uniform-pressure Coulomb floor, swarp_gz_test
+# out/sysid/reference.md) turns the bar 64 deg/m on a push 0.2 m off-centre and 145 at
+# 0.4 m, which a viscous drag of 40/s under-rotates at 39 and 113. On floor_friction 0.3
+# with no drag, the sysid gives -60 / -142 / -48 deg/m against the reference's -64 / -145
+# / -48 and Gazebo's -62 / -143 / -50, and the T stops where Gazebo's does
+# (0.018/0.077/0.042 m against 0.020/0.080/0.045). A Coulomb T needs only mu m g (about
+# 3 N) to slide, against 16 N of drag at 0.4 m/s, so the robots' mass comes down from 6.7
+# to 2: at mass 1 a 0.2 m/s push still lost 9% of its speed, at 2 the pusher keeps
+# 0.95-0.98 of the command (Gazebo 1.00) and two robots driving head-on overlap 1.2 cm.
+# mu is drawn per env on every reset, 0.2-0.5 around Gazebo's 0.3. 8000 iterations: the
+# drive's randomisation roughly halves the sample efficiency, and iterations are cheap.
+SPECS["pusht_lidar_limo_dr_coulomb"] = replace(
+    SPECS["pusht_lidar_limo_dr"],
+    scen_kwargs={
+        **SPECS["pusht_lidar_limo_dr"].scen_kwargs,
+        "agent_mass": 2.0, "floor_friction": (0.2, 0.5),
+        "linear_damping": 0.0, "angular_damping": 0.0,
+    },
+    iters=8000,
+)
+
+
 def scenario_name(name: str) -> str:
     """The registered scenario behind ``name``: a ``SPECS`` key's ``scenario`` when it
     sets one, else ``name`` itself (a registry name, or a key that is one)."""

@@ -275,3 +275,50 @@ def test_wall_angle_parameterization_does_not_change_body_dynamics(device):
         assert torch.allclose(a[:, 0], b[:, 0], atol=1e-5), (
             "the wall's angle parameterization changed the body's trajectory"
         )
+
+
+def _slide(device, mu_g_env=None, v0=0.4, om0=0.0, **cfg_kw):
+    """A lone movable box launched at ``v0`` (and ``om0``) along +x, no agent near it."""
+    w = _world(device, obstacle_linear_damping=0.0, obstacle_angular_damping=0.0, **cfg_kw)
+    dev, dt = w.device, w.dtype
+    w.state.pos.data.fill_(1.5)  # the agent is parked far away
+    w.set_obstacles(
+        Obstacles(
+            torch.zeros(w.n_envs, 1, 2, device=dev, dtype=dt),
+            torch.full((1,), 0.1, device=dev, dtype=dt),
+            shape=torch.full((1,), int(ObstacleShape.BOX), device=dev, dtype=torch.int32),
+            angle=torch.zeros(w.n_envs, 1, device=dev, dtype=dt),
+            half_extents=torch.tensor([[0.2, 0.1]], device=dev, dtype=dt),
+            vel=torch.tensor([[[v0, 0.0]]], device=dev, dtype=dt).repeat(w.n_envs, 1, 1),
+            ang_vel=torch.full((w.n_envs, 1), om0, device=dev, dtype=dt),
+            kind=torch.tensor([int(ObstacleKind.MOVABLE)], device=dev, dtype=torch.int32),
+            mass=torch.full((1,), 1.0, device=dev, dtype=dt),
+            inertia=torch.full((1,), 1.0 * (0.4**2 + 0.2**2) / 12.0, device=dev, dtype=dt),
+        )
+    )
+    if mu_g_env is not None:
+        w.stepper.set_body_friction(torch.tensor(mu_g_env, device=dev, dtype=dt))
+    act = torch.zeros(w.n_envs, 1, 2, device=dev, dtype=dt)
+    for _ in range(40):  # 2 s, long after any of these has stopped
+        w.step(act)
+    return w.obstacle_state_views()
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_coulomb_floor_stops_a_sliding_body_at_v2_over_2_mu_g(device):
+    """A translating body decelerates at mu g and stops dead, ``v^2 / (2 mu g)`` on
+    (less about ``v sub_dt``: semi-implicit Euler moves it at the decelerated velocity)."""
+    pos, angle, vel, ang_vel = _slide(device, obstacle_friction=0.3)
+    expected = 0.4**2 / (2 * 0.3 * 9.81)
+    assert pos[:, 0, 0].sub(expected).abs().max().item() < 0.1 * expected
+    assert torch.equal(vel, torch.zeros_like(vel)), "the body did not stick"
+    assert angle.abs().max().item() < 1e-6, "a straight slide turned the body"
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_coulomb_floor_stops_a_spin_and_reads_mu_per_env(device):
+    pos, angle, vel, ang_vel = _slide(device, mu_g_env=[0.2 * 9.81, 0.4 * 9.81], v0=0.0, om0=3.0)
+    assert torch.equal(ang_vel, torch.zeros_like(ang_vel)), "the spin did not stick"
+    turned = angle[:, 0]
+    assert (turned > 0).all() and turned[0] > 1.8 * turned[1], "per-env mu not applied"
+    assert pos.abs().max().item() < 1e-6, "a spin about the centroid moved it"

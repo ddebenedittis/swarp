@@ -25,7 +25,7 @@ import numpy as np
 import torch
 import warp as wp
 
-from swarp.core.bodies import launch_obstacle_dynamics
+from swarp.core.bodies import launch_body_friction, launch_obstacle_dynamics
 from swarp.core.collisions import launch_collision_forces
 from swarp.core.config import Obstacles, WorldConfig
 from swarp.core.fused_substeps import MAX_AGENTS as FUSED_MAX_AGENTS
@@ -170,6 +170,10 @@ class Stepper:
         self.body_vel = wp.zeros((1, 1), dtype=vec2, device=device)
         self.body_ang_vel = wp.zeros((1, 1), dtype=dtype, device=device)
         self.any_movable = False
+        # Per-env floor friction (mu * g) of the movable bodies; None reads the world's
+        # scalar. The dummy fills the kernel's array slot when there is no override.
+        self.body_friction: wp.array | None = None
+        self.body_friction_dummy = wp.zeros(1, dtype=dtype, device=device)
 
         self._zero_forces: dict[int, wp.array] = {}
         self._zero_nbr: dict[int, tuple[wp.array, wp.array]] = {}
@@ -404,6 +408,21 @@ class Stepper:
             else obs.ang_vel[:, root].contiguous()
         )
         return ids, off, b_pos, r_ang, b_vel, b_ang_vel
+
+    def set_body_friction(self, mu_g: torch.Tensor) -> None:
+        """Install a per-env floor friction ``mu * g`` (``[n_envs]``) for the movable
+        bodies, overriding ``WorldConfig.obstacle_friction``.
+
+        Allocated on the first call; later calls copy in place, so the array a captured
+        step reads keeps its pointer. A scenario that draws it per episode can also write
+        :attr:`body_friction` directly from a reset kernel.
+        """
+        src = wp.from_torch(mu_g.detach().to(self.torch_dtype).contiguous(), dtype=self.dtype)
+        if self.body_friction is None or self.body_friction.shape != src.shape:
+            self.body_friction = wp.clone(src)
+            self.mutation_version += 1
+        else:
+            wp.copy(self.body_friction, src)
 
     def set_agent_params_per_env(self, floats: torch.Tensor | np.ndarray) -> None:
         """Install a per-env parameter override for domain randomization.
@@ -843,6 +862,16 @@ class Stepper:
                         ang_vel=st.ang_vel,
                         boxes=self.has_box_agents,
                     )
+                    if self.body_friction is not None or world.obstacle_friction > 0.0:
+                        launch_body_friction(
+                            self,
+                            st.pos.shape[0],
+                            sub_dt=self.sub_dt,
+                            friction_acc=world.obstacle_friction * world.obstacle_gravity,
+                            friction_speed=world.obstacle_friction_speed,
+                            friction_grid=world.obstacle_friction_grid,
+                            dtype=self.dtype,
+                        )
             launch_integrate(
                 st,
                 chain[k + 1],

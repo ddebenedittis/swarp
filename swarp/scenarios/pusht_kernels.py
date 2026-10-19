@@ -387,6 +387,30 @@ def pusht_actuation_reset_kernel(
     params[e, a, P_CMD_GAIN_W] = _draw(u3, gw_lo, gw_hi, params[e, a, P_CMD_GAIN_W])
 
 
+@wp.kernel
+def pusht_friction_reset_kernel(
+    reset_mask: wp.array(dtype=wp.uint8),
+    use_mask: wp.int32,
+    seed: wp.int32,
+    lo: Any,
+    hi: Any,
+    gravity: Any,
+    mu_g: wp.array(dtype=Any),
+):
+    """Thread per env: a fresh floor friction ``mu * g``, ``mu`` uniform in ``[lo, hi]``,
+    for the respawned envs. Its own seed."""
+    e = wp.tid()
+    if use_mask == 1 and reset_mask[e] == wp.uint8(0):
+        return
+    rng = wp.rand_init(seed, e)
+    mu_g[e] = (lo + (hi - lo) * _as(wp.randf(rng), lo)) * gravity
+
+
+def _friction_reset_signature(dtype) -> list:
+    return [wp.array(dtype=wp.uint8), wp.int32, wp.int32, dtype, dtype, dtype,
+            wp.array(dtype=dtype)]
+
+
 def _actuation_reset_signature(dtype) -> list:
     return [
         wp.array(dtype=wp.uint8),
@@ -434,3 +458,4 @@ for _T in (wp.float32, wp.float64):
     register(pusht_reset_kernel, _T, _reset_signature(_T))
     register(pusht_heading_reset_kernel, _T, _heading_reset_signature(_T))
     register(pusht_actuation_reset_kernel, _T, _actuation_reset_signature(_T))
+    register(pusht_friction_reset_kernel, _T, _friction_reset_signature(_T))

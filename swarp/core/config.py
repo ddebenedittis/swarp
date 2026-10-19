@@ -191,6 +191,15 @@ class WorldConfig:
             table friction — a pushed body settles at ``sum(f) / (mass * damping)``
             instead of accelerating without limit. ``0`` is a frictionless coasting puck.
         obstacle_angular_damping: the same, for a movable body's spin.
+        obstacle_friction: Coulomb friction coefficient ``mu`` of ``MOVABLE`` obstacles on
+            the floor, their weight ``m * obstacle_gravity`` spread uniformly over their
+            footprint (``0`` disables it). Unlike the drag it stops a body within
+            ``v^2 / (2 mu g)`` and turns an off-centre push about the footprint's limit
+            surface. ``Stepper.set_body_friction`` overrides it per env.
+        obstacle_gravity: ``g`` of that weight.
+        obstacle_friction_speed: sliding speed below which the friction direction is
+            regularised (the law is smooth through rest instead of chattering).
+        obstacle_friction_grid: friction points per side of each shape's footprint.
         contact_max_overlap: depth at which the contact spring saturates, smoothly
             (``0`` disables). Bounds the impulse a deep overlap can inject; must stay
             *above* the depth a velocity-mode agent settles at, or agents walk through
@@ -223,6 +232,11 @@ class WorldConfig:
     # for a frictionless puck that coasts.
     obstacle_linear_damping: float = 10.0
     obstacle_angular_damping: float = 10.0
+    # Coulomb floor friction of MOVABLE obstacles (0 disables; see the docstring).
+    obstacle_friction: float = 0.0
+    obstacle_gravity: float = 9.81
+    obstacle_friction_speed: float = 0.005
+    obstacle_friction_grid: int = 6
     # Depth at which the contact spring saturates (smoothly; 0 disables). A
     # velocity-controlled agent has no contact memory and settles at an overlap of
     # v*mass/(k*sub_dt), which at high collision_k is a violent impulse against a light
@@ -280,6 +294,10 @@ class WorldConfig:
                 raise ValueError("bounds must satisfy x_min < x_max and y_min < y_max")
         if self.collision_k < 0.0 or self.collision_c < 0.0 or self.collision_margin < 0.0:
             raise ValueError("collision constants must be non-negative")
+        if self.obstacle_friction < 0.0 or self.obstacle_friction_speed <= 0.0:
+            raise ValueError("obstacle_friction must be >= 0 and obstacle_friction_speed > 0")
+        if self.obstacle_friction_grid < 1:
+            raise ValueError("obstacle_friction_grid must be >= 1")
         if self.obstacle_linear_damping < 0.0 or self.obstacle_angular_damping < 0.0:
             raise ValueError("obstacle damping must be non-negative")
         if self.contact_max_overlap < 0.0:

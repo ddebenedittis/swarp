@@ -51,6 +51,7 @@ from swarp.interop.autograd import torch_stream_scope
 from swarp.scenarios.fused import Buf, FusedPass, FusedScenario
 from swarp.scenarios.pusht_kernels import (
     pusht_actuation_reset_kernel,
+    pusht_friction_reset_kernel,
     pusht_heading_reset_kernel,
     pusht_obs_kernel,
     pusht_reset_kernel,
@@ -114,6 +115,7 @@ class PushTScenario(FusedScenario):
         cmd_gain_v: float | tuple[float, float] | None = None,
         cmd_gain_w: float | tuple[float, float] | None = None,
         agent_mass: float = 1.0,
+        floor_friction: float | tuple[float, float] | None = None,
     ) -> None:
         """``model="diff_drive"`` makes the robots unicycles commanded by ``(v, omega)``,
         with turn rates up to ``max_ang_vel``; ``agent_shape="box"`` makes them rectangles
@@ -134,7 +136,12 @@ class PushTScenario(FusedScenario):
 
         ``agent_mass`` is the robots' mass. A velocity-commanded robot has no inertia of
         its own, so the mass only sets how far a contact deflects it: in a push it gives
-        up ``tee_mass * linear_damping * sub_dt / agent_mass`` of its speed to the T."""
+        up ``tee_mass * linear_damping * sub_dt / agent_mass`` of its speed to the T.
+
+        ``floor_friction`` puts the T on a Coulomb floor with that ``mu`` (see
+        ``WorldConfig.obstacle_friction``), or a ``(low, high)`` range drawn per env on
+        every reset; it adds to the viscous ``linear_damping``/``angular_damping``, which a
+        Coulomb T usually sets near 0."""
         self.n_agents = n_agents
         self.model = _coerce(DynamicsModel, model, "model")
         if self.model not in self.supported_models:
@@ -152,6 +159,13 @@ class PushTScenario(FusedScenario):
         if agent_mass <= 0.0:
             raise ValueError(f"agent_mass must be positive, got {agent_mass}")
         self.agent_mass = agent_mass
+        self.floor_friction = (
+            None if floor_friction is None else _as_range(floor_friction, 0.0, "floor_friction")
+        )
+        #: Whether ``mu`` is drawn per env on reset.
+        self.friction_dr = self.floor_friction is not None and (
+            self.floor_friction[0] != self.floor_friction[1]
+        )
         self._actuation = (servo_accel, servo_ang_accel, cmd_gain_v, cmd_gain_w)
         #: Whether the robots drive through ``ControlMode.SERVO``.
         self.servo = any(v is not None for v in self._actuation)
@@ -310,6 +324,7 @@ class PushTScenario(FusedScenario):
             # The T is a movable obstacle now, so its drag is engine config.
             obstacle_linear_damping=self.linear_damping,
             obstacle_angular_damping=self.angular_damping,
+            obstacle_friction=0.0 if self.floor_friction is None else self.floor_friction[0],
             contact_max_overlap=self.max_overlap,
         ).override_with(world_config)
         self.dt = dt
@@ -391,6 +406,13 @@ class PushTScenario(FusedScenario):
         self._reset_launch = CachedLaunch()
         self._heading_launch = CachedLaunch()
         self._actuation_launch = CachedLaunch()
+        self._friction_launch = CachedLaunch()
+        if self.friction_dr:
+            # A per-env mu * g, allocated here (outside any capture) and redrawn in place.
+            g = self.world.config.obstacle_gravity
+            self.world.stepper.set_body_friction(
+                torch.full((n_envs,), self.floor_friction[0] * g, **tt)
+            )
         if self.actuation_dr:
             # Per-env parameter rows, installed once here (outside any capture) and then
             # redrawn in place by the reset kernel, so the step's kernels keep one pointer.
@@ -536,6 +558,8 @@ class PushTScenario(FusedScenario):
                 self._launch_heading_reset(st, mask, use_mask)
             if self.actuation_dr:
                 self._launch_actuation_reset(mask, use_mask)
+            if self.friction_dr:
+                self._launch_friction_reset(mask, use_mask)
 
     def _launch_heading_reset(self, st, mask, use_mask) -> None:
         """Random headings, zero speed and spin for the respawned robots (only launched
@@ -554,6 +578,25 @@ class PushTScenario(FusedScenario):
                 ptr_key(st.speed),
                 ptr_key(st.ang_vel),
             ),
+        )
+        launch.set_param_by_name("use_mask", use_mask)
+        launch.set_param_by_name("seed", seed)
+        launch.launch()
+
+    def _launch_friction_reset(self, mask, use_mask) -> None:
+        """Redraw the respawned envs' floor friction (``friction_dr``)."""
+        w = self.world
+        scalar = w.wp_dtype
+        seed = wp.int32(w.next_kernel_seed())
+        out = w.stepper.body_friction
+        lo, hi = self.floor_friction
+        launch = self._friction_launch.get(
+            concrete(pusht_friction_reset_kernel, scalar),
+            dim=w.n_envs,
+            inputs=[mask, use_mask, seed, scalar(lo), scalar(hi),
+                    scalar(w.config.obstacle_gravity), out],
+            device=w.device,
+            key=(w.n_envs, ptr_key(mask), ptr_key(out)),
         )
         launch.set_param_by_name("use_mask", use_mask)
         launch.set_param_by_name("seed", seed)
