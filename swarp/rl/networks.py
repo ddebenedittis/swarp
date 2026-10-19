@@ -89,15 +89,22 @@ class Critic(nn.Module):
 
     ``[*, n_agents, obs_dim]`` -> ``[*, n_agents]``. Its input width is
     ``n_agents * obs_dim``, so a critic does not transfer across agent counts.
+
+    With ``n_values`` (a vector reward, one value per objective) the output is
+    ``[*, n_agents, n_values]``; ``None`` keeps the scalar critic.
     """
 
-    def __init__(self, obs_dim: int, n_agents: int, num_cells: int = 256) -> None:
+    def __init__(
+        self, obs_dim: int, n_agents: int, num_cells: int = 256, n_values: int | None = None
+    ) -> None:
         super().__init__()
-        self.n_agents = n_agents
-        self.net = mlp(n_agents * obs_dim, 1, num_cells)
+        self.n_agents, self.n_values = n_agents, n_values
+        self.net = mlp(n_agents * obs_dim, n_values or 1, num_cells)
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
         v = self.net(obs.flatten(-2))
+        if self.n_values is not None:
+            return v.unsqueeze(-2).expand(*v.shape[:-1], self.n_agents, self.n_values)
         return v.expand(*v.shape[:-1], self.n_agents)
 
 
@@ -142,8 +149,9 @@ def _take(x: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
 # ------------------------------------------------------------------------------ actors
 
 ROLE_PARAMS = ("shared", "heads", "separate")
-#: ``PolicyNet.comm`` values: no communication, or one round of attention over teammates.
-COMMS = ("none", "attn")
+#: ``PolicyNet.comm`` values: no communication, one round of attention over teammates, or
+#: rounds of graph attention (GATv2) with edge features.
+COMMS = ("none", "attn", "gatv2")
 
 
 def _trunk(n_in: int, num_cells: int, depth: int = 2) -> nn.Sequential:
@@ -152,6 +160,90 @@ def _trunk(n_in: int, num_cells: int, depth: int = 2) -> nn.Sequential:
     for i in range(depth):
         layers += [nn.Linear(n_in if i == 0 else num_cells, num_cells), nn.Tanh()]
     return nn.Sequential(*layers)
+
+
+def _glorot_(w: torch.Tensor) -> None:
+    """PyG's ``glorot``: uniform in ``+-sqrt(6 / (fan_in + fan_out))`` over the last two
+    dims."""
+    bound = math.sqrt(6.0 / (w.size(-2) + w.size(-1)))
+    with torch.no_grad():
+        w.uniform_(-bound, bound)
+
+
+class DenseGATv2(nn.Module):
+    """One GATv2 layer (Brody et al.) over every ordered agent pair of a team, dense.
+
+    ``forward(x [*, A, dim], allowed [*, A, A] bool, edge [*, A, A, edge_dim] | None)``:
+    agent ``i`` aggregates ``sum_j alpha_ij W_l x_j`` over the ``j`` that
+    ``allowed[..., i, j]`` lets it hear, with ``alpha_ij`` the softmax over ``j`` of
+    ``att . leaky_relu(W_r x_i + W_l x_j + W_e e_ij)``, per head; the heads are
+    concatenated (``dim / heads`` channels each) and a bias added. PyG's ``GATv2Conv``
+    with ``concat=True, share_weights=False, add_self_loops=False``, parameter for
+    parameter, but over a static ``[A, A]`` grid instead of an edge list: no
+    data-dependent shapes, so it is CUDA-graph capturable. An agent that hears nobody
+    aggregates zero (then the bias), as an empty scatter-sum does, with no NaN in the
+    backward pass either.
+    """
+
+    def __init__(
+        self, dim: int, heads: int = 1, edge_dim: int = 0, negative_slope: float = 0.2
+    ) -> None:
+        super().__init__()
+        if dim % heads:
+            raise ValueError(f"comm_dim {dim} must be divisible by comm_heads {heads}")
+        self.dim, self.heads, self.channels = dim, heads, dim // heads
+        self.negative_slope = negative_slope
+        self.lin_l = nn.Linear(dim, dim)
+        self.lin_r = nn.Linear(dim, dim)
+        self.lin_edge = nn.Linear(edge_dim, dim, bias=False) if edge_dim else None
+        self.att = nn.Parameter(torch.empty(heads, self.channels))
+        self.bias = nn.Parameter(torch.zeros(dim))
+        for w in (self.lin_l.weight, self.lin_r.weight, self.att):
+            _glorot_(w)
+        if self.lin_edge is not None:
+            _glorot_(self.lin_edge.weight)
+        nn.init.zeros_(self.lin_l.bias)
+        nn.init.zeros_(self.lin_r.bias)
+
+    def forward(
+        self, x: torch.Tensor, allowed: torch.Tensor, edge: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(out [*, A, dim], alpha [*, A, A, heads])``."""
+        H, C = self.heads, self.channels
+        x_l = self.lin_l(x).unflatten(-1, (H, C))  # source j
+        x_r = self.lin_r(x).unflatten(-1, (H, C))  # target i
+        s = x_r.unsqueeze(-3) + x_l.unsqueeze(-4)  # [*, i, j, H, C]
+        if self.lin_edge is not None and edge is not None:
+            s = s + self.lin_edge(edge).unflatten(-1, (H, C))
+        logits = (F.leaky_relu(s, self.negative_slope) * self.att).sum(-1)  # [*, i, j, H]
+        mask = allowed.unsqueeze(-1)
+        logits = logits.masked_fill(~mask, float("-inf"))
+        logits = torch.where(mask.any(-2, keepdim=True), logits, torch.zeros_like(logits))
+        alpha = torch.softmax(logits, -2) * mask
+        out = torch.einsum("...ijh,...jhc->...ihc", alpha, x_l)
+        return out.flatten(-2) + self.bias, alpha
+
+
+def pair_features(
+    obs: torch.Tensor,
+    pos_cols: torch.Tensor | Sequence[int],
+    rel_cols: torch.Tensor | Sequence[int],
+) -> torch.Tensor | None:
+    """Per ordered pair ``[*, A, A, F]``: ``[x_j - x_i over pos_cols, |that|, x_j - x_i over
+    rel_cols]``, row ``i`` (receiver), column ``j`` (sender); ``None`` without columns.
+    Pass the columns as a device tensor to stay capturable (a list is copied to the device
+    on every call)."""
+    parts = []
+    for cols, with_norm in ((pos_cols, True), (rel_cols, False)):
+        if len(cols):
+            if not torch.is_tensor(cols):
+                cols = torch.tensor(list(cols), device=obs.device)
+            o = obs.index_select(-1, cols)
+            rel = o.unsqueeze(-3) - o.unsqueeze(-2)
+            parts.append(rel)
+            if with_norm:
+                parts.append(rel.norm(dim=-1, keepdim=True))
+    return torch.cat(parts, -1) if parts else None
 
 
 class PolicyNet(nn.Module):
@@ -181,8 +273,13 @@ class PolicyNet(nn.Module):
     encoded to ``e`` ``[*, A, comm_dim]``, attends over its teammates with single-head
     scaled dot-product attention (never over itself, and only over the teammates
     ``comm_mask`` ``[*, A, A]`` allows: ``comm_mask[..., i, j]`` means ``i`` hears ``j``),
-    and the trunk reads ``cat(e, message)``. Communication needs one shared trunk, so it
-    is refused with ``"separate"`` roles.
+    and the trunk reads ``cat(e, message)``. ``comm="gatv2"`` is a graph network instead:
+    the same encoding, then ``comm_layers`` rounds of :class:`DenseGATv2` (``comm_heads``
+    heads) over the same allowed pairs, each ``e <- e + tanh(gat(e))``, with edge features
+    from the observation (:func:`pair_features` over the ``edge_pos`` and ``edge_rel``
+    columns, e.g. position and velocity); the trunk reads ``e``. Communication needs one
+    shared trunk, so it is refused with ``"separate"`` roles. ``trunk_depth`` sets the
+    trunk's Tanh layers (2, as :class:`Actor`'s MLP, by default).
 
     :meth:`step` is the one-step entry point, ``(obs, roles, h) -> (loc, scale, aux, h)``;
     without ``recurrent`` the hidden state is passed through untouched. :meth:`unroll` runs
@@ -202,6 +299,11 @@ class PolicyNet(nn.Module):
         hidden_dim: int = 128,
         comm: str = "none",
         comm_dim: int = 64,
+        comm_layers: int = 1,
+        comm_heads: int = 1,
+        edge_pos: Sequence[int] = (),
+        edge_rel: Sequence[int] = (),
+        trunk_depth: int = 2,
         low: torch.Tensor | Sequence[float] | None = None,
         high: torch.Tensor | Sequence[float] | None = None,
     ) -> None:
@@ -225,12 +327,24 @@ class PolicyNet(nn.Module):
         self.communicates = comm != "none"
         if self.communicates and self.separate:
             raise ValueError(
-                "comm='attn' needs one shared trunk: use role_params 'heads' or 'shared' "
+                f"comm={comm!r} needs one shared trunk: use role_params 'heads' or 'shared' "
                 "with roles, not 'separate'"
             )
+        if min(comm_layers, comm_heads, trunk_depth) < 1:
+            raise ValueError("comm_layers, comm_heads and trunk_depth must be >= 1")
+        self.edge_pos = tuple(int(c) for c in edge_pos)
+        self.edge_rel = tuple(int(c) for c in edge_rel)
+        if any(not 0 <= c < obs_dim for c in (*self.edge_pos, *self.edge_rel)):
+            raise ValueError(f"edge columns must lie in [0, {obs_dim}), got "
+                             f"{self.edge_pos} and {self.edge_rel}")
+        # Device copies of the edge columns, so the feature gather never copies from host.
+        self.register_buffer("edge_pos_idx", torch.tensor(self.edge_pos, dtype=torch.long),
+                             persistent=False)
+        self.register_buffer("edge_rel_idx", torch.tensor(self.edge_rel, dtype=torch.long),
+                             persistent=False)
         feat_dim = hidden_dim if self.recurrent else num_cells
         if self.separate:
-            self.trunks = nn.ModuleList(_trunk(obs_dim, num_cells) for _ in range(R))
+            self.trunks = nn.ModuleList(_trunk(obs_dim, num_cells, trunk_depth) for _ in range(R))
             if self.recurrent:
                 self.grus = nn.ModuleList(nn.GRUCell(num_cells, hidden_dim) for _ in range(R))
             self.heads = nn.ModuleList(nn.Linear(feat_dim, 2 * act_dim) for _ in range(R))
@@ -240,9 +354,16 @@ class PolicyNet(nn.Module):
             n_in = obs_dim + (R if self.role_input else 0)
             if self.communicates:
                 self.comm_enc = nn.Linear(n_in, comm_dim)
-                self.comm_qkv = nn.Linear(comm_dim, 3 * comm_dim)
-                n_in = 2 * comm_dim
-            self.trunk = _trunk(n_in, num_cells)
+                if comm == "attn":
+                    self.comm_qkv = nn.Linear(comm_dim, 3 * comm_dim)
+                    n_in = 2 * comm_dim
+                else:
+                    edge_dim = len(self.edge_pos) + bool(self.edge_pos) + len(self.edge_rel)
+                    self.gat = nn.ModuleList(
+                        DenseGATv2(comm_dim, comm_heads, edge_dim) for _ in range(comm_layers)
+                    )
+                    n_in = comm_dim
+            self.trunk = _trunk(n_in, num_cells, trunk_depth)
             if self.recurrent:
                 self.gru = nn.GRUCell(num_cells, hidden_dim)
             self.head = nn.Linear(feat_dim, (R if self.role_heads else 1) * 2 * act_dim)
@@ -267,6 +388,13 @@ class PolicyNet(nn.Module):
             self.config.update(recurrent=True, hidden_dim=hidden_dim)
         if self.communicates:
             self.config.update(comm=comm, comm_dim=comm_dim)
+        if comm == "gatv2":
+            self.config.update(
+                comm_layers=comm_layers, comm_heads=comm_heads, edge_pos=list(self.edge_pos),
+                edge_rel=list(self.edge_rel),
+            )
+        if trunk_depth != 2:
+            self.config.update(trunk_depth=trunk_depth)
 
     @property
     def uses_roles(self) -> bool:
@@ -297,16 +425,24 @@ class PolicyNet(nn.Module):
         return torch.cat([obs, onehot], -1)
 
     def _communicate(
-        self, x: torch.Tensor, comm_mask: torch.Tensor | None
+        self, x: torch.Tensor, comm_mask: torch.Tensor | None, obs: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """``(cat(e, message), weights)``: one round of attention over teammates."""
+        """``(features for the trunk, weights)``: one round of attention over teammates,
+        ``(cat(e, message), weights)``, or the GATv2 rounds, ``(e, last round's weights
+        averaged over heads)``."""
         e = torch.tanh(self.comm_enc(x))
-        q, k, v = self.comm_qkv(e).chunk(3, -1)
-        scores = torch.matmul(q, k.transpose(-1, -2)) * (self.comm_dim**-0.5)
         n = x.shape[-2]
         allowed = ~torch.eye(n, dtype=torch.bool, device=x.device)
         if comm_mask is not None:
             allowed = allowed & comm_mask.bool()
+        if self.comm == "gatv2":
+            edge = pair_features(obs, self.edge_pos_idx, self.edge_rel_idx)
+            for layer in self.gat:
+                m, w = layer(e, allowed, edge)
+                e = torch.tanh(m) + e
+            return e, w.mean(-1)
+        q, k, v = self.comm_qkv(e).chunk(3, -1)
+        scores = torch.matmul(q, k.transpose(-1, -2)) * (self.comm_dim**-0.5)
         scores = scores.masked_fill(~allowed, float("-inf"))
         # An agent with nobody to hear (one agent, or masked off) gets a zero message, not
         # the NaN of a softmax over nothing, in the forward and the backward pass.
@@ -324,7 +460,7 @@ class PolicyNet(nn.Module):
             ]
         x = self._with_role(obs, roles)
         if self.communicates:
-            x = self._communicate(x, comm_mask)[0]
+            x = self._communicate(x, comm_mask, obs)[0]
         return self.trunk(x)
 
     def _input_gates(self, feat):
@@ -469,12 +605,12 @@ class PolicyNet(nn.Module):
         comm_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """The attention weights ``[*, A, A]`` (row ``i``: what agent ``i`` hears from each
-        teammate), for inspection. Zero on the diagonal and wherever ``comm_mask`` is
-        ``False``."""
+        teammate), for inspection: the last GATv2 round's, averaged over heads, with
+        ``comm="gatv2"``. Zero on the diagonal and wherever ``comm_mask`` is ``False``."""
         if not self.communicates:
             raise ValueError("this PolicyNet does not communicate (comm='none')")
         roles = self._check(roles, False)
-        return self._communicate(self._with_role(obs, roles), comm_mask)[1]
+        return self._communicate(self._with_role(obs, roles), comm_mask, obs)[1]
 
     def forward(
         self, obs: torch.Tensor, roles: torch.Tensor | None = None
@@ -514,7 +650,9 @@ class StateCritic(nn.Module):
 
     One value broadcast to every agent by default. With ``per_agent`` it outputs one value
     per role-sorted slot (per agent index without roles), mapped back to agent order: the
-    per-role rewards then get a value each instead of sharing the team's.
+    per-role rewards then get a value each instead of sharing the team's. ``n_values``
+    makes every value a vector, one entry per objective of a vector reward: the output is
+    then ``[*, A, n_values]``.
 
     ``state`` is read as it comes, never reordered: with roles, slot ``k`` of the output is
     the agent holding role-sorted rank ``k``, so a per-agent part of ``critic_state()``
@@ -533,6 +671,7 @@ class StateCritic(nn.Module):
         use_obs: bool = False,
         role_counts: Sequence[int] = (),
         per_agent: bool = False,
+        n_values: int | None = None,
     ) -> None:
         super().__init__()
         n_in = state_dim + (n_agents * obs_dim if use_obs else 0)
@@ -541,17 +680,20 @@ class StateCritic(nn.Module):
         if role_counts and sum(role_counts) != n_agents:
             raise ValueError(f"role_counts {tuple(role_counts)} do not sum to {n_agents} agents")
         self.state_dim, self.obs_dim, self.n_agents = state_dim, obs_dim, n_agents
-        self.use_obs, self.per_agent = use_obs, per_agent
+        self.use_obs, self.per_agent, self.n_values = use_obs, per_agent, n_values
         self.role_counts = tuple(int(c) for c in role_counts)
         #: Whether ``forward`` reads ``roles``: only to order the obs or the per-slot values.
         self.uses_roles = bool(self.role_counts) and (use_obs or per_agent)
-        self.net = mlp(n_in, n_agents if per_agent else 1, num_cells)
+        self.net = mlp(n_in, (n_agents if per_agent else 1) * (n_values or 1), num_cells)
         #: The constructor's arguments as primitives, which is what a checkpoint stores.
+        #: ``n_values`` appears only when set, so a scalar critic's config is unchanged.
         self.config = {
             "state_dim": state_dim, "obs_dim": obs_dim, "n_agents": n_agents,
             "num_cells": num_cells, "use_obs": use_obs,
             "role_counts": list(self.role_counts), "per_agent": per_agent,
         }
+        if n_values is not None:
+            self.config["n_values"] = n_values
 
     def forward(
         self,
@@ -565,6 +707,12 @@ class StateCritic(nn.Module):
             o = obs if slots is None else _take(obs, invert_permutation(slots))
             parts.append(o.flatten(-2))
         v = self.net(parts[0] if len(parts) == 1 else torch.cat(parts, -1))
+        if self.n_values is not None:
+            K = self.n_values
+            if not self.per_agent:
+                return v.unsqueeze(-2).expand(*v.shape[:-1], self.n_agents, K)
+            v = v.view(*v.shape[:-1], self.n_agents, K)
+            return v if slots is None else _take(v, slots)
         if not self.per_agent:
             return v.expand(*v.shape[:-1], self.n_agents)
         return v if slots is None else v.gather(-1, slots)

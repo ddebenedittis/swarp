@@ -7,6 +7,15 @@ All notable changes to `swarp`. Newest first. Nothing has been released yet — 
 
 ### Added
 
+- **`swarp.rl` trains on vector rewards, with pluggable update rules, rollout tags and a GATv2 actor, all inside the captured graphs.**
+  `TrainSpec.reward_key` (`--reward-key`) names an `info()` key holding a per-agent reward vector `[n_envs, n_agents, K]`: the reward, value, advantage and return buffers gain a trailing `K`, GAE runs once per objective, the advantages are standardized per objective, `Critic` and `StateCritic` take `n_values=K`, and the default update combines the objectives with `objective_weights`.
+  `MAPPO(update_rule=...)` replaces the minibatch's loss and backward with an `UpdateRule` (`PPORule`, the previous code, is the default): it receives a `Minibatch`, fills the gradients (several `autograd.grad` calls over one retained graph are fine, and `write_grads` writes a hand-computed gradient in place), returns its statistics, and runs inside the minibatch graph unless it declares `graph_safe = False`.
+  `MAPPO(tags=(...))` records per-agent integer `info()` buffers next to each observation, in the act graph, for the rule to group samples by (`Minibatch.tags`).
+  `clip_per_network` clips the actor's and the critic's gradient norms separately.
+  `PolicyNet(comm="gatv2")` is a graph network: `comm_layers` rounds of dense multi-head GATv2 (`DenseGATv2`, PyG's `GATv2Conv` parameter for parameter, over the `[A, A]` grid, so capturable) over the scenario's `comm_mask()`, with relative position (`edge_pos`) and velocity (`edge_rel`) edge features and a residual; `trunk_depth` sets the trunk's depth.
+  With every new option at its default the trainer is bit-identical: a test replays the pre-refactor minibatch body against the default rule, and a 60-iteration `navigation` run writes the same `metrics.csv` (every non-timing cell) as before, at the same speed (`train_throughput`, RTX 4070 Ti SUPER, `graphs` / `fast`: navigation 48.0 / 30.0 ms per iteration before and after, giveway 91.0 / 57.5 before, 91.0 / 58.0 after).
+  Built for M2RL's lexicographic MAPPO, which runs as an `UpdateRule` grouping samples by a priority-order tag.
+
 - **`pusht_lidar`, a twelfth scenario: multi-robot Push-T observed through lidar, with pusher and observer roles.**
   Five identical robots, two pushers and three observers by default, with the roles redrawn per env per episode at fixed counts; every robot can push, and the roles differ only in their rewards.
   From `obs_level=1` on a robot does not observe the T pose: it sees its own pose, the goal, its teammates and its own 32-ray lidar (range, object mask, robot mask per ray), optionally a ring of past scans and, at level 2, every teammate's object-hit points pooled in the world frame.

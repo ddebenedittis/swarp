@@ -159,8 +159,11 @@ Both are off by default, and with both off the networks, buffers and graphs are 
 | `recurrent` | `--recurrent` | `False`, `True` | nothing |
 | `hidden_dim` | `--hidden-dim` | `128`, any width | nothing |
 | `seq_len` | `--seq-len` | `0` (= `steps_per_batch`), a divisor of `steps_per_batch` | nothing |
-| `comm` | `--comm` | `"none"`, `"attn"` | `comm_mask()`, optionally |
+| `comm` | `--comm` | `"none"`, `"attn"`, `"gatv2"` | `comm_mask()`, optionally |
 | `comm_dim` | `--comm-dim` | `64`, any width | nothing |
+| `comm_layers`, `comm_heads` | `--comm-layers`, `--comm-heads` | `1`, `1` (`"gatv2"` only) | nothing |
+| `edge_pos`, `edge_rel` | `--edge-pos`, `--edge-rel` | `()`, observation columns (`"gatv2"` only) | nothing |
+| `trunk_depth` | `--trunk-depth` | `2`, any depth | nothing |
 
 **Memory.**
 `recurrent` puts a `GRUCell` after the trunk (one per role with `"separate"`), and the action heads and the auxiliary head read its output.
@@ -185,6 +188,13 @@ An agent that hears nobody gets a zero message.
 The message is computed from the current step's inputs, so communication works with and without memory, and with memory the GRU is what lets a message's content persist.
 Communication needs one shared trunk, so it combines with `role_params` `"heads"` or `"shared"`; with roles and `"separate"`, `train` refuses it.
 
+`comm="gatv2"` is a graph network over the same "who hears whom" pairs.
+The input is encoded to `comm_dim` as for `"attn"`, then `comm_layers` rounds of GATv2 (Brody et al.; PyG's `GATv2Conv` parameter for parameter, `comm_heads` heads concatenated) each add `tanh` of the aggregated messages to the node features, and the trunk reads them.
+Edge features come from the observation: for the `edge_pos` columns (a position) the sender-minus-receiver difference and its norm, for the `edge_rel` columns (a velocity) the difference alone.
+The layer runs densely over the `[n_agents, n_agents]` grid with the mask applied, so its shapes never depend on the data and it is captured with the rest of the update.
+An agent that hears nobody aggregates zero, plus the bias.
+`trunk_depth` sets how many `Tanh` layers follow (two by default, as in `Actor`).
+
 The mask is a training hook with the same fixed-address contract as the others ([Writing a scenario](writing-a-scenario.md#training-hooks-optional)); the rollout records it next to the observation and the update reads it back with each sample.
 Whether a scenario has one is decided once, when `MAPPO` is built, from whether `comm_mask()` returns `None`.
 
@@ -197,6 +207,33 @@ A loop whose envs reset mid-run builds a fresh action function per episode.
 python -m swarp.rl --scenario <name> --actor policynet --recurrent --hidden-dim 128 \
     --seq-len 16 --comm attn --comm-dim 64
 ```
+
+## Vector rewards and custom update rules
+
+`MAPPO` can train on a vector reward and with an update other than its own PPO step, without leaving the captured graphs.
+Both are off by default, and with both off the buffers, graphs and numerics are the ones above (a test pins the update to the pre-extension one bit for bit).
+
+**Vector rewards.**
+`TrainSpec.reward_key` (`--reward-key`) names an `info()` key holding a per-agent reward vector `[n_envs, n_agents, K]`, such as the `multiobj_reward` several scenarios already emit.
+The rollout then stores `K` rewards per agent and step, the critic returns `K` values (`Critic(..., n_values=K)`, `StateCritic(..., n_values=K)`), and GAE runs once per objective.
+The default update standardizes each objective's advantage on its own (per agent, or per role-sorted slot), combines them with `objective_weights` (`--objective-weights`, all ones by default) and trains the critic on all `K` returns.
+The logged `mean_reward` is the per-step sum over the objectives.
+`MAPPO` reads the key's width from `info()` when it is built, so reset the env once before building it (`train` does).
+
+**Custom update rules.**
+`MAPPO(..., update_rule=rule)` replaces the minibatch's loss and backward with `rule.backward(mb, actor, critic, ent_coef)`.
+`mb` is a `Minibatch`: the gathered observations, stored pre-tanh samples, old log-probs, the raw (unnormalized) advantages and returns, an entropy noise draw, the optional inputs `ppo_loss` takes, and the tags (below).
+The rule fills the parameters' `.grad`, either by `backward()` or by writing a gradient it computed itself into the existing `.grad` tensors with `swarp.rl.write_grads`, and returns a 1-D tensor of statistics named by its `stat_names`, which `update()` sums over the minibatches.
+`MAPPO` still zeroes the gradients, clips them (jointly, or per network with `clip_per_network`), skips a non-finite minibatch on the device and steps Adam.
+The rule runs inside the minibatch's CUDA graph, so it must be capturable: no host reads, no data-dependent shapes, Python branches only on configuration.
+Several `torch.autograd.grad` calls over one retained forward graph are fine, which is what a gradient projection needs (one gradient per objective, then a combination); a test checks such a rule lands on the same weights captured and eager.
+A rule that cannot be captured declares `graph_safe = False`, and its minibatches run eagerly while the rollout stays captured.
+`PPORule` is the default rule, and `rule.setup(algo)` is called once with the built `MAPPO`.
+
+**Tags.**
+`MAPPO(..., tags=("priority_order",))` records per-agent integers from `info()` (each a fixed-address `[n_envs, n_agents]` buffer) next to every observation, in the act graph, and hands them to the rule as `mb.tags`.
+Because they are read when the agent acts, a tag the scenario redraws at an auto-reset belongs to the new episode's first step, as the observation does.
+A rule can use them to group samples, for example by which priority order each agent follows.
 
 ## What differs from the TorchRL trainer
 

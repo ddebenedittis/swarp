@@ -30,6 +30,14 @@ Two deliberate differences from the reference trainer:
   run at the starting difficulty.
 
 On a non-CUDA device, or with ``graphs=False``, the same bodies run eagerly.
+
+Two extension points keep the captured loop while changing what it optimizes. A vector
+reward (``TrainSpec.reward_key``, an ``info()`` key ``[E, A, K]``) gives the rollout, the
+critic, GAE and the advantage normalization a trailing objective dim. An
+:class:`UpdateRule` replaces the minibatch's loss-to-gradient step (the default,
+:class:`PPORule`, is the code above), and ``MAPPO(tags=...)`` records per-agent ``info()``
+integers next to each observation for it to read (e.g. which priority order an agent
+follows).
 """
 
 from __future__ import annotations
@@ -39,7 +47,7 @@ import csv
 import math
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -52,6 +60,7 @@ from swarp.rl.networks import (
     Critic,
     PolicyNet,
     StateCritic,
+    _take,
     invert_permutation,
     role_slots,
     tanh_normal_log_prob,
@@ -168,11 +177,14 @@ def gae(
     the observation after the rollout), the flags are ``[T, E]`` in ``{0, 1}``. The trace
     is cut wherever an episode ended. A terminated step does not bootstrap; a truncated,
     non-terminated one bootstraps from ``V(s_t)`` because ``s_{t+1}`` already belongs to
-    the next episode (see the module docstring).
+    the next episode (see the module docstring). A vector reward adds a trailing objective
+    dim to ``rew``, ``value`` and the result (``[T, E, A, K]``); each objective is its own
+    independent GAE.
     """
     T = rew.shape[0]
-    done = torch.maximum(terminated, truncated).unsqueeze(-1)
-    timeout = (truncated * (1.0 - terminated)).unsqueeze(-1)
+    trail = (1,) * (rew.ndim - terminated.ndim)
+    done = torch.maximum(terminated, truncated).view(*terminated.shape, *trail)
+    timeout = (truncated * (1.0 - terminated)).view(*terminated.shape, *trail)
     rew = rew + gamma * value[:T] * timeout
     not_done = 1.0 - done
     out = torch.empty_like(rew) if out is None else out
@@ -197,10 +209,15 @@ def standardize_advantage(
     ascending index, then role 1's, ...), standardized per column and scattered back, so
     when roles move between agents every column still holds one role. ``role_counts``
     is static; the permutation is a one-hot cumulative sum, capturable like the rest.
+    A vector advantage ``[B, A, K]`` is standardized per agent (or slot) and objective.
     """
     if roles is None or not role_counts:
         return (adv - adv.mean(0)) / adv.std(0).clamp_min(_ADV_EPS)
     slots = role_slots(roles, len(role_counts))  # agent -> slot
+    if adv.ndim > roles.ndim:  # [B, A, K]: the agent dim is -2
+        ranked = _take(adv, invert_permutation(slots))
+        ranked = (ranked - ranked.mean(0)) / ranked.std(0).clamp_min(_ADV_EPS)
+        return _take(ranked, slots)
     ranked = adv.gather(-1, invert_permutation(slots))  # slot -> agent's advantage
     ranked = (ranked - ranked.mean(0)) / ranked.std(0).clamp_min(_ADV_EPS)
     return ranked.gather(-1, slots)
@@ -325,6 +342,128 @@ def ppo_loss(
     return objective, F.smooth_l1_loss(value, ret), entropy, F.mse_loss(aux, aux_target)
 
 
+# --------------------------------------------------------------------- update rules
+
+
+@dataclass
+class Minibatch:
+    """One minibatch's rows of the rollout, as :class:`MAPPO` gathers them.
+
+    ``obs`` ``[B, A, obs_dim]``, ``u`` (the stored pre-tanh sample) and ``noise`` (a
+    standard normal draw for an entropy sample) ``[B, A, act_dim]``, ``logp_old``
+    ``[B, A]``, and ``adv`` and ``ret`` ``[B, A]`` (``[B, A, K]`` with a vector reward),
+    raw: normalizing them is the rule's business. ``extra`` holds the optional inputs
+    :func:`ppo_loss` takes by keyword (``state``, ``roles``, ``role_counts``,
+    ``aux_target``, ``comm_mask``, ``h0``, ``done``), present only when recorded, and
+    ``tags`` each recorded tag ``[B, A]`` (long) by its ``info()`` key.
+    """
+
+    obs: torch.Tensor
+    u: torch.Tensor
+    logp_old: torch.Tensor
+    adv: torch.Tensor
+    ret: torch.Tensor
+    noise: torch.Tensor
+    extra: dict[str, Any] = field(default_factory=dict)
+    tags: dict[str, torch.Tensor] = field(default_factory=dict)
+
+
+class UpdateRule:
+    """The loss-to-gradient step of one minibatch: what :class:`MAPPO` optimizes.
+
+    :meth:`backward` fills the ``.grad`` of the actor's and the critic's parameters (MAPPO
+    zeroes them first, then clips, skips a non-finite minibatch and steps Adam) and
+    returns a 1-D tensor of :attr:`stat_names`' width, summed over the iteration's
+    minibatches into :meth:`MAPPO.update`'s result. It runs inside the minibatch's CUDA
+    graph, so it must be capturable: no host reads, no data-dependent shapes, Python
+    branches only on configuration. It may call ``torch.autograd.grad`` any number of
+    times over one retained forward graph. A rule that cannot be captured sets
+    ``graph_safe = False`` and its minibatches run eagerly (the rollout stays captured).
+
+    A gradient written by hand must land in the existing ``.grad`` tensors (see
+    :func:`write_grads`): the captured optimizer step reads them by address.
+    """
+
+    #: One name per entry of :meth:`backward`'s result.
+    stat_names: tuple[str, ...] = ()
+    #: Whether :meth:`backward` can run inside a CUDA graph.
+    graph_safe: bool = True
+
+    def setup(self, algo: MAPPO) -> None:
+        """Called once by :class:`MAPPO` after its buffers and optimizer exist."""
+
+    def backward(
+        self,
+        mb: Minibatch,
+        actor: torch.nn.Module,
+        critic: torch.nn.Module,
+        ent_coef: torch.Tensor,
+    ) -> torch.Tensor:
+        raise NotImplementedError
+
+
+def write_grads(params: Sequence[torch.Tensor], grads: Sequence[torch.Tensor | None]) -> None:
+    """Write ``grads`` into ``params``' ``.grad`` in place (allocating it on first use, which
+    happens in the warm-up before any capture); ``None`` means zero."""
+    for p, g in zip(params, grads, strict=True):
+        if p.grad is None:
+            p.grad = torch.zeros_like(p) if g is None else g.detach().clone()
+        elif g is None:
+            p.grad.zero_()
+        else:
+            p.grad.copy_(g)
+
+
+class PPORule(UpdateRule):
+    """MAPPO's own update: clipped surrogate, smooth-L1 value loss, MC entropy bonus and
+    the optional auxiliary loss, one ``backward`` of their sum.
+
+    With a vector reward the advantages are normalized per objective (when
+    ``normalize_advantage``), combined by ``objective_weights`` (ones by default) into one
+    advantage, and the value loss averages over the objectives too.
+    """
+
+    def __init__(
+        self,
+        normalize_advantage: bool = True,
+        aux_coef: float = 0.0,
+        objective_weights: Sequence[float] | None = None,
+        compile: bool = False,
+    ) -> None:
+        self.normalize_advantage, self.aux_coef = normalize_advantage, aux_coef
+        self.objective_weights = objective_weights
+        self.stat_names = (*LEGACY_STAT_NAMES[3:6], *(("loss_aux",) if aux_coef > 0 else ()))
+        # Inductor fuses the loss's elementwise work (bias/tanh/log-prob chains) around the
+        # cuBLAS GEMMs; the result is still captured by the minibatch graph.
+        self._loss = torch.compile(ppo_loss, dynamic=False) if compile else ppo_loss
+        self.weights: torch.Tensor | None = None
+
+    def setup(self, algo: MAPPO) -> None:
+        if algo.K is not None:
+            w = self.objective_weights or (1.0,) * algo.K
+            if len(w) != algo.K:
+                raise ValueError(f"{len(w)} objective_weights for a {algo.K}-objective reward")
+            self.weights = torch.tensor(w, dtype=torch.float32, device=algo.device)
+
+    def backward(self, mb, actor, critic, ent_coef):
+        adv, normalize = mb.adv, self.normalize_advantage
+        if self.weights is not None:
+            if normalize:
+                roles = mb.extra.get("roles")
+                adv = standardize_advantage(adv, roles, mb.extra.get("role_counts", ()))
+            adv, normalize = (adv * self.weights).sum(-1), False
+        losses = self._loss(
+            actor, critic, mb.obs, mb.u, mb.logp_old, adv, mb.ret, mb.noise, normalize,
+            **mb.extra,
+        )
+        loss_obj, loss_crit, entropy = losses[:3]
+        total = loss_obj + loss_crit + -ent_coef * entropy
+        if self.aux_coef > 0:
+            total = total + self.aux_coef * losses[3]
+        total.backward()
+        return torch.stack(losses).detach()
+
+
 # ------------------------------------------------------------------------------ the core
 
 
@@ -370,6 +509,17 @@ class MAPPO:
     chunk unrolled from its stored ``h_buf`` row with the hidden state zeroed after every
     done, so the recomputed log-probs are the rollout's. A minibatch holds
     ``(E * T / L) // minibatches`` chunks, the same number of samples as without memory.
+
+    ``spec.reward_key`` trains on a vector reward ``info()[reward_key]`` ``[E, A, K]``: the
+    reward, value, advantage and return buffers gain a trailing ``K`` and the critic must
+    return ``[*, A, K]`` (``Critic(n_values=K)``). Build the env and reset it once before
+    ``MAPPO``, so ``info()`` holds the key. ``update_rule`` replaces the minibatch's loss
+    and backward (:class:`UpdateRule`; :class:`PPORule` by default), and ``tags`` names
+    ``info()`` keys holding a fixed-address integer ``[E, A]`` buffer that the act graph
+    records next to each observation (``tag_bufs[key]`` ``[T, E, A]``, long) and hands to
+    the rule as ``Minibatch.tags``. A tag is read when the agent acts, so one the
+    scenario redraws at an auto-reset belongs to the new episode's first step, as the
+    observation does.
     """
 
     def __init__(
@@ -381,6 +531,8 @@ class MAPPO:
         metrics: Mapping[str, int] = (),
         graphs: bool = True,
         compile: bool = False,
+        update_rule: UpdateRule | None = None,
+        tags: Sequence[str] = (),
     ) -> None:
         if not env.auto_reset or env.clone_outputs:
             raise ValueError("MAPPO needs an Environment with auto_reset=True, clone_outputs=False")
@@ -403,11 +555,32 @@ class MAPPO:
         def z(*shape: int, dtype: torch.dtype = torch.float32) -> torch.Tensor:
             return torch.zeros(*shape, device=dev, dtype=dtype)
 
+        # A vector reward: K objectives, a trailing dim on every reward-shaped buffer.
+        self.reward_key = spec.reward_key
+        self.K: int | None = None
+        if self.reward_key is not None:
+            try:
+                rew0 = env.scenario.info()[self.reward_key]
+            except Exception as exc:
+                raise ValueError(
+                    f"reward_key={self.reward_key!r}: info() has no such key; reset the env "
+                    "once before building MAPPO so info() is populated"
+                ) from exc
+            if rew0.ndim != 3 or tuple(rew0.shape[:2]) != (E, A):
+                raise ValueError(
+                    f"info()[{self.reward_key!r}] must be [n_envs, n_agents, K], got "
+                    f"{tuple(rew0.shape)}"
+                )
+            self.K = int(rew0.shape[-1])
+        kd = () if self.K is None else (self.K,)
+        self._kd = kd
+        self.tags = tuple(tags)
+
         # Rollout, time-major so a step writes one contiguous slot.
         self.obs_buf = z(T + 1, E, A, Ob)
         self.u_buf = z(T, E, A, D)
         self.logp_buf = z(T, E, A)
-        self.rew_buf = z(T, E, A)
+        self.rew_buf = z(T, E, A, *kd)
         self.term_buf = z(T, E)
         self.trunc_buf = z(T, E)
         self.actions = z(E, A, D)
@@ -456,6 +629,8 @@ class MAPPO:
         self.recurrent = self.policy_net and actor.recurrent
         self.use_mask = self.policy_net and actor.communicates and env.comm_mask() is not None
         self.mask_buf = z(T, E, A, A, dtype=torch.bool) if self.use_mask else None
+        self.tag_bufs = {k: z(T, E, A, dtype=torch.long) for k in self.tags}
+        self._tag_src: tuple[torch.Tensor, ...] = ()
         self.h = self.h_buf = self.done_buf = None
         # The update draws minibatches of ``mb_units`` units out of ``n_units``: samples,
         # or (recurrent) chunks of L consecutive steps of one env.
@@ -479,28 +654,36 @@ class MAPPO:
         # state, roles, aux targets, comm mask
         self._src: tuple[torch.Tensor | None, ...] = (None, None, None, None)
         # Update.
-        self.v_buf = z(T + 1, E, A)
-        self.adv_buf = z(T, E, A)
-        self.ret_buf = z(T, E, A)
+        self.v_buf = z(T + 1, E, A, *kd)
+        self.adv_buf = z(T, E, A, *kd)
+        self.ret_buf = z(T, E, A, *kd)
         self.perms = z(spec.epochs * self.M, self.mb_units, dtype=torch.long)
         self.k = z(1, dtype=torch.long)
         self.ent_coef = torch.tensor(spec.entropy_coeff, device=dev)
-        # [mean reward, n_terminated, n_done] from prepare, then
-        # [objective, critic, entropy, (aux,) skips] summed over the minibatch steps.
-        self.n_losses = 4 if self.use_aux else 3
+        if update_rule is None:
+            update_rule = PPORule(
+                spec.normalize_advantage, spec.aux_coef, spec.objective_weights, compile
+            )
+        self.rule = update_rule
+        # [mean reward, n_terminated, n_done] from prepare, then the rule's statistics
+        # ([objective, critic, entropy, (aux)] for PPORule) and the skips, summed over the
+        # minibatch steps.
+        self.n_losses = len(self.rule.stat_names)
         self.prep_stats = z(3)
         self.mb_stats = z(self.n_losses + 1)
         self.found_inf = z(())
         self.force_skip = z(())
         #: The keys of :meth:`update`'s result, in the order the stats buffers hold them.
-        losses = [*LEGACY_STAT_NAMES[:6], *(["loss_aux"] if self.use_aux else [])]
+        losses = [*LEGACY_STAT_NAMES[:3], *self.rule.stat_names]
         self.stat_names = [*losses, "grad_skips", *self.metric_names]
 
         params = [*actor.parameters(), *critic.parameters()]
         self.params = params
-        # Inductor fuses the loss's elementwise work (bias/tanh/log-prob chains) around the
-        # cuBLAS GEMMs; the result is still captured by the minibatch graph below.
-        self._loss = torch.compile(ppo_loss, dynamic=False) if compile else ppo_loss
+        # Clipped jointly, or per network.
+        self.clip_groups = (
+            [list(actor.parameters()), list(critic.parameters())]
+            if spec.clip_per_network else [params]
+        )
         if self.cuda:
             # fused + capturable: a capturable step, and a fused kernel that honours
             # ``found_inf`` by skipping the update and undoing the step increment. Eager
@@ -523,10 +706,12 @@ class MAPPO:
         )
         self._prepare = _Graphed(self._prepare_body, self.graphs, carries=(), warmup=1)
         self._minibatch = _Graphed(
-            self._minibatch_body, self.graphs, carries=(self.k, self.mb_stats),
+            self._minibatch_body, self.graphs and self.rule.graph_safe,
+            carries=(self.k, self.mb_stats),
             before_warmup=lambda: self.force_skip.fill_(1.0),
             after_warmup=lambda: self.force_skip.fill_(0.0),
         )
+        self.rule.setup(self)
 
     # --------------------------------------------------------------------- rollout
 
@@ -590,6 +775,7 @@ class MAPPO:
         return (
             rew.data_ptr(), term.data_ptr(), trunc.data_ptr(),
             *(info[k].data_ptr() for k in self.metrics),
+            *((info[self.reward_key].data_ptr(),) if self.reward_key else ()),
         )
 
     def _greedy(self, obs: torch.Tensor) -> torch.Tensor:
@@ -607,8 +793,22 @@ class MAPPO:
         return self.actor.squash(loc)
 
     def _fetch_sources(self) -> None:
-        """Point at the env's state/role/aux/mask buffers for the current observation
-        (host only)."""
+        """Point at the env's state/role/aux/mask buffers and the tags for the current
+        observation (host only)."""
+        if self.tags:
+            info = self._out[4] if self._out is not None and self._out[4] is not None else None
+            if info is None:
+                info = self.env.scenario.info()
+            srcs = []
+            for k in self.tags:
+                x = info.get(k)
+                if x is None or tuple(x.shape) != (self.E, self.A) or x.is_floating_point():
+                    raise ValueError(
+                        f"tag info()[{k!r}] must be an integer {(self.E, self.A)} tensor, got "
+                        f"{_shape(x)}"
+                    )
+                srcs.append(x)
+            self._tag_src = tuple(srcs)
         if not (self.use_state or self.use_roles or self.use_aux or self.use_mask):
             return
         E, A = self.E, self.A
@@ -639,7 +839,7 @@ class MAPPO:
 
     def _act_inputs(self) -> tuple[torch.Tensor, ...]:
         """The env-owned buffers the act graph reads by address."""
-        return (self._out[0], *(x for x in self._src if x is not None))
+        return (self._out[0], *(x for x in self._src if x is not None), *self._tag_src)
 
     def _act_body(self) -> None:
         obs = self._out[0]
@@ -654,6 +854,8 @@ class MAPPO:
             self.aux_buf.index_copy_(0, self.t, aux.unsqueeze(0))
         if self.mask_buf is not None:
             self.mask_buf.index_copy_(0, self.t, mask.unsqueeze(0))
+        for k, src in zip(self.tags, self._tag_src, strict=True):
+            self.tag_bufs[k].index_copy_(0, self.t, src.long().unsqueeze(0))
         if self.recurrent:
             self.h_buf.index_copy_(0, self.t, self.h.unsqueeze(0))
             loc, scale, _, h = self.actor.step(obs, roles, self.h, comm_mask=mask)
@@ -667,6 +869,8 @@ class MAPPO:
 
     def _store_body(self) -> None:
         _, rew, term, trunc, info = self._out
+        if self.reward_key is not None:
+            rew = info[self.reward_key]
         self.rew_buf.index_copy_(0, self.t, rew.unsqueeze(0))
         self.term_buf.index_copy_(0, self.t, term.unsqueeze(0).float())
         self.trunc_buf.index_copy_(0, self.t, trunc.unsqueeze(0).float())
@@ -751,7 +955,10 @@ class MAPPO:
             for e in range(spec.epochs):
                 p = torch.rand(self.n_units, device=self.device).argsort()[:n]
                 self.perms[e * self.M : (e + 1) * self.M] = p.view(self.M, self.mb_units)
-            self.prep_stats[0] = self.rew_buf.mean()
+            # The mean per-agent reward per step; a vector reward's objectives are summed.
+            self.prep_stats[0] = (
+                self.rew_buf.mean() if self.K is None else self.rew_buf.sum(-1).mean()
+            )
             self.prep_stats[1] = term.sum()
             self.prep_stats[2] = torch.maximum(term, self.trunc_buf).sum()
             self.mb_stats.zero_()
@@ -781,11 +988,12 @@ class MAPPO:
         if self.recurrent:
             n_chunks = idx.numel()
             idx = self._sequence_rows(idx)
+        kd = self._kd
         obs = self.obs_buf[: self.T].reshape(self.N, A, -1).index_select(0, idx)
         u = self.u_buf.reshape(self.N, A, -1).index_select(0, idx)
         logp_old = self.logp_buf.reshape(self.N, A).index_select(0, idx)
-        adv = self.adv_buf.reshape(self.N, A).index_select(0, idx)
-        ret = self.ret_buf.reshape(self.N, A).index_select(0, idx)
+        adv = self.adv_buf.reshape(self.N, A, *kd).index_select(0, idx)
+        ret = self.ret_buf.reshape(self.N, A, *kd).index_select(0, idx)
         extra = {}
         if self.state_buf is not None:
             extra["state"] = self.state_buf[: self.T].reshape(self.N, -1).index_select(0, idx)
@@ -802,22 +1010,18 @@ class MAPPO:
             h_rows = self.h_buf.reshape(self.N, A, -1)
             extra["h0"] = h_rows.index_select(0, idx[:n_chunks])
             extra["done"] = self.done_buf.reshape(self.N).index_select(0, idx).view(self.L, -1)
+        tags = {k: b.reshape(self.N, A).index_select(0, idx) for k, b in self.tag_bufs.items()}
         noise = torch.randn_like(u)  # drawn here, not in the (possibly compiled) loss
-        losses = self._loss(
-            self.actor, self.critic, obs, u, logp_old, adv, ret, noise,
-            self.spec.normalize_advantage, **extra,
-        )
-        loss_obj, loss_crit, entropy = losses[:3]
-        loss_ent = -self.ent_coef * entropy
+        mb = Minibatch(obs, u, logp_old, adv, ret, noise, extra, tags)
 
         self.optim.zero_grad(set_to_none=False)
-        total = loss_obj + loss_crit + loss_ent
-        if self.use_aux:
-            total = total + self.spec.aux_coef * losses[3]
-        total.backward()
-        gnorm = torch.nn.utils.clip_grad_norm_(
-            self.params, _MAX_GRAD_NORM, foreach=self.cuda or None
-        )
+        kept = self.rule.backward(mb, self.actor, self.critic, self.ent_coef)
+        norms = [
+            torch.nn.utils.clip_grad_norm_(group, _MAX_GRAD_NORM, foreach=self.cuda or None)
+            for group in self.clip_groups
+        ]
+        # Finite iff every group's norm is.
+        gnorm = norms[0] if len(norms) == 1 else torch.stack(norms).sum()
         if self.cuda:
             found = torch.maximum((~torch.isfinite(gnorm)).float(), self.force_skip)
             self.found_inf.copy_(found)
@@ -826,7 +1030,6 @@ class MAPPO:
             found = (~torch.isfinite(gnorm)).float()
             if not found.item():
                 self.optim.step()
-        kept = torch.stack(losses).detach()
         n = self.n_losses
         self.mb_stats[:n] += torch.where(found > 0, torch.zeros_like(kept), kept)
         self.mb_stats[n] += found
@@ -932,7 +1135,18 @@ def _network_flags(cls: str, kwargs: Mapping[str, Any]) -> list[str]:
             flags += ["--recurrent", "--hidden-dim", str(kwargs["hidden_dim"])]
         if kwargs.get("comm", "none") != "none":
             flags += ["--comm", kwargs["comm"], "--comm-dim", str(kwargs["comm_dim"])]
+        if kwargs.get("comm") == "gatv2":
+            flags += [
+                "--comm-layers", str(kwargs["comm_layers"]),
+                "--comm-heads", str(kwargs["comm_heads"]),
+                "--edge-pos", ",".join(map(str, kwargs["edge_pos"])),
+                "--edge-rel", ",".join(map(str, kwargs["edge_rel"])),
+            ]
+        if "trunk_depth" in kwargs:
+            flags += ["--trunk-depth", str(kwargs["trunk_depth"])]
         return [*flags, "--aux-coef", "<positive>"] if kwargs.get("aux_dim") else flags
+    if kwargs.get("n_values") is not None:
+        flags += ["--reward-key", "<the vector reward's info() key>"]
     if cls == "Critic":
         return ["--critic-input", "obs", "--no-per-agent-value", *flags]
     state, obs = kwargs.get("state_dim", 0) > 0, kwargs.get("use_obs", False)
@@ -1026,10 +1240,15 @@ def greedy_score_kwargs(actor: torch.nn.Module) -> dict[str, Any]:
 
 
 def network_archs(
-    spec: TrainSpec, env: Environment, act_low: torch.Tensor, act_high: torch.Tensor
+    spec: TrainSpec,
+    env: Environment,
+    act_low: torch.Tensor,
+    act_high: torch.Tensor,
+    n_values: int | None = None,
 ) -> tuple[str, dict[str, Any], str, dict[str, Any]]:
     """``(actor_cls, actor_kwargs, critic_cls, critic_kwargs)`` for a spec on an env, as
-    :data:`ARCHS` names and primitive keywords (what a checkpoint stores).
+    :data:`ARCHS` names and primitive keywords (what a checkpoint stores). ``n_values`` is
+    the objective count of a vector reward (``spec.reward_key``), one critic output each.
 
     The defaults give :class:`Actor` and :class:`Critic`, except on a scenario with roles,
     where the obs critic is a :class:`StateCritic` over the role-sorted observations: the
@@ -1065,6 +1284,13 @@ def network_archs(
                     "role_params 'heads' or 'shared', not 'separate'"
                 )
             actor[1].update(comm=spec.comm, comm_dim=spec.comm_dim)
+        if spec.comm == "gatv2":
+            actor[1].update(
+                comm_layers=spec.comm_layers, comm_heads=spec.comm_heads,
+                edge_pos=list(spec.edge_pos), edge_rel=list(spec.edge_rel),
+            )
+        if spec.trunk_depth != 2:
+            actor[1].update(trunk_depth=spec.trunk_depth)
     use_state = spec.critic_input in ("state", "state+obs")
     if use_state and env.state_dim == 0:
         raise ValueError(
@@ -1079,6 +1305,8 @@ def network_archs(
             "use_obs": spec.critic_input in ("obs", "state+obs"), "role_counts": roles,
             "per_agent": spec.per_agent_value,
         }
+    if n_values is not None:  # only then, so a scalar critic's kwargs are unchanged
+        critic[1]["n_values"] = n_values
     return (*actor, *critic)
 
 
@@ -1114,6 +1342,14 @@ class TrainConfig:
     compile: bool = False
     """``torch.compile`` the minibatch loss (needs triton). Costs startup time, then fuses
     the elementwise work between the GEMMs."""
+
+
+def _int_tuple(text: str) -> tuple[int, ...]:
+    return tuple(int(x) for x in text.split(",") if x.strip())
+
+
+def _float_tuple(text: str) -> tuple[float, ...]:
+    return tuple(float(x) for x in text.split(",") if x.strip())
 
 
 def parse_args(argv: list[str] | None = None) -> TrainConfig:
@@ -1164,7 +1400,19 @@ def parse_args(argv: list[str] | None = None) -> TrainConfig:
                    help="BPTT chunk length; must divide --steps-per-batch (default: all of it)")
     p.add_argument("--comm", choices=COMMS,
                    help="attn: one round of attention over teammates before the trunk")
-    p.add_argument("--comm-dim", type=int, help="message width (with --comm attn)")
+    p.add_argument("--comm-dim", type=int, help="message / node-feature width (with --comm)")
+    p.add_argument("--comm-layers", type=int, help="graph-attention rounds (--comm gatv2)")
+    p.add_argument("--comm-heads", type=int, help="attention heads (--comm gatv2)")
+    p.add_argument("--edge-pos", type=_int_tuple, metavar="I,J",
+                   help="obs columns of a position: edge features (--comm gatv2)")
+    p.add_argument("--edge-rel", type=_int_tuple, metavar="I,J",
+                   help="obs columns of a velocity: edge features (--comm gatv2)")
+    p.add_argument("--trunk-depth", type=int, help="Tanh layers of the policynet trunk")
+    p.add_argument("--reward-key", help="train on the vector reward info()[KEY] [E, A, K]")
+    p.add_argument("--objective-weights", type=_float_tuple, metavar="W,W,...",
+                   help="weights of the vector reward's objectives (with --reward-key)")
+    p.add_argument("--clip-per-network", action="store_true", default=None,
+                   help="clip the actor's and the critic's gradient norms separately")
     p.add_argument("--normalize-advantage", action="store_true", default=None)
     p.add_argument("--no-normalize-advantage", dest="normalize_advantage",
                    action="store_false")
@@ -1200,7 +1448,8 @@ def parse_args(argv: list[str] | None = None) -> TrainConfig:
             "entropy_coeff", "entropy_coeff_final", "num_cells", "normalize_advantage",
             "curriculum_iters", "curriculum_gate", "actor", "role_params", "critic_input",
             "per_agent_value", "aux_coef", "recurrent", "hidden_dim", "seq_len", "comm",
-            "comm_dim",
+            "comm_dim", "comm_layers", "comm_heads", "edge_pos", "edge_rel", "trunk_depth",
+            "reward_key", "objective_weights", "clip_per_network",
         )
         if getattr(a, f) is not None
     }
@@ -1292,9 +1541,17 @@ def train(cfg: TrainConfig) -> Path:
         k: (info0[k].shape[-1] if k == "multiobj_reward" else 1) for k in spec.metrics
     }
     metric_cols = metric_names(metrics)
+    n_values = None
+    if spec.reward_key is not None:
+        if spec.reward_key not in info0:
+            raise ValueError(
+                f"reward_key {spec.reward_key!r} is not an info() key of {cfg.scenario!r}; "
+                f"available: {sorted(info0)}"
+            )
+        n_values = int(info0[spec.reward_key].shape[-1])
 
     actor_cls, actor_kwargs, critic_cls, critic_kwargs = network_archs(
-        spec, env, act_low, act_high
+        spec, env, act_low, act_high, n_values
     )
     actor = build_arch(actor_cls, actor_kwargs).to(device)
     critic = build_arch(critic_cls, critic_kwargs).to(device)

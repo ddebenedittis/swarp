@@ -169,8 +169,31 @@ class TrainSpec:
     """``"none"``, or ``"attn"``: one round of attention over teammates' encoded inputs
     before the trunk, restricted by the scenario's ``comm_mask()`` when it has one."""
     comm_dim: int = 64
-    """Width of the encoded input, the keys, the values and the message. Ignored unless
-    ``comm="attn"``."""
+    """Width of the encoded input, the keys, the values and the message (``"attn"``), or of
+    the node features (``"gatv2"``). Ignored unless ``comm`` is on."""
+    comm_layers: int = 1
+    """``"gatv2"``: rounds of graph attention."""
+    comm_heads: int = 1
+    """``"gatv2"``: attention heads per round; must divide ``comm_dim``."""
+    edge_pos: tuple[int, ...] = ()
+    """``"gatv2"``: observation columns whose pairwise difference, and its norm, are edge
+    features (a position)."""
+    edge_rel: tuple[int, ...] = ()
+    """``"gatv2"``: observation columns whose pairwise difference is an edge feature (a
+    velocity)."""
+    trunk_depth: int = 2
+    """Tanh layers of a ``"policynet"`` actor's trunk."""
+    # --- multi-objective rewards --------------------------------------------------------
+    reward_key: str | None = None
+    """An ``info()`` key holding a vector reward ``[n_envs, n_agents, K]`` to train on
+    instead of the scalar reward (e.g. ``"multiobj_reward"``): the rollout, the critic, GAE
+    and the advantage normalization then carry one entry per objective."""
+    objective_weights: tuple[float, ...] | None = None
+    """How the default update combines the objectives' normalized advantages: a weighted
+    sum, all ones when ``None``. Needs ``reward_key``; a custom update rule may ignore it."""
+    clip_per_network: bool = False
+    """Clip the actor's and the critic's gradient norms separately (each to 1.0) instead of
+    jointly."""
 
     def __post_init__(self) -> None:
         for name, allowed in (
@@ -199,6 +222,15 @@ class TrainSpec:
             raise ValueError(
                 f"seq_len {self.seq_len} must divide steps_per_batch {self.steps_per_batch}"
             )
+        for name in ("comm_layers", "comm_heads", "trunk_depth"):
+            if getattr(self, name) < 1:
+                raise ValueError(f"{name} must be >= 1, got {getattr(self, name)}")
+        if self.comm == "gatv2" and self.comm_dim % self.comm_heads:
+            raise ValueError(
+                f"comm_heads {self.comm_heads} must divide comm_dim {self.comm_dim}"
+            )
+        if self.objective_weights is not None and self.reward_key is None:
+            raise ValueError("objective_weights weighs a vector reward: it needs reward_key")
 
 
 # Scenarios with no success criterion: both inherit the all-False ``Scenario.done``, so an
