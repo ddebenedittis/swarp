@@ -1082,6 +1082,346 @@ def collision_forces_box_kernel_per_env(
     forces[e, a] = f
 
 
+# ------------------------------------------------- wheel-faithful contacts (torques)
+#
+# The torque twins of the box-agent force functions, for WorldConfig.wheel_contacts: the
+# same forces, summed in the same order, plus each contact's torque about the agent
+# centre. Only the wheel kernels below call them, so a box world without wheel contacts
+# compiles none of it.
+
+
+@wp.func
+def _cross2(r: Any, f: Any):
+    return r[0] * f[1] - r[1] * f[0]
+
+
+@wp.func
+def _box_sd(v: Any, center: Any, ca: Any, sa: Any, half: Any):
+    """Signed distance from point ``v`` to an oriented box: the exterior distance, or
+    minus the distance to the nearest face inside."""
+    d = v - center
+    lx = wp.abs(ca * d[0] + sa * d[1]) - half[0]
+    ly = wp.abs(-sa * d[0] + ca * d[1]) - half[1]
+    ox = wp.max(lx, type(ca)(0.0))
+    oy = wp.max(ly, type(ca)(0.0))
+    return wp.sqrt(ox * ox + oy * oy) + wp.min(wp.max(lx, ly), type(ca)(0.0))
+
+
+@wp.func
+def _manifold_point(
+    cA: Any, thA: Any, hA: Any, cB: Any, thB: Any, hB: Any, reach: Any, x: Any
+):
+    """Where a box-box contact pushes, for its torque: the vertices of either box that
+    reach into the other (within ``reach``), averaged with their depths as weights.
+
+    :func:`obb_contact`'s point sits mid-way along the overlap, which is right for the
+    force but carries no torque when a face lies nearly flush on another: there it is the
+    deeper corner that the contact pushes on. Falls back to ``x`` when no vertex is in
+    reach (an edge-on crossing)."""
+    zero = type(reach)(0.0)
+    caA = wp.cos(thA)
+    saA = wp.sin(thA)
+    caB = wp.cos(thB)
+    saB = wp.sin(thB)
+    eA0 = type(cA)(caA * hA[0], saA * hA[0])
+    eA1 = type(cA)(-saA * hA[1], caA * hA[1])
+    eB0 = type(cA)(caB * hB[0], saB * hB[0])
+    eB1 = type(cA)(-saB * hB[1], caB * hB[1])
+    acc = type(cA)(zero, zero)
+    wsum = zero
+    for i in range(4):
+        sx = type(reach)(1.0)
+        sy = type(reach)(1.0)
+        if i == 1 or i == 2:
+            sx = -sx
+        if i >= 2:
+            sy = -sy
+        va = cA + eA0 * sx + eA1 * sy
+        da = wp.max(reach - _box_sd(va, cB, caB, saB, hB), zero)
+        acc += va * da
+        wsum += da
+        vb = cB + eB0 * sx + eB1 * sy
+        db = wp.max(reach - _box_sd(vb, cA, caA, saA, hA), zero)
+        acc += vb * db
+        wsum += db
+    out = x
+    if wsum > zero:
+        out = acc / wsum
+    return out
+
+
+@wp.func
+def _agent_pair_force_torque(
+    a: wp.int32,
+    b: wp.int32,
+    shape_a: Any,
+    shape_b: Any,
+    p: Any,
+    th: Any,
+    v: Any,
+    w: Any,
+    ra: Any,
+    ha: Any,
+    pb: Any,
+    thb: Any,
+    vb: Any,
+    wb: Any,
+    rb: Any,
+    hb: Any,
+    margin: Any,
+    k: Any,
+    c: Any,
+    damp_denom: Any,
+    max_overlap: Any,
+):
+    """:func:`_agent_pair_force` and its torque about agent ``a``'s centre: ``0`` for a
+    disc ``a`` (its contacts pass through its centre), the lever to the contact point for
+    a box."""
+    half = type(k)(0.5)
+    zero = type(k)(0.0)
+    f = type(p)(zero, zero)
+    tau = zero
+    if shape_a < half:
+        if shape_b < half:
+            f = pair_force(p - pb, v - vb, ra + rb + margin, k, c, damp_denom, max_overlap)
+        else:
+            f = box_force(p, v, pb, thb, hb, ra + margin, k, c, damp_denom, max_overlap, vb, wb)
+    else:
+        if shape_b < half:
+            f = -box_force(pb, vb, p, th, ha, rb + margin, k, c, damp_denom, max_overlap, v, w)
+            fn = wp.length(f)
+            if fn > zero:
+                tau = _cross2(pb + f * (rb / fn) - p, f)  # the disc's point nearest to a
+        else:
+            x = p
+            if a < b:
+                f, x = obb_force(
+                    p, th, ha, v, w, pb, thb, hb, vb, wb, margin, k, c, damp_denom, max_overlap
+                )
+            else:
+                fo, x = obb_force(
+                    pb, thb, hb, vb, wb, p, th, ha, v, w, margin, k, c, damp_denom, max_overlap
+                )
+                f = -fo
+            if wp.length_sq(f) > zero:
+                tau = _cross2(_manifold_point(p, th, ha, pb, thb, hb, margin, x) - p, f)
+    return f, tau
+
+
+@wp.func
+def _static_forces_torque(
+    e: wp.int32,
+    shape_a: Any,
+    p: Any,
+    th: Any,
+    v: Any,
+    w: Any,
+    ra: Any,
+    ha: Any,
+    obs_pos: wp.array2d(dtype=Any),
+    obs_radius: wp.array(dtype=Any),
+    obs_type: wp.array(dtype=wp.int32),
+    obs_angle: wp.array2d(dtype=Any),
+    obs_half: wp.array(dtype=Any),
+    obs_vel: wp.array2d(dtype=Any),
+    obs_ang_vel: wp.array2d(dtype=Any),
+    n_obstacles: wp.int32,
+    k: Any,
+    c: Any,
+    margin: Any,
+    damp_denom: Any,
+    max_overlap: Any,
+    soft_walls: wp.int32,
+    bounds_min: Any,
+    bounds_max: Any,
+):
+    """:func:`_static_forces_shaped` and the torque of a box agent's obstacle and wall
+    contacts about its centre (a disc's is ``0``)."""
+    zero = type(k)(0.0)
+    f = type(p)(zero, zero)
+    tau = zero
+    if shape_a < type(k)(0.5):
+        f = _static_forces(
+            e, p, v, ra, obs_pos, obs_radius, obs_type, obs_angle, obs_half, obs_vel,
+            obs_ang_vel, n_obstacles, k, c, margin, damp_denom, max_overlap, soft_walls,
+            bounds_min, bounds_max,
+        )
+    else:
+        for o in range(n_obstacles):
+            st = obs_type[o]
+            fo, x = _box_obstacle_force(
+                p, th, v, w, ha, obs_pos[e, o], st, obs_angle[e, o], obs_radius[o],
+                obs_half[o], obs_vel[e, o], obs_ang_vel[e, o], k, c, margin, damp_denom,
+                max_overlap,
+            )
+            if wp.length_sq(fo) > zero:
+                if st == SHAPE_CIRCLE:
+                    x = x + fo * (obs_radius[o] / wp.length(fo))  # its point nearest the box
+                elif st == SHAPE_BOX:
+                    x = _manifold_point(p, th, ha, obs_pos[e, o], obs_angle[e, o], obs_half[o],
+                                        margin, x)
+                else:  # a segment: the degenerate box of its core, reached through its radius
+                    x = _manifold_point(p, th, ha, obs_pos[e, o], obs_angle[e, o],
+                                        type(p)(obs_half[o][0], zero), obs_radius[o] + margin, x)
+            f += fo
+            tau += _cross2(x - p, fo)
+        if soft_walls == 1:
+            # _wall_forces_box, wall by wall, each force at its support vertex.
+            ca = wp.cos(th)
+            sa = wp.sin(th)
+            ex = ha[0] * wp.abs(ca) + ha[1] * wp.abs(sa)
+            ey = ha[0] * wp.abs(sa) + ha[1] * wp.abs(ca)
+            sc = _sgn0(ca)
+            ss = _sgn0(sa)
+            rl_y = -sc * ha[0] * sa + ss * ha[1] * ca
+            rb_x = -ss * ha[0] * ca + sc * ha[1] * sa
+            fx = zero
+            fy = zero
+            pen = ex + margin - (p[0] - bounds_min[0])
+            if pen > zero:
+                fl = _normal_coeff(pen, v[0] - w * rl_y, k, c, damp_denom, max_overlap)
+                fx += fl
+                tau += -rl_y * fl  # lever (-ex, rl_y)
+            pen = ex + margin - (bounds_max[0] - p[0])
+            if pen > zero:
+                fr = -_normal_coeff(pen, -(v[0] + w * rl_y), k, c, damp_denom, max_overlap)
+                fx += fr
+                tau += rl_y * fr  # lever (ex, -rl_y)
+            pen = ey + margin - (p[1] - bounds_min[1])
+            if pen > zero:
+                fb = _normal_coeff(pen, v[1] + w * rb_x, k, c, damp_denom, max_overlap)
+                fy += fb
+                tau += rb_x * fb  # lever (rb_x, -ey)
+            pen = ey + margin - (bounds_max[1] - p[1])
+            if pen > zero:
+                ft = -_normal_coeff(pen, -(v[1] - w * rb_x), k, c, damp_denom, max_overlap)
+                fy += ft
+                tau += -rb_x * ft  # lever (-rb_x, ey)
+            f += type(p)(fx, fy)
+    return f, tau
+
+
+@wp.kernel(module="unique", module_options=BOX_MODULE_OPTIONS, grid_stride=False)
+def collision_forces_wheel_kernel(
+    pos: wp.array2d(dtype=Any),
+    theta: wp.array2d(dtype=Any),
+    vel: wp.array2d(dtype=Any),
+    ang_vel: wp.array2d(dtype=Any),
+    params: wp.array2d(dtype=Any),  # [n_agents, NUM_PARAMS] shared across envs
+    neighbor_idx: wp.array3d(dtype=wp.int32),
+    neighbor_count: wp.array2d(dtype=wp.int32),
+    obs_pos: wp.array2d(dtype=Any),
+    obs_radius: wp.array(dtype=Any),
+    obs_type: wp.array(dtype=wp.int32),
+    obs_angle: wp.array2d(dtype=Any),
+    obs_half: wp.array(dtype=Any),
+    obs_vel: wp.array2d(dtype=Any),
+    obs_ang_vel: wp.array2d(dtype=Any),
+    n_obstacles: wp.int32,
+    k: Any,
+    c: Any,
+    margin: Any,
+    sub_dt: Any,
+    max_overlap: Any,
+    soft_walls: wp.int32,
+    bounds_min: Any,
+    bounds_max: Any,
+    forces: wp.array2d(dtype=Any),
+    torques: wp.array2d(dtype=Any),
+):
+    """:func:`collision_forces_box_kernel` plus each agent's contact torque about its
+    centre, for ``WorldConfig.wheel_contacts``."""
+    e, a = wp.tid()
+    p = pos[e, a]
+    th = theta[e, a]
+    v = vel[e, a]
+    w = ang_vel[e, a]
+    ra = params[a, P_RADIUS]
+    sha = params[a, P_SHAPE]
+    ha = type(p)(params[a, P_HALF_X], params[a, P_HALF_Y])
+    zero = type(k)(0.0)
+    f = type(p)(zero, zero)
+    tau = zero
+    damp_denom = type(k)(1.0) + c * sub_dt / params[a, P_MASS]
+    for n_i in range(neighbor_count[e, a]):
+        b = neighbor_idx[e, a, n_i]
+        fb, tb = _agent_pair_force_torque(
+            a, b, sha, params[b, P_SHAPE], p, th, v, w, ra, ha, pos[e, b], theta[e, b],
+            vel[e, b], ang_vel[e, b], params[b, P_RADIUS],
+            type(p)(params[b, P_HALF_X], params[b, P_HALF_Y]), margin, k, c, damp_denom,
+            max_overlap,
+        )
+        f += fb
+        tau += tb
+    fs, ts = _static_forces_torque(
+        e, sha, p, th, v, w, ra, ha, obs_pos, obs_radius, obs_type, obs_angle, obs_half,
+        obs_vel, obs_ang_vel, n_obstacles, k, c, margin, damp_denom, max_overlap, soft_walls,
+        bounds_min, bounds_max,
+    )
+    forces[e, a] = f + fs
+    torques[e, a] = tau + ts
+
+
+@wp.kernel(module="unique", module_options=BOX_MODULE_OPTIONS, grid_stride=False)
+def collision_forces_wheel_kernel_per_env(
+    pos: wp.array2d(dtype=Any),
+    theta: wp.array2d(dtype=Any),
+    vel: wp.array2d(dtype=Any),
+    ang_vel: wp.array2d(dtype=Any),
+    params: wp.array3d(dtype=Any),  # [n_envs, n_agents, NUM_PARAMS] per-env
+    neighbor_idx: wp.array3d(dtype=wp.int32),
+    neighbor_count: wp.array2d(dtype=wp.int32),
+    obs_pos: wp.array2d(dtype=Any),
+    obs_radius: wp.array(dtype=Any),
+    obs_type: wp.array(dtype=wp.int32),
+    obs_angle: wp.array2d(dtype=Any),
+    obs_half: wp.array(dtype=Any),
+    obs_vel: wp.array2d(dtype=Any),
+    obs_ang_vel: wp.array2d(dtype=Any),
+    n_obstacles: wp.int32,
+    k: Any,
+    c: Any,
+    margin: Any,
+    sub_dt: Any,
+    max_overlap: Any,
+    soft_walls: wp.int32,
+    bounds_min: Any,
+    bounds_max: Any,
+    forces: wp.array2d(dtype=Any),
+    torques: wp.array2d(dtype=Any),
+):
+    """Per-env-parameter twin of :func:`collision_forces_wheel_kernel`."""
+    e, a = wp.tid()
+    p = pos[e, a]
+    th = theta[e, a]
+    v = vel[e, a]
+    w = ang_vel[e, a]
+    ra = params[e, a, P_RADIUS]
+    sha = params[e, a, P_SHAPE]
+    ha = type(p)(params[e, a, P_HALF_X], params[e, a, P_HALF_Y])
+    zero = type(k)(0.0)
+    f = type(p)(zero, zero)
+    tau = zero
+    damp_denom = type(k)(1.0) + c * sub_dt / params[e, a, P_MASS]
+    for n_i in range(neighbor_count[e, a]):
+        b = neighbor_idx[e, a, n_i]
+        fb, tb = _agent_pair_force_torque(
+            a, b, sha, params[e, b, P_SHAPE], p, th, v, w, ra, ha, pos[e, b], theta[e, b],
+            vel[e, b], ang_vel[e, b], params[e, b, P_RADIUS],
+            type(p)(params[e, b, P_HALF_X], params[e, b, P_HALF_Y]), margin, k, c, damp_denom,
+            max_overlap,
+        )
+        f += fb
+        tau += tb
+    fs, ts = _static_forces_torque(
+        e, sha, p, th, v, w, ra, ha, obs_pos, obs_radius, obs_type, obs_angle, obs_half,
+        obs_vel, obs_ang_vel, n_obstacles, k, c, margin, damp_denom, max_overlap, soft_walls,
+        bounds_min, bounds_max,
+    )
+    forces[e, a] = f + fs
+    torques[e, a] = tau + ts
+
+
 def _box_signature(dtype, per_env: bool = False) -> list:
     """:func:`_signature` with ``theta`` and ``ang_vel`` after ``pos`` and ``vel``."""
     sig = _signature(dtype, per_env)
@@ -1123,6 +1463,12 @@ for _T in (wp.float32, wp.float64):
     register(collision_forces_kernel_per_env, _T, _signature(_T, per_env=True))
     register(collision_forces_box_kernel, _T, _box_signature(_T))
     register(collision_forces_box_kernel_per_env, _T, _box_signature(_T, per_env=True))
+    register(collision_forces_wheel_kernel, _T, [*_box_signature(_T), wp.array2d(dtype=_T)])
+    register(
+        collision_forces_wheel_kernel_per_env,
+        _T,
+        [*_box_signature(_T, per_env=True), wp.array2d(dtype=_T)],
+    )
 
 
 def launch_collision_forces(
@@ -1152,6 +1498,7 @@ def launch_collision_forces(
     dtype,
     theta: wp.array | None = None,
     ang_vel: wp.array | None = None,
+    torques: wp.array | None = None,
 ) -> None:
     """Launch the soft-contact force pass. Everything past the arrays is keyword-only:
     the scalar tail is three floats and a bool in a row, where a swapped argument would be
@@ -1159,12 +1506,21 @@ def launch_collision_forces(
 
     Passing the agents' ``theta`` and ``ang_vel`` selects the box-agent kernel
     (:func:`collision_forces_box_kernel`); the stepper does so exactly when the world
-    holds a box agent, and a disc-only world launches the disc kernel as before."""
+    holds a box agent, and a disc-only world launches the disc kernel as before.
+
+    Passing ``torques`` (with ``theta``/``ang_vel``) selects the wheel-contact kernel
+    (:func:`collision_forces_wheel_kernel`), which also writes each agent's contact torque
+    about its centre."""
     n_envs, n_agents = pos.shape
     boxes = theta is not None
     per_env = params.floats_per_env is not None
     floats = params.floats_per_env if per_env else params.floats
-    if boxes:
+    outputs = [forces]
+    if torques is not None:
+        kernel = collision_forces_wheel_kernel_per_env if per_env else collision_forces_wheel_kernel
+        state = [pos, theta, vel, ang_vel]
+        outputs = [forces, torques]
+    elif boxes:
         kernel = collision_forces_box_kernel_per_env if per_env else collision_forces_box_kernel
         state = [pos, theta, vel, ang_vel]
     else:
@@ -1195,6 +1551,6 @@ def launch_collision_forces(
             bounds_min,
             bounds_max,
         ],
-        outputs=[forces],
+        outputs=outputs,
         device=pos.device,
     )

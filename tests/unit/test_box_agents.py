@@ -437,3 +437,57 @@ def test_newtons_third_law_agent_body(device, shape):
     elif shape == ObstacleShape.BOX:
         r = np.array([face - g / 2, cy])
         close(tau, r[0] * f_body[1] - r[1] * f_body[0], atol=1e-9)
+
+
+# ---------------------------------------------------------------- wheel-faithful contacts
+
+
+def _wheel_world(device, wheel, gap, side=False, **world_kw):
+    """A diff-drive box (0.4 x 0.2, unit mass) whose front face (``side``: left face) sits
+    ``gap`` inside the contact margin of an immovable box."""
+    cfg = AgentConfig(
+        model=DynamicsModel.DIFF_DRIVE, ctrl_mode=ControlMode.VELOCITY, shape="box",
+        half_extents=(0.2, 0.1), max_speed=1.0, max_ang_vel=2.0,
+    )
+    world = WorldConfig(
+        collision_k=8000.0, collision_c=100.0, collision_margin=0.01, wheel_contacts=wheel,
+        **world_kw,
+    )
+    st = Stepper([cfg], dt=0.1, substeps=16, device=device, dtype=wp.float64, world=world)
+    face = (0.1 if side else 0.2) + 0.01 - gap
+    centre = [[0.0, face + 0.5]] if side else [[face + 0.5, 0.0]]
+    st.set_obstacles(
+        obstacles(centre, [0.0], [ObstacleShape.BOX], half=[[0.5, 0.5]], kind=torch.tensor([0]))
+    )
+    return st
+
+
+def _drive(st, device, action, steps=20):
+    s = state([[0.0, 0.0]], theta=[0.0], device=device)
+    act = torch.tensor([[action]], dtype=F64, device=device)
+    with torch.no_grad():
+        for _ in range(steps):
+            s = warp_step(st, s, act)
+    return s
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_wheel_contacts_lock_a_turn_into_a_held_face(device):
+    """A box driving flush into a face that does not give way cannot turn: its corner
+    would have to swing through the face. Without wheel contacts it turns freely."""
+    free = _drive(_wheel_world(device, False, 0.001), device, [0.3, 1.0])
+    held = _drive(_wheel_world(device, True, 0.001, wheel_turn_torque=0.5), device, [0.3, 1.0])
+    assert abs(float(free.theta[0, 0]) - 2.0) < 1e-9
+    assert abs(float(held.theta[0, 0])) < 0.15, float(held.theta[0, 0])
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_wheel_contacts_grip_a_sideways_push(device):
+    """A side contact weaker than the wheels' grip leaves the box where it is."""
+    slid = _drive(_wheel_world(device, False, 0.0005, side=True), device, [0.0, 0.0], 5)
+    held = _drive(
+        _wheel_world(device, True, 0.0005, side=True, wheel_lateral_friction=1.0), device,
+        [0.0, 0.0], 5,
+    )
+    assert float(slid.pos[0, 0, 1]) < -1e-4, "the push did not move the free box"
+    assert float(held.pos[0, 0, 1]) == 0.0 and float(held.theta[0, 0]) == 0.0

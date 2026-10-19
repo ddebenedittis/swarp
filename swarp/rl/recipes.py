@@ -586,6 +586,29 @@ SPECS["pusht_lidar_limo_dr_coulomb"] = replace(
 )
 
 
+# pusht_lidar_limo_dr_coulomb with wheel-faithful contacts (WorldConfig.wheel_contacts).
+# In Gazebo, L3b (greedy 0.99 in swarp) solved 0.35: its robots squeezed the T head-on
+# from opposite faces and spun in place, which swarp allowed because contacts only
+# translated a robot, and which a real Limo cannot do: its flush front corner would have to
+# swing through a face the other robot holds. The sysid (swarp_gz_test 3a33337,
+# out/sysid/variants/contact): two robots pressing the T from opposite faces at 0.28 m/s
+# and commanded to turn at 0.9 rad/s hold their yaw (swarp -4/-5 deg, Gazebo 0, swarp
+# without wheel contacts +258); one robot turning against the free T, or two that do not
+# press, still turn (+199 deg, Gazebo +198 and +183). The drive holds its turn rate
+# against 3.5 N m (the skid-steer torque from the sysid), so an off-centre push leaves the
+# pusher's heading alone (0 deg, Gazebo 0) and the T turns as before (-58 / -141 / -47
+# deg/m at 0.2 / 0.4 m off-centre and a 30 deg glance); the wheels grip sideways with
+# mu 0.2 (Gazebo's), and no push in the sysid slides a robot sideways any more.
+SPECS["pusht_lidar_limo_dr_wheel"] = replace(
+    SPECS["pusht_lidar_limo_dr_coulomb"],
+    scen_kwargs={
+        **SPECS["pusht_lidar_limo_dr_coulomb"].scen_kwargs,
+        "wheel_contacts": True, "wheel_lateral_friction": 0.2, "wheel_turn_torque": 3.5,
+    },
+    iters=16000,
+)
+
+
 def scenario_name(name: str) -> str:
     """The registered scenario behind ``name``: a ``SPECS`` key's ``scenario`` when it
     sets one, else ``name`` itself (a registry name, or a key that is one)."""

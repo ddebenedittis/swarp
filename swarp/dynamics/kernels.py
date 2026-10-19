@@ -1324,10 +1324,285 @@ def integrate2d_kernel_per_env(
     ang_vel_out[e, a] = w_out
 
 
+_BOX_OPTS = {"fuse_fp": False}
+
+
+@wp.func
+def wheel_contact(
+    p: Any,
+    th: Any,
+    p_new: Any,
+    th_new: Any,
+    v_out: Any,
+    w_cmd: Any,
+    force: Any,
+    torque: Any,
+    tag: wp.int32,
+    mass: Any,
+    half_x: Any,
+    half_y: Any,
+    lat_grip: Any,
+    turn_cap: Any,
+    dt: Any,
+):
+    """Rework a diff-drive agent's :func:`_step_2d` result for wheel-faithful contacts
+    (``WorldConfig.wheel_contacts``); any other model passes through.
+
+    The contact force acts along the heading as before (the drive gives way by
+    ``F dt / m``) but sideways only by what exceeds the wheels' grip ``lat_grip * m``
+    (``lat_grip`` is ``mu g``), and the contact torque turns the agent the same way, by
+    what exceeds the torque ``turn_cap`` the drive holds its turn rate against:
+    ``omega = w_cmd + (|tau| - turn_cap)+ sign(tau) dt / I``, ``I = m (hx^2 + hy^2) / 3``.
+    A box turning into a face that does not give way therefore stalls once the corner it
+    drives in pushes back harder than the drive turns, while an off-centre push that
+    torques it less than ``turn_cap`` leaves its heading alone. Returns the new
+    ``(pos, heading, velocity)``; the drive's own turn rate ``w_cmd`` stays the state."""
+    zero = type(dt)(0.0)
+    p_out = p_new
+    th_out = th_new
+    v_new = v_out
+    if tag == TAG_DIFF_DRIVE:
+        ca = wp.cos(th)
+        sa = wp.sin(th)
+        f_lat = -force[0] * sa + force[1] * ca
+        slip = wp.max(wp.abs(f_lat) - lat_grip * mass, zero)
+        if f_lat < zero:
+            slip = -slip
+        # The velocity _step_2d produced already holds the whole force; swap its sideways
+        # part for the slip.
+        dv = (slip - f_lat) * (dt / mass)
+        corr = type(p)(-sa * dv, ca * dv)
+        v_new = v_out + corr
+        p_out = p_new + corr * dt
+        inertia = mass * (half_x * half_x + half_y * half_y) / type(dt)(3.0)
+        excess = wp.max(wp.abs(torque) - turn_cap, zero)
+        if torque < zero:
+            excess = -excess
+        th_out = th + (w_cmd + excess * (dt / inertia)) * dt
+    return p_out, th_out, v_new
+
+
+@wp.kernel(module="unique", module_options=_BOX_OPTS, grid_stride=False)
+def integrate2d_wheel_kernel(
+    # 2D state in
+    pos: wp.array2d(dtype=Any),
+    theta: wp.array2d(dtype=Any),
+    vel: wp.array2d(dtype=Any),
+    speed: wp.array2d(dtype=Any),
+    ang_vel: wp.array2d(dtype=Any),
+    # inputs
+    actions: wp.array3d(dtype=Any),
+    forces: wp.array2d(dtype=Any),
+    params: wp.array2d(dtype=Any),  # [n_agents, NUM_PARAMS] shared across envs
+    model_tag: wp.array(dtype=wp.int32),
+    ctrl_mode: wp.array(dtype=wp.int32),
+    dt: Any,
+    bounds_min: Any,
+    bounds_max: Any,
+    clamp_bounds: wp.int32,
+    torques: wp.array2d(dtype=Any),
+    lat_grip: Any,
+    turn_cap: Any,
+    # 2D state out
+    pos_out: wp.array2d(dtype=Any),
+    theta_out: wp.array2d(dtype=Any),
+    vel_out: wp.array2d(dtype=Any),
+    speed_out: wp.array2d(dtype=Any),
+    ang_vel_out: wp.array2d(dtype=Any),
+):
+    """:func:`integrate2d_kernel` with wheel-faithful contacts (see :func:`wheel_contact`)."""
+    e, a = wp.tid()
+    a0 = actions[e, a, 0]
+    a1 = actions[e, a, 1]
+    mode = ctrl_mode[a]
+    if mode == MODE_SERVO:
+        a0, a1 = servo_command(
+            a0,
+            a1,
+            speed[e, a],
+            ang_vel[e, a],
+            params[a, P_MAX_SPEED],
+            params[a, P_MAX_ANG_VEL],
+            params[a, P_MAX_ACCEL],
+            params[a, P_MAX_ANG_ACCEL],
+            params[a, P_CMD_GAIN_V],
+            params[a, P_CMD_GAIN_W],
+            dt,
+        )
+        mode = MODE_VELOCITY
+    p_new, th_new, v_out, s_out, w_out = _step_2d(
+        pos[e, a],
+        theta[e, a],
+        vel[e, a],
+        speed[e, a],
+        ang_vel[e, a],
+        a0,
+        a1,
+        model_tag[a],
+        mode,
+        forces[e, a],
+        params[a, P_MAX_SPEED],
+        params[a, P_MIN_SPEED],
+        params[a, P_MAX_ACCEL],
+        params[a, P_MAX_ANG_VEL],
+        params[a, P_MAX_ANG_ACCEL],
+        params[a, P_LF],
+        params[a, P_LR],
+        params[a, P_MAX_STEER],
+        params[a, P_MASS],
+        dt,
+    )
+    p_new, th_new, v_out = wheel_contact(
+        pos[e, a],
+        theta[e, a],
+        p_new,
+        th_new,
+        v_out,
+        w_out,
+        forces[e, a],
+        torques[e, a],
+        model_tag[a],
+        params[a, P_MASS],
+        params[a, P_HALF_X],
+        params[a, P_HALF_Y],
+        lat_grip,
+        turn_cap,
+        dt,
+    )
+    if clamp_bounds == 1:
+        radius = params[a, P_RADIUS]
+        p_new = type(p_new)(
+            wp.clamp(p_new[0], bounds_min[0] + radius, bounds_max[0] - radius),
+            wp.clamp(p_new[1], bounds_min[1] + radius, bounds_max[1] - radius),
+        )
+    elif clamp_bounds == CLAMP_FOOTPRINT:
+        p_new = clamp_footprint(
+            p_new,
+            th_new,
+            params[a, P_RADIUS],
+            params[a, P_SHAPE],
+            params[a, P_HALF_X],
+            params[a, P_HALF_Y],
+            bounds_min,
+            bounds_max,
+        )
+    pos_out[e, a] = p_new
+    theta_out[e, a] = th_new
+    vel_out[e, a] = v_out
+    speed_out[e, a] = s_out
+    ang_vel_out[e, a] = w_out
+
+@wp.kernel(module="unique", module_options=_BOX_OPTS, grid_stride=False)
+def integrate2d_wheel_kernel_per_env(
+    pos: wp.array2d(dtype=Any),
+    theta: wp.array2d(dtype=Any),
+    vel: wp.array2d(dtype=Any),
+    speed: wp.array2d(dtype=Any),
+    ang_vel: wp.array2d(dtype=Any),
+    actions: wp.array3d(dtype=Any),
+    forces: wp.array2d(dtype=Any),
+    params: wp.array3d(dtype=Any),  # [n_envs, n_agents, NUM_PARAMS] per-env
+    model_tag: wp.array(dtype=wp.int32),
+    ctrl_mode: wp.array(dtype=wp.int32),
+    dt: Any,
+    bounds_min: Any,
+    bounds_max: Any,
+    clamp_bounds: wp.int32,
+    torques: wp.array2d(dtype=Any),
+    lat_grip: Any,
+    turn_cap: Any,
+    pos_out: wp.array2d(dtype=Any),
+    theta_out: wp.array2d(dtype=Any),
+    vel_out: wp.array2d(dtype=Any),
+    speed_out: wp.array2d(dtype=Any),
+    ang_vel_out: wp.array2d(dtype=Any),
+):
+    """Per-env-parameter twin of :func:`integrate2d_wheel_kernel`."""
+    e, a = wp.tid()
+    a0 = actions[e, a, 0]
+    a1 = actions[e, a, 1]
+    mode = ctrl_mode[a]
+    if mode == MODE_SERVO:
+        a0, a1 = servo_command(
+            a0,
+            a1,
+            speed[e, a],
+            ang_vel[e, a],
+            params[e, a, P_MAX_SPEED],
+            params[e, a, P_MAX_ANG_VEL],
+            params[e, a, P_MAX_ACCEL],
+            params[e, a, P_MAX_ANG_ACCEL],
+            params[e, a, P_CMD_GAIN_V],
+            params[e, a, P_CMD_GAIN_W],
+            dt,
+        )
+        mode = MODE_VELOCITY
+    p_new, th_new, v_out, s_out, w_out = _step_2d(
+        pos[e, a],
+        theta[e, a],
+        vel[e, a],
+        speed[e, a],
+        ang_vel[e, a],
+        a0,
+        a1,
+        model_tag[a],
+        mode,
+        forces[e, a],
+        params[e, a, P_MAX_SPEED],
+        params[e, a, P_MIN_SPEED],
+        params[e, a, P_MAX_ACCEL],
+        params[e, a, P_MAX_ANG_VEL],
+        params[e, a, P_MAX_ANG_ACCEL],
+        params[e, a, P_LF],
+        params[e, a, P_LR],
+        params[e, a, P_MAX_STEER],
+        params[e, a, P_MASS],
+        dt,
+    )
+    p_new, th_new, v_out = wheel_contact(
+        pos[e, a],
+        theta[e, a],
+        p_new,
+        th_new,
+        v_out,
+        w_out,
+        forces[e, a],
+        torques[e, a],
+        model_tag[a],
+        params[e, a, P_MASS],
+        params[e, a, P_HALF_X],
+        params[e, a, P_HALF_Y],
+        lat_grip,
+        turn_cap,
+        dt,
+    )
+    if clamp_bounds == 1:
+        radius = params[e, a, P_RADIUS]
+        p_new = type(p_new)(
+            wp.clamp(p_new[0], bounds_min[0] + radius, bounds_max[0] - radius),
+            wp.clamp(p_new[1], bounds_min[1] + radius, bounds_max[1] - radius),
+        )
+    elif clamp_bounds == CLAMP_FOOTPRINT:
+        p_new = clamp_footprint(
+            p_new,
+            th_new,
+            params[e, a, P_RADIUS],
+            params[e, a, P_SHAPE],
+            params[e, a, P_HALF_X],
+            params[e, a, P_HALF_Y],
+            bounds_min,
+            bounds_max,
+        )
+    pos_out[e, a] = p_new
+    theta_out[e, a] = th_new
+    vel_out[e, a] = v_out
+    speed_out[e, a] = s_out
+    ang_vel_out[e, a] = w_out
+
+
 #: Box-world copies of the slim kernels: the same functions compiled without FP
 #: contraction (see ``swarp.core.collisions.BOX_MODULE_OPTIONS``), so a box world's
 #: layered step rounds exactly like its fused one. Disc worlds launch the originals.
-_BOX_OPTS = {"fuse_fp": False}
 integrate2d_box_kernel = wp.kernel(
     integrate2d_kernel.func, module="unique", module_options=_BOX_OPTS, grid_stride=False
 )
@@ -1357,6 +1632,13 @@ def _signature2d(dtype, per_env: bool = False) -> list:
         wp.int32,
         *state,
     ]
+
+
+def _signature2d_wheel(dtype, per_env: bool = False) -> list:
+    """:func:`_signature2d` with ``torques``, ``lat_grip`` and ``turn_cap`` after
+    ``clamp_bounds``."""
+    sig = _signature2d(dtype, per_env)
+    return [*sig[:14], wp.array2d(dtype=dtype), dtype, dtype, *sig[14:]]
 
 
 def _signature(dtype, per_env: bool = False) -> list:
@@ -1394,6 +1676,8 @@ for _T in (wp.float32, wp.float64):
     register(integrate2d_kernel_per_env, _T, _signature2d(_T, per_env=True))
     register(integrate2d_box_kernel, _T, _signature2d(_T))
     register(integrate2d_box_kernel_per_env, _T, _signature2d(_T, per_env=True))
+    register(integrate2d_wheel_kernel, _T, _signature2d_wheel(_T))
+    register(integrate2d_wheel_kernel_per_env, _T, _signature2d_wheel(_T, per_env=True))
 
 
 #: Integrator enum value -> kernel tag (must match the INT_* constants above).
@@ -1412,6 +1696,9 @@ def launch_integrate(
     slim: bool = False,
     skip_drone: bool = False,
     footprint: bool = False,
+    torques: wp.array | None = None,
+    lat_grip: float = 0.0,
+    turn_cap: float = 0.0,
 ) -> None:
     """Launch one integration sub-step. Functional: never writes to ``state_in``.
 
@@ -1420,6 +1707,11 @@ def launch_integrate(
     agent by its support extents at its new heading instead (the stepper passes it exactly
     when the world holds a box agent; a disc is inset by its radius either way).
     ``integrator`` selects the semi-implicit Euler recurrence (default) or classic RK4.
+
+    ``torques`` (the force pass's per-agent contact torques) selects the wheel-contact
+    variant of the slim kernel (:func:`wheel_contact`, ``lat_grip`` is the wheels'
+    sideways ``mu g``, ``turn_cap`` the torque the drive holds its turn rate against); it
+    needs ``slim``.
 
     ``slim=True`` launches the 2D-only Euler kernel that computes five state
     arrays instead of nine (no drone math, no RK4 branch). The caller must
@@ -1440,8 +1732,14 @@ def launch_integrate(
         do_clamp = 2 if footprint else 1
     per_env = params.floats_per_env is not None
     floats = params.floats_per_env if per_env else params.floats
+    if torques is not None and not slim:
+        raise ValueError("wheel contacts (torques) need the slim Euler 2D path")
     if slim:
-        if footprint:
+        wheel = []
+        if torques is not None:
+            kernel2d = integrate2d_wheel_kernel_per_env if per_env else integrate2d_wheel_kernel
+            wheel = [torques, dtype(lat_grip), dtype(turn_cap)]
+        elif footprint:
             kernel2d = integrate2d_box_kernel_per_env if per_env else integrate2d_box_kernel
         else:
             kernel2d = integrate2d_kernel_per_env if per_env else integrate2d_kernel
@@ -1463,6 +1761,7 @@ def launch_integrate(
                 b_min,
                 b_max,
                 wp.int32(do_clamp),
+                *wheel,
             ],
             outputs=[
                 state_out.pos,

@@ -83,8 +83,16 @@ The force is `f = max(0, (k*overlap - c*v_n) / (1 + c*sub_dt/m)) * n` with `over
 | box agent – `CIRCLE` obstacle | `box_force` with the circle centre as the point | circle radius + margin |
 
 A box-box pair is evaluated with the lower agent index as box A on both threads, so the two threads compute one contact and the pair's forces cancel exactly for equal masses.
-Contacts push a box agent's centre only: a box agent feels **no contact torque** yet.
+By default contacts push a box agent's centre only: a box agent feels **no contact torque**.
 Its heading is its own, driven by its dynamics model, so a diff-drive or bicycle box turns as it steers and a holonomic box keeps the heading it was reset with.
+
+`WorldConfig.wheel_contacts` makes the contacts of diff-drive agents wheel-faithful (no-grad Euler path only; the world then never runs the fused substep chain).
+The force pass also sums each box agent's contact torque `r × F` about its centre.
+For a box-box contact the lever runs to the vertices that reach into the other box, averaged with their depths as weights, because the midpoint of the overlap carries no torque when a face lies nearly flush on another.
+The torque turns the agent only by what exceeds `wheel_turn_torque`, the torque its drive holds the turn rate against: `ω = ω_cmd + sign(τ) max(|τ| - wheel_turn_torque, 0) dt / I`, with `I = m (hx² + hy²) / 3`.
+A box driving flush into a face that does not give way therefore stalls its turn, because its corner would have to swing through the face, while an off-centre push weaker than the drive leaves its heading alone.
+Along the heading the contact force moves the agent as before, but sideways it only slides by what exceeds the wheels' grip `wheel_lateral_friction · m · gravity`.
+Against a Gazebo Limo (`swarp_gz_test` sysid) this reproduces a pair of robots squeezing the T head-on locking each other's yaw (+0° of a commanded +258°), and a single robot turning against a free T (about +200°).
 
 Every kernel a box world runs compiles without floating-point contraction (`fuse_fp=False`), which keeps the layered and fused paths bit-identical (see [Performance](performance.md#fused-substep-chain)).
 A world without a box agent never launches them, so its step is the disc step unchanged.
@@ -140,7 +148,7 @@ Like the agent side, this is gather-based — one thread per `(env, obstacle)`, 
 Several shapes that share a `body` id form one **compound** rigid body with a single pose, placed by their `body_offset` in the body frame. That is what makes Push-T's T work: a crossbar and a stem, one rigid pose, mass split by area and inertia from the parallel-axis theorem about the area centroid — which is what gives a contact above the centroid the torque that makes the orientation half of the task solvable.
 
 `obstacle_linear_damping` and `obstacle_angular_damping` stand in for table friction: a pushed body settles at `Σf / (m·damping)` instead of accelerating without limit. Set them to 0 for a frictionless puck that coasts.
-`obstacle_friction` (a Coulomb coefficient μ, 0 by default) instead puts movable bodies on a Coulomb floor: the weight `m·obstacle_gravity` is spread uniformly over each shape's footprint on an `obstacle_friction_grid` × `obstacle_friction_grid` lattice, and every lattice point resists its own sliding velocity with its share of μ·m·g, regularised below `obstacle_friction_speed` (5 mm/s).
+`obstacle_friction` (a Coulomb coefficient μ, 0 by default) instead puts movable bodies on a Coulomb floor: the weight `m·gravity` is spread uniformly over each shape's footprint on an `obstacle_friction_grid` × `obstacle_friction_grid` lattice, and every lattice point resists its own sliding velocity with its share of μ·m·g, regularised below `obstacle_friction_speed` (5 mm/s).
 Summed, that is the footprint's limit surface, so a body pushed off-centre turns about the pivot a real one would, and a sliding body stops within `v² / (2μg)`.
 An impulse that would reverse a body's motion or spin sticks it instead (static friction), which keeps the stiff law stable at any substep.
 `Stepper.set_body_friction` overrides μ·g per env.

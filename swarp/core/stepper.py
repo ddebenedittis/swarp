@@ -176,6 +176,7 @@ class Stepper:
         self.body_friction_dummy = wp.zeros(1, dtype=dtype, device=device)
 
         self._zero_forces: dict[int, wp.array] = {}
+        self._torques: dict[int, wp.array] = {}
         self._zero_nbr: dict[int, tuple[wp.array, wp.array]] = {}
         self._grids: dict[int, NeighborGrid] = {}
         self._cached_buffers: dict[int, StepBuffers] = {}
@@ -525,6 +526,15 @@ class Stepper:
     def _needs_forces(self) -> bool:
         return self.collisions or self._soft_walls or self.n_obstacles > 0
 
+    def _wheel_torques(self, n_envs: int) -> wp.array:
+        """The per-agent contact torques of the wheel contacts, one buffer per batch size
+        (zeroed, so a world whose force pass never runs reads no torque)."""
+        buf = self._torques.get(n_envs)
+        if buf is None:
+            buf = wp.zeros((n_envs, self.n_agents), dtype=self.dtype, device=self.device)
+            self._torques[n_envs] = buf
+        return buf
+
     def zero_forces(self, n_envs: int) -> wp.array:
         """Shared all-zero force buffer (read-only, safe to reuse under a tape)."""
         buf = self._zero_forces.get(n_envs)
@@ -698,6 +708,7 @@ class Stepper:
             and self.world.integrator == Integrator.EULER
             and not self.any_movable
             and self.params.floats_per_env is None
+            and not self.world.wheel_contacts
             and state_in.pos.device.is_cuda
             and self.n_agents <= FUSED_MAX_AGENTS
             and (not self.collisions or self.grid(state_in.pos.shape[0]).method == "brute")
@@ -770,6 +781,14 @@ class Stepper:
             and not buffers.taped
             and world.integrator == Integrator.EULER
         )
+        torques = None
+        if world.wheel_contacts:
+            if not slim:
+                raise ValueError(
+                    "WorldConfig.wheel_contacts runs on the slim Euler 2D path only (no "
+                    "drone agents, untaped, Integrator.EULER)"
+                )
+            torques = self._wheel_torques(n_envs)
         if write_in_place:
             if not slim:
                 raise ValueError(
@@ -829,8 +848,9 @@ class Stepper:
                     dtype=self.dtype,
                     # Box contacts read the headings and spins; a disc world passes None
                     # and keeps the disc kernel.
-                    theta=st.theta if self.has_box_agents else None,
-                    ang_vel=st.ang_vel if self.has_box_agents else None,
+                    theta=st.theta if self.has_box_agents or torques is not None else None,
+                    ang_vel=st.ang_vel if self.has_box_agents or torques is not None else None,
+                    torques=torques,
                 )
                 if self.any_movable and not buffers.taped:
                     # Same state the force pass just used, so action and reaction match;
@@ -867,7 +887,7 @@ class Stepper:
                             self,
                             st.pos.shape[0],
                             sub_dt=self.sub_dt,
-                            friction_acc=world.obstacle_friction * world.obstacle_gravity,
+                            friction_acc=world.obstacle_friction * world.gravity,
                             friction_speed=world.obstacle_friction_speed,
                             friction_grid=world.obstacle_friction_grid,
                             dtype=self.dtype,
@@ -884,6 +904,9 @@ class Stepper:
                 slim=slim,
                 skip_drone=skip_drone and slim,
                 footprint=self.has_box_agents,
+                torques=torques,
+                lat_grip=world.wheel_lateral_friction * world.gravity,
+                turn_cap=world.wheel_turn_torque,
             )
         # State has advanced; the grid's lists no longer match this generation.
         self.state_version += 1

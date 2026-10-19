@@ -116,6 +116,9 @@ class PushTScenario(FusedScenario):
         cmd_gain_w: float | tuple[float, float] | None = None,
         agent_mass: float = 1.0,
         floor_friction: float | tuple[float, float] | None = None,
+        wheel_contacts: bool = False,
+        wheel_lateral_friction: float = 0.2,
+        wheel_turn_torque: float = 0.0,
     ) -> None:
         """``model="diff_drive"`` makes the robots unicycles commanded by ``(v, omega)``,
         with turn rates up to ``max_ang_vel``; ``agent_shape="box"`` makes them rectangles
@@ -141,7 +144,12 @@ class PushTScenario(FusedScenario):
         ``floor_friction`` puts the T on a Coulomb floor with that ``mu`` (see
         ``WorldConfig.obstacle_friction``), or a ``(low, high)`` range drawn per env on
         every reset; it adds to the viscous ``linear_damping``/``angular_damping``, which a
-        Coulomb T usually sets near 0."""
+        Coulomb T usually sets near 0.
+
+        ``wheel_contacts`` gives ``diff_drive`` robots wheel-faithful contacts
+        (``WorldConfig.wheel_contacts``): a contact turns a box robot through its torque
+        past the drive's ``wheel_turn_torque``, and pushes it sideways only past the
+        wheels' grip ``wheel_lateral_friction``."""
         self.n_agents = n_agents
         self.model = _coerce(DynamicsModel, model, "model")
         if self.model not in self.supported_models:
@@ -159,6 +167,11 @@ class PushTScenario(FusedScenario):
         if agent_mass <= 0.0:
             raise ValueError(f"agent_mass must be positive, got {agent_mass}")
         self.agent_mass = agent_mass
+        if wheel_contacts and self.model != DynamicsModel.DIFF_DRIVE:
+            raise ValueError("wheel_contacts needs model='diff_drive'")
+        self.wheel_contacts = bool(wheel_contacts)
+        self.wheel_lateral_friction = wheel_lateral_friction
+        self.wheel_turn_torque = wheel_turn_torque
         self.floor_friction = (
             None if floor_friction is None else _as_range(floor_friction, 0.0, "floor_friction")
         )
@@ -325,6 +338,9 @@ class PushTScenario(FusedScenario):
             obstacle_linear_damping=self.linear_damping,
             obstacle_angular_damping=self.angular_damping,
             obstacle_friction=0.0 if self.floor_friction is None else self.floor_friction[0],
+            wheel_contacts=self.wheel_contacts,
+            wheel_lateral_friction=self.wheel_lateral_friction,
+            wheel_turn_torque=self.wheel_turn_torque,
             contact_max_overlap=self.max_overlap,
         ).override_with(world_config)
         self.dt = dt
@@ -409,7 +425,7 @@ class PushTScenario(FusedScenario):
         self._friction_launch = CachedLaunch()
         if self.friction_dr:
             # A per-env mu * g, allocated here (outside any capture) and redrawn in place.
-            g = self.world.config.obstacle_gravity
+            g = self.world.config.gravity
             self.world.stepper.set_body_friction(
                 torch.full((n_envs,), self.floor_friction[0] * g, **tt)
             )
@@ -594,7 +610,7 @@ class PushTScenario(FusedScenario):
             concrete(pusht_friction_reset_kernel, scalar),
             dim=w.n_envs,
             inputs=[mask, use_mask, seed, scalar(lo), scalar(hi),
-                    scalar(w.config.obstacle_gravity), out],
+                    scalar(w.config.gravity), out],
             device=w.device,
             key=(w.n_envs, ptr_key(mask), ptr_key(out)),
         )
