@@ -167,6 +167,11 @@ A deployment that bins the real scan into the 32 centre rays needs no change for
 `SPECS["pusht_lidar_limo_dr_coulomb"]` puts the T on a Coulomb floor (`floor_friction`, μ drawn per env from 0.2–0.5) with no viscous drag, and robots of mass 2.
 A viscous drag under-rotates an off-centre push: the quasi-static pushing reference turns the bar 64°/m at a 0.2 m offset and 145°/m at 0.4 m, and 39 and 113°/m on a viscous floor.
 On the Coulomb floor swarp gives 60, 142 and 48°/m (glancing push; reference 48), and the T stops where Gazebo's does.
+
+`SPECS["pusht_lidar_limo_dr_wheel"]` adds wheel-faithful contacts (`wheel_contacts`, see [World](world.md#box-agents)): a robot's contact torque turns it only past the 3.5 N·m its drive holds, and its wheels grip sideways with μ 0.2.
+A policy trained without them (L3b, 0.99 greedy in swarp) solved 0.35 in Gazebo: its two robots squeezed the T head-on from opposite faces and spun in place, which a Limo cannot do, because its flush front corner would have to swing through a face the other robot holds.
+With wheel contacts, two robots pressing the T from opposite faces hold their yaw as in Gazebo (−4° and −5° of a commanded +258°; Gazebo 0°), and a robot turning against the free T still turns (+199°; Gazebo +198°).
+Trained from scratch the recipe reaches 0.96 greedy at 16000 iterations; resumed from the Coulomb policy it reaches 0.99 in 8000.
 Its comment in `swarp/rl/recipes.py` derives every value that differs from U-H1's.
 A recipe keyed by a name other than its scenario's sets `TrainSpec.scenario`, which `scenario_name` resolves wherever a scenario is built from a `SPECS` key.
 
