@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field, fields, replace
 from enum import IntEnum
 
@@ -209,6 +210,10 @@ class WorldConfig:
         wheel_turn_torque: the torque the drive holds its turn rate against (N m in the
             world's units): an off-centre push weaker than that leaves the heading
             alone, and a turn into a face that pushes back harder stalls.
+        wheel_drive_force: the drive's traction along the heading (N): a contact that
+            pushes back harder stalls the drive for the substep, so two agents driving
+            into each other, or into a held body, press with about this force instead of
+            the velocity command's ``m v / sub_dt`` (``inf``: no limit).
         obstacle_friction_speed: sliding speed below which the friction direction is
             regularised (the law is smooth through rest instead of chattering).
         obstacle_friction_grid: friction points per side of each shape's footprint.
@@ -251,6 +256,7 @@ class WorldConfig:
     wheel_contacts: bool = False
     wheel_lateral_friction: float = 0.2
     wheel_turn_torque: float = 0.0
+    wheel_drive_force: float = math.inf
     obstacle_friction_speed: float = 0.005
     obstacle_friction_grid: int = 6
     # Depth at which the contact spring saturates (smoothly; 0 disables). A
@@ -314,6 +320,8 @@ class WorldConfig:
             raise ValueError("obstacle_friction must be >= 0 and obstacle_friction_speed > 0")
         if self.wheel_lateral_friction < 0.0 or self.wheel_turn_torque < 0.0:
             raise ValueError("wheel_lateral_friction and wheel_turn_torque must be >= 0")
+        if self.wheel_drive_force <= 0.0:
+            raise ValueError("wheel_drive_force must be > 0")
         if self.obstacle_friction_grid < 1:
             raise ValueError("obstacle_friction_grid must be >= 1")
         if self.obstacle_linear_damping < 0.0 or self.obstacle_angular_damping < 0.0:

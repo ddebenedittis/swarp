@@ -119,6 +119,7 @@ class PushTScenario(FusedScenario):
         wheel_contacts: bool = False,
         wheel_lateral_friction: float = 0.2,
         wheel_turn_torque: float = 0.0,
+        wheel_drive_force: float = math.inf,
     ) -> None:
         """``model="diff_drive"`` makes the robots unicycles commanded by ``(v, omega)``,
         with turn rates up to ``max_ang_vel``; ``agent_shape="box"`` makes them rectangles
@@ -148,8 +149,8 @@ class PushTScenario(FusedScenario):
 
         ``wheel_contacts`` gives ``diff_drive`` robots wheel-faithful contacts
         (``WorldConfig.wheel_contacts``): a contact turns a box robot through its torque
-        past the drive's ``wheel_turn_torque``, and pushes it sideways only past the
-        wheels' grip ``wheel_lateral_friction``."""
+        past the drive's ``wheel_turn_torque``, pushes it sideways only past the wheels'
+        grip ``wheel_lateral_friction``, and stalls its drive past ``wheel_drive_force``."""
         self.n_agents = n_agents
         self.model = _coerce(DynamicsModel, model, "model")
         if self.model not in self.supported_models:
@@ -172,6 +173,7 @@ class PushTScenario(FusedScenario):
         self.wheel_contacts = bool(wheel_contacts)
         self.wheel_lateral_friction = wheel_lateral_friction
         self.wheel_turn_torque = wheel_turn_torque
+        self.wheel_drive_force = wheel_drive_force
         self.floor_friction = (
             None if floor_friction is None else _as_range(floor_friction, 0.0, "floor_friction")
         )
@@ -341,6 +343,7 @@ class PushTScenario(FusedScenario):
             wheel_contacts=self.wheel_contacts,
             wheel_lateral_friction=self.wheel_lateral_friction,
             wheel_turn_torque=self.wheel_turn_torque,
+            wheel_drive_force=self.wheel_drive_force,
             contact_max_overlap=self.max_overlap,
         ).override_with(world_config)
         self.dt = dt

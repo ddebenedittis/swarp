@@ -1334,6 +1334,7 @@ def wheel_contact(
     p_new: Any,
     th_new: Any,
     v_out: Any,
+    s_cmd: Any,
     w_cmd: Any,
     force: Any,
     torque: Any,
@@ -1343,6 +1344,7 @@ def wheel_contact(
     half_y: Any,
     lat_grip: Any,
     turn_cap: Any,
+    drive_cap: Any,
     dt: Any,
 ):
     """Rework a diff-drive agent's :func:`_step_2d` result for wheel-faithful contacts
@@ -1352,11 +1354,16 @@ def wheel_contact(
     ``F dt / m``) but sideways only by what exceeds the wheels' grip ``lat_grip * m``
     (``lat_grip`` is ``mu g``), and the contact torque turns the agent the same way, by
     what exceeds the torque ``turn_cap`` the drive holds its turn rate against:
-    ``omega = w_cmd + (|tau| - turn_cap)+ sign(tau) dt / I``, ``I = m (hx^2 + hy^2) / 3``.
-    A box turning into a face that does not give way therefore stalls once the corner it
-    drives in pushes back harder than the drive turns, while an off-centre push that
-    torques it less than ``turn_cap`` leaves its heading alone. Returns the new
-    ``(pos, heading, velocity)``; the drive's own turn rate ``w_cmd`` stays the state."""
+    ``omega = w_cmd + (|tau| - turn_cap)+ sign(tau) dt / I``, ``I = m (hx^2 + hy^2) / 3``,
+    and a torque beyond ``turn_cap`` that opposes the commanded turn also stalls the
+    drive's turn for the substep. A box turning into a face that does not give way
+    therefore stops once the corner it drives in pushes back harder than the drive turns,
+    while an off-centre push that torques it less than ``turn_cap`` leaves its heading
+    alone. A contact that pushes back
+    along the heading harder than the drive's traction ``drive_cap`` (a force) stalls the
+    drive's own speed ``s_cmd`` for the substep, so an agent pressing something that does
+    not give way presses with about that force. Returns the new ``(pos, heading,
+    velocity)``; the drive's own speed and turn rate stay the state."""
     zero = type(dt)(0.0)
     p_out = p_new
     th_out = th_new
@@ -1372,13 +1379,19 @@ def wheel_contact(
         # part for the slip.
         dv = (slip - f_lat) * (dt / mass)
         corr = type(p)(-sa * dv, ca * dv)
+        f_lon = force[0] * ca + force[1] * sa
+        if f_lon * s_cmd < zero and wp.abs(f_lon) > drive_cap:
+            corr = corr - type(p)(ca * s_cmd, sa * s_cmd)
         v_new = v_out + corr
         p_out = p_new + corr * dt
         inertia = mass * (half_x * half_x + half_y * half_y) / type(dt)(3.0)
         excess = wp.max(wp.abs(torque) - turn_cap, zero)
         if torque < zero:
             excess = -excess
-        th_out = th + (w_cmd + excess * (dt / inertia)) * dt
+        w_drive = w_cmd
+        if torque * w_cmd < zero and wp.abs(torque) > turn_cap:
+            w_drive = zero  # the contact resists the turn harder than the drive turns
+        th_out = th + (w_drive + excess * (dt / inertia)) * dt
     return p_out, th_out, v_new
 
 
@@ -1403,6 +1416,7 @@ def integrate2d_wheel_kernel(
     torques: wp.array2d(dtype=Any),
     lat_grip: Any,
     turn_cap: Any,
+    drive_cap: Any,
     # 2D state out
     pos_out: wp.array2d(dtype=Any),
     theta_out: wp.array2d(dtype=Any),
@@ -1458,6 +1472,7 @@ def integrate2d_wheel_kernel(
         p_new,
         th_new,
         v_out,
+        s_out,
         w_out,
         forces[e, a],
         torques[e, a],
@@ -1467,6 +1482,7 @@ def integrate2d_wheel_kernel(
         params[a, P_HALF_Y],
         lat_grip,
         turn_cap,
+        drive_cap,
         dt,
     )
     if clamp_bounds == 1:
@@ -1511,6 +1527,7 @@ def integrate2d_wheel_kernel_per_env(
     torques: wp.array2d(dtype=Any),
     lat_grip: Any,
     turn_cap: Any,
+    drive_cap: Any,
     pos_out: wp.array2d(dtype=Any),
     theta_out: wp.array2d(dtype=Any),
     vel_out: wp.array2d(dtype=Any),
@@ -1565,6 +1582,7 @@ def integrate2d_wheel_kernel_per_env(
         p_new,
         th_new,
         v_out,
+        s_out,
         w_out,
         forces[e, a],
         torques[e, a],
@@ -1574,6 +1592,7 @@ def integrate2d_wheel_kernel_per_env(
         params[e, a, P_HALF_Y],
         lat_grip,
         turn_cap,
+        drive_cap,
         dt,
     )
     if clamp_bounds == 1:
@@ -1635,10 +1654,10 @@ def _signature2d(dtype, per_env: bool = False) -> list:
 
 
 def _signature2d_wheel(dtype, per_env: bool = False) -> list:
-    """:func:`_signature2d` with ``torques``, ``lat_grip`` and ``turn_cap`` after
-    ``clamp_bounds``."""
+    """:func:`_signature2d` with ``torques``, ``lat_grip``, ``turn_cap`` and
+    ``drive_cap`` after ``clamp_bounds``."""
     sig = _signature2d(dtype, per_env)
-    return [*sig[:14], wp.array2d(dtype=dtype), dtype, dtype, *sig[14:]]
+    return [*sig[:14], wp.array2d(dtype=dtype), dtype, dtype, dtype, *sig[14:]]
 
 
 def _signature(dtype, per_env: bool = False) -> list:
@@ -1699,6 +1718,7 @@ def launch_integrate(
     torques: wp.array | None = None,
     lat_grip: float = 0.0,
     turn_cap: float = 0.0,
+    drive_cap: float = float("inf"),
 ) -> None:
     """Launch one integration sub-step. Functional: never writes to ``state_in``.
 
@@ -1710,8 +1730,8 @@ def launch_integrate(
 
     ``torques`` (the force pass's per-agent contact torques) selects the wheel-contact
     variant of the slim kernel (:func:`wheel_contact`, ``lat_grip`` is the wheels'
-    sideways ``mu g``, ``turn_cap`` the torque the drive holds its turn rate against); it
-    needs ``slim``.
+    sideways ``mu g``, ``turn_cap`` the torque the drive holds its turn rate against,
+    ``drive_cap`` its traction along the heading); it needs ``slim``.
 
     ``slim=True`` launches the 2D-only Euler kernel that computes five state
     arrays instead of nine (no drone math, no RK4 branch). The caller must
@@ -1738,7 +1758,7 @@ def launch_integrate(
         wheel = []
         if torques is not None:
             kernel2d = integrate2d_wheel_kernel_per_env if per_env else integrate2d_wheel_kernel
-            wheel = [torques, dtype(lat_grip), dtype(turn_cap)]
+            wheel = [torques, dtype(lat_grip), dtype(turn_cap), dtype(drive_cap)]
         elif footprint:
             kernel2d = integrate2d_box_kernel_per_env if per_env else integrate2d_box_kernel
         else:

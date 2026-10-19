@@ -907,6 +907,7 @@ class Stepper:
                 torques=torques,
                 lat_grip=world.wheel_lateral_friction * world.gravity,
                 turn_cap=world.wheel_turn_torque,
+                drive_cap=world.wheel_drive_force,
             )
         # State has advanced; the grid's lists no longer match this generation.
         self.state_version += 1
