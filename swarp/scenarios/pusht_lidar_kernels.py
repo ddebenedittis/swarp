@@ -63,6 +63,10 @@ TEE_DIM = 8
 #: Coverage sectors around the T centroid, in the T frame.
 N_SECTORS = 8
 
+#: Slack on the field-of-view test, so a ray exactly at half the field of view (270
+#: degrees keeps the rays at +-135) is kept despite rounding.
+FOV_EPS = wp.constant(1e-4)
+
 _HIT_AGENT = wp.constant(wp.uint8(1))
 _HIT_MOVABLE = wp.constant(wp.uint8(3))
 
@@ -104,6 +108,9 @@ def pusht_lidar_obs_kernel(
     pos: wp.array2d(dtype=Any),
     vel: wp.array2d(dtype=Any),
     theta: wp.array2d(dtype=Any),
+    obs_pos: wp.array2d(dtype=Any),
+    obs_vel: wp.array2d(dtype=Any),
+    obs_theta: wp.array2d(dtype=Any),
     tee_pos: wp.array(dtype=Any),
     tee_theta: wp.array(dtype=Any),
     tee_vel: wp.array(dtype=Any),
@@ -137,7 +144,9 @@ def pusht_lidar_obs_kernel(
     sectors_out: wp.array2d(dtype=wp.uint8),
     near_out: wp.array2d(dtype=wp.uint8),
 ):
-    """Thread per (env, agent). Layout: see ``PushTLidarScenario``'s docstring."""
+    """Thread per (env, agent). Layout: see ``PushTLidarScenario``'s docstring. The self
+    and teammate blocks read the observed poses ``obs_pos``/``obs_vel``/``obs_theta``
+    (the true ones without pose noise); everything else reads the true state."""
     e, a = wp.tid()
     n_agents = pos.shape[1]
     n_rays = ranges.shape[2]
@@ -155,27 +164,29 @@ def pusht_lidar_obs_kernel(
     if role == 1:
         sgn = one
 
-    # ---- self block
-    obs[e, a, 0] = p[0]
-    obs[e, a, 1] = p[1]
-    obs[e, a, 2] = v[0]
-    obs[e, a, 3] = v[1]
+    # ---- self block, from the observed pose
+    po = obs_pos[e, a]
+    vo = obs_vel[e, a]
+    obs[e, a, 0] = po[0]
+    obs[e, a, 1] = po[1]
+    obs[e, a, 2] = vo[0]
+    obs[e, a, 3] = vo[1]
     obs[e, a, 4] = sgn
-    obs[e, a, 5] = g[0] - p[0]
-    obs[e, a, 6] = g[1] - p[1]
+    obs[e, a, 5] = g[0] - po[0]
+    obs[e, a, 6] = g[1] - po[1]
     obs[e, a, 7] = wp.cos(gth)
     obs[e, a, 8] = wp.sin(gth)
     k = wp.int32(9)
     if heading == 1:
-        obs[e, a, 9] = wp.cos(theta[e, a])
-        obs[e, a, 10] = wp.sin(theta[e, a])
+        obs[e, a, 9] = wp.cos(obs_theta[e, a])
+        obs[e, a, 10] = wp.sin(obs_theta[e, a])
         k = wp.int32(11)
-    # ---- teammates: relative position + role sign, ascending index, self skipped
+    # ---- teammates: relative observed position + role sign, ascending index, self skipped
     for j in range(n_agents):
         if j != a:
-            pj = pos[e, j]
-            obs[e, a, k] = pj[0] - p[0]
-            obs[e, a, k + 1] = pj[1] - p[1]
+            pj = obs_pos[e, j]
+            obs[e, a, k] = pj[0] - po[0]
+            obs[e, a, k + 1] = pj[1] - po[1]
             sj = -one
             if roles[e, j] == 1:
                 sj = one
@@ -564,6 +575,9 @@ def _obs_signature(dtype) -> list:
         wp.array2d(dtype=vec2),  # pos
         wp.array2d(dtype=vec2),  # vel
         a2s,  # theta
+        wp.array2d(dtype=vec2),  # obs_pos
+        wp.array2d(dtype=vec2),  # obs_vel
+        a2s,  # obs_theta
         wp.array(dtype=vec2),  # tee_pos
         a1s,  # tee_theta
         wp.array(dtype=vec2),  # tee_vel
@@ -644,20 +658,25 @@ def lidar_sensor_kernel(
     body_frame: wp.int32,
     mount_offset: Any,
     min_range: Any,
-    half_fov: Any,
-    noise_std: Any,
+    half_fov: wp.array2d(dtype=Any),
+    noise_std: wp.array2d(dtype=Any),
     rng_state: wp.array2d(dtype=wp.uint32),
     ranges: wp.array3d(dtype=Any),
     hit_class: wp.array3d(dtype=wp.uint8),
 ):
     """Thread per (env, agent): turn the centre-ray scan into what the mounted sensor
     returns, in place. A hit within ``min_range`` of the mount (``mount_offset`` ahead of
-    the centre along the heading) or on a ray more than ``half_fov`` off the heading
-    reads as a miss (``max_range``, class 0); the remaining hits get Gaussian range noise
-    of ``noise_std``, clamped to ``[0, max_range]``, from this thread's own RNG stream."""
+    the centre along the heading) or on a ray more than this robot's ``half_fov`` (plus
+    ``FOV_EPS``) off the heading reads as a miss (``max_range``, class 0); the remaining
+    hits get Gaussian range noise of this robot's ``noise_std``, clamped to
+    ``[0, max_range]``, from this thread's own RNG stream. A body-frame ray's angle off
+    the heading is its fixed offset ``angle_start + r ray_step`` wrapped to
+    ``(-pi, pi]``, so which rays a field of view keeps does not depend on the heading."""
     e, a = wp.tid()
     n_rays = ranges.shape[2]
     zero = type(max_range)(0.0)
+    hf = half_fov[e, a] + type(max_range)(FOV_EPS)
+    sigma = noise_std[e, a]
     th = theta[e, a]
     base = zero
     if body_frame != 0:
@@ -672,14 +691,17 @@ def lidar_sensor_kernel(
             hx = t * wp.cos(ang) - mx
             hy = t * wp.sin(ang) - my
             blind = hx * hx + hy * hy < min_range * min_range
-            if wp.abs(_wrap(ang - th)) > half_fov:
+            off = ang - th
+            if body_frame != 0:
+                off = angle_start + type(max_range)(r) * ray_step
+            if wp.abs(_wrap(off)) > hf:
                 blind = True
             if blind:
                 ranges[e, a, r] = max_range
                 hit_class[e, a, r] = wp.uint8(0)
-            elif noise_std > zero:
+            elif sigma > zero:
                 n = type(max_range)(wp.randn(rng))
-                ranges[e, a, r] = wp.clamp(t + noise_std * n, zero, max_range)
+                ranges[e, a, r] = wp.clamp(t + sigma * n, zero, max_range)
     rng_state[e, a] = rng
 
 
@@ -688,14 +710,150 @@ def _sensor_signature(dtype) -> list:
         wp.array2d(dtype=dtype),  # theta
         *([dtype] * 3),  # max_range, ray_step, angle_start
         wp.int32,  # body_frame
-        *([dtype] * 4),  # mount_offset, min_range, half_fov, noise_std
+        *([dtype] * 2),  # mount_offset, min_range
+        *([wp.array2d(dtype=dtype)] * 2),  # half_fov, noise_std
         wp.array2d(dtype=wp.uint32),  # rng_state
         wp.array3d(dtype=dtype),  # ranges
         wp.array3d(dtype=wp.uint8),  # hit_class
     ]
 
 
+@wp.func
+def _draw_range(u: float, lo: Any, hi: Any, old: Any):
+    """``u`` in ``[0, 1)`` onto ``[lo, hi]``, or ``old`` for a fixed knob (``lo == hi``)."""
+    out = old
+    if hi > lo:
+        out = lo + (hi - lo) * type(lo)(u)
+    return out
+
+
+@wp.kernel
+def pusht_lidar_dr_reset_kernel(
+    reset_mask: wp.array(dtype=wp.uint8),
+    use_mask: wp.int32,
+    seed: wp.int32,
+    fov_lo: Any,
+    fov_hi: Any,
+    noise_lo: Any,
+    noise_hi: Any,
+    scale_lo: Any,
+    scale_hi: Any,
+    bias_pos_std: Any,
+    bias_theta_std: Any,
+    half_fov: wp.array2d(dtype=Any),
+    noise_std: wp.array2d(dtype=Any),
+    pose_scale: wp.array2d(dtype=Any),
+    bias_pos: wp.array2d(dtype=Any),
+    bias_theta: wp.array2d(dtype=Any),
+):
+    """Thread per (env, robot), respawned envs only: this robot's half field of view and
+    range-noise deviation, each uniform in its range (left alone when fixed); the env's
+    pose-noise scale (one draw per env, so every robot of the env reads the same), and
+    this robot's localisation bias for the episode, Gaussian with the scale times
+    ``bias_pos_std`` per axis and ``bias_theta_std``."""
+    e, a = wp.tid()
+    if use_mask == 1 and reset_mask[e] == wp.uint8(0):
+        return
+    na = half_fov.shape[1]
+    rng = wp.rand_init(seed, e * (na + 1) + 1 + a)
+    half_fov[e, a] = _draw_range(wp.randf(rng), fov_lo, fov_hi, half_fov[e, a])
+    noise_std[e, a] = _draw_range(wp.randf(rng), noise_lo, noise_hi, noise_std[e, a])
+    env_rng = wp.rand_init(seed, e * (na + 1))
+    u = _draw_range(wp.randf(env_rng), scale_lo, scale_hi, scale_lo)
+    pose_scale[e, a] = u
+    bx = type(u)(wp.randn(rng))
+    by = type(u)(wp.randn(rng))
+    bt = type(u)(wp.randn(rng))
+    bias_pos[e, a] = type(bias_pos[e, a])(u * bias_pos_std * bx, u * bias_pos_std * by)
+    bias_theta[e, a] = u * bias_theta_std * bt
+
+
+@wp.kernel
+def pose_obs_noise_kernel(
+    pos: wp.array2d(dtype=Any),
+    vel: wp.array2d(dtype=Any),
+    theta: wp.array2d(dtype=Any),
+    reset_mask: wp.array(dtype=wp.uint8),
+    advance_prev: wp.int32,
+    pose_scale: wp.array2d(dtype=Any),
+    bias_pos: wp.array2d(dtype=Any),
+    bias_theta: wp.array2d(dtype=Any),
+    jitter_pos_std: Any,
+    jitter_theta_std: Any,
+    vel_std: Any,
+    rng_state: wp.array2d(dtype=wp.uint32),
+    obs_pos: wp.array2d(dtype=Any),
+    obs_vel: wp.array2d(dtype=Any),
+    obs_theta: wp.array2d(dtype=Any),
+):
+    """Thread per (env, robot): the pose the robot's localisation reports, on a step and
+    for the envs a reset respawned (a reset pass leaves the others' alone, as their
+    state did not change). Position and heading are the true ones plus the episode's
+    bias plus fresh Gaussian jitter of the env's scale times the jitter deviations; the
+    world-frame velocity is the true one turned by the heading error (a body-frame
+    odometry twist rotated by the reported heading) plus Gaussian noise of the scale
+    times ``vel_std`` per axis."""
+    e, a = wp.tid()
+    if advance_prev == 0 and reset_mask[e] == wp.uint8(0):
+        return
+    rng = rng_state[e, a]
+    u = pose_scale[e, a]
+    jx = type(u)(wp.randn(rng))
+    jy = type(u)(wp.randn(rng))
+    jt = type(u)(wp.randn(rng))
+    vx = type(u)(wp.randn(rng))
+    vy = type(u)(wp.randn(rng))
+    rng_state[e, a] = rng
+    p = pos[e, a]
+    jp = u * jitter_pos_std
+    obs_pos[e, a] = p + bias_pos[e, a] + type(p)(jp * jx, jp * jy)
+    dth = bias_theta[e, a] + u * jitter_theta_std * jt
+    obs_theta[e, a] = theta[e, a] + dth
+    v = vel[e, a]
+    c = wp.cos(dth)
+    s = wp.sin(dth)
+    vs = u * vel_std
+    obs_vel[e, a] = type(v)(c * v[0] - s * v[1] + vs * vx, s * v[0] + c * v[1] + vs * vy)
+
+
+def _dr_reset_signature(dtype) -> list:
+    a2s = wp.array2d(dtype=dtype)
+    return [
+        wp.array(dtype=wp.uint8),  # reset_mask
+        wp.int32,  # use_mask
+        wp.int32,  # seed
+        *([dtype] * 8),  # fov, noise, scale ranges; bias deviations
+        a2s,  # half_fov
+        a2s,  # noise_std
+        a2s,  # pose_scale
+        wp.array2d(dtype=VEC2[dtype]),  # bias_pos
+        a2s,  # bias_theta
+    ]
+
+
+def _pose_noise_signature(dtype) -> list:
+    a2s = wp.array2d(dtype=dtype)
+    a2v = wp.array2d(dtype=VEC2[dtype])
+    return [
+        a2v,  # pos
+        a2v,  # vel
+        a2s,  # theta
+        wp.array(dtype=wp.uint8),  # reset_mask
+        wp.int32,  # advance_prev
+        a2s,  # pose_scale
+        a2v,  # bias_pos
+        a2s,  # bias_theta
+        *([dtype] * 3),  # jitter_pos_std, jitter_theta_std, vel_std
+        wp.array2d(dtype=wp.uint32),  # rng_state
+        a2v,  # obs_pos
+        a2v,  # obs_vel
+        a2s,  # obs_theta
+    ]
+
+
 for _T in (wp.float32, wp.float64):
+    register(pusht_lidar_dr_reset_kernel, _T, _dr_reset_signature(_T))
+    register(pose_obs_noise_kernel, _T, _pose_noise_signature(_T))
     register(lidar_sensor_kernel, _T, _sensor_signature(_T))
     register(pusht_lidar_obs_kernel, _T, _obs_signature(_T))
     register(pusht_lidar_reward_kernel, _T, _reward_signature(_T))

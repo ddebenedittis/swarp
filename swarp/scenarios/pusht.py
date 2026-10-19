@@ -53,6 +53,7 @@ from swarp.scenarios.pusht_kernels import (
     pusht_actuation_reset_kernel,
     pusht_friction_reset_kernel,
     pusht_heading_reset_kernel,
+    pusht_latency_reset_kernel,
     pusht_obs_kernel,
     pusht_reset_kernel,
     pusht_reward_kernel,
@@ -120,6 +121,7 @@ class PushTScenario(FusedScenario):
         wheel_lateral_friction: float = 0.2,
         wheel_turn_torque: float = 0.0,
         wheel_drive_force: float = math.inf,
+        cmd_latency: float | tuple[float, float] = 0.0,
     ) -> None:
         """``model="diff_drive"`` makes the robots unicycles commanded by ``(v, omega)``,
         with turn rates up to ``max_ang_vel``; ``agent_shape="box"`` makes them rectangles
@@ -150,7 +152,14 @@ class PushTScenario(FusedScenario):
         ``wheel_contacts`` gives ``diff_drive`` robots wheel-faithful contacts
         (``WorldConfig.wheel_contacts``): a contact turns a box robot through its torque
         past the drive's ``wheel_turn_torque``, pushes it sideways only past the wheels'
-        grip ``wheel_lateral_friction``, and stalls its drive past ``wheel_drive_force``."""
+        grip ``wheel_lateral_friction``, and stalls its drive past ``wheel_drive_force``.
+
+        ``cmd_latency`` (seconds, a value or a ``(low, high)`` range drawn per env and
+        robot on every reset) delays every command: for that long into each step, rounded
+        to whole substeps, a robot still applies the previous step's command
+        (:meth:`Stepper.enable_command_delay
+        <swarp.core.stepper.Stepper.enable_command_delay>`); a respawned robot's previous
+        command is zero. A latency past ``dt`` is held at ``dt``."""
         self.n_agents = n_agents
         self.model = _coerce(DynamicsModel, model, "model")
         if self.model not in self.supported_models:
@@ -174,6 +183,11 @@ class PushTScenario(FusedScenario):
         self.wheel_lateral_friction = wheel_lateral_friction
         self.wheel_turn_torque = wheel_turn_torque
         self.wheel_drive_force = wheel_drive_force
+        lat = (cmd_latency, cmd_latency) if isinstance(cmd_latency, int | float) else cmd_latency
+        if not 0.0 <= lat[0] <= lat[1]:
+            raise ValueError(f"cmd_latency must be >= 0 with low <= high, got {cmd_latency!r}")
+        #: ``(low, high)`` command latency in seconds; turned into substeps in make_world.
+        self.cmd_latency = (float(lat[0]), float(lat[1]))
         self.floor_friction = (
             None if floor_friction is None else _as_range(floor_friction, 0.0, "floor_friction")
         )
@@ -426,6 +440,14 @@ class PushTScenario(FusedScenario):
         self._heading_launch = CachedLaunch()
         self._actuation_launch = CachedLaunch()
         self._friction_launch = CachedLaunch()
+        self._latency_launch = CachedLaunch()
+        #: The command delay's ``(low, high)`` in substeps; ``None`` without a latency.
+        self.cmd_delay_substeps: tuple[int, int] | None = None
+        if self.cmd_latency[1] > 0.0:
+            lo, hi = (min(round(x / sub_dt), substeps) for x in self.cmd_latency)
+            if hi > 0:
+                self.cmd_delay_substeps = (lo, hi)
+                self.world.stepper.enable_command_delay(n_envs, self.world.act_dim, hi)
         if self.friction_dr:
             # A per-env mu * g, allocated here (outside any capture) and redrawn in place.
             g = self.world.config.gravity
@@ -579,6 +601,8 @@ class PushTScenario(FusedScenario):
                 self._launch_actuation_reset(mask, use_mask)
             if self.friction_dr:
                 self._launch_friction_reset(mask, use_mask)
+            if self.cmd_delay_substeps is not None:
+                self._launch_latency_reset(mask, use_mask)
 
     def _launch_heading_reset(self, st, mask, use_mask) -> None:
         """Random headings, zero speed and spin for the respawned robots (only launched
@@ -616,6 +640,25 @@ class PushTScenario(FusedScenario):
                     scalar(w.config.gravity), out],
             device=w.device,
             key=(w.n_envs, ptr_key(mask), ptr_key(out)),
+        )
+        launch.set_param_by_name("use_mask", use_mask)
+        launch.set_param_by_name("seed", seed)
+        launch.launch()
+
+    def _launch_latency_reset(self, mask, use_mask) -> None:
+        """Redraw the respawned robots' command delays and zero their last command."""
+        w = self.world
+        st = w.stepper
+        seed = wp.int32(w.next_kernel_seed())
+        lo, hi = self.cmd_delay_substeps
+        launch = self._latency_launch.get(
+            concrete(pusht_latency_reset_kernel, w.wp_dtype),
+            dim=(w.n_envs, self.n_agents),
+            inputs=[mask, use_mask, seed, wp.int32(lo), wp.int32(hi), w.wp_dtype(0.0),
+                    st.cmd_delay, st.prev_actions],
+            device=w.device,
+            key=(w.n_envs, ptr_key(mask), lo, hi, ptr_key(st.cmd_delay),
+                 ptr_key(st.prev_actions)),
         )
         launch.set_param_by_name("use_mask", use_mask)
         launch.set_param_by_name("seed", seed)
@@ -790,7 +833,11 @@ class PushTScenario(FusedScenario):
         kernels — would otherwise leave the body one step ahead of the eager path.
         """
         w = self.world
-        return [*w.obstacle_state_views(), *w.obstacle_state_views(body=True)]
+        out = [*w.obstacle_state_views(), *w.obstacle_state_views(body=True)]
+        if w.stepper.prev_actions is not None:
+            # The step copies its command into the latency's last-command buffer.
+            out.append(wp.to_torch(w.stepper.prev_actions))
+        return out
 
     def launch_fused(self, pass_: FusedPass) -> None:
         """Lift the engine's body state into ``tee_*``, then obs and reward.

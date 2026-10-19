@@ -411,6 +411,43 @@ def _friction_reset_signature(dtype) -> list:
             wp.array(dtype=dtype)]
 
 
+@wp.kernel
+def pusht_latency_reset_kernel(
+    reset_mask: wp.array(dtype=wp.uint8),
+    use_mask: wp.int32,
+    seed: wp.int32,
+    lo: wp.int32,
+    hi: wp.int32,
+    zero: Any,
+    delay: wp.array2d(dtype=wp.int32),
+    prev_actions: wp.array3d(dtype=Any),
+):
+    """Thread per (env, robot): a fresh command delay, uniform over the integer substeps
+    ``[lo, hi]``, and a zero previous command (the robot respawns at rest) for the
+    respawned envs. Its own seed, like the actuation draw."""
+    e, a = wp.tid()
+    if use_mask == 1 and reset_mask[e] == wp.uint8(0):
+        return
+    rng = wp.rand_init(seed, e * delay.shape[1] + a)
+    d = lo + wp.int32(wp.randf(rng) * float(hi - lo + 1))
+    delay[e, a] = wp.min(d, hi)
+    for i in range(prev_actions.shape[2]):
+        prev_actions[e, a, i] = zero
+
+
+def _latency_reset_signature(dtype) -> list:
+    return [
+        wp.array(dtype=wp.uint8),
+        wp.int32,
+        wp.int32,
+        wp.int32,
+        wp.int32,
+        dtype,  # zero
+        wp.array2d(dtype=wp.int32),
+        wp.array3d(dtype=dtype),
+    ]
+
+
 def _actuation_reset_signature(dtype) -> list:
     return [
         wp.array(dtype=wp.uint8),
@@ -459,3 +496,4 @@ for _T in (wp.float32, wp.float64):
     register(pusht_heading_reset_kernel, _T, _heading_reset_signature(_T))
     register(pusht_actuation_reset_kernel, _T, _actuation_reset_signature(_T))
     register(pusht_friction_reset_kernel, _T, _friction_reset_signature(_T))
+    register(pusht_latency_reset_kernel, _T, _latency_reset_signature(_T))

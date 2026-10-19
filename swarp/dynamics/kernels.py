@@ -1688,7 +1688,34 @@ def _signature(dtype, per_env: bool = False) -> list:
     ]
 
 
+@wp.kernel
+def delayed_actions_kernel(
+    actions: wp.array3d(dtype=Any),
+    prev_actions: wp.array3d(dtype=Any),
+    delay: wp.array2d(dtype=wp.int32),
+    out: wp.array4d(dtype=Any),
+):
+    """Thread per (env, agent): the command each of the first ``out.shape[0]`` substeps
+    applies under a command latency, ``out[k] = prev_actions`` while ``k < delay`` and
+    ``actions`` from then on (see :meth:`Stepper.enable_command_delay
+    <swarp.core.stepper.Stepper.enable_command_delay>`)."""
+    e, a = wp.tid()
+    d = delay[e, a]
+    for k in range(out.shape[0]):
+        for i in range(actions.shape[2]):
+            if k < d:
+                out[k, e, a, i] = prev_actions[e, a, i]
+            else:
+                out[k, e, a, i] = actions[e, a, i]
+
+
 for _T in (wp.float32, wp.float64):
+    register(
+        delayed_actions_kernel,
+        _T,
+        [wp.array3d(dtype=_T), wp.array3d(dtype=_T), wp.array2d(dtype=wp.int32),
+         wp.array4d(dtype=_T)],
+    )
     register(integrate_kernel, _T, _signature(_T))
     register(integrate_kernel_per_env, _T, _signature(_T, per_env=True))
     register(integrate2d_kernel, _T, _signature2d(_T))

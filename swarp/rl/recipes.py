@@ -609,6 +609,35 @@ SPECS["pusht_lidar_limo_dr_wheel"] = replace(
 )
 
 
+# pusht_lidar_limo_dr_wheel for the real AgileX Limos (EAI T-mini Pro lidar, localised by
+# mocap or by nav2 AMCL), with what Gazebo did not have:
+#
+# - The T-mini Pro's 0.02 m minimum range (Gazebo's sensor was cut at 0.10) and its range
+#   noise drawn per env and robot from 5-20 mm (the datasheet's ~20 mm accuracy at the
+#   top). The field of view is drawn per env and robot from 240-360 deg centred on the
+#   heading, so the policy works whatever the chassis hides of the rear; the deployment
+#   blanks the same rays for its measured field of view (lidar_sensor_kernel's rule).
+# - Localisation noise on the observed pose only (pose_noise): a per-episode bias per
+#   robot (3 cm per axis, 0.03 rad at scale 1) and per-step jitter (2 cm, 0.02 rad), the
+#   velocity turned by the heading error plus 2 cm/s, all times a scale drawn per env
+#   from 0-1, so mocap (scale ~0) and AMCL (scale ~1) are both in the distribution. A
+#   teammate's position is its own reported one, so the relative positions carry both
+#   robots' errors. Reward, success and the critic keep the true state.
+# - A command latency (WiFi plus processing, 30-120 ms) drawn per env and robot from
+#   0-125 ms: that many of the step's 32 substeps (0-20) still apply the previous command.
+SPECS["pusht_lidar_limo_real"] = replace(
+    SPECS["pusht_lidar_limo_dr_wheel"],
+    scen_kwargs={
+        **SPECS["pusht_lidar_limo_dr_wheel"].scen_kwargs,
+        "lidar_min_range": 0.02, "lidar_noise": (0.005, 0.02),
+        "lidar_fov": (math.radians(240.0), 2.0 * math.pi),
+        "pose_noise": (0.0, 1.0), "pose_bias_std": (0.03, 0.03),
+        "pose_jitter_std": (0.02, 0.02), "vel_noise_std": 0.02,
+        "cmd_latency": (0.0, 0.125),
+    },
+)
+
+
 def scenario_name(name: str) -> str:
     """The registered scenario behind ``name``: a ``SPECS`` key's ``scenario`` when it
     sets one, else ``name`` itself (a registry name, or a key that is one)."""

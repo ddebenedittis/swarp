@@ -8,6 +8,8 @@ below therefore allow a small share of elements outside the declared parity boun
 (:data:`MISMATCH_SHARE`) rather than none; in practice the share is zero.
 """
 
+import math
+
 import pytest
 import torch
 from conftest import (
@@ -117,8 +119,18 @@ def test_fused_matches_torch(device, n_agents, obs_level):
             "servo_ang_accel": (20.0, 60.0), "cmd_gain_w": (0.7, 1.0),
             "lidar_mount_offset": 0.03, "lidar_min_range": 0.06, "lidar_fov": 4.5,
         },
+        # The real-robot knobs, with every draw the two paths share: per-robot fields of
+        # view, a localisation bias (jitter and velocity noise off, as their streams
+        # differ by path) and a command latency.
+        {
+            "model": "diff_drive", "agent_shape": "box", "servo_accel": (8.0, 20.0),
+            "servo_ang_accel": (20.0, 60.0), "lidar_mount_offset": 0.03,
+            "lidar_min_range": 0.02, "lidar_fov": (4.2, 2.0 * math.pi),
+            "pose_noise": (0.5, 1.0), "pose_jitter_std": (0.0, 0.0), "vel_noise_std": 0.0,
+            "cmd_latency": (0.0, 0.05),
+        },
     ],
-    ids=["unicycle", "box", "unicycle-box", "drive-sensor"],
+    ids=["unicycle", "box", "unicycle-box", "drive-sensor", "real"],
 )
 def test_fleet_fused_matches_torch(device, fleet, obs_level):
     """Unicycles and boxes: heading in the obs and critic, body-frame rays, box hits."""

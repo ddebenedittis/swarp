@@ -25,6 +25,7 @@ import numpy as np
 import torch
 import warp as wp
 
+from swarp._overloads import concrete
 from swarp.core.bodies import launch_body_friction, launch_obstacle_dynamics
 from swarp.core.collisions import launch_collision_forces
 from swarp.core.config import Obstacles, WorldConfig
@@ -43,7 +44,7 @@ from swarp.dynamics.base import (
     Integrator,
     build_agent_params,
 )
-from swarp.dynamics.kernels import launch_integrate
+from swarp.dynamics.kernels import delayed_actions_kernel, launch_integrate
 
 #: ``"auto"`` fuses the substep chain only up to this many agents per env per substep...
 FUSE_AGENTS_PER_SUBSTEP = 4
@@ -224,8 +225,34 @@ class Stepper:
         # field name -> (identity key, Warp view, the tensor it views). Zero-copy wraps of
         # the obstacle install's *source* tensors, kept across installs; see _src_handle.
         self._src_handles: dict[str, tuple[tuple, wp.array, torch.Tensor]] = {}
+        # Command latency, off until enable_command_delay: then cmd_delay [n_envs,
+        # n_agents] substeps of each step still apply prev_actions.
+        self.cmd_delay: wp.array | None = None
+        self.prev_actions: wp.array | None = None
+        self._delayed: list[wp.array] = []
 
     # ------------------------------------------------------------------ setup
+
+    def enable_command_delay(self, n_envs: int, act_dim: int, max_delay: int) -> None:
+        """Apply each agent's previous command for the first ``cmd_delay[e, a]`` substeps of
+        every step and the new one after, as a command latency of that many substeps would.
+
+        Allocates ``cmd_delay`` (int32 ``[n_envs, n_agents]``, zero: no latency) and
+        ``prev_actions`` (``[n_envs, n_agents, act_dim]``, the command the last step
+        applied; zero: at rest), which the caller writes in place (a scenario's reset
+        kernel draws the delays and zeroes the respawned agents' commands). ``max_delay``
+        bounds the delays and sizes the per-substep command scratch. The step then runs
+        the layered pipeline, with one extra launch per step; untaped steps only.
+        """
+        if not 0 < max_delay <= self.substeps:
+            raise ValueError(f"max_delay must lie in [1, substeps], got {max_delay}")
+        z = {"device": self.device, "dtype": self.dtype}
+        self.cmd_delay = wp.zeros((n_envs, self.n_agents), dtype=wp.int32, device=self.device)
+        self.prev_actions = wp.zeros((n_envs, self.n_agents, act_dim), **z)
+        scratch = wp.zeros((max_delay, n_envs, self.n_agents, act_dim), **z)
+        self._delayed_scratch = scratch
+        self._delayed = [scratch[k] for k in range(max_delay)]
+        self.mutation_version += 1
 
     def set_obstacles(self, obstacles: Obstacles) -> None:
         """Install (or refresh) the obstacle set described by ``obstacles``.
@@ -709,6 +736,7 @@ class Stepper:
             and not self.any_movable
             and self.params.floats_per_env is None
             and not self.world.wheel_contacts
+            and self.cmd_delay is None
             and state_in.pos.device.is_cuda
             and self.n_agents <= FUSED_MAX_AGENTS
             and (not self.collisions or self.grid(state_in.pos.shape[0]).method == "brute")
@@ -801,6 +829,22 @@ class Stepper:
             chain = [state_in] * (self.substeps + 1)
         else:
             chain = [state_in, *buffers.inter_states, state_out]
+        delayed = self._delayed if self.cmd_delay is not None else []
+        if delayed:
+            if buffers.taped:
+                raise ValueError("a command delay runs on untaped steps only")
+            if self.cmd_delay.shape[0] != n_envs:
+                raise ValueError(
+                    f"the command delay was enabled for {self.cmd_delay.shape[0]} envs, "
+                    f"stepping {n_envs}"
+                )
+            wp.launch(
+                concrete(delayed_actions_kernel, self.dtype),
+                dim=(n_envs, self.n_agents),
+                inputs=[actions, self.prev_actions, self.cmd_delay, self._delayed_scratch],
+                device=self.device,
+                record_tape=False,
+            )
         grid = self.grid(n_envs) if self.collisions else None
         can_reuse = (
             reuse_neighbors
@@ -895,7 +939,7 @@ class Stepper:
             launch_integrate(
                 st,
                 chain[k + 1],
-                actions,
+                delayed[k] if k < len(delayed) else actions,
                 forces,
                 self.params,
                 self.sub_dt,
@@ -909,5 +953,7 @@ class Stepper:
                 turn_cap=world.wheel_turn_torque,
                 drive_cap=world.wheel_drive_force,
             )
+        if delayed:
+            wp.copy(self.prev_actions, actions)
         # State has advanced; the grid's lists no longer match this generation.
         self.state_version += 1

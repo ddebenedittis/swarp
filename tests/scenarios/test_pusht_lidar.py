@@ -1,11 +1,20 @@
 """PushTLidarScenario's own contract: roles, trainer buffers, reward terms, layout."""
 
+import math
+
 import pytest
 import torch
+import warp as wp
 from conftest import DEVICES
 
 from swarp import Environment, PushTLidarScenario, PushTScenario
-from swarp.scenarios.pusht_lidar_kernels import OBJECTIVES, STATE_AGENT, STATE_HEAD
+from swarp._overloads import concrete
+from swarp.scenarios.pusht_lidar_kernels import (
+    OBJECTIVES,
+    STATE_AGENT,
+    STATE_HEAD,
+    lidar_sensor_kernel,
+)
 
 
 def _env(device, *, n_envs=32, fused=True, max_steps=None, auto_reset=False, **kw):
@@ -294,3 +303,75 @@ def test_lidar_blind_zone_hides_a_touching_face(device, fused):
         seen[sensor] = (newest[r].item(), newest[2 * r + r // 2].item())  # T ray 0, robot ray 16
     assert seen[False] == (1.0, 1.0)
     assert seen[True] == (0.0, 0.0)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize(("fov_deg", "kept"), [(240.0, 10), (270.0, 12), (360.0, 16)])
+def test_field_of_view_keeps_the_rays_within_half_of_it(device, fov_deg, kept):
+    """Body-frame ray ``r`` sits ``r 2 pi / 32`` off the heading, wrapped to (-pi, pi]; it
+    is kept iff that offset is within half the field of view (inclusive), whatever the
+    heading: 240 deg keeps rays -10..10, 270 deg -12..12 (the edge rays at +-135 deg
+    included), 360 deg all."""
+    nr, n_agents = 32, 3
+    theta = torch.tensor([[0.0, 1.234, -2.9]], dtype=torch.float32)
+    wp_th = wp.from_torch(theta.to(device))
+    ranges = wp.from_torch(torch.full((1, n_agents, nr), 0.5, device=device))
+    hit = wp.from_torch(torch.full((1, n_agents, nr), 3, dtype=torch.uint8, device=device))
+    half = wp.from_torch(torch.full((1, n_agents), math.radians(fov_deg) / 2, device=device))
+    sigma = wp.from_torch(torch.zeros(1, n_agents, device=device))
+    rng = wp.zeros((1, n_agents), dtype=wp.uint32, device=device)
+    wp.launch(
+        concrete(lidar_sensor_kernel, wp.float32),
+        dim=(1, n_agents),
+        inputs=[wp_th, 1.5, 2.0 * math.pi / nr, 0.0, 1, 0.1, 0.02, half, sigma, rng,
+                ranges, hit],
+        device=device,
+    )
+    k = torch.arange(nr)
+    offset = torch.where(k > nr // 2, k - nr, k)  # ray index off the heading, (-16, 16]
+    expect = (offset.abs() <= kept).expand(n_agents, -1)
+    assert torch.equal(wp.to_torch(hit).cpu()[0] == 3, expect)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("fused", [True, False])
+def test_pose_noise_is_observed_only(device, fused):
+    """With jitter off, a robot observes its true pose plus its episode bias, a teammate
+    at the teammate's own biased position, and its velocity turned by its heading bias;
+    the critic state and the reward see the true state."""
+    kw = {"n_agents": 2, "n_pushers": 2, "model": "diff_drive", "agent_shape": "box",
+          "agent_half_extents": (0.05, 0.03)}
+    noise = {"pose_noise": (1.0, 1.0), "pose_jitter_std": (0.0, 0.0), "vel_noise_std": 0.0,
+             "pose_bias_std": (0.05, 0.1)}
+    runs = {}
+    for on in (False, True):
+        env = _env(device, n_envs=16, fused=fused, **kw, **(noise if on else {}))
+        env.reset(seed=0)
+        gen = torch.Generator(device=device).manual_seed(1)
+        with torch.no_grad():
+            for _ in range(3):
+                obs, rew, *_ = env.step(_actions(env, gen))
+        scen = env.scenario
+        runs[on] = (obs.clone(), rew.clone(), scen.critic_state().clone(), scen)
+    (obs0, rew0, crit0, _), (obs1, rew1, crit1, scen) = runs[False], runs[True]
+    assert torch.equal(rew0, rew1)
+    assert torch.equal(crit0, crit1)
+    lay = scen.obs_layout()
+    s = scen.world.state
+    bias, bth = scen._bias_pos, scen._bias_theta
+    assert bias.abs().max() > 0.0
+    tol = {"atol": 1e-5, "rtol": 0}
+    torch.testing.assert_close(obs1[..., lay["pos"]], s.pos + bias, **tol)
+    torch.testing.assert_close(obs1[..., lay["goal_rel"]],
+                               scen.goal_pos.unsqueeze(1) - s.pos - bias, **tol)
+    th = s.theta + bth
+    torch.testing.assert_close(obs1[..., lay["heading"]],
+                               torch.stack([th.cos(), th.sin()], -1), **tol)
+    c, sn = bth.cos(), bth.sin()
+    v = s.vel
+    turned = torch.stack([c * v[..., 0] - sn * v[..., 1], sn * v[..., 0] + c * v[..., 1]], -1)
+    torch.testing.assert_close(obs1[..., lay["vel"]], turned, **tol)
+    mate = obs1[:, 0, lay["teammates"]][:, :2]
+    torch.testing.assert_close(mate, (s.pos[:, 1] + bias[:, 1]) - (s.pos[:, 0] + bias[:, 0]),
+                               **tol)
+    torch.testing.assert_close(obs1[..., lay["lidar"]], obs0[..., lay["lidar"]])
