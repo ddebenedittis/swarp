@@ -531,13 +531,16 @@ SPECS: dict[str, TrainSpec] = {
 # The Limo recipe with the gaps a Gazebo sysid (swarp_gz_test/out/sysid/report.md) found
 # between swarp and the velocity-servoed Limo, which Gazebo stands in for:
 #
-# - Drag 6/s instead of 40/s on the T. A velocity-mode pusher gives up
-#   T mass * drag * sub_dt / robot mass of its speed to the contact, 25% at 40: the T
+# - Robots of mass 6.7 instead of 1. A velocity-mode pusher gives up
+#   T mass * drag * sub_dt / robot mass of its speed to the contact, 25% at mass 1: the T
 #   moved at 0.75 of the command where Gazebo's moves at 1.00, and the robot slid 0.02 m/s
-#   sideways on an off-centre push. At 6 the T moves at 0.96 of the command with 0.003 m/s
-#   of slip and coasts 1-3 cm further than Gazebo's once the push stops (4: 0.98, 3-5 cm;
-#   8: 0.95, 0-1 cm). Linear and angular drag drop together, so the rotation per metre of
-#   an off-centre push stays where it was (-39 deg/m at a 0.2 m offset, under study).
+#   sideways on an off-centre push. At 6.7 the T moves at 0.95 of the command with
+#   0.003-0.005 m/s of slip and stops where Gazebo's does (0.020/0.078/0.044 m against
+#   0.020/0.080/0.045). The price is a contact that cannot give way deflecting the robot
+#   6.7x deeper: two robots driving head-on overlap 5 cm instead of 0.6. Lowering the T's
+#   drag to 6/s instead matched the push speed (0.96) but let the T coast and spin on, and
+#   it cost the most learning of any change here: 0.08 greedy at iteration 2000 with the
+#   drag alone, against 0.67 without it and 0.98 with the mass alone.
 # - A rate-limited drive (ControlMode.SERVO), drawn per env and robot on every reset.
 #   Gazebo's Limo accelerates at 1 m/s^2 and 3 rad/s^2 (0.4 s to 0.4 m/s, stopping in
 #   8 cm) and turns at 0.79 of the commanded rate (skid-steer). At those values swarp
@@ -552,7 +555,7 @@ SPECS["pusht_lidar_limo_dr"] = replace(
     SPECS["pusht_lidar_limo"],
     scen_kwargs={
         **SPECS["pusht_lidar_limo"].scen_kwargs,
-        "linear_damping": 6.0, "angular_damping": 6.0,
+        "agent_mass": 6.7,
         "servo_accel": (0.6, 2.0), "servo_ang_accel": (2.0, 6.0),
         "cmd_gain_v": (0.9, 1.05), "cmd_gain_w": (0.7, 1.0),
         "lidar_mount_offset": 0.103, "lidar_min_range": 0.10, "lidar_noise": 0.01,

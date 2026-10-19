@@ -157,7 +157,8 @@ Lowering the entropy coefficient to 1e-3, normalizing advantages, a per-step gam
 A deployment holds each command for 0.2 s and advances the frame stack once per policy step, so four frames span 0.8 s.
 
 `SPECS["pusht_lidar_limo_dr"]` adds what a sysid against Gazebo (standing in for the real Limo) found missing.
-The T's drag drops from 40/s to 6/s, linear and angular together, so a velocity-mode pusher keeps 96% of its commanded speed in contact (Gazebo's servoed robot keeps all of it, swarp's kept 75%).
+The robots weigh 6.7 instead of 1 (`agent_mass`), so a velocity-mode pusher keeps 95% of its commanded speed in contact (Gazebo's servoed robot keeps all of it, swarp's kept 75%) and the T stops where Gazebo's does.
+Lowering the T's drag to 6/s matched the push speed as well, but the T then coasted and spun on, and training reached 0.08 greedy at iteration 2000 against 0.98 with the heavier robots.
 The robots drive through `ControlMode.SERVO` with accelerations and command gains drawn per env and robot on every reset (`servo_accel` 0.6–2.0 m/s², `servo_ang_accel` 2–6 rad/s², `cmd_gain_v` 0.9–1.05, `cmd_gain_w` 0.7–1.0); Gazebo's Limo sits inside every range (1 m/s², 3 rad/s², 1.0, 0.79).
 The lidar takes a sensor model: rays are still cast from the robot's centre, but a hit within `lidar_min_range` (0.10 m) of a mount `lidar_mount_offset` (0.103 m) ahead of the centre reads as a miss, and the remaining hits carry Gaussian range noise of `lidar_noise` (0.01 m).
 `lidar_fov` below 2π would also blank the rays behind the robot; the recipe leaves it at 2π.
