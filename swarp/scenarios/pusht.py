@@ -113,6 +113,7 @@ class PushTScenario(FusedScenario):
         servo_ang_accel: float | tuple[float, float] | None = None,
         cmd_gain_v: float | tuple[float, float] | None = None,
         cmd_gain_w: float | tuple[float, float] | None = None,
+        agent_mass: float = 1.0,
     ) -> None:
         """``model="diff_drive"`` makes the robots unicycles commanded by ``(v, omega)``,
         with turn rates up to ``max_ang_vel``; ``agent_shape="box"`` makes them rectangles
@@ -129,7 +130,11 @@ class PushTScenario(FusedScenario):
         scaled by the gains and reached at most at the accelerations, instead of at once.
         Each is a value, or a ``(low, high)`` range drawn uniformly per env and robot on
         every reset. Setting any one of them turns the drive on; the others then default
-        to no limit and unit gain. All ``None`` keeps the instantaneous velocity command."""
+        to no limit and unit gain. All ``None`` keeps the instantaneous velocity command.
+
+        ``agent_mass`` is the robots' mass. A velocity-commanded robot has no inertia of
+        its own, so the mass only sets how far a contact deflects it: in a push it gives
+        up ``tee_mass * linear_damping * sub_dt / agent_mass`` of its speed to the T."""
         self.n_agents = n_agents
         self.model = _coerce(DynamicsModel, model, "model")
         if self.model not in self.supported_models:
@@ -144,6 +149,9 @@ class PushTScenario(FusedScenario):
         self.agent_shape = footprint.shape
         self.agent_half_extents = footprint.half_extents
         self.max_ang_vel = max_ang_vel
+        if agent_mass <= 0.0:
+            raise ValueError(f"agent_mass must be positive, got {agent_mass}")
+        self.agent_mass = agent_mass
         self._actuation = (servo_accel, servo_ang_accel, cmd_gain_v, cmd_gain_w)
         #: Whether the robots drive through ``ControlMode.SERVO``.
         self.servo = any(v is not None for v in self._actuation)
@@ -266,6 +274,7 @@ class PushTScenario(FusedScenario):
             AgentConfig(
                 model=self.model,
                 radius=None if self.agent_shape == AgentShape.BOX else self.agent_radius,
+                mass=self.agent_mass,
                 max_speed=self.max_speed,
                 max_ang_vel=self.max_ang_vel,
                 shape=self.agent_shape,
@@ -285,7 +294,7 @@ class PushTScenario(FusedScenario):
         # through the T; twice it bounds a deep sweep's impulse while leaving the holding
         # force intact (2x headroom, and legitimate pushing sits ~20x shallower).
         sub_dt = dt / max(1, substeps)
-        equilibrium_depth = self.max_speed / (self.contact_k * sub_dt)
+        equilibrium_depth = self.max_speed * self.agent_mass / (self.contact_k * sub_dt)
         self.max_overlap = 2.0 * equilibrium_depth
         # No neighbor_radius override: obstacles are scanned linearly by
         # _static_forces, not looked up in the neighbor grid, so the T's size does
