@@ -638,6 +638,26 @@ SPECS["pusht_lidar_limo_real"] = replace(
 )
 
 
+# pusht_lidar_limo_real with the localisation error sized from nav2 AMCL in Gazebo
+# (swarp_gz_test, tuned AMCL, L6 at a 240 deg field of view, 40 robot-episodes): position
+# error median 0.091 m, p95 0.58, max 2.8; heading p95 0.060 rad; per-episode bias 0.10 m
+# mean; decorrelation 3.6 s (position) and 1.6 s (heading); 89% of the excursions above
+# 0.3 m start within 5 s of a shove the odometry missed. At pose-noise scale 1 these knobs
+# give, under L6 in swarp: median 0.12, p95 0.55, max 3.0 m; heading p95 0.059 rad; bias
+# 0.13 m mean. The slip gain is 2 rather than 1 because AMCL amplifies a shove (median
+# 0.15 m, p95 1.5 m after one) more than the shove alone accounts for. The scale is drawn
+# up to 1.25 for margin, and down to 0 for mocap.
+SPECS["pusht_lidar_limo_amcl"] = replace(
+    SPECS["pusht_lidar_limo_real"],
+    scen_kwargs={
+        **SPECS["pusht_lidar_limo_real"].scen_kwargs,
+        "pose_noise": (0.0, 1.25), "pose_bias_std": (0.04, 0.015),
+        "pose_jitter_std": (0.01, 0.005), "pose_drift_tau": (3.6, 1.6),
+        "pose_drift_std": (0.05, 0.015), "pose_slip_gain": (2.0, 0.1),
+    },
+)
+
+
 def scenario_name(name: str) -> str:
     """The registered scenario behind ``name``: a ``SPECS`` key's ``scenario`` when it
     sets one, else ``name`` itself (a registry name, or a key that is one)."""

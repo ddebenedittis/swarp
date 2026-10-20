@@ -155,7 +155,7 @@ class PushTLidarScenario(PushTScenario):
         pose_bias_std: tuple[float, float] = (0.03, 0.03),
         pose_jitter_std: tuple[float, float] = (0.02, 0.02),
         vel_noise_std: float = 0.02,
-        pose_drift_tau: float = 0.0,
+        pose_drift_tau: float | tuple[float, float] = 0.0,
         pose_drift_std: tuple[float, float] = (0.0, 0.0),
         pose_slip_gain: tuple[float, float] = (1.0, 1.0),
         **kwargs: Any,
@@ -232,15 +232,21 @@ class PushTLidarScenario(PushTScenario):
         self.vel_noise_std = float(vel_noise_std)
         #: Whether the self and teammate blocks observe a noisy pose.
         self.pose_noise_on = pose[1] > 0.0
-        if pose_drift_tau < 0.0:
-            raise ValueError(f"pose_drift_tau must be >= 0, got {pose_drift_tau}")
+        tau = (
+            (float(pose_drift_tau),) * 2
+            if isinstance(pose_drift_tau, int | float)
+            else (float(pose_drift_tau[0]), float(pose_drift_tau[1]))
+        )
+        if min(tau) < 0.0 or (max(tau) > 0.0 and min(tau) == 0.0):
+            raise ValueError(f"pose_drift_tau must be 0 or positive, got {pose_drift_tau}")
         #: The localisation drift (see :func:`pose_obs_noise_kernel`): time constant in
-        #: seconds (0: off), stationary deviation (position, heading) at scale 1, and the
-        #: share of the wheel-odometry slip that enters it (position, heading).
-        self.pose_drift_tau = float(pose_drift_tau)
+        #: seconds (position, heading; 0: off), stationary deviation (position, heading)
+        #: at scale 1, and the share of the wheel-odometry slip that enters it (position,
+        #: heading).
+        self.pose_drift_tau = tau
         self.pose_drift_std = (float(pose_drift_std[0]), float(pose_drift_std[1]))
         self.pose_slip_gain = (float(pose_slip_gain[0]), float(pose_slip_gain[1]))
-        self.pose_drift_on = self.pose_noise_on and self.pose_drift_tau > 0.0
+        self.pose_drift_on = self.pose_noise_on and tau[0] > 0.0
         #: Whether a reset draws per-robot sensor or pose-noise values.
         self.sensor_dr = fov[0] < fov[1] or noise[0] < noise[1] or self.pose_noise_on
 
@@ -509,15 +515,17 @@ class PushTLidarScenario(PushTScenario):
             [thm.cos(), thm.sin()], dim=-1
         )
         slip_th = turn - 0.5 * (prev[..., 4] + s.ang_vel) * self.dt
-        a = math.exp(-self.dt / self.pose_drift_tau)
-        kick = math.sqrt(1.0 - a * a)
+        a, at = (math.exp(-self.dt / t) for t in self.pose_drift_tau)
+        kick, kick_t = math.sqrt(1.0 - a * a), math.sqrt(1.0 - at * at)
         g = u * self.pose_slip_gain[0]
         nd = torch.randn(*u.shape, 3, device=u.device, dtype=u.dtype)
         sp, st = self.pose_drift_std
         dp = a * prev[..., 5:7] - g.unsqueeze(-1) * slip + (u * sp * kick).unsqueeze(-1) * nd[
             ..., :2
         ]
-        dtd = a * prev[..., 7] - u * self.pose_slip_gain[1] * slip_th + u * st * kick * nd[..., 2]
+        dtd = at * prev[..., 7] - u * self.pose_slip_gain[1] * slip_th + u * st * kick_t * nd[
+            ..., 2
+        ]
         fresh = torch.ones_like(u, dtype=torch.bool) if reset else torch.zeros_like(
             u, dtype=torch.bool
         )
@@ -882,7 +890,8 @@ class PushTLidarScenario(PushTScenario):
                 scalar(self.vel_noise_std),
                 wp.int32(int(self.pose_drift_on)),
                 scalar(self.dt),
-                scalar(math.exp(-self.dt / self.pose_drift_tau) if self.pose_drift_on else 0.0),
+                *(scalar(math.exp(-self.dt / t) if self.pose_drift_on else 0.0)
+                  for t in self.pose_drift_tau),
                 scalar(self.pose_drift_std[0]),
                 scalar(self.pose_drift_std[1]),
                 scalar(self.pose_slip_gain[0]),

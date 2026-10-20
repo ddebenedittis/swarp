@@ -786,6 +786,7 @@ def pose_obs_noise_kernel(
     drift: wp.int32,
     dt: Any,
     drift_decay: Any,
+    drift_decay_theta: Any,
     drift_pos_std: Any,
     drift_theta_std: Any,
     slip_gain_pos: Any,
@@ -807,9 +808,9 @@ def pose_obs_noise_kernel(
     With ``drift`` on, a slowly decaying error adds to the bias: ``drift_state[e, a]``
     holds the robot's pose, speed and turn rate after the last pass (0-4) and the drift
     itself (5-7: x, y, heading). Each step the drift decays by ``drift_decay``
-    (``exp(-dt / tau)``), takes minus the scale times ``slip_gain_pos`` (``slip_gain_theta``
-    for the heading) times the step's slip (the
-    motion its wheel odometry missed: the true displacement and turn minus the speed and
+    (``exp(-dt / tau)``; ``drift_decay_theta`` for the heading), takes minus the scale
+    times ``slip_gain_pos`` (``slip_gain_theta`` for the heading) times the step's slip
+    (the motion its wheel odometry missed: the true displacement and turn minus the speed and
     turn rate averaged over the step, along the mid-step heading), and an
     Ornstein-Uhlenbeck kick whose stationary deviation is the scale times
     ``drift_pos_std`` per axis and ``drift_theta_std``. A respawn zeroes it."""
@@ -844,11 +845,12 @@ def pose_obs_noise_kernel(
             slip = (p - p0) - type(p)(ds * wp.cos(thm), ds * wp.sin(thm))
             slip_th = turn - half * (drift_state[e, a, 4] + w1) * dt
             kick = wp.sqrt(type(u)(1.0) - drift_decay * drift_decay)
+            kick_t = wp.sqrt(type(u)(1.0) - drift_decay_theta * drift_decay_theta)
             g = u * slip_gain_pos
             dp = drift_decay * type(p)(drift_state[e, a, 5], drift_state[e, a, 6]) - g * slip
             dp = dp + u * drift_pos_std * kick * type(p)(nx, ny)
-            dtd = drift_decay * drift_state[e, a, 7] - u * slip_gain_theta * slip_th
-            dtd = dtd + u * drift_theta_std * kick * nt
+            dtd = drift_decay_theta * drift_state[e, a, 7] - u * slip_gain_theta * slip_th
+            dtd = dtd + u * drift_theta_std * kick_t * nt
         drift_state[e, a, 0] = p[0]
         drift_state[e, a, 1] = p[1]
         drift_state[e, a, 2] = th
@@ -900,7 +902,7 @@ def _pose_noise_signature(dtype) -> list:
         a2s,  # bias_theta
         *([dtype] * 3),  # jitter_pos_std, jitter_theta_std, vel_std
         wp.int32,  # drift
-        *([dtype] * 6),  # dt, drift_decay, drift std (pos, theta), slip gain (pos, theta)
+        *([dtype] * 7),  # dt, drift decay, std and slip gain (pos, theta each)
         wp.array3d(dtype=dtype),  # drift_state
         wp.array2d(dtype=wp.uint32),  # rng_state
         a2v,  # obs_pos
