@@ -664,6 +664,23 @@ SPECS["pusht_lidar_limo_amcl"] = replace(
 )
 
 
+# pusht_lidar_limo_amcl on an open floor, as the real arena and Gazebo are: no walls, so
+# the T is no longer clamped inside the 4 x 4 m arena (L6 in swarp had its T at the clamp
+# before solving in 18% of episodes at 360 deg and 61% at 240 deg per ray, where Gazebo
+# lost the T out of the arena), and the robots meet the safety bridge's arena stop at
+# 2.25 m instead of a spring wall. A T centroid beyond 2.5 m on either axis fails the
+# episode: -0.05 per robot and step from then on (about the goal bonus over the ~90 steps
+# a failed episode has left at gamma 0.99), and no solve.
+SPECS["pusht_lidar_limo_open"] = replace(
+    SPECS["pusht_lidar_limo_amcl"],
+    scen_kwargs={
+        **SPECS["pusht_lidar_limo_amcl"].scen_kwargs,
+        "open_arena": True, "arena_stop_margin": 0.25, "oob_margin": 0.5,
+        "oob_penalty": 0.05,
+    },
+)
+
+
 def scenario_name(name: str) -> str:
     """The registered scenario behind ``name``: a ``SPECS`` key's ``scenario`` when it
     sets one, else ``name`` itself (a registry name, or a key that is one)."""

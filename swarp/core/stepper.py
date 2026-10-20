@@ -44,7 +44,7 @@ from swarp.dynamics.base import (
     Integrator,
     build_agent_params,
 )
-from swarp.dynamics.kernels import delayed_actions_kernel, launch_integrate
+from swarp.dynamics.kernels import launch_integrate, step_commands_kernel
 
 #: ``"auto"`` fuses the substep chain only up to this many agents per env per substep...
 FUSE_AGENTS_PER_SUBSTEP = 4
@@ -230,6 +230,9 @@ class Stepper:
         self.cmd_delay: wp.array | None = None
         self.prev_actions: wp.array | None = None
         self._delayed: list[wp.array] = []
+        # Arena stop, off until enable_arena_stop: the edge, and the filtered command.
+        self.arena_edge: float = 0.0
+        self._after: wp.array | None = None
 
     # ------------------------------------------------------------------ setup
 
@@ -252,6 +255,23 @@ class Stepper:
         scratch = wp.zeros((max_delay, n_envs, self.n_agents, act_dim), **z)
         self._delayed_scratch = scratch
         self._delayed = [scratch[k] for k in range(max_delay)]
+        self.mutation_version += 1
+
+    def enable_arena_stop(self, n_envs: int, act_dim: int, edge: float) -> None:
+        """Zero a diff-drive's speed command (slot 0) while its centre is beyond ``edge``
+        on an axis (``|x| > edge`` or ``|y| > edge``) and the command would drive it further
+        out along that axis; turning, and driving back in, pass. A real robot's safety
+        bridge does this on every command from the robot's latest pose; here it is judged
+        on the pose at the start of each step and holds for the step (also for the
+        delayed command, with :meth:`enable_command_delay`). Untaped steps only."""
+        if edge <= 0.0:
+            raise ValueError(f"edge must be positive, got {edge}")
+        z = {"device": self.device, "dtype": self.dtype}
+        self.arena_edge = float(edge)
+        self._after = wp.zeros((n_envs, self.n_agents, act_dim), **z)
+        # Stand-ins for the delay's buffers when only the arena stop is on (never written).
+        self._zero_delay = wp.zeros((n_envs, self.n_agents), dtype=wp.int32, device=self.device)
+        self._zero_scratch = wp.zeros((1, 1, 1, 1), **z)
         self.mutation_version += 1
 
     def set_obstacles(self, obstacles: Obstacles) -> None:
@@ -737,6 +757,7 @@ class Stepper:
             and self.params.floats_per_env is None
             and not self.world.wheel_contacts
             and self.cmd_delay is None
+            and self._after is None
             and state_in.pos.device.is_cuda
             and self.n_agents <= FUSED_MAX_AGENTS
             and (not self.collisions or self.grid(state_in.pos.shape[0]).method == "brute")
@@ -830,21 +851,33 @@ class Stepper:
         else:
             chain = [state_in, *buffers.inter_states, state_out]
         delayed = self._delayed if self.cmd_delay is not None else []
-        if delayed:
+        after = self._after
+        if delayed or after is not None:
             if buffers.taped:
-                raise ValueError("a command delay runs on untaped steps only")
-            if self.cmd_delay.shape[0] != n_envs:
+                raise ValueError("a command delay or arena stop runs on untaped steps only")
+            n_set = (self.cmd_delay if delayed else after).shape[0]
+            if n_set != n_envs:
                 raise ValueError(
-                    f"the command delay was enabled for {self.cmd_delay.shape[0]} envs, "
-                    f"stepping {n_envs}"
+                    f"the command filters were enabled for {n_set} envs, stepping {n_envs}"
                 )
             wp.launch(
-                concrete(delayed_actions_kernel, self.dtype),
+                concrete(step_commands_kernel, self.dtype),
                 dim=(n_envs, self.n_agents),
-                inputs=[actions, self.prev_actions, self.cmd_delay, self._delayed_scratch],
+                inputs=[
+                    actions,
+                    self.prev_actions if delayed else actions,
+                    self.cmd_delay if delayed else self._zero_delay,
+                    state_in.pos,
+                    state_in.theta,
+                    wp.int32(len(delayed)),
+                    self.dtype(self.arena_edge),
+                    self._delayed_scratch if delayed else self._zero_scratch,
+                    after if after is not None else actions,
+                ],
                 device=self.device,
                 record_tape=False,
             )
+        applied = after if after is not None else actions
         grid = self.grid(n_envs) if self.collisions else None
         can_reuse = (
             reuse_neighbors
@@ -939,7 +972,7 @@ class Stepper:
             launch_integrate(
                 st,
                 chain[k + 1],
-                delayed[k] if k < len(delayed) else actions,
+                delayed[k] if k < len(delayed) else applied,
                 forces,
                 self.params,
                 self.sub_dt,

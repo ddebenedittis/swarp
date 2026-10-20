@@ -437,3 +437,40 @@ def test_field_of_view_at_the_mount_hides_close_side_hits(device):
     assert not seen[0, 10] and not seen[0, 22]
     assert seen[1, 10] and seen[1, 22]
     assert seen[0, 8] and seen[0, 0]  # 90 deg: 117 deg from the mount
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("fused", [True, False])
+def test_out_of_bounds_fails_the_episode_until_respawn(device, fused):
+    """In an open arena a T whose centroid passes ``world_size + oob_margin`` fails its
+    episode: from that step on every robot earns ``-oob_penalty`` and the goal no longer
+    counts, even with the T brought back onto it; a respawn clears it."""
+    env = _env(device, n_envs=2, fused=fused, n_agents=2, n_pushers=2, model="diff_drive",
+               agent_shape="box", agent_half_extents=(0.05, 0.03), open_arena=True,
+               oob_margin=0.5, oob_penalty=0.3)
+    env.reset(seed=0)
+    scen = env.scenario
+    zero = torch.zeros(2, 2, 2, device=device)
+
+    def place(x):
+        with torch.no_grad():
+            scen.tee_pos[0] = torch.tensor([x, 0.0], device=device)
+            scen.tee_pos[1] = scen.goal_pos[1]
+            scen.tee_theta[1] = scen.goal_theta[1]
+            scen.tee_vel.zero_()
+            scen.tee_ang_vel.zero_()
+            scen._install_obstacles()
+
+    place(scen.world_size + 0.6)
+    _, rew, term, *_ = env.step(zero)
+    assert torch.equal(rew[0], torch.full((2,), -0.3, device=device))
+    assert not term[0] and term[1]
+    with torch.no_grad():  # back onto its goal: still failed
+        scen.tee_pos[0] = scen.goal_pos[0]
+        scen.tee_theta[0] = scen.goal_theta[0]
+        scen._install_obstacles()
+    _, rew, term, *_ = env.step(zero)
+    assert torch.equal(rew[0], torch.full((2,), -0.3, device=device)) and not term[0]
+    env.reset(seed=1)
+    _, rew, term, *_ = env.step(zero)
+    assert (rew[0] != -0.3).any()

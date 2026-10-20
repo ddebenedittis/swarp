@@ -1688,33 +1688,73 @@ def _signature(dtype, per_env: bool = False) -> list:
     ]
 
 
+@wp.func
+def _drives_outward(p: Any, th: Any, v: Any, edge: Any):
+    """Whether a diff-drive centre at ``p`` beyond ``edge`` on an axis would drive further
+    out along it at speed ``v`` and heading ``th`` (the arena stop's test)."""
+    vx = v * wp.cos(th)
+    vy = v * wp.sin(th)
+    out = False
+    if wp.abs(p[0]) > edge and vx * p[0] > type(v)(0.0):
+        out = True
+    if wp.abs(p[1]) > edge and vy * p[1] > type(v)(0.0):
+        out = True
+    return out
+
+
 @wp.kernel
-def delayed_actions_kernel(
+def step_commands_kernel(
     actions: wp.array3d(dtype=Any),
     prev_actions: wp.array3d(dtype=Any),
     delay: wp.array2d(dtype=wp.int32),
-    out: wp.array4d(dtype=Any),
+    pos: wp.array2d(dtype=Any),
+    theta: wp.array2d(dtype=Any),
+    n_delay: wp.int32,
+    arena_edge: Any,
+    delayed: wp.array4d(dtype=Any),
+    after: wp.array3d(dtype=Any),
 ):
-    """Thread per (env, agent): the command each of the first ``out.shape[0]`` substeps
-    applies under a command latency, ``out[k] = prev_actions`` while ``k < delay`` and
-    ``actions`` from then on (see :meth:`Stepper.enable_command_delay
-    <swarp.core.stepper.Stepper.enable_command_delay>`)."""
+    """Thread per (env, agent): the commands a step applies (see
+    :meth:`Stepper.enable_command_delay <swarp.core.stepper.Stepper.enable_command_delay>`
+    and :meth:`~swarp.core.stepper.Stepper.enable_arena_stop`). ``delayed[k]``, for the
+    first ``n_delay`` substeps, is ``prev_actions`` while ``k < delay`` and ``actions``
+    from then on; ``after`` is ``actions``, for the substeps past ``n_delay``. With
+    ``arena_edge > 0`` a command whose speed (slot 0) drives a robot that is beyond the
+    edge further out has its speed zeroed, judged on the step's starting pose."""
     e, a = wp.tid()
     d = delay[e, a]
-    for k in range(out.shape[0]):
+    stop_new = False
+    stop_prev = False
+    if arena_edge > type(arena_edge)(0.0):
+        p = pos[e, a]
+        th = theta[e, a]
+        stop_new = _drives_outward(p, th, actions[e, a, 0], arena_edge)
+        stop_prev = _drives_outward(p, th, prev_actions[e, a, 0], arena_edge)
+        for i in range(actions.shape[2]):
+            v = actions[e, a, i]
+            if i == 0 and stop_new:
+                v = type(v)(0.0)
+            after[e, a, i] = v
+    for k in range(n_delay):
         for i in range(actions.shape[2]):
             if k < d:
-                out[k, e, a, i] = prev_actions[e, a, i]
+                v = prev_actions[e, a, i]
+                if i == 0 and stop_prev:
+                    v = type(v)(0.0)
             else:
-                out[k, e, a, i] = actions[e, a, i]
+                v = actions[e, a, i]
+                if i == 0 and stop_new:
+                    v = type(v)(0.0)
+            delayed[k, e, a, i] = v
 
 
 for _T in (wp.float32, wp.float64):
     register(
-        delayed_actions_kernel,
+        step_commands_kernel,
         _T,
         [wp.array3d(dtype=_T), wp.array3d(dtype=_T), wp.array2d(dtype=wp.int32),
-         wp.array4d(dtype=_T)],
+         wp.array2d(dtype=VEC2[_T]), wp.array2d(dtype=_T), wp.int32, _T,
+         wp.array4d(dtype=_T), wp.array3d(dtype=_T)],
     )
     register(integrate_kernel, _T, _signature(_T))
     register(integrate_kernel_per_env, _T, _signature(_T, per_env=True))

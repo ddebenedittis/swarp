@@ -159,6 +159,8 @@ class PushTLidarScenario(PushTScenario):
         pose_drift_tau: float | tuple[float, float] = 0.0,
         pose_drift_std: tuple[float, float] = (0.0, 0.0),
         pose_slip_gain: tuple[float, float] = (1.0, 1.0),
+        oob_margin: float | None = None,
+        oob_penalty: float = 0.05,
         **kwargs: Any,
     ) -> None:
         super().__init__(n_agents=n_agents, shape=shape, **kwargs)
@@ -251,6 +253,11 @@ class PushTLidarScenario(PushTScenario):
         self.pose_drift_std = (float(pose_drift_std[0]), float(pose_drift_std[1]))
         self.pose_slip_gain = (float(pose_slip_gain[0]), float(pose_slip_gain[1]))
         self.pose_drift_on = self.pose_noise_on and tau[0] > 0.0
+        #: Out of bounds: once the T's centroid is more than ``world_size + oob_margin``
+        #: from the centre on either axis, the episode has failed (see
+        #: :func:`pusht_lidar_reward_kernel`); ``None`` never fails it.
+        self.oob_limit = 0.0 if oob_margin is None else self.world_size + float(oob_margin)
+        self.oob_penalty = float(oob_penalty)
         #: Whether a reset draws per-robot sensor or pose-noise values.
         self.sensor_dr = fov[0] < fov[1] or noise[0] < noise[1] or self.pose_noise_on
 
@@ -375,6 +382,10 @@ class PushTLidarScenario(PushTScenario):
         shape = (n_envs, na, 8) if self.pose_drift_on else (1, 1, 8)
         self._drift_state = torch.zeros(*shape, **tt)
         self._drift_wp = wp.from_torch(self._drift_state)
+        # The out-of-bounds latch (a fused carry when the check is on).
+        self._oob = torch.zeros(n_envs if self.oob_limit > 0.0 else 1, dtype=torch.uint8,
+                                device=device)
+        self._oob_wp = wp.from_torch(self._oob)
         self._lidar_obs_launch = CachedLaunch()
         self._lidar_reward_launch = CachedLaunch()
         self._lcache: dict[str, torch.Tensor] | None = None
@@ -692,7 +703,19 @@ class PushTLidarScenario(PushTScenario):
 
         # --- rewards
         c = self._cache  # Push-T's refresh, just run by super()
-        team = (c["shaping"] + self.goal_reward * c["on_goal"].to(dt)).unsqueeze(1).expand(-1, na)
+        on_goal = c["on_goal"]
+        failed = torch.zeros_like(on_goal)
+        if self.oob_limit > 0.0:
+            out = (q.detach().abs() > self.oob_limit).any(-1)
+            if reset:
+                fresh = torch.ones_like(out) if env_mask is None else env_mask
+                failed = torch.where(fresh, torch.zeros_like(out), self._oob.bool())
+            else:
+                failed = self._oob.bool() | out
+            self._oob = failed.to(torch.uint8)
+            on_goal = on_goal & ~failed
+        team = (c["shaping"] + self.goal_reward * on_goal.to(dt)).unsqueeze(1).expand(-1, na)
+        team = torch.where(failed.unsqueeze(1), torch.full_like(team, -self.oob_penalty), team)
         zero = torch.zeros_like(team)
         approach = torch.where(is_obs, zero, c["agent_shaping"])
         serr = (dist - self.standoff_dist).abs()
@@ -718,6 +741,11 @@ class PushTLidarScenario(PushTScenario):
         )
         occ_t = torch.where(is_obs, -self.occlusion_weight * occl, zero)
         con_t = torch.where(is_obs & near, torch.full_like(zero, -self.contact_penalty), zero)
+        if self.oob_limit > 0.0:
+            f = failed.unsqueeze(1)
+            approach, standoff, vis_t, cov_t, occ_t, con_t = (
+                torch.where(f, zero, t) for t in (approach, standoff, vis_t, cov_t, occ_t, con_t)
+            )
         terms = (team, approach, standoff, vis_t, cov_t, occ_t, con_t)
         reward = team + approach + standoff + vis_t + cov_t + occ_t + con_t
         n_obs = is_obs.sum(-1).clamp(min=1).to(dt)
@@ -757,6 +785,8 @@ class PushTLidarScenario(PushTScenario):
         )
 
         self._lcache = {
+            "done": on_goal,
+            "out_of_bounds": failed,
             "obs": obs,
             "reward": reward,
             "multiobj": torch.stack(terms, dim=-1),
@@ -824,6 +854,12 @@ class PushTLidarScenario(PushTScenario):
             Buf("visibility", (ne,)),
             Buf("occlusion", (ne,)),
             Buf("tee_seen", (ne, na), "uint8", bool_view=True),
+            *(
+                (Buf("oob", (ne,), "uint8", attr="_oob", alloc="never", carry=True,
+                     watch=True),)
+                if self.oob_limit > 0.0
+                else ()
+            ),
             *(
                 (Buf("drift_state", (ne, na, 8), attr="_drift_state", alloc="never",
                      carry=True, watch=True),)
@@ -1029,7 +1065,10 @@ class PushTLidarScenario(PushTScenario):
             self.coverage_weight,
             self.occlusion_weight,
             self.contact_penalty,
+            self.oob_limit,
+            self.oob_penalty,
         )
+        oob = self._wp["oob"] if self.oob_limit > 0.0 else self._oob_wp
         launch = self._lidar_reward_launch.get(
             concrete(pusht_lidar_reward_kernel, scalar),
             dim=w.n_envs,
@@ -1043,6 +1082,7 @@ class PushTLidarScenario(PushTScenario):
                 *(scalar(x) for x in weights),
                 wp.int32(advance_prev),
                 wp.int32(full_pass),
+                oob,
             ],
             outputs=outs,
             device=w.device,
@@ -1055,6 +1095,7 @@ class PushTLidarScenario(PushTScenario):
                 ptr_key(self._roles_wp),
                 *(ptr_key(x) for x in stats),
                 *weights,
+                ptr_key(oob),
                 *(ptr_key(o) for o in outs),
             ),
         )
@@ -1073,6 +1114,12 @@ class PushTLidarScenario(PushTScenario):
         if self.fused_active:
             return self.fb["reward"]
         return self._lcache["reward"]
+
+    def done(self) -> torch.Tensor:
+        """The goal pose reached, in an episode not failed out of bounds."""
+        if self.fused_active:
+            return self.fb["done_bool"]
+        return self._lcache["done"]
 
     def critic_state(self) -> torch.Tensor:
         """``[E, state_dim]``: the T's pose, goal offset, heading terms, velocity and
@@ -1130,6 +1177,8 @@ class PushTLidarScenario(PushTScenario):
                 occlusion=self.fb["occlusion"],
                 tee_seen=self.fb["tee_seen_bool"],
             )
+            if self.oob_limit > 0.0:
+                out["out_of_bounds"] = self._oob.bool()
             return out
         c = self._lcache
         out.update(
@@ -1139,6 +1188,8 @@ class PushTLidarScenario(PushTScenario):
             occlusion=c["occlusion"],
             tee_seen=c["tee_seen"],
         )
+        if self.oob_limit > 0.0:
+            out["out_of_bounds"] = c["out_of_bounds"]
         return out
 
 

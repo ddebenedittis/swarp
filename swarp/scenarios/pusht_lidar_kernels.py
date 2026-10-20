@@ -392,8 +392,11 @@ def pusht_lidar_reward_kernel(
     coverage_weight: Any,
     occlusion_weight: Any,
     contact_penalty: Any,
+    oob_limit: Any,
+    oob_penalty: Any,
     advance_prev: wp.int32,
     full_pass: wp.int32,
+    oob: wp.array(dtype=wp.uint8),
     prev_dist: wp.array(dtype=Any),
     prev_ang: wp.array(dtype=Any),
     prev_adist: wp.array2d(dtype=Any),
@@ -414,6 +417,11 @@ def pusht_lidar_reward_kernel(
     a reset exactly as in ``pusht_reward_kernel``; the outputs are written on a full pass
     only, so an obs-only auto-reset leaves the transition's reward and info intact.
     ``reward`` is written as one addition of the seven ``multiobj`` columns.
+
+    With ``oob_limit > 0``, a step that leaves the T's centroid beyond it on either axis
+    latches ``oob`` until the env respawns: the episode has failed, so it can no longer
+    be solved, and every robot's reward is ``-oob_penalty`` (in the team column) on every
+    step from then on.
     """
     e = wp.tid()
     zero = type(pos_shaping_factor)(0.0)
@@ -446,13 +454,24 @@ def pusht_lidar_reward_kernel(
             prev_dist[e] = d
             prev_ang[e] = ang
         shaping = ps
+    # ``oob`` is a one-element stand-in, never touched, without the check.
+    failed = wp.uint8(0)
+    if oob_limit > zero:
+        failed = oob[e]
+        if reset_hit == 1:
+            failed = wp.uint8(0)
+        elif advance_prev == 1 and (wp.abs(tp[0]) > oob_limit or wp.abs(tp[1]) > oob_limit):
+            failed = wp.uint8(1)
+        oob[e] = failed
     on_goal = wp.uint8(0)
-    if d < goal_tolerance and ang < angle_tolerance:
+    if d < goal_tolerance and ang < angle_tolerance and failed == wp.uint8(0):
         on_goal = wp.uint8(1)
     bonus = zero
     if on_goal == wp.uint8(1):
         bonus = goal_reward
     team = shaping + bonus
+    if failed == wp.uint8(1):
+        team = -oob_penalty
 
     inv_d = one / wp.max(d, type(zero)(1.0e-6))
     bx = tp[0] - gx * inv_d * push_point_offset
@@ -498,7 +517,8 @@ def pusht_lidar_reward_kernel(
         occ_t = zero
         con_t = zero
         if roles[e, a] == 0:
-            approach = ash
+            if failed == wp.uint8(0):
+                approach = ash
         else:
             vis = wp.min(n_obj[e, a] / visibility_rays, one)
             standoff = ssh
@@ -507,6 +527,12 @@ def pusht_lidar_reward_kernel(
             occ_t = -occlusion_weight * occl[e, a]
             if near[e, a] == wp.uint8(1):
                 con_t = -contact_penalty
+            if failed == wp.uint8(1):
+                standoff = zero
+                vis_t = zero
+                cov_t = zero
+                occ_t = zero
+                con_t = zero
             vis_sum += vis
             occ_sum += occl[e, a]
             n_obs += wp.int32(1)
@@ -631,8 +657,11 @@ def _reward_signature(dtype) -> list:
         wp.array2d(dtype=wp.uint8),  # near
         wp.int32,  # n_agents
         *([dtype] * 16),  # the pusht weights, then the observer weights
+        dtype,  # oob_limit
+        dtype,  # oob_penalty
         wp.int32,  # advance_prev
         wp.int32,  # full_pass
+        wp.array(dtype=wp.uint8),  # oob
         a1s,  # prev_dist
         a1s,  # prev_ang
         a2s,  # prev_adist

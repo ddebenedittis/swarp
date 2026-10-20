@@ -122,6 +122,8 @@ class PushTScenario(FusedScenario):
         wheel_turn_torque: float = 0.0,
         wheel_drive_force: float = math.inf,
         cmd_latency: float | tuple[float, float] = 0.0,
+        open_arena: bool = False,
+        arena_stop_margin: float = 0.25,
     ) -> None:
         """``model="diff_drive"`` makes the robots unicycles commanded by ``(v, omega)``,
         with turn rates up to ``max_ang_vel``; ``agent_shape="box"`` makes them rectangles
@@ -159,7 +161,13 @@ class PushTScenario(FusedScenario):
         to whole substeps, a robot still applies the previous step's command
         (:meth:`Stepper.enable_command_delay
         <swarp.core.stepper.Stepper.enable_command_delay>`); a respawned robot's previous
-        command is zero. A latency past ``dt`` is held at ``dt``."""
+        command is zero. A latency past ``dt`` is held at ``dt``.
+
+        ``open_arena`` removes the arena's walls, as on a real floor: the T is no longer
+        clamped inside ``world_size`` and the robots meet no wall. A ``diff_drive`` robot
+        instead gets a safety bridge's arena stop (:meth:`Stepper.enable_arena_stop
+        <swarp.core.stepper.Stepper.enable_arena_stop>`) at ``world_size +
+        arena_stop_margin``."""
         self.n_agents = n_agents
         self.model = _coerce(DynamicsModel, model, "model")
         if self.model not in self.supported_models:
@@ -188,6 +196,10 @@ class PushTScenario(FusedScenario):
             raise ValueError(f"cmd_latency must be >= 0 with low <= high, got {cmd_latency!r}")
         #: ``(low, high)`` command latency in seconds; turned into substeps in make_world.
         self.cmd_latency = (float(lat[0]), float(lat[1]))
+        if open_arena and self.model != DynamicsModel.DIFF_DRIVE:
+            raise ValueError("open_arena needs model='diff_drive' (its arena stop)")
+        self.open_arena = bool(open_arena)
+        self.arena_stop_margin = float(arena_stop_margin)
         self.floor_friction = (
             None if floor_friction is None else _as_range(floor_friction, 0.0, "floor_friction")
         )
@@ -347,7 +359,9 @@ class PushTScenario(FusedScenario):
             collision_k=self.contact_k,
             collision_c=self.contact_c,
             collision_margin=margin,
-            bounds=(-self.world_size, self.world_size, -self.world_size, self.world_size),
+            bounds=None
+            if self.open_arena
+            else (-self.world_size, self.world_size, -self.world_size, self.world_size),
             bounds_mode="soft",
             max_neighbors=min(32, max(4, self.n_agents)),
             # The T is a movable obstacle now, so its drag is engine config.
@@ -448,6 +462,10 @@ class PushTScenario(FusedScenario):
             if hi > 0:
                 self.cmd_delay_substeps = (lo, hi)
                 self.world.stepper.enable_command_delay(n_envs, self.world.act_dim, hi)
+        if self.open_arena:
+            self.world.stepper.enable_arena_stop(
+                n_envs, self.world.act_dim, self.world_size + self.arena_stop_margin
+            )
         if self.friction_dr:
             # A per-env mu * g, allocated here (outside any capture) and redrawn in place.
             g = self.world.config.gravity
@@ -1064,7 +1082,7 @@ class PushTScenario(FusedScenario):
             # force is recomputed from the frozen agent state each sub-step, which is what
             # keeps a stiff contact_k stable. Gradients flow through every sub-step.
             sub_dt = self.dt / self.body_substeps
-            b = self.world_size - self.tee_radius
+            b = math.inf if self.open_arena else self.world_size - self.tee_radius
             for _ in range(self.body_substeps):
                 force, torque = self._box_contact(pos, vel)  # [E,A,B,2], [E,A,B]
                 f_total = force.sum(dim=(1, 2))  # [E, 2] net force on the T
