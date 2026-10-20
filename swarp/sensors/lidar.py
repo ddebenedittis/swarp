@@ -30,6 +30,11 @@ Rays start at ``angle_start``. Over the full circle they are ``2*pi / n_rays`` a
 ``angle_end`` spanning less than ``2*pi`` the first ray is at ``angle_start``, the last at
 ``angle_end``, and they are ``fov / (n_rays - 1)`` apart. With ``body_frame=True`` they
 rotate with each agent's heading.
+
+A real lidar spins: its rays are taken one after the other over a scan period while the
+robot moves, and all are reported against the one pose of the scan's stamp. ``sweep``
+models that (and a mount yaw error) by casting each ray from the pose at its own time,
+extrapolated at constant velocity; see :func:`sweep_offsets`.
 """
 
 from __future__ import annotations
@@ -107,6 +112,31 @@ def _ray_capsule(rel, d, ca, sa, half_len, rad, miss: float):
     return torch.where(outside, t, miss)
 
 
+def sweep_offsets(
+    offsets: torch.Tensor,  # [n_rays]
+    vel: torch.Tensor,  # [n_envs, n_agents, 2]
+    ang_vel: torch.Tensor,  # [n_envs, n_agents]
+    yaw_bias: torch.Tensor,  # [n_envs, n_agents]
+    stamp_phase: torch.Tensor,  # [n_envs, n_agents]
+    scan_period: float,
+    sweep_dir: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The rotating scan's per-ray origin and angle shifts, ``([E, A, R, 2], [E, A, R])``.
+
+    The sensor sweeps in ``sweep_dir`` (+1 counter-clockwise, -1 clockwise) once per
+    ``scan_period``, starting and ending at the rear (``pi`` off the frame's axis), so ray
+    ``r`` at offset ``o_r`` is taken at phase ``phi_r = frac(sweep_dir (o_r - pi) / 2 pi)``
+    of the sweep. The scan is reported at ``stamp_phase`` of the sweep (1: its end, 0: its
+    start), so ray ``r`` was taken ``tau_r = (stamp_phase - phi_r) scan_period`` before the
+    reported pose. Cast from the pose then, at constant velocity: its origin is shifted by
+    ``-tau_r vel`` and its angle by ``yaw_bias - tau_r ang_vel``, the mount's yaw error
+    included. Other bodies are taken where they are now."""
+    x = sweep_dir * (offsets - torch.pi) / (2.0 * torch.pi)
+    tau = (stamp_phase.unsqueeze(-1) - (x - torch.floor(x))) * scan_period  # [E, A, R]
+    shift = -tau.unsqueeze(-1) * vel.unsqueeze(2)
+    return shift, yaw_bias.unsqueeze(-1) - tau * ang_vel.unsqueeze(-1)
+
+
 def lidar_scan(
     pos: torch.Tensor,  # [n_envs, n_agents, 2]
     theta: torch.Tensor,  # [n_envs, n_agents]
@@ -127,6 +157,7 @@ def lidar_scan(
     obstacle_half: torch.Tensor | None = None,  # [n_obstacles, 2]
     obstacle_kind: torch.Tensor | None = None,  # [n_obstacles] ObstacleKind
     return_hits: bool = False,
+    sweep: tuple | None = None,
 ):
     """Ranges ``[n_envs, n_agents, n_rays]`` in ``[0, max_range]``; see the module docstring.
 
@@ -138,6 +169,9 @@ def lidar_scan(
 
     With ``return_hits=True`` returns ``(ranges, hit_class, hit_index)``: ``uint8`` and
     ``int32`` tensors of the same shape. No host synchronization either way.
+
+    ``sweep = (vel, ang_vel, yaw_bias, stamp_phase, scan_period, sweep_dir)`` casts every
+    ray from the pose at the time the rotating sensor took it (:func:`sweep_offsets`).
     """
     n_envs, n_agents = pos.shape[0], pos.shape[1]
     device, dtype = pos.device, pos.dtype
@@ -147,8 +181,12 @@ def lidar_scan(
         n_rays, angle_start, angle_end
     )
     ray_ang = base.unsqueeze(-1) + offsets  # [E, A, R]
-    dirs = torch.stack([torch.cos(ray_ang), torch.sin(ray_ang)], dim=-1).unsqueeze(3)
     origin = pos[:, :, None, None, :]  # [E, A, 1, 1, 2]
+    if sweep is not None:
+        shift, dang = sweep_offsets(offsets, *sweep)
+        ray_ang = ray_ang + dang
+        origin = (pos.unsqueeze(2) + shift).unsqueeze(3)  # [E, A, R, 1, 2]
+    dirs = torch.stack([torch.cos(ray_ang), torch.sin(ray_ang)], dim=-1).unsqueeze(3)
     miss = float(max_range)
 
     rng = pos.new_full((n_envs, n_agents, n_rays), max_range)
@@ -245,7 +283,11 @@ class Lidar:
         obs = torch.cat([base_obs, lidar.scan(self.world)], dim=-1)
 
     With ``return_hits=True`` a scan returns ``(ranges, hit_class, hit_index)`` instead
-    (see :func:`lidar_scan`). ``angle_end`` narrows the field of view.
+    (see :func:`lidar_scan`). ``angle_end`` narrows the field of view. ``scan_period > 0``
+    turns on the rotating-scan sweep (:func:`sweep_offsets`, in ``sweep_dir``): each
+    agent's mount yaw error and stamp phase are then the ``[n_envs, n_agents]`` buffers
+    :attr:`yaw_bias` and :attr:`stamp_phase` (zero until written), allocated by
+    :meth:`bind`, and the velocities are read from the world state.
 
     Two interchangeable backends, selected by ``backend``:
 
@@ -277,9 +319,13 @@ class Lidar:
         include_obstacles: bool = True,
         return_hits: bool = False,
         backend: str = "torch",
+        scan_period: float = 0.0,
+        sweep_dir: float = 1.0,
     ) -> None:
         if n_rays < 1:
             raise ValueError("n_rays must be >= 1")
+        if scan_period < 0.0 or sweep_dir not in (1.0, -1.0):
+            raise ValueError("scan_period must be >= 0 and sweep_dir +1 or -1")
         if max_range <= 0.0:
             raise ValueError("max_range must be positive")
         if backend not in ("torch", "warp"):
@@ -295,6 +341,14 @@ class Lidar:
         self.include_obstacles = include_obstacles
         self.return_hits = return_hits
         self.backend = backend
+        self.scan_period = float(scan_period)
+        self.sweep_dir = float(sweep_dir)
+        #: Whether the rays are cast from the pose at their own sweep time.
+        self.sweep = self.scan_period > 0.0
+        self.yaw_bias: torch.Tensor | None = None
+        self.stamp_phase: torch.Tensor | None = None
+        self.wp_yaw_bias = None
+        self.wp_stamp_phase = None
         # Warp-side binding, see bind(). ``version`` is bumped whenever the output buffers
         # are reallocated, so a scenario can fold it into its recapture token.
         self._bound_key: tuple | None = None
@@ -350,6 +404,12 @@ class Lidar:
             )
         if sp.has_box_agents:
             kw.update(agent_shape=world.agent_shape, agent_half=world.agent_half_extents)
+        if self.sweep:
+            st = world.state
+            zero = torch.zeros_like(st.theta)
+            yaw = zero if self.yaw_bias is None else self.yaw_bias
+            phase = zero if self.stamp_phase is None else self.stamp_phase
+            kw["sweep"] = (st.vel, st.ang_vel, yaw, phase, self.scan_period, self.sweep_dir)
         return lidar_scan(
             world.state.pos,
             world.state.theta,
@@ -387,6 +447,11 @@ class Lidar:
         self.wp_ranges = wp.zeros(shape, dtype=world.wp_dtype, device=dev)
         self.wp_hit_class = wp.zeros(hit_shape, dtype=wp.uint8, device=dev)
         self.wp_hit_index = wp.zeros(hit_shape, dtype=wp.int32, device=dev)
+        if self.sweep:
+            self.wp_yaw_bias = wp.zeros(shape[:2], dtype=world.wp_dtype, device=dev)
+            self.wp_stamp_phase = wp.zeros(shape[:2], dtype=world.wp_dtype, device=dev)
+            self.yaw_bias = wp.to_torch(self.wp_yaw_bias, requires_grad=False)
+            self.stamp_phase = wp.to_torch(self.wp_stamp_phase, requires_grad=False)
         self.ranges = wp.to_torch(self.wp_ranges, requires_grad=False)
         if self.return_hits:
             self.hit_class = wp.to_torch(self.wp_hit_class, requires_grad=False)
@@ -399,6 +464,7 @@ class Lidar:
             self._box_agents,
             self.return_hits,
             self.return_hits,
+            self.sweep,
             device=dev,
         )
         self._bound_key = key
@@ -407,9 +473,10 @@ class Lidar:
     def launch(self, world, state=None) -> None:
         """Scan into the bound buffers: one ``wp.launch``, legal inside a graph capture.
 
-        Reads the agent pose from ``state`` (anything with Warp ``pos``/``theta`` arrays)
-        or, by default, :meth:`~swarp.core.world.World.state_wp`, which in persistent mode
-        returns the runtime's own pointer-stable arrays. Obstacles are read from the
+        Reads the agent pose from ``state`` (anything with Warp ``pos``/``theta`` arrays,
+        and ``vel``/``ang_vel`` with the sweep on) or, by default,
+        :meth:`~swarp.core.world.World.state_wp`, which in persistent mode returns the
+        runtime's own pointer-stable arrays. Obstacles are read from the
         stepper's live ``obs_*`` arrays at call time, and the agent footprint from its
         shared parameter matrix (a per-env parameter override is not seen). Nothing is
         allocated, wrapped or read back, and no stream is opened: inside a fused
@@ -448,9 +515,15 @@ class Lidar:
             index_out=self.wp_hit_index,
             emit_class=self.return_hits,
             emit_index=self.return_hits,
+            sweep=(
+                (st.vel, st.ang_vel, self.wp_yaw_bias, self.wp_stamp_phase, self.scan_period,
+                 self.sweep_dir)
+                if self.sweep
+                else None
+            ),
         )
 
     __call__ = scan
 
 
-__all__ = ["Lidar", "lidar_scan", "lidar_scan_warp"]
+__all__ = ["Lidar", "lidar_scan", "lidar_scan_warp", "sweep_offsets"]

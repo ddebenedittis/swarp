@@ -19,8 +19,9 @@ A ray whose origin lies inside a shape misses that shape. Targets are visited ag
 when strictly nearer, so ties resolve to the first in that order.
 
 Kernels are compiled per configuration (:func:`lidar_kernel`): agents on/off, obstacles
-on/off, box agents on/off and which hit outputs are written are ``wp.static`` flags, so a
-disc-only, range-only scan runs exactly the arithmetic it always did. Inference-only
+on/off, box agents on/off, which hit outputs are written and the rotating-scan sweep
+(:func:`swarp.sensors.lidar.sweep_offsets`) are ``wp.static`` flags, so a disc-only,
+range-only scan runs exactly the arithmetic it always did. Inference-only
 (``enable_backward=False``); gradients come from the torch path.
 """
 
@@ -151,7 +152,12 @@ def _ray_capsule(rel: Any, d: Any, angle: Any, half_len: Any, rad: Any, miss: An
 
 
 def _make_kernel(
-    agents: bool, obstacles: bool, box_agents: bool, emit_class: bool, emit_index: bool
+    agents: bool,
+    obstacles: bool,
+    box_agents: bool,
+    emit_class: bool,
+    emit_index: bool,
+    sweep: bool = False,
 ) -> wp.Kernel:
     """The scan kernel with the given features compiled in (see the module docstring)."""
 
@@ -171,6 +177,12 @@ def _make_kernel(
         ray_step: Any,
         angle_start: Any,
         body_frame: wp.int32,
+        vel: wp.array2d(dtype=Any),  # [E, A] vec2, read when sweep
+        ang_vel: wp.array2d(dtype=Any),  # [E, A], read when sweep
+        yaw_bias: wp.array2d(dtype=Any),  # [E, A], read when sweep
+        stamp_phase: wp.array2d(dtype=Any),  # [E, A], read when sweep
+        scan_period: Any,
+        sweep_dir: Any,
         range_out: wp.array3d(dtype=Any),  # [E, A, R]
         class_out: wp.array3d(dtype=wp.uint8),  # [E, A, R] when emit_class
         index_out: wp.array3d(dtype=wp.int32),  # [E, A, R] when emit_index
@@ -185,6 +197,15 @@ def _make_kernel(
         # Same arithmetic as the torch offsets (angle_start + r * ray_step, added to the
         # heading), which is what keeps the two backends' ranges equal.
         ang = base + angle_start + type(max_range)(r) * ray_step
+        if wp.static(sweep):
+            # Cast from the pose at the time the rotating sensor took this ray (the model
+            # of swarp.sensors.lidar.sweep_offsets), reported at the nominal angle.
+            pi = type(max_range)(3.141592653589793)
+            off = angle_start + type(max_range)(r) * ray_step
+            x = sweep_dir * (off - pi) / (type(max_range)(2.0) * pi)
+            tau = (stamp_phase[e, a] - (x - wp.floor(x))) * scan_period
+            p = p - tau * vel[e, a]
+            ang = ang + (yaw_bias[e, a] - tau * ang_vel[e, a])
         d = type(p)(wp.cos(ang), wp.sin(ang))
         best = max_range
         cls = wp.int32(0)
@@ -256,13 +277,19 @@ def _signature(dtype) -> list:
         dtype,  # ray_step
         dtype,  # angle_start
         wp.int32,  # body_frame
+        wp.array2d(dtype=vec2),  # vel
+        wp.array2d(dtype=dtype),  # ang_vel
+        wp.array2d(dtype=dtype),  # yaw_bias
+        wp.array2d(dtype=dtype),  # stamp_phase
+        dtype,  # scan_period
+        dtype,  # sweep_dir
         wp.array3d(dtype=dtype),  # range_out
         wp.array3d(dtype=wp.uint8),  # class_out
         wp.array3d(dtype=wp.int32),  # index_out
     ]
 
 
-#: (agents, obstacles, box_agents, emit_class, emit_index, dtype) -> concrete kernel.
+#: (agents, obstacles, box_agents, emit_class, emit_index, sweep, dtype) -> concrete kernel.
 _KERNELS: dict[tuple, wp.Kernel] = {}
 
 
@@ -273,6 +300,7 @@ def lidar_kernel(
     box_agents: bool,
     emit_class: bool,
     emit_index: bool,
+    sweep: bool = False,
     *,
     device=None,
 ) -> wp.Kernel:
@@ -283,11 +311,11 @@ def lidar_kernel(
     from the installed obstacle count, and a kernel first launched inside a graph capture
     cannot be loaded there. Without ``device`` the module loads lazily on first launch.
     """
-    key = (agents, obstacles, box_agents, emit_class, emit_index, dtype)
+    key = (agents, obstacles, box_agents, emit_class, emit_index, sweep, dtype)
     kernel = _KERNELS.get(key)
     if kernel is None or device is not None:
         for obs in (False, True):
-            sib = (agents, obs, box_agents, emit_class, emit_index, dtype)
+            sib = (agents, obs, box_agents, emit_class, emit_index, sweep, dtype)
             k = _KERNELS.get(sib)
             if k is None:
                 k = wp.overload(_make_kernel(*sib[:-1]), _signature(dtype))
@@ -322,16 +350,24 @@ def launch_lidar(
     index_out: wp.array,
     emit_class: bool,
     emit_index: bool,
+    sweep: tuple | None = None,
 ) -> None:
     """One scan launch: ``wp.launch`` and nothing else, so it is legal inside a capture.
 
     Every argument is a ready Warp array or a host scalar; the launch names its device and
-    does not scope a stream (the caller decides that, see :meth:`Lidar.scan`)."""
+    does not scope a stream (the caller decides that, see :meth:`Lidar.scan`). ``sweep``,
+    when given, is ``(vel, ang_vel, yaw_bias, stamp_phase, scan_period, sweep_dir)`` (the
+    model of :func:`swarp.sensors.lidar.sweep_offsets`); without it the plain kernel
+    runs, on stand-in arrays."""
     dtype = range_out.dtype
     n_envs, n_agents = pos.shape[0], pos.shape[1]
     kernel = lidar_kernel(
-        dtype, include_agents, n_obstacles > 0, box_agents, emit_class, emit_index
+        dtype, include_agents, n_obstacles > 0, box_agents, emit_class, emit_index,
+        sweep is not None,
     )
+    if sweep is None:
+        sweep = (pos, theta, theta, theta, 0.0, 1.0)
+    s_vel, s_w, s_yaw, s_phase, s_period, s_dir = sweep
     wp.launch(
         kernel,
         dim=(n_envs, n_agents, n_rays),
@@ -350,6 +386,12 @@ def launch_lidar(
             dtype(ray_step),
             dtype(angle_start),
             wp.int32(1 if body_frame else 0),
+            s_vel,
+            s_w,
+            s_yaw,
+            s_phase,
+            dtype(s_period),
+            dtype(s_dir),
         ],
         outputs=[range_out, class_out, index_out],
         device=range_out.device,
@@ -381,6 +423,7 @@ def lidar_scan_warp(
     obstacle_half: torch.Tensor | None = None,  # [n_obstacles, 2]
     obstacle_kind: torch.Tensor | None = None,  # [n_obstacles] ObstacleKind
     return_hits: bool = False,
+    sweep: tuple | None = None,
 ):
     """Warp-kernel equivalent of :func:`swarp.sensors.lidar.lidar_scan`, from tensors.
 
@@ -439,6 +482,12 @@ def lidar_scan_warp(
     else:
         hit_class = torch.empty((1, 1, 1), device=device, dtype=torch.uint8)
         hit_index = torch.empty((1, 1, 1), device=device, dtype=torch.int32)
+    if sweep is not None:
+        s_vel, s_w, s_yaw, s_phase, s_period, s_dir = sweep
+        sweep = (
+            _wp(s_vel.to(tdt), vec2), _wp(s_w.to(tdt), wdt), _wp(s_yaw.to(tdt), wdt),
+            _wp(s_phase.to(tdt), wdt), float(s_period), float(s_dir),
+        )
     with torch_stream_scope(str(device)):
         launch_lidar(
             pos=_wp(pos, vec2),
@@ -458,6 +507,7 @@ def lidar_scan_warp(
             index_out=_wp(hit_index, wp.int32),
             emit_class=return_hits,
             emit_index=return_hits,
+            sweep=sweep,
         )
     if return_hits:
         return ranges, hit_class, hit_index

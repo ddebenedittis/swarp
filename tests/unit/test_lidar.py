@@ -859,3 +859,75 @@ def test_captured_launch_replays_live_geometry():
         outs.append(eager[0])
     assert not torch.equal(outs[0], outs[1])  # the body moved between the two replays
     assert (lidar.hit_class[:, 0, 0] == 3).all()  # agent 0's +x ray is on the movable box
+
+
+def _random_sweep(seed, device, dtype, e, a):
+    """Velocities, turn rates, yaw errors and stamp phases for a sweep scan."""
+    g = torch.Generator(device="cpu").manual_seed(100 + seed)
+
+    def u(*shape, lo=0.0, hi=1.0):
+        x = torch.rand(*shape, generator=g, dtype=torch.float64) * (hi - lo) + lo
+        return x.to(device=device, dtype=dtype)
+
+    return (u(e, a, 2, lo=-0.5, hi=0.5), u(e, a, lo=-2.0, hi=2.0), u(e, a, lo=-0.05, hi=0.05),
+            u(e, a), 0.1, -1.0 if seed % 2 else 1.0)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("body_frame", [True, False])
+def test_warp_matches_torch_with_sweep(device, dtype, body_frame):
+    """The rotating-scan sweep agrees across the backends on randomized mixed scenes, as
+    the plain scan does (float64 exactly on what was hit)."""
+    for seed in range(3):
+        s = _random_scene(seed, device, dtype)
+        pos, theta, rad = s.pop("pos"), s.pop("theta"), s.pop("agent_radius")
+        sweep = _random_sweep(seed, device, dtype, *pos.shape[:2])
+        kw = dict(n_rays=96, max_range=1.5, body_frame=body_frame, angle_start=-2.0,
+                  angle_end=2.0, return_hits=True, sweep=sweep, **s)
+        r_ref, c_ref, i_ref = lidar_scan(pos, theta, rad, **kw)
+        r_got, c_got, i_got = lidar_scan_warp(pos, theta, rad, **kw)
+        plain = lidar_scan(pos, theta, rad, **{**kw, "sweep": None})[0]
+        assert not torch.allclose(r_ref, plain)  # the sweep moved the rays
+        same = (c_ref == c_got) & (i_ref == i_got)
+        if dtype == torch.float64:
+            assert same.all()
+        else:
+            assert (~same).double().mean() < 2e-3
+        torch.testing.assert_close(r_got[same], r_ref[same], **_TOL[dtype])
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_sweep_casts_each_ray_from_the_pose_at_its_time(device):
+    """A robot turning counter-clockwise at 1 rad/s, its scan (0.1 s, counter-clockwise
+    from the rear) stamped at the end: the forward ray was taken half a period, 0.05 s,
+    earlier, when the robot faced 0.05 rad clockwise of now, so a post dead ahead shows
+    up to the left of the forward ray, on the ray at ``a`` with ``a = 1 rad/s * tau(a)``,
+    ``tau(a) = (0.5 - a / 2 pi) 0.1 s``. A robot driving forward at 1 m/s instead took it
+    0.05 m further back. A sweep at rest is the plain scan."""
+    f64 = {"device": device, "dtype": torch.float64}
+    pos = torch.zeros(1, 1, 2, **f64)
+    theta = torch.zeros(1, 1, **f64)
+    rad = torch.tensor([0.05], **f64)
+    post = dict(obstacle_pos=torch.tensor([[[1.0, 0.0]]], **f64),
+                obstacle_radius=torch.tensor([1e-3], **f64))
+    zero = torch.zeros(1, 1, **f64)
+    n = 3601  # 0.1 mrad apart over +-0.18 rad
+    kw = dict(n_rays=n, max_range=MAXR, angle_start=-0.18, angle_end=0.18, **post)
+
+    def seen(sweep):
+        for fn in (lidar_scan, lidar_scan_warp):
+            r = fn(pos, theta, rad, sweep=sweep, **kw)[0, 0]
+            hit = torch.nonzero(r < MAXR).squeeze(-1).double()
+            yield -0.18 + hit.mean().item() * 0.36 / (n - 1), r.min().item()
+
+    turning = (torch.zeros(1, 1, 2, **f64), torch.ones(1, 1, **f64), zero, zero + 1.0, 0.1, 1.0)
+    for ang, _ in seen(turning):
+        assert ang == pytest.approx(0.05 / (1.0 + 0.1 / (2.0 * math.pi)), abs=2e-4)
+    driving = (torch.tensor([[[1.0, 0.0]]], **f64), zero, zero, zero + 1.0, 0.1, 1.0)
+    for ang, rng in seen(driving):
+        assert ang == pytest.approx(0.0, abs=2e-4)
+        assert rng == pytest.approx(1.05 - 1e-3, abs=1e-6)
+    rest = (torch.zeros(1, 1, 2, **f64), zero, zero, zero + 0.3, 0.1, 1.0)
+    torch.testing.assert_close(lidar_scan(pos, theta, rad, sweep=rest, **kw),
+                               lidar_scan(pos, theta, rad, **kw))
