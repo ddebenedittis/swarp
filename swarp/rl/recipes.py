@@ -647,10 +647,16 @@ SPECS["pusht_lidar_limo_real"] = replace(
 # 0.13 m mean. The slip gain is 2 rather than 1 because AMCL amplifies a shove (median
 # 0.15 m, p95 1.5 m after one) more than the shove alone accounts for. The scale is drawn
 # up to 1.25 for margin, and down to 0 for mocap.
+#
+# The field of view is also cropped at the mount, as the sensor (and a body hiding its
+# rear) does, not per centre ray: L6, trained per ray, solved 0.84 greedy at 240 deg per
+# ray but 0.10 cropped at the mount (Gazebo: 1/20), because a hit close beside the robot
+# lies within 112.5 deg of the heading from the centre and 125-135 deg from the mount.
 SPECS["pusht_lidar_limo_amcl"] = replace(
     SPECS["pusht_lidar_limo_real"],
     scen_kwargs={
         **SPECS["pusht_lidar_limo_real"].scen_kwargs,
+        "lidar_fov_at_mount": True,
         "pose_noise": (0.0, 1.25), "pose_bias_std": (0.04, 0.015),
         "pose_jitter_std": (0.01, 0.005), "pose_drift_tau": (3.6, 1.6),
         "pose_drift_std": (0.05, 0.015), "pose_slip_gain": (2.0, 0.1),

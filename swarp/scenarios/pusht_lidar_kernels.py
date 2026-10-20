@@ -659,6 +659,7 @@ def lidar_sensor_kernel(
     mount_offset: Any,
     min_range: Any,
     half_fov: wp.array2d(dtype=Any),
+    fov_at_mount: wp.int32,
     noise_std: wp.array2d(dtype=Any),
     rng_state: wp.array2d(dtype=wp.uint32),
     ranges: wp.array3d(dtype=Any),
@@ -671,7 +672,9 @@ def lidar_sensor_kernel(
     hits get Gaussian range noise of this robot's ``noise_std``, clamped to
     ``[0, max_range]``, from this thread's own RNG stream. A body-frame ray's angle off
     the heading is its fixed offset ``angle_start + r ray_step`` wrapped to
-    ``(-pi, pi]``, so which rays a field of view keeps does not depend on the heading."""
+    ``(-pi, pi]``, so which rays a field of view keeps does not depend on the heading.
+    With ``fov_at_mount`` the field of view is the sensor's instead: a hit is blanked when
+    its bearing from the mount, off the heading, exceeds ``half_fov``."""
     e, a = wp.tid()
     n_rays = ranges.shape[2]
     zero = type(max_range)(0.0)
@@ -692,7 +695,9 @@ def lidar_sensor_kernel(
             hy = t * wp.sin(ang) - my
             blind = hx * hx + hy * hy < min_range * min_range
             off = ang - th
-            if body_frame != 0:
+            if fov_at_mount != 0:
+                off = wp.atan2(hy, hx) - th
+            elif body_frame != 0:
                 off = angle_start + type(max_range)(r) * ray_step
             if wp.abs(_wrap(off)) > hf:
                 blind = True
@@ -711,7 +716,9 @@ def _sensor_signature(dtype) -> list:
         *([dtype] * 3),  # max_range, ray_step, angle_start
         wp.int32,  # body_frame
         *([dtype] * 2),  # mount_offset, min_range
-        *([wp.array2d(dtype=dtype)] * 2),  # half_fov, noise_std
+        wp.array2d(dtype=dtype),  # half_fov
+        wp.int32,  # fov_at_mount
+        wp.array2d(dtype=dtype),  # noise_std
         wp.array2d(dtype=wp.uint32),  # rng_state
         wp.array3d(dtype=dtype),  # ranges
         wp.array3d(dtype=wp.uint8),  # hit_class

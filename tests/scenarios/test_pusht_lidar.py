@@ -324,7 +324,7 @@ def test_field_of_view_keeps_the_rays_within_half_of_it(device, fov_deg, kept):
     wp.launch(
         concrete(lidar_sensor_kernel, wp.float32),
         dim=(1, n_agents),
-        inputs=[wp_th, 1.5, 2.0 * math.pi / nr, 0.0, 1, 0.1, 0.02, half, sigma, rng,
+        inputs=[wp_th, 1.5, 2.0 * math.pi / nr, 0.0, 1, 0.1, 0.02, half, 0, sigma, rng,
                 ranges, hit],
         device=device,
     )
@@ -408,3 +408,32 @@ def test_pose_drift_misses_a_shove_then_decays(device, fused):
     shove = torch.tensor([0.1, 0.0], device=device)
     for k, err in enumerate(errs):
         torch.testing.assert_close(err, e0 * a ** (k + 1) - shove * a**k, atol=1e-5, rtol=0)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_field_of_view_at_the_mount_hides_close_side_hits(device):
+    """With ``fov_at_mount`` the 240 deg field of view is the sensor's, centred on the mount
+    0.1 m ahead: a hit 0.2 m away on ray 10 (112.5 deg off the heading from the centre)
+    is 134 deg off it from the mount and reads as a miss, while a hit 1.4 m away on the
+    same ray (118 deg from the mount) stays."""
+    wp.init()
+    nr = 32
+    th = wp.from_torch(torch.zeros(1, 2, device=device))
+    r = torch.full((1, 2, nr), 0.2, device=device)
+    r[0, 1] = 1.4
+    ranges = wp.from_torch(r)
+    hit = wp.from_torch(torch.full((1, 2, nr), 3, dtype=torch.uint8, device=device))
+    half = wp.from_torch(torch.full((1, 2), math.radians(120.0), device=device))
+    sigma = wp.from_torch(torch.zeros(1, 2, device=device))
+    rng = wp.zeros((1, 2), dtype=wp.uint32, device=device)
+    wp.launch(
+        concrete(lidar_sensor_kernel, wp.float32),
+        dim=(1, 2),
+        inputs=[th, 1.5, 2.0 * math.pi / nr, 0.0, 1, 0.1, 0.02, half, 1, sigma, rng,
+                ranges, hit],
+        device=device,
+    )
+    seen = wp.to_torch(hit).cpu()[0] == 3
+    assert not seen[0, 10] and not seen[0, 22]
+    assert seen[1, 10] and seen[1, 22]
+    assert seen[0, 8] and seen[0, 0]  # 90 deg: 117 deg from the mount

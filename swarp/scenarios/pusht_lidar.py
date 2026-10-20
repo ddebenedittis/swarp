@@ -151,6 +151,7 @@ class PushTLidarScenario(PushTScenario):
         lidar_min_range: float = 0.0,
         lidar_fov: float | tuple[float, float] = 2.0 * math.pi,
         lidar_noise: float | tuple[float, float] = 0.0,
+        lidar_fov_at_mount: bool = False,
         pose_noise: float | tuple[float, float] = 0.0,
         pose_bias_std: tuple[float, float] = (0.03, 0.03),
         pose_jitter_std: tuple[float, float] = (0.02, 0.02),
@@ -220,6 +221,9 @@ class PushTLidarScenario(PushTScenario):
         #: per env and robot on every reset when ``low < high``.
         self.lidar_fov = fov
         self.lidar_noise = noise
+        #: Whether the field of view is measured at the mount (the sensor's own crop) rather
+        #: than per centre ray.
+        self.lidar_fov_at_mount = bool(lidar_fov_at_mount)
         #: Whether the scan goes through :func:`lidar_sensor_kernel` (and its torch twin).
         self.sensor_model = (
             self.lidar_min_range > 0.0 or noise[1] > 0.0 or fov[0] < 2.0 * math.pi
@@ -453,7 +457,9 @@ class PushTLidarScenario(PushTScenario):
         hx = ranges * torch.cos(ang) - self.lidar_mount_offset * torch.cos(th)
         hy = ranges * torch.sin(ang) - self.lidar_mount_offset * torch.sin(th)
         off = ang - th
-        if self.lidar.body_frame:
+        if self.lidar_fov_at_mount:
+            off = torch.atan2(hy, hx) - th
+        elif self.lidar.body_frame:
             off = self.lidar.ray_offsets(device=ang.device, dtype=ang.dtype).expand_as(ang)
         rel = torch.atan2(torch.sin(off), torch.cos(off))
         half = self._half_fov.unsqueeze(-1) + FOV_EPS
@@ -860,6 +866,7 @@ class PushTLidarScenario(PushTScenario):
                 scalar(self.lidar_mount_offset),
                 scalar(self.lidar_min_range),
                 self._half_fov_wp,
+                wp.int32(int(self.lidar_fov_at_mount)),
                 self._noise_std_wp,
                 self._lidar_rng,
                 lid.wp_ranges,
