@@ -155,6 +155,9 @@ class PushTLidarScenario(PushTScenario):
         pose_bias_std: tuple[float, float] = (0.03, 0.03),
         pose_jitter_std: tuple[float, float] = (0.02, 0.02),
         vel_noise_std: float = 0.02,
+        pose_drift_tau: float = 0.0,
+        pose_drift_std: tuple[float, float] = (0.0, 0.0),
+        pose_slip_gain: float = 1.0,
         **kwargs: Any,
     ) -> None:
         super().__init__(n_agents=n_agents, shape=shape, **kwargs)
@@ -229,6 +232,15 @@ class PushTLidarScenario(PushTScenario):
         self.vel_noise_std = float(vel_noise_std)
         #: Whether the self and teammate blocks observe a noisy pose.
         self.pose_noise_on = pose[1] > 0.0
+        if pose_drift_tau < 0.0:
+            raise ValueError(f"pose_drift_tau must be >= 0, got {pose_drift_tau}")
+        #: The localisation drift (see :func:`pose_obs_noise_kernel`): time constant in
+        #: seconds (0: off), stationary deviation (position, heading) at scale 1, and the
+        #: share of the wheel-odometry slip that enters it.
+        self.pose_drift_tau = float(pose_drift_tau)
+        self.pose_drift_std = (float(pose_drift_std[0]), float(pose_drift_std[1]))
+        self.pose_slip_gain = float(pose_slip_gain)
+        self.pose_drift_on = self.pose_noise_on and self.pose_drift_tau > 0.0
         #: Whether a reset draws per-robot sensor or pose-noise values.
         self.sensor_dr = fov[0] < fov[1] or noise[0] < noise[1] or self.pose_noise_on
 
@@ -348,6 +360,11 @@ class PushTLidarScenario(PushTScenario):
                 wp.from_torch(self._obs_vel, dtype=vec2),
                 wp.from_torch(self._obs_theta),
             ]
+        # The drift's carry (pose, speed and turn rate after the last pass, then the drift),
+        # adopted by the fused spec; a one-element dummy fills the kernel slot without it.
+        shape = (n_envs, na, 8) if self.pose_drift_on else (1, 1, 8)
+        self._drift_state = torch.zeros(*shape, **tt)
+        self._drift_wp = wp.from_torch(self._drift_state)
         self._lidar_obs_launch = CachedLaunch()
         self._lidar_reward_launch = CachedLaunch()
         self._lcache: dict[str, torch.Tensor] | None = None
@@ -456,8 +473,12 @@ class PushTLidarScenario(PushTScenario):
         u = self._pose_scale
         jp, jt = self.pose_jitter_std
         n = torch.randn(*u.shape, 5, device=u.device, dtype=u.dtype)
-        opos = s.pos + self._bias_pos + (u * jp).unsqueeze(-1) * n[..., :2]
-        dth = self._bias_theta + u * jt * n[..., 2]
+        dp = torch.zeros_like(s.pos)
+        dtd = torch.zeros_like(u)
+        if self.pose_drift_on:
+            dp, dtd = self._drift_torch(env_mask, reset=reset)
+        opos = s.pos + self._bias_pos + dp + (u * jp).unsqueeze(-1) * n[..., :2]
+        dth = self._bias_theta + dtd + u * jt * n[..., 2]
         c, sn = torch.cos(dth), torch.sin(dth)
         v = s.vel
         ovel = torch.stack(
@@ -471,6 +492,48 @@ class PushTLidarScenario(PushTScenario):
             oth = torch.where(m, oth, self._obs_theta)
         self._obs_pos, self._obs_vel, self._obs_theta = opos, ovel, oth
         return opos, ovel, oth
+
+    def _drift_torch(
+        self, env_mask: torch.Tensor | None, *, reset: bool
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The drift of :func:`pose_obs_noise_kernel` on the torch path: ``[E, A, 2]``
+        position and ``[E, A]`` heading, advancing ``_drift_state``."""
+        s = self.world.state
+        u = self._pose_scale
+        prev = self._drift_state
+        p, th = s.pos.detach(), s.theta.detach()
+        turn = torch.atan2(torch.sin(th - prev[..., 2]), torch.cos(th - prev[..., 2]))
+        thm = prev[..., 2] + 0.5 * turn
+        ds = 0.5 * (prev[..., 3] + s.speed) * self.dt
+        slip = (p - prev[..., :2]) - ds.unsqueeze(-1) * torch.stack(
+            [thm.cos(), thm.sin()], dim=-1
+        )
+        slip_th = turn - 0.5 * (prev[..., 4] + s.ang_vel) * self.dt
+        a = math.exp(-self.dt / self.pose_drift_tau)
+        kick = math.sqrt(1.0 - a * a)
+        g = u * self.pose_slip_gain
+        nd = torch.randn(*u.shape, 3, device=u.device, dtype=u.dtype)
+        sp, st = self.pose_drift_std
+        dp = a * prev[..., 5:7] - g.unsqueeze(-1) * slip + (u * sp * kick).unsqueeze(-1) * nd[
+            ..., :2
+        ]
+        dtd = a * prev[..., 7] - g * slip_th + u * st * kick * nd[..., 2]
+        fresh = torch.ones_like(u, dtype=torch.bool) if reset else torch.zeros_like(
+            u, dtype=torch.bool
+        )
+        if reset and env_mask is not None:
+            fresh = env_mask.view(-1, 1).expand_as(u)
+        dp = torch.where(fresh.unsqueeze(-1), torch.zeros_like(dp), dp)
+        dtd = torch.where(fresh, torch.zeros_like(dtd), dtd)
+        new = torch.cat(
+            [p, th.unsqueeze(-1), s.speed.unsqueeze(-1), s.ang_vel.unsqueeze(-1), dp,
+             dtd.unsqueeze(-1)], dim=-1,
+        )
+        if reset and env_mask is not None:
+            new = torch.where(env_mask.view(-1, 1, 1), new, prev)
+            dp, dtd = new[..., 5:7], new[..., 7]
+        self._drift_state = new.contiguous()
+        return dp, dtd
 
     def _ray_angles(self) -> torch.Tensor:
         """``[E, A, R]`` world-frame ray angles, as :func:`lidar_scan` builds them."""
@@ -747,6 +810,12 @@ class PushTLidarScenario(PushTScenario):
             Buf("visibility", (ne,)),
             Buf("occlusion", (ne,)),
             Buf("tee_seen", (ne, na), "uint8", bool_view=True),
+            *(
+                (Buf("drift_state", (ne, na, 8), attr="_drift_state", alloc="never",
+                     carry=True, watch=True),)
+                if self.pose_drift_on
+                else ()
+            ),
         )
 
     def launch_fused(self, pass_: FusedPass) -> None:
@@ -803,12 +872,21 @@ class PushTLidarScenario(PushTScenario):
                 st.pos,
                 st.vel,
                 st.theta,
+                st.speed,
+                st.ang_vel,
                 self._wp["resetmask"],
                 wp.int32(advance_prev),
                 *self._pose_dr_wp,
                 scalar(self.pose_jitter_std[0]),
                 scalar(self.pose_jitter_std[1]),
                 scalar(self.vel_noise_std),
+                wp.int32(int(self.pose_drift_on)),
+                scalar(self.dt),
+                scalar(math.exp(-self.dt / self.pose_drift_tau) if self.pose_drift_on else 0.0),
+                scalar(self.pose_drift_std[0]),
+                scalar(self.pose_drift_std[1]),
+                scalar(self.pose_slip_gain),
+                self._wp["drift_state"] if self.pose_drift_on else self._drift_wp,
                 self._pose_rng,
             ],
             outputs=self._obs_pose_wp,

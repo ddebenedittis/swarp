@@ -773,6 +773,8 @@ def pose_obs_noise_kernel(
     pos: wp.array2d(dtype=Any),
     vel: wp.array2d(dtype=Any),
     theta: wp.array2d(dtype=Any),
+    speed: wp.array2d(dtype=Any),
+    ang_vel: wp.array2d(dtype=Any),
     reset_mask: wp.array(dtype=wp.uint8),
     advance_prev: wp.int32,
     pose_scale: wp.array2d(dtype=Any),
@@ -781,6 +783,13 @@ def pose_obs_noise_kernel(
     jitter_pos_std: Any,
     jitter_theta_std: Any,
     vel_std: Any,
+    drift: wp.int32,
+    dt: Any,
+    drift_decay: Any,
+    drift_pos_std: Any,
+    drift_theta_std: Any,
+    slip_gain: Any,
+    drift_state: wp.array3d(dtype=Any),
     rng_state: wp.array2d(dtype=wp.uint32),
     obs_pos: wp.array2d(dtype=Any),
     obs_vel: wp.array2d(dtype=Any),
@@ -792,7 +801,16 @@ def pose_obs_noise_kernel(
     bias plus fresh Gaussian jitter of the env's scale times the jitter deviations; the
     world-frame velocity is the true one turned by the heading error (a body-frame
     odometry twist rotated by the reported heading) plus Gaussian noise of the scale
-    times ``vel_std`` per axis."""
+    times ``vel_std`` per axis.
+
+    With ``drift`` on, a slowly decaying error adds to the bias: ``drift_state[e, a]``
+    holds the robot's pose, speed and turn rate after the last pass (0-4) and the drift
+    itself (5-7: x, y, heading). Each step the drift decays by ``drift_decay``
+    (``exp(-dt / tau)``), takes ``-slip_gain`` times the scale times the step's slip (the
+    motion its wheel odometry missed: the true displacement and turn minus the speed and
+    turn rate averaged over the step, along the mid-step heading), and an
+    Ornstein-Uhlenbeck kick whose stationary deviation is the scale times
+    ``drift_pos_std`` per axis and ``drift_theta_std``. A respawn zeroes it."""
     e, a = wp.tid()
     if advance_prev == 0 and reset_mask[e] == wp.uint8(0):
         return
@@ -803,12 +821,45 @@ def pose_obs_noise_kernel(
     jt = type(u)(wp.randn(rng))
     vx = type(u)(wp.randn(rng))
     vy = type(u)(wp.randn(rng))
-    rng_state[e, a] = rng
     p = pos[e, a]
+    th = theta[e, a]
+    zero = type(u)(0.0)
+    dp = type(p)(zero, zero)
+    dtd = zero
+    if drift == 1:
+        nx = type(u)(wp.randn(rng))
+        ny = type(u)(wp.randn(rng))
+        nt = type(u)(wp.randn(rng))
+        s1 = speed[e, a]
+        w1 = ang_vel[e, a]
+        if reset_mask[e] == wp.uint8(0):
+            p0 = type(p)(drift_state[e, a, 0], drift_state[e, a, 1])
+            th0 = drift_state[e, a, 2]
+            half = type(u)(0.5)
+            turn = _wrap(th - th0)
+            thm = th0 + half * turn
+            ds = half * (drift_state[e, a, 3] + s1) * dt
+            slip = (p - p0) - type(p)(ds * wp.cos(thm), ds * wp.sin(thm))
+            slip_th = turn - half * (drift_state[e, a, 4] + w1) * dt
+            kick = wp.sqrt(type(u)(1.0) - drift_decay * drift_decay)
+            g = u * slip_gain
+            dp = drift_decay * type(p)(drift_state[e, a, 5], drift_state[e, a, 6]) - g * slip
+            dp = dp + u * drift_pos_std * kick * type(p)(nx, ny)
+            dtd = drift_decay * drift_state[e, a, 7] - g * slip_th
+            dtd = dtd + u * drift_theta_std * kick * nt
+        drift_state[e, a, 0] = p[0]
+        drift_state[e, a, 1] = p[1]
+        drift_state[e, a, 2] = th
+        drift_state[e, a, 3] = s1
+        drift_state[e, a, 4] = w1
+        drift_state[e, a, 5] = dp[0]
+        drift_state[e, a, 6] = dp[1]
+        drift_state[e, a, 7] = dtd
+    rng_state[e, a] = rng
     jp = u * jitter_pos_std
-    obs_pos[e, a] = p + bias_pos[e, a] + type(p)(jp * jx, jp * jy)
-    dth = bias_theta[e, a] + u * jitter_theta_std * jt
-    obs_theta[e, a] = theta[e, a] + dth
+    obs_pos[e, a] = p + bias_pos[e, a] + dp + type(p)(jp * jx, jp * jy)
+    dth = bias_theta[e, a] + dtd + u * jitter_theta_std * jt
+    obs_theta[e, a] = th + dth
     v = vel[e, a]
     c = wp.cos(dth)
     s = wp.sin(dth)
@@ -838,12 +889,17 @@ def _pose_noise_signature(dtype) -> list:
         a2v,  # pos
         a2v,  # vel
         a2s,  # theta
+        a2s,  # speed
+        a2s,  # ang_vel
         wp.array(dtype=wp.uint8),  # reset_mask
         wp.int32,  # advance_prev
         a2s,  # pose_scale
         a2v,  # bias_pos
         a2s,  # bias_theta
         *([dtype] * 3),  # jitter_pos_std, jitter_theta_std, vel_std
+        wp.int32,  # drift
+        *([dtype] * 5),  # dt, drift_decay, drift_pos_std, drift_theta_std, slip_gain
+        wp.array3d(dtype=dtype),  # drift_state
         wp.array2d(dtype=wp.uint32),  # rng_state
         a2v,  # obs_pos
         a2v,  # obs_vel

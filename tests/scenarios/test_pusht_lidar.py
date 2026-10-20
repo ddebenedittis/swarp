@@ -312,6 +312,7 @@ def test_field_of_view_keeps_the_rays_within_half_of_it(device, fov_deg, kept):
     is kept iff that offset is within half the field of view (inclusive), whatever the
     heading: 240 deg keeps rays -10..10, 270 deg -12..12 (the edge rays at +-135 deg
     included), 360 deg all."""
+    wp.init()
     nr, n_agents = 32, 3
     theta = torch.tensor([[0.0, 1.234, -2.9]], dtype=torch.float32)
     wp_th = wp.from_torch(theta.to(device))
@@ -375,3 +376,35 @@ def test_pose_noise_is_observed_only(device, fused):
     torch.testing.assert_close(mate, (s.pos[:, 1] + bias[:, 1]) - (s.pos[:, 0] + bias[:, 0]),
                                **tol)
     torch.testing.assert_close(obs1[..., lay["lidar"]], obs0[..., lay["lidar"]])
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("fused", [True, False])
+def test_pose_drift_misses_a_shove_then_decays(device, fused):
+    """A robot moved 0.1 m while its wheels stand still reports its old position (its
+    odometry missed the move), and the error then decays by ``exp(-dt / tau)`` a step."""
+    tau = 0.2
+    env = _env(device, n_envs=1, fused=fused, n_agents=2, n_pushers=2, model="diff_drive",
+               agent_shape="box", agent_half_extents=(0.05, 0.03), pose_noise=(1.0, 1.0),
+               pose_bias_std=(0.0, 0.0), pose_jitter_std=(0.0, 0.0), vel_noise_std=0.0,
+               pose_drift_tau=tau)
+    env.reset(seed=0)
+    scen = env.scenario
+    pos = torch.tensor([[[-0.3, -0.3], [0.3, 0.3]]], device=device)
+    zero = torch.zeros(1, 2, 2, device=device)
+    with torch.no_grad():
+        env.world.write_state(pos=pos, theta=torch.zeros(1, 2, device=device), speed=0.0,
+                              ang_vel=0.0)
+        obs, *_ = env.step(zero)  # the placement itself is a first missed move
+        lay = scen.obs_layout()
+        e0 = obs[0, :, lay["pos"]] - env.world.state.pos[0]
+        before = env.world.state.pos.clone()
+        env.world.write_state(pos=before + torch.tensor([0.1, 0.0], device=device))
+        errs = []
+        for _ in range(3):
+            obs, *_ = env.step(zero)
+            errs.append(obs[0, :, lay["pos"]] - env.world.state.pos[0])
+    a = math.exp(-scen.dt / tau)
+    shove = torch.tensor([0.1, 0.0], device=device)
+    for k, err in enumerate(errs):
+        torch.testing.assert_close(err, e0 * a ** (k + 1) - shove * a**k, atol=1e-5, rtol=0)
