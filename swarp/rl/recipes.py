@@ -156,6 +156,16 @@ class TrainSpec:
     """Weight of the auxiliary loss ``mse(aux_head(features), scenario.aux_targets())``;
     0 disables it. Above 0 it needs ``actor="policynet"`` and a scenario with
     ``aux_dim > 0``."""
+    action_rate_coef: float = 0.0
+    """Weight of the action-rate penalty: every agent's reward loses
+    ``action_rate_coef * mean_i(((a_t - a_{t-1}) / half_i)^2)``, ``half_i`` the action
+    box's half-width, with ``a_{t-1} = 0`` on an episode's first step (a robot starts at
+    rest). 0 disables it; above 0 the trainer logs the mean squared change as
+    ``action_rate``."""
+    action_rate_ramp_iters: int = 0
+    """Iterations over which the action-rate weight ramps linearly from 0 to
+    ``action_rate_coef``; 0 starts at the full weight. Counted from the run's first
+    iteration, a resumed run included."""
     # --- memory and communication (a ``"policynet"`` actor only) ----------------------
     recurrent: bool = False
     """A GRU after the policy's trunk, its hidden state carried across steps and reset at
@@ -181,6 +191,8 @@ class TrainSpec:
                 raise ValueError(f"{name} must be one of {allowed}, got {getattr(self, name)!r}")
         if self.aux_coef < 0:
             raise ValueError(f"aux_coef must be >= 0, got {self.aux_coef}")
+        if self.action_rate_coef < 0 or self.action_rate_ramp_iters < 0:
+            raise ValueError("action_rate_coef and action_rate_ramp_iters must be >= 0")
         if self.aux_coef > 0 and self.actor != "policynet":
             raise ValueError("aux_coef > 0 needs actor='policynet' (the aux head lives there)")
         if self.recurrent and self.actor != "policynet":

@@ -721,3 +721,34 @@ def test_train_round_trips_a_recurrent_communicating_policy_and_scores_it(tmp_pa
     assert torch.equal(first, actor.greedy(obs))  # from a zero hidden state
     assert torch.equal(second, actor.greedy(obs, h=h1)) and not torch.equal(first, second)
     assert torch.equal(greedy_env_arm(actor)(env)(obs), first)  # a fresh arm starts at zero
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda:0", marks=pytest.mark.gpu)])
+def test_action_rate_penalty_charges_each_step_s_change(device):
+    """With ``action_rate_coef`` every agent's stored reward is the env's minus the coef
+    times the mean squared change of its action since the last step, from rest (zero) on
+    an episode's first step, across the rollout boundary too; the actions taken are the
+    unpenalised run's, and the mean change is logged as ``action_rate``."""
+    coef = 0.3
+    runs = []
+    for c in (0.0, coef):  # one after the other: the policies draw from torch's RNG
+        a = _algo(graphs=device != "cpu", device=device, action_rate_coef=c, max_steps=6)
+        if c > 0:
+            a.metrics = {"action_rate": 1}
+            a.metric_acc = torch.zeros(1, device=device)
+        a.rollout()
+        last = a.actor.squash(a.u_buf[-1]).masked_fill(
+            (torch.maximum(a.term_buf[-1], a.trunc_buf[-1]) > 0).view(-1, 1, 1), 0.0
+        )
+        a.metric_acc.zero_()
+        a.rollout()
+        runs.append(a)
+    plain, algo = runs
+    assert torch.equal(plain.u_buf, algo.u_buf)
+    acts = algo.actor.squash(algo.u_buf)  # [T, E, A, D]
+    ended = (torch.maximum(algo.term_buf, algo.trunc_buf) > 0).view(algo.T, -1, 1, 1)
+    prev = torch.cat([last.unsqueeze(0), acts[:-1].masked_fill(ended[:-1], 0.0)])
+    rate = (acts - prev).square().mean(-1)
+    assert ended.any()  # an episode ended inside the rollout
+    torch.testing.assert_close(algo.rew_buf, plain.rew_buf - coef * rate)
+    torch.testing.assert_close(algo.metric_acc[0], rate.mean(dim=(1, 2)).sum())

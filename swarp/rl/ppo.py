@@ -411,6 +411,14 @@ class MAPPO:
         self.term_buf = z(T, E)
         self.trunc_buf = z(T, E)
         self.actions = z(E, A, D)
+        # The action-rate penalty: the last step's action (zero after a done) and the
+        # action box's half-widths, only when it is on.
+        self.action_rate = spec.action_rate_coef > 0
+        if self.action_rate:
+            self.prev_actions = z(E, A, D)
+            self.act_half = actor.act_half.to(dev).float()
+            #: The weight the captured store graph reads; :func:`train` ramps it.
+            self.rate_coef = torch.tensor(spec.action_rate_coef, device=dev)
         self.t = z(1, dtype=torch.long)
         self.metric_acc = z(sum(self.metrics.values()))
         # Optional inputs, Python flags read at capture time. Each buffer is ``None`` unless
@@ -548,6 +556,8 @@ class MAPPO:
         obs = self.env.reset()
         if self.recurrent:
             self.h.zero_()
+        if self.action_rate:
+            self.prev_actions.zero_()
         horizon = self.env.max_steps or 0
         if self.spec.stagger_starts and horizon > 1:
             gen = torch.Generator(device=self.device).manual_seed(0)
@@ -589,7 +599,7 @@ class MAPPO:
         _, rew, term, trunc, info = out
         return (
             rew.data_ptr(), term.data_ptr(), trunc.data_ptr(),
-            *(info[k].data_ptr() for k in self.metrics),
+            *(info[k].data_ptr() for k in self.metrics if k in info),
         )
 
     def _greedy(self, obs: torch.Tensor) -> torch.Tensor:
@@ -667,11 +677,21 @@ class MAPPO:
 
     def _store_body(self) -> None:
         _, rew, term, trunc, info = self._out
+        rate = None
+        if self.action_rate:
+            rate = ((self.actions - self.prev_actions) / self.act_half).square().mean(-1)
+            rew = rew - self.rate_coef * rate
+            done = torch.logical_or(term, trunc).view(-1, 1, 1)
+            self.prev_actions.copy_(self.actions.masked_fill(done, 0.0))
         self.rew_buf.index_copy_(0, self.t, rew.unsqueeze(0))
         self.term_buf.index_copy_(0, self.t, term.unsqueeze(0).float())
         self.trunc_buf.index_copy_(0, self.t, trunc.unsqueeze(0).float())
         off = 0
         for key, width in self.metrics.items():
+            if key == "action_rate" and rate is not None:
+                self.metric_acc[off : off + 1] += rate.mean()
+                off += 1
+                continue
             x = info[key].float().reshape(-1, width).mean(0)
             self.metric_acc[off : off + width] += x
             off += width
@@ -1157,6 +1177,10 @@ def parse_args(argv: list[str] | None = None) -> TrainConfig:
                    help="one value per agent (role-sorted slot) instead of one per team")
     p.add_argument("--no-per-agent-value", dest="per_agent_value", action="store_false")
     p.add_argument("--aux-coef", type=float, help="auxiliary-loss weight (needs policynet)")
+    p.add_argument("--action-rate-coef", type=float,
+                   help="weight of the action-rate penalty on each agent's reward")
+    p.add_argument("--action-rate-ramp-iters", type=int,
+                   help="iterations over which the action-rate weight ramps in (0: none)")
     p.add_argument("--recurrent", action="store_true", default=None,
                    help="a GRU after the policynet's trunk, trained by BPTT")
     p.add_argument("--hidden-dim", type=int, help="GRU hidden-state width (with --recurrent)")
@@ -1199,8 +1223,8 @@ def parse_args(argv: list[str] | None = None) -> TrainConfig:
             "steps_per_batch", "epochs", "minibatches", "lr", "gamma", "lmbda",
             "entropy_coeff", "entropy_coeff_final", "num_cells", "normalize_advantage",
             "curriculum_iters", "curriculum_gate", "actor", "role_params", "critic_input",
-            "per_agent_value", "aux_coef", "recurrent", "hidden_dim", "seq_len", "comm",
-            "comm_dim",
+            "per_agent_value", "aux_coef", "action_rate_coef", "action_rate_ramp_iters",
+            "recurrent", "hidden_dim", "seq_len", "comm", "comm_dim",
         )
         if getattr(a, f) is not None
     }
@@ -1291,6 +1315,8 @@ def train(cfg: TrainConfig) -> Path:
     metrics = {
         k: (info0[k].shape[-1] if k == "multiobj_reward" else 1) for k in spec.metrics
     }
+    if spec.action_rate_coef > 0:
+        metrics["action_rate"] = 1  # computed by the trainer, not read from info
     metric_cols = metric_names(metrics)
 
     actor_cls, actor_kwargs, critic_cls, critic_kwargs = network_archs(
@@ -1410,6 +1436,9 @@ def train(cfg: TrainConfig) -> Path:
             coeff = spec.entropy_coeff + frac * (spec.entropy_coeff_final - spec.entropy_coeff)
         else:
             coeff = spec.entropy_coeff
+        if algo.action_rate and spec.action_rate_ramp_iters > 0:
+            ramp = min(1.0, (it + 1) / spec.action_rate_ramp_iters)
+            algo.rate_coef.fill_(spec.action_rate_coef * ramp)
         algo.rollout()
         stats = algo.update(coeff)  # the iteration's one host sync
         wall = time.perf_counter() - t0
