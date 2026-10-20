@@ -681,6 +681,21 @@ SPECS["pusht_lidar_limo_open"] = replace(
 )
 
 
+# pusht_lidar_limo_open with a slim T: two 0.50 x 0.04 m bars, the stem hanging from the
+# bar's middle (0.50 x 0.54 m overall). 64 rays, not 32: against 32 centre rays the slim T
+# takes half the hits of the 1.0 / 0.7 x 0.3 m T (2.2 against 4.6 on average with its
+# centroid 1.0-1.5 m away, one hit or none in 14% of those views), and 64 rays give it the
+# coverage the old T had at 32. The observation changes width, so this trains from scratch.
+SPECS["pusht_lidar_limo_slim"] = replace(
+    SPECS["pusht_lidar_limo_open"],
+    scen_kwargs={
+        **SPECS["pusht_lidar_limo_open"].scen_kwargs,
+        "bar_len": 0.5, "bar_width": 0.04, "stem_len": 0.5, "stem_width": 0.04,
+        "n_rays": 64,
+    },
+)
+
+
 def scenario_name(name: str) -> str:
     """The registered scenario behind ``name``: a ``SPECS`` key's ``scenario`` when it
     sets one, else ``name`` itself (a registry name, or a key that is one)."""
