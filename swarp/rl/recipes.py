@@ -708,6 +708,49 @@ SPECS["pusht_lidar_limo_slim"] = replace(
 )
 
 
+# pusht_lidar_limo_slim trained from scratch at the real robots' 240 deg, with what the
+# real sensor and the deployment add and a smoothness cost (L8):
+#
+# - 43 rays spanning +-120 deg from the centre (lidar_span), the 5.6 deg spacing of 64 rays
+#   over the full circle: from the mount nothing further back is ever visible, so the
+#   observation drops the rear rays a 360 deg ring would always blank. The field of view is
+#   fixed at 240 deg cut at the mount (not drawn from 240-360): the chassis hides the rear
+#   on every real Limo, and L6/L7, trained on the range, solved 0.05-0.13 at 240 deg in
+#   Gazebo.
+# - Labels from the reported poses (lidar_label_from_pose): the deployment can only tell a
+#   teammate from the T by the teammate's reported footprint, so under the pose noise a
+#   teammate hit off its reported box reads as the T. In swarp at this recipe's noise that
+#   relabels 28% of the teammate hits; training on the true classes never saw it.
+# - Returns lost on the T's faces at grazing incidence (probability 1 - cos / cos 80 deg),
+#   random dropouts (0-3% per robot) and spurious short returns (0-0.5% of the rays per
+#   robot), which the deployment labels as T. A per-robot range scale error of up to 1% and
+#   bias of up to 1 cm (the T-mini Pro's datasheet accuracy).
+# - The rotating scan (10 Hz, as the driver is set): at 1.5 rad/s one scan turns by 0.15
+#   rad, nearly three ray spacings, and the policy reads it against one pose. The stamp's
+#   place in the sweep is drawn per robot over the whole sweep (the driver's stamp and the
+#   pose's own latency are not measured), and a mount yaw error of up to 2 deg per robot.
+# - Every randomised parameter in the critic state (critic_dr), so the value no longer has
+#   to average over drives, delays and sensors it cannot see.
+# - An action-rate penalty of 0.03 times the mean squared change of the normalised action:
+#   16% of the team term at L7's sampled jitter (0.30 per step against |team| 0.056 at full
+#   difficulty) and 4% at its greedy one (0.055 against 0.043). It ramps in over the first
+#   2000 iterations: the initial policy's change is 0.73, a penalty of 0.022 per step
+#   against team and approach terms of about 0.001 there.
+SPECS["pusht_lidar_limo_slim240"] = replace(
+    SPECS["pusht_lidar_limo_slim"],
+    scen_kwargs={
+        **SPECS["pusht_lidar_limo_slim"].scen_kwargs,
+        "n_rays": 43, "lidar_span": 4.0 * math.pi / 3.0, "lidar_fov": 4.0 * math.pi / 3.0,
+        "lidar_label_from_pose": True, "lidar_grazing_cos": math.cos(math.radians(80.0)),
+        "lidar_dropout": (0.0, 0.03), "lidar_spurious": (0.0, 0.005),
+        "lidar_range_scale": 0.01, "lidar_range_bias": 0.01, "lidar_scan_period": 0.1,
+        "lidar_stamp_phase": (0.0, 1.0), "lidar_yaw_bias": math.radians(2.0),
+        "critic_dr": True,
+    },
+    action_rate_coef=0.03, action_rate_ramp_iters=2000,
+)
+
+
 def scenario_name(name: str) -> str:
     """The registered scenario behind ``name``: a ``SPECS`` key's ``scenario`` when it
     sets one, else ``name`` itself (a registry name, or a key that is one)."""
