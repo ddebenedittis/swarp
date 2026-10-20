@@ -9,6 +9,14 @@ from conftest import DEVICES
 
 from swarp import Environment, PushTLidarScenario, PushTScenario
 from swarp._overloads import concrete
+from swarp.dynamics.base import NUM_PARAMS, P_HALF_X, P_HALF_Y, P_RADIUS, P_SHAPE
+from swarp.scenarios.pusht_lidar_artefacts import (
+    ART_DIM,
+    ART_DROPOUT,
+    ART_SPURIOUS,
+    lidar_artefact_kernel,
+    lidar_relabel_kernel,
+)
 from swarp.scenarios.pusht_lidar_kernels import (
     OBJECTIVES,
     STATE_AGENT,
@@ -474,3 +482,178 @@ def test_out_of_bounds_fails_the_episode_until_respawn(device, fused):
     env.reset(seed=1)
     _, rew, term, *_ = env.step(zero)
     assert (rew[0] != -0.3).any()
+
+
+# ------------------------------------------------------------------- lidar artefacts
+
+
+def _artefacts(device, pos, theta, ranges, cls, idx, art, *, grazing=0.0, smin=0.1,
+               box=((0.0, 0.0), 0.0, (0.5, 0.02))):
+    """One launch of the artefact kernel over a synthetic scan (one ray per agent, along
+    the heading) against a single box obstacle; returns the edited (ranges, classes)."""
+    wp.init()
+    n_e, n_a = theta.shape
+    v2 = wp.vec2f
+    rng = wp.array((torch.arange(n_e * n_a) * 7919 + 1).view(n_e, n_a).numpy().astype("uint32"),
+                   dtype=wp.uint32, device=device)
+    r, c, i = ranges.clone().to(device), cls.clone().to(device), idx.clone().to(device)
+    wp.launch(
+        concrete(lidar_artefact_kernel, wp.float32),
+        dim=(n_e, n_a),
+        inputs=[
+            wp.from_torch(pos.to(device), dtype=v2), wp.from_torch(theta.to(device)), 2.0,
+            0.0, 0.0, 1,
+            wp.array([[box[0]]] * n_e, dtype=v2, device=device),
+            wp.array([[box[1]]] * n_e, dtype=wp.float32, device=device),
+            wp.array([box[2]], dtype=v2, device=device),
+            grazing, smin, wp.from_torch(art.to(device)), rng, wp.from_torch(r),
+            wp.from_torch(c), wp.from_torch(i),
+        ],
+        device=device,
+    )
+    return r.cpu(), c.cpu()
+
+
+def _binomial_ok(k, n, p):
+    return abs(k / n - p) <= 5.0 * math.sqrt(p * (1.0 - p) / n) + 1e-9
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_dropout_and_spurious_returns_at_their_rates(device):
+    """Every hit is lost with the robot's dropout probability; every ray, a miss
+    included, returns a spurious hit (the T's class) with its spurious probability, at a
+    range between ``spurious_min`` and where the ray ended. A range scale and bias then
+    apply to every remaining hit."""
+    n = 20000
+    pos = torch.zeros(n, 1, 2)
+    theta = torch.zeros(n, 1)
+    idx = torch.zeros(n, 1, 1, dtype=torch.int32)
+    art = torch.zeros(n, 1, ART_DIM)
+    art[..., ART_DROPOUT] = 0.2
+    hits = torch.full((n, 1, 1), 3, dtype=torch.uint8)
+    r, c = _artefacts(device, pos, theta, torch.full((n, 1, 1), 1.0), hits, idx, art)
+    lost = (c == 0).sum().item()
+    assert _binomial_ok(lost, n, 0.2)
+    assert (r[c == 0] == 2.0).all() and (r[c == 3] == 1.0).all()
+
+    art.zero_()
+    art[..., ART_SPURIOUS] = 0.1
+    misses = torch.zeros(n, 1, 1, dtype=torch.uint8)
+    r, c = _artefacts(device, pos, theta, torch.full((n, 1, 1), 2.0), misses, idx, art)
+    spur = c == 3
+    assert _binomial_ok(spur.sum().item(), n, 0.1)
+    assert (r[spur] >= 0.1).all() and (r[spur] <= 2.0).all() and (r[~spur] == 2.0).all()
+
+    art.zero_()
+    art[..., 2], art[..., 3] = 0.1, 0.01  # scale, bias
+    r, c = _artefacts(device, pos[:4], theta[:4], torch.full((4, 1, 1), 1.0), hits[:4],
+                      idx[:4], art[:4])
+    torch.testing.assert_close(r, torch.full((4, 1, 1), 1.11))
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_grazing_hits_on_the_t_are_lost(device):
+    """A ray square onto the bar's end face always returns; one meeting its long face at
+    incidence cosine 0.18 is lost with probability ``1 - 0.18 / grazing_cos``."""
+    n = 20000
+    head = torch.tensor([-1.5, 0.0])
+    graze = torch.tensor([-1.5, 0.3])
+    d = torch.tensor([0.0, 0.02]) - graze
+    cos_i = (d[1].abs() / d.norm()).item()
+    pos = torch.stack([head, graze]).repeat(n // 2, 1).view(n, 1, 2)
+    theta = torch.tensor([0.0, math.atan2(d[1], d[0])]).repeat(n // 2).view(n, 1)
+    t = torch.tensor([1.0, d.norm().item()]).repeat(n // 2).view(n, 1, 1)
+    cls = torch.full((n, 1, 1), 3, dtype=torch.uint8)
+    idx = torch.zeros(n, 1, 1, dtype=torch.int32)
+    _, c = _artefacts(device, pos, theta, t, cls, idx, torch.zeros(n, 1, ART_DIM),
+                      grazing=0.5)
+    c = c.view(n // 2, 2)
+    assert (c[:, 0] == 3).all()
+    assert _binomial_ok((c[:, 1] == 0).sum().item(), n // 2, 1.0 - cos_i / 0.5)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_labels_come_from_the_reported_poses(device):
+    """The deployment's rule (swarp_gz_test ``label_rays``): a hit inside a teammate's
+    *reported* box grown by the margin is an agent hit, anything else in bounds is the T,
+    and a hit beyond the bound is a miss. A teammate hit 0.84 m ahead reads as an agent at
+    the teammate's true pose and as the T once its reported pose is 0.1 m further off."""
+    wp.init()
+    v2 = wp.vec2f
+
+    def label(mate_x, t, bound=2.0):
+        opos = torch.tensor([[[0.0, 0.0], [mate_x, 0.0]]])
+        params = torch.zeros(2, NUM_PARAMS)
+        params[:, P_SHAPE], params[:, P_HALF_X], params[:, P_HALF_Y] = 1.0, 0.16, 0.11
+        params[:, P_RADIUS] = 0.195
+        r = torch.tensor([[[t], [3.0]]], device=device)
+        c = torch.tensor([[[1], [0]]], dtype=torch.uint8, device=device)
+        wp.launch(
+            concrete(lidar_relabel_kernel, wp.float32),
+            dim=(1, 2),
+            inputs=[wp.from_torch(opos.to(device), dtype=v2),
+                    wp.from_torch(torch.zeros(1, 2, device=device)),
+                    wp.from_torch(params.to(device)), 3.0, 0.0, 0.0, 1, bound, 0.03,
+                    wp.from_torch(r), wp.from_torch(c)],
+            device=device,
+        )
+        return c[0, 0, 0].item(), r[0, 0, 0].item()
+
+    assert label(1.0, 0.84) == (1, pytest.approx(0.84))
+    assert label(1.1, 0.84) == (3, pytest.approx(0.84))
+    assert label(1.0, 0.84, bound=0.5) == (0, 3.0)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("fused", [True, False])
+def test_critic_carries_the_randomised_parameters_role_sorted(device, fused):
+    """``critic_dr`` appends every drawn parameter, normalised over its range, per robot
+    in role-sorted order: here the speed gain and the range-noise deviation."""
+    env = _env(device, n_envs=16, fused=fused, n_agents=3, n_pushers=1, model="diff_drive",
+               agent_shape="box", agent_half_extents=(0.05, 0.03),
+               cmd_gain_v=(0.8, 1.0), lidar_noise=(0.0, 0.02), critic_dr=True)
+    scen = env.scenario
+    assert (scen.dr_env_dim, scen.dr_agent_dim) == (0, 2)
+    assert scen.state_dim == scen.state_base_dim + 2 * 3
+    env.reset(seed=0)
+    with torch.no_grad():
+        env.step(torch.zeros(16, 3, 2, device=device))
+    from swarp.dynamics.base import P_CMD_GAIN_V
+
+    gain = wp.to_torch(env.world.stepper.params.floats_per_env)[..., P_CMD_GAIN_V]
+    want = torch.stack([(gain - 0.9) / 0.1, (scen._noise_std - 0.01) / 0.01], dim=-1)
+    perm = torch.argsort(scen.agent_roles(), dim=-1, stable=True)
+    want = want.gather(1, perm.unsqueeze(-1).expand(-1, -1, 2)).flatten(1)
+    got = scen.critic_state()[:, scen.state_base_dim:]
+    torch.testing.assert_close(got, want)
+    assert got.std() > 0.3
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("fused", [True, False])
+def test_span_scans_only_its_sector(device, fused):
+    """A 240-deg span puts its first and last rays at +-120 deg and never sees the T
+    straight behind, which the full circle does."""
+    seen = {}
+    for span in (2.0 * math.pi, 4.0 * math.pi / 3.0):
+        env = _env(device, n_envs=1, fused=fused, n_agents=1, n_pushers=1, n_rays=43,
+                   model="diff_drive", agent_shape="box", agent_half_extents=(0.05, 0.03),
+                   lidar_span=span)
+        env.reset(seed=0)
+        scen = env.scenario
+        with torch.no_grad():
+            scen.tee_pos.zero_()
+            scen.tee_vel.zero_()
+            scen.tee_ang_vel.zero_()
+            scen._install_obstacles()
+            env.world.write_state(pos=torch.tensor([[[0.6, 0.0]]], device=device),
+                                  theta=torch.zeros(1, 1, device=device), speed=0.0,
+                                  ang_vel=0.0)
+            obs, *_ = env.step(torch.zeros(1, 1, 2, device=device))
+        lidar = obs[0, 0, scen.obs_layout()["lidar_newest"]]
+        seen[span < 6.0] = bool((lidar[43:86] > 0.5).any())
+        if span < 6.0:
+            off = scen.lidar.ray_offsets()
+            assert off[0].item() == pytest.approx(-2.0 * math.pi / 3.0)
+            assert off[-1].item() == pytest.approx(2.0 * math.pi / 3.0)
+    assert seen == {False: True, True: False}

@@ -15,10 +15,27 @@ from swarp._overloads import concrete
 from swarp.core.cached_launch import CachedLaunch, ptr_key
 from swarp.core.state import VEC2
 from swarp.core.world import World
-from swarp.dynamics.base import AgentShape
+from swarp.dynamics.base import (
+    P_CMD_GAIN_V,
+    P_CMD_GAIN_W,
+    P_MAX_ACCEL,
+    P_MAX_ANG_ACCEL,
+    AgentShape,
+)
 from swarp.interop.autograd import torch_stream_scope
 from swarp.scenarios.fused import Buf, FusedPass
 from swarp.scenarios.pusht import PushTScenario
+from swarp.scenarios.pusht_lidar_artefacts import (
+    ART_BIAS,
+    ART_DIM,
+    ART_DROPOUT,
+    ART_SCALE,
+    ART_SPURIOUS,
+    lidar_artefact_kernel,
+    lidar_artefact_reset_kernel,
+    lidar_relabel_kernel,
+    pusht_lidar_critic_dr_kernel,
+)
 from swarp.scenarios.pusht_lidar_kernels import (
     FOV_EPS,
     N_OBJ,
@@ -116,6 +133,21 @@ class PushTLidarScenario(PushTScenario):
     hit's range (clamped to ``[0, lidar_max_range]``). These edit the scan itself, so the
     observation, the auxiliary targets' visibility statistics and the reward inputs all
     see the sensor's scan.
+
+    Scan artefacts (all off by default; :mod:`swarp.scenarios.pusht_lidar_artefacts`).
+    ``lidar_span`` below ``2 pi`` spans the rays over that angle centred on the heading
+    (first and last ray at its ends) instead of the full circle. ``lidar_scan_period``
+    turns the scan into a rotating one, each ray cast from the pose at its own time in the
+    sweep, with a per-robot mount yaw error of up to ``lidar_yaw_bias`` and a per-robot
+    stamp phase drawn from ``lidar_stamp_phase`` (:func:`~swarp.sensors.lidar.
+    sweep_offsets`). Before the sensor model, a T hit at incidence cosine ``c`` is lost
+    with probability ``1 - c / lidar_grazing_cos``, any hit with a per-robot probability
+    drawn from ``lidar_dropout``, any ray returns a spurious T hit with a per-robot
+    probability drawn from ``lidar_spurious``, and the hits' ranges take a per-robot scale
+    error and bias of up to ``lidar_range_scale`` and ``lidar_range_bias``. With
+    ``lidar_label_from_pose`` the hit classes are the deployment's, from the reported
+    poses: a hit inside a teammate's reported footprint grown by ``lidar_label_margin``
+    is an agent, a hit beyond ``label_bound`` a miss, anything else the T.
     """
 
     #: Two roles: pushers (0) and observers (1).
@@ -161,6 +193,19 @@ class PushTLidarScenario(PushTScenario):
         pose_slip_gain: tuple[float, float] = (1.0, 1.0),
         oob_margin: float | None = None,
         oob_penalty: float = 0.05,
+        lidar_span: float = 2.0 * math.pi,
+        lidar_dropout: float | tuple[float, float] = 0.0,
+        lidar_spurious: float | tuple[float, float] = 0.0,
+        lidar_grazing_cos: float = 0.0,
+        lidar_range_scale: float = 0.0,
+        lidar_range_bias: float = 0.0,
+        lidar_scan_period: float = 0.0,
+        lidar_sweep_dir: float = 1.0,
+        lidar_stamp_phase: float | tuple[float, float] = 1.0,
+        lidar_yaw_bias: float = 0.0,
+        lidar_label_from_pose: bool = False,
+        lidar_label_margin: float = 0.03,
+        critic_dr: bool = False,
         **kwargs: Any,
     ) -> None:
         super().__init__(n_agents=n_agents, shape=shape, **kwargs)
@@ -260,6 +305,59 @@ class PushTLidarScenario(PushTScenario):
         self.oob_penalty = float(oob_penalty)
         #: Whether a reset draws per-robot sensor or pose-noise values.
         self.sensor_dr = fov[0] < fov[1] or noise[0] < noise[1] or self.pose_noise_on
+        if not 0.0 < lidar_span <= 2.0 * math.pi:
+            raise ValueError(f"lidar_span must lie in (0, 2 pi], got {lidar_span}")
+        #: The angle the rays span, centred on the heading (``2 pi``: the full circle).
+        self.lidar_span = float(lidar_span)
+        drop = _range(lidar_dropout, "lidar_dropout")
+        spur = _range(lidar_spurious, "lidar_spurious")
+        phase = _range(lidar_stamp_phase, "lidar_stamp_phase")
+        if drop[1] > 1.0 or spur[1] > 1.0 or phase[1] > 1.0:
+            raise ValueError("lidar_dropout, lidar_spurious and lidar_stamp_phase lie in [0, 1]")
+        widths = (lidar_grazing_cos, lidar_range_scale, lidar_range_bias, lidar_scan_period,
+                  lidar_yaw_bias, lidar_label_margin)
+        if min(widths) < 0.0 or lidar_grazing_cos > 1.0:
+            raise ValueError("the lidar artefact widths must be >= 0 (lidar_grazing_cos <= 1)")
+        #: The scan artefacts (:func:`~swarp.scenarios.pusht_lidar_artefacts.
+        #: lidar_artefact_kernel`): ``(low, high)`` of the per-robot dropout and
+        #: spurious-return probabilities, the grazing threshold on the incidence cosine,
+        #: and the half-widths of the per-robot range scale error and range bias.
+        self.lidar_dropout = drop
+        self.lidar_spurious = spur
+        self.lidar_grazing_cos = float(lidar_grazing_cos)
+        self.lidar_range_scale = float(lidar_range_scale)
+        self.lidar_range_bias = float(lidar_range_bias)
+        #: Whether the scan goes through the artefact kernel.
+        self.lidar_artefacts = (
+            drop[1] > 0.0 or spur[1] > 0.0 or self.lidar_grazing_cos > 0.0
+            or self.lidar_range_scale > 0.0 or self.lidar_range_bias > 0.0
+        )
+        #: The rotating scan (:func:`~swarp.sensors.lidar.sweep_offsets`): its period (0:
+        #: off), direction, the ``(low, high)`` of the per-robot stamp phase and the
+        #: half-width of the per-robot mount yaw error.
+        self.lidar_scan_period = float(lidar_scan_period)
+        self.lidar_sweep_dir = float(lidar_sweep_dir)
+        self.lidar_stamp_phase = phase
+        self.lidar_yaw_bias = float(lidar_yaw_bias)
+        self.lidar_sweep = self.lidar_scan_period > 0.0
+        if self.lidar_yaw_bias > 0.0 and not self.lidar_sweep:
+            raise ValueError("lidar_yaw_bias needs lidar_scan_period > 0 (the sweep kernel)")
+        #: Whether a reset draws per-robot artefact values.
+        self.artefact_dr = self.lidar_artefacts or self.lidar_sweep
+        #: Whether the hit classes come from the deployment's rule on the reported poses
+        #: (:func:`~swarp.scenarios.pusht_lidar_artefacts.lidar_relabel_kernel`), with the
+        #: teammates' footprints grown by ``lidar_label_margin`` and hits beyond
+        #: ``label_bound`` on either axis dropped: the out-of-bounds limit when there is
+        #: one, else the arena (none in an open arena).
+        self.lidar_label_from_pose = bool(lidar_label_from_pose)
+        self.lidar_label_margin = float(lidar_label_margin)
+        if self.oob_limit > 0.0:
+            self.label_bound = self.oob_limit
+        else:
+            self.label_bound = math.inf if self.open_arena else float(self.world_size)
+        #: Whether the critic state carries the randomised parameters (:meth:`critic_state`).
+        self.critic_dr = bool(critic_dr)
+        self.dr_env_dim, self.dr_agent_dim = self._critic_dr_layout() if critic_dr else (0, 0)
 
     # ------------------------------------------------------------- dimensions
 
@@ -273,7 +371,43 @@ class PushTLidarScenario(PushTScenario):
 
     @property
     def state_dim(self) -> int:  # type: ignore[override]
+        return self.state_base_dim + self.dr_env_dim + self.dr_agent_dim * self.n_agents
+
+    @property
+    def state_base_dim(self) -> int:
+        """Width of the critic state without the randomised parameters."""
         return STATE_HEAD + self.state_agent_dim * self.n_agents
+
+    def _critic_dr_layout(self) -> tuple[int, int]:
+        """``(env, per-robot)`` widths of the randomised-parameter block: one column per
+        parameter a reset draws (see :meth:`critic_state`)."""
+        env = int(self.friction_dr)
+        agent = sum(lo < hi for lo, hi in self._actuation_ranges)
+        agent += int(self.cmd_latency[0] < self.cmd_latency[1])
+        agent += int(self.lidar_noise[0] < self.lidar_noise[1])
+        if self.pose_noise_on:
+            agent += int(self.pose_noise[0] < self.pose_noise[1]) + 3
+            agent += 3 if self.pose_drift_on else 0
+        agent += len(self._art_columns())
+        agent += 2 if self._sweep_dr else 0
+        return env, agent
+
+    def _art_columns(self) -> list[tuple[int, float, float]]:
+        """``(art column, mid, half-width)`` of every drawn artefact parameter."""
+        cols = []
+        for col, (lo, hi) in ((ART_DROPOUT, self.lidar_dropout),
+                              (ART_SPURIOUS, self.lidar_spurious)):
+            if lo < hi:
+                cols.append((col, 0.5 * (lo + hi), 0.5 * (hi - lo)))
+        for col, w in ((ART_SCALE, self.lidar_range_scale), (ART_BIAS, self.lidar_range_bias)):
+            if w > 0.0:
+                cols.append((col, 0.0, w))
+        return cols
+
+    @property
+    def _sweep_dr(self) -> bool:
+        lo, hi = self.lidar_stamp_phase
+        return self.lidar_sweep and (self.lidar_yaw_bias > 0.0 or lo < hi)
 
     @property
     def aux_dim(self) -> int:  # type: ignore[override]
@@ -332,14 +466,21 @@ class PushTLidarScenario(PushTScenario):
         self._prev_standoff: torch.Tensor | None = None
         # The fused path's lidar: bound here, outside any capture, so launching it inside
         # the captured step is a bare wp.launch on pointer-stable buffers.
+        half_span = 0.5 * self.lidar_span
         self.lidar = Lidar(
             self.n_rays,
             self.lidar_max_range,
             body_frame=self.lidar_body_frame,
+            angle_start=-half_span if self.lidar_span < 2.0 * math.pi else 0.0,
+            angle_end=half_span if self.lidar_span < 2.0 * math.pi else None,
             return_hits=True,
             backend="warp",
+            scan_period=self.lidar_scan_period,
+            sweep_dir=self.lidar_sweep_dir,
         )
         self.lidar.bind(world)
+        if self.lidar_sweep:
+            self.lidar.stamp_phase.fill_(self.lidar_stamp_phase[0])
         if self.sensor_model:
             # One RNG stream per robot for the range noise, advanced in place by the sensor
             # kernel (so it draws fresh noise on every replay of a captured step).
@@ -386,6 +527,18 @@ class PushTLidarScenario(PushTScenario):
         self._oob = torch.zeros(n_envs if self.oob_limit > 0.0 else 1, dtype=torch.uint8,
                                 device=device)
         self._oob_wp = wp.from_torch(self._oob)
+        if self.artefact_dr:
+            # Per-robot artefact values (ART_* columns), at the ranges' low ends until a
+            # reset redraws them in place, and their RNG streams.
+            art = torch.zeros(n_envs, na, ART_DIM, **tt)
+            art[..., ART_DROPOUT] = self.lidar_dropout[0]
+            art[..., ART_SPURIOUS] = self.lidar_spurious[0]
+            self._lidar_art = art
+            self._lidar_art_wp = wp.from_torch(art)
+            self._art_rng = self._rng_streams(world)
+            self._art_launch = CachedLaunch()
+        if self.critic_dr:
+            self._setup_critic_dr(world)
         self._lidar_obs_launch = CachedLaunch()
         self._lidar_reward_launch = CachedLaunch()
         self._lcache: dict[str, torch.Tensor] | None = None
@@ -421,6 +574,8 @@ class PushTLidarScenario(PushTScenario):
             launch.launch()
             if self.sensor_dr:
                 self._launch_sensor_dr(mask, use_mask)
+            if self.artefact_dr:
+                self._launch_artefact_dr(mask, use_mask)
 
     def _launch_sensor_dr(self, mask, use_mask) -> None:
         """Redraw the respawned robots' field of view, range noise, pose-noise scale and
@@ -444,6 +599,122 @@ class PushTLidarScenario(PushTScenario):
         launch.set_param_by_name("use_mask", use_mask)
         launch.set_param_by_name("seed", seed)
         launch.launch()
+
+    def _launch_artefact_dr(self, mask, use_mask) -> None:
+        """Redraw the respawned robots' artefact values (``artefact_dr``)."""
+        w = self.world
+        scalar = w.wp_dtype
+        seed = wp.int32(w.next_kernel_seed())
+        bounds = (
+            *self.lidar_dropout, *self.lidar_spurious, self.lidar_range_scale,
+            self.lidar_range_bias, self.lidar_yaw_bias, *self.lidar_stamp_phase,
+        )
+        lid = self.lidar
+        yaw = lid.wp_yaw_bias if self.lidar_sweep else self._dummy_2d()
+        phase = lid.wp_stamp_phase if self.lidar_sweep else yaw
+        outs = [self._lidar_art_wp, yaw, phase]
+        launch = self._art_launch.get(
+            concrete(lidar_artefact_reset_kernel, scalar),
+            dim=(w.n_envs, self.n_agents),
+            inputs=[mask, use_mask, seed, *(scalar(x) for x in bounds),
+                    wp.int32(int(self.lidar_sweep))],
+            outputs=outs,
+            device=w.device,
+            key=(w.n_envs, ptr_key(mask), *bounds, *(ptr_key(o) for o in outs)),
+        )
+        launch.set_param_by_name("use_mask", use_mask)
+        launch.set_param_by_name("seed", seed)
+        launch.launch()
+
+    def _dummy_3d(self) -> wp.array:
+        """A ``[1, 1, 1]`` scalar array for a kernel slot a config leaves unused."""
+        if getattr(self, "_dummy3", None) is None:
+            self._dummy3 = wp.zeros((1, 1, 1), dtype=self.world.wp_dtype,
+                                    device=self.world.device)
+        return self._dummy3
+
+    def _dummy_2d(self) -> wp.array:
+        """A ``[1, 1]`` scalar array for a kernel slot a config leaves unused."""
+        if getattr(self, "_dummy2", None) is None:
+            self._dummy2 = wp.zeros((1, 1), dtype=self.world.wp_dtype, device=self.world.device)
+        return self._dummy2
+
+    def _setup_critic_dr(self, world: World) -> None:
+        """The randomised-parameter block's column scaling and the critic kernel's fixed
+        inputs (see :meth:`critic_state`), once, outside any capture."""
+        st = world.stepper
+        dev, wdt = world.device, world.wp_dtype
+        env: list[tuple[float, float]] = []
+        agent: list[tuple[float, float]] = []
+
+        def mid_half(lo: float, hi: float) -> tuple[float, float]:
+            return 0.5 * (lo + hi), 0.5 * (hi - lo)
+
+        if self.friction_dr:
+            env.append(mid_half(*self.floor_friction))
+        act_cols = []
+        for col, (lo, hi) in zip(
+            (P_MAX_ACCEL, P_MAX_ANG_ACCEL, P_CMD_GAIN_V, P_CMD_GAIN_W),
+            self._actuation_ranges, strict=True,
+        ):
+            if lo < hi:
+                act_cols.append(col)
+                agent.append(mid_half(lo, hi))
+        self._dr_delay = self.cmd_latency[0] < self.cmd_latency[1]
+        if self._dr_delay:
+            agent.append(mid_half(*(self.cmd_delay_substeps or (0, 0))))
+        delay = st.cmd_delay
+        if delay is None:  # a latency range that rounds to no substep: always 0
+            delay = wp.zeros((world.n_envs, self.n_agents), dtype=wp.int32, device=dev)
+        self._dr_noise = self.lidar_noise[0] < self.lidar_noise[1]
+        if self._dr_noise:
+            agent.append(mid_half(*self.lidar_noise))
+        self._dr_scale = self.pose_noise_on and self.pose_noise[0] < self.pose_noise[1]
+        if self._dr_scale:
+            agent.append(mid_half(*self.pose_noise))
+        if self.pose_noise_on:
+            # Zero-mean Gaussians: two deviations at the top of the scale span [-1, 1].
+            u = self.pose_noise[1]
+            bp, bt = self.pose_bias_std
+            agent += [(0.0, 2.0 * u * bp)] * 2 + [(0.0, 2.0 * u * bt)]
+            if self.pose_drift_on:
+                dp, dt_ = self.pose_drift_std
+                agent += [(0.0, 2.0 * u * dp)] * 2 + [(0.0, 2.0 * u * dt_)]
+        art_cols = [c for c, _, _ in self._art_columns()]
+        agent += [(m, h) for _, m, h in self._art_columns()]
+        if self._sweep_dr:
+            agent += [(0.0, self.lidar_yaw_bias), mid_half(*self.lidar_stamp_phase)]
+        assert (len(env), len(agent)) == (self.dr_env_dim, self.dr_agent_dim)
+        cols = env + agent
+        mid = torch.tensor([m for m, _ in cols] or [0.0], dtype=torch.float64)
+        half = torch.tensor([h for _, h in cols] or [0.0], dtype=torch.float64)
+        inv = torch.where(half > 0.0, 1.0 / half.clamp(min=1e-30), torch.zeros_like(half))
+        tt = {"device": world.device, "dtype": world.dtype}
+        #: Per column of the block: ``(x - mid) * inv``.
+        self._dr_mid, self._dr_inv = mid.to(**tt), inv.to(**tt)
+        self._dr_mid_wp = wp.from_torch(self._dr_mid)
+        self._dr_inv_wp = wp.from_torch(self._dr_inv)
+        self._dr_act_cols = act_cols
+        self._dr_art_cols = art_cols
+        self._dr_act_wp = wp.array(act_cols or [-1], dtype=wp.int32, device=dev)
+        self._dr_art_wp = wp.array(art_cols or [-1], dtype=wp.int32, device=dev)
+        d2 = self._dummy_2d()
+        self._dr_inputs = [
+            wp.int32(int(self.friction_dr)),
+            st.body_friction if self.friction_dr else wp.zeros(1, dtype=wdt, device=dev),
+            wdt(1.0 / world.config.gravity) if self.friction_dr else wdt(0.0),
+            self._dr_act_wp,
+            st.params.floats_per_env if act_cols else wp.zeros((1, 1, 1), dtype=wdt, device=dev),
+            wp.int32(int(self._dr_delay)),
+            delay if self._dr_delay else wp.zeros((1, 1), dtype=wp.int32, device=dev),
+            wp.int32(int(self._dr_noise)),
+            self._noise_std_wp if self._dr_noise else d2,
+            wp.int32(int(self.pose_noise_on)),
+            wp.int32(int(self._dr_scale)),
+            *(self._pose_dr_wp if self.pose_noise_on
+              else [d2, wp.zeros((1, 1), dtype=VEC2[wdt], device=dev), d2]),
+            wp.int32(int(self.pose_drift_on)),
+        ]
 
     # ---------------------------------------- torch reference path (parity oracle)
 
@@ -485,6 +756,122 @@ class PushTLidarScenario(PushTScenario):
             noisy = (ranges + sigma * torch.randn_like(ranges)).clamp(0.0, mr)
             ranges = torch.where(hit_class != 0, noisy, ranges)
         return ranges, hit_class
+
+    def _artefacts_torch(
+        self, ranges: torch.Tensor, hit_class: torch.Tensor, hit_index: torch.Tensor,
+        centres: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The torch twin of :func:`~swarp.scenarios.pusht_lidar_artefacts.
+        lidar_artefact_kernel`, its draws from torch's generator. ``centres`` ``[E, B, 2]``
+        are the T's box centres (every box at the T's heading)."""
+        mr = self.lidar_max_range
+        art = self._lidar_art
+        ang = self._ray_angles()
+        dx, dy = torch.cos(ang), torch.sin(ang)
+        p = self.world.state.pos.unsqueeze(2)  # [E, A, 1, 2]
+        lost = torch.zeros_like(hit_class, dtype=torch.bool)
+        if self.lidar_grazing_cos > 0.0:
+            idx = hit_index.long().clamp(min=0)  # [E, A, R]
+            e_idx = torch.arange(idx.shape[0], device=idx.device).view(-1, 1, 1)
+            cen = centres[e_idx, idx]  # [E, A, R, 2]
+            half = self._obs_half[idx]
+            th = self.tee_theta.view(-1, 1, 1)
+            co, so = torch.cos(th), torch.sin(th)
+            rx = p[..., 0] + ranges * dx - cen[..., 0]
+            ry = p[..., 1] + ranges * dy - cen[..., 1]
+            lx = co * rx + so * ry
+            ly = -so * rx + co * ry
+            face_x = lx.abs() * half[..., 1] > ly.abs() * half[..., 0]
+            cos_i = torch.where(face_x, (co * dx + so * dy).abs(), (-so * dx + co * dy).abs())
+            p_lost = 1.0 - cos_i / self.lidar_grazing_cos
+            lost = (hit_class == HIT_MOVABLE) & (torch.rand_like(ranges) < p_lost)
+        pd = art[..., ART_DROPOUT].unsqueeze(-1)
+        lost = lost | ((hit_class != 0) & (torch.rand_like(ranges) < pd))
+        ranges = torch.where(lost, torch.full_like(ranges, mr), ranges)
+        hit_class = torch.where(lost, torch.zeros_like(hit_class), hit_class)
+        smin = self.agent_radius
+        ps = art[..., ART_SPURIOUS].unsqueeze(-1)
+        spur = (torch.rand_like(ranges) < ps) & (ranges > smin)
+        ranges = torch.where(spur, smin + (ranges - smin) * torch.rand_like(ranges), ranges)
+        hit_class = torch.where(spur, torch.full_like(hit_class, HIT_MOVABLE), hit_class)
+        kappa = art[..., ART_SCALE].unsqueeze(-1)
+        beta = art[..., ART_BIAS].unsqueeze(-1)
+        scaled = (ranges * (1.0 + kappa) + beta).clamp(0.0, mr)
+        return torch.where(hit_class != 0, scaled, ranges), hit_class
+
+    def _relabel_torch(
+        self, ranges: torch.Tensor, hit_class: torch.Tensor, opos: torch.Tensor,
+        oth: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The torch twin of :func:`~swarp.scenarios.pusht_lidar_artefacts.
+        lidar_relabel_kernel`: hits classed from the reported poses ``opos``/``oth``."""
+        w = self.world
+        na = self.n_agents
+        off = self.lidar.ray_offsets(device=ranges.device, dtype=ranges.dtype)
+        base = oth if self.lidar.body_frame else torch.zeros_like(oth)
+        ang = base.unsqueeze(-1) + off
+        hit = opos.unsqueeze(2) + ranges.unsqueeze(-1) * torch.stack(
+            [torch.cos(ang), torch.sin(ang)], dim=-1
+        )  # [E, A, R, 2]
+        out = (hit.abs() > self.label_bound).any(-1)
+        rel = hit.unsqueeze(3) - opos.view(-1, 1, 1, na, 2)  # [E, A, R, J, 2]
+        cj = torch.cos(oth).view(-1, 1, 1, na)
+        sj = torch.sin(oth).view(-1, 1, 1, na)
+        lx = cj * rel[..., 0] + sj * rel[..., 1]
+        ly = -sj * rel[..., 0] + cj * rel[..., 1]
+        m = self.lidar_label_margin
+        hx, hy = w.agent_half_extents[:, 0], w.agent_half_extents[:, 1]
+        in_box = (lx.abs() <= hx + m) & (ly.abs() <= hy + m)
+        in_disc = rel.norm(dim=-1) <= w.agent_radius + m
+        is_box = w.agent_shape == int(AgentShape.BOX)
+        inside = torch.where(is_box, in_box, in_disc)
+        eye = torch.eye(na, dtype=torch.bool, device=ranges.device).view(1, na, 1, na)
+        mate = (inside & ~eye).any(-1)
+        hit_any = hit_class != 0
+        cls = torch.where(mate, HIT_AGENT, HIT_MOVABLE)
+        cls = torch.where(hit_any & ~out, cls, 0).to(hit_class.dtype)
+        ranges = torch.where(hit_any & out, torch.full_like(ranges, self.lidar_max_range), ranges)
+        return ranges, cls
+
+    def _critic_dr_torch(self, perm: torch.Tensor) -> torch.Tensor:
+        """``[E, dr_env_dim + dr_agent_dim A]``: the randomised parameters, normalised
+        and role-sorted (the torch twin of :func:`~swarp.scenarios.pusht_lidar_artefacts.
+        pusht_lidar_critic_dr_kernel`)."""
+        w = self.world
+        st = w.stepper
+        dt = w.state.pos.dtype
+        env, agent = [], []
+        if self.friction_dr:
+            env.append(wp.to_torch(st.body_friction) / w.config.gravity)
+        if self._dr_act_cols:
+            params = wp.to_torch(st.params.floats_per_env)
+            agent += [params[..., c] for c in self._dr_act_cols]
+        if self._dr_delay:
+            delay = st.cmd_delay
+            agent.append(
+                torch.zeros_like(self.roles, dtype=dt) if delay is None
+                else wp.to_torch(delay).to(dt)
+            )
+        if self._dr_noise:
+            agent.append(self._noise_std)
+        if self._dr_scale:
+            agent.append(self._pose_scale)
+        if self.pose_noise_on:
+            agent += [self._bias_pos[..., 0], self._bias_pos[..., 1], self._bias_theta]
+            if self.pose_drift_on:
+                agent += [self._drift_state[..., 5 + i] for i in range(3)]
+        agent += [self._lidar_art[..., c] for c in self._dr_art_cols]
+        if self._sweep_dr:
+            agent += [self.lidar.yaw_bias, self.lidar.stamp_phase]
+        ne = self.dr_env_dim
+        out = []
+        if env:
+            out.append((torch.stack(env, -1) - self._dr_mid[:ne]) * self._dr_inv[:ne])
+        if agent:
+            block = (torch.stack(agent, -1) - self._dr_mid[ne:]) * self._dr_inv[ne:]
+            block = block.gather(1, perm.unsqueeze(-1).expand(-1, -1, block.shape[-1]))
+            out.append(block.flatten(1))
+        return torch.cat(out, dim=-1)
 
     def _observed_pose(
         self, env_mask: torch.Tensor | None, *, reset: bool
@@ -595,7 +982,12 @@ class PushTLidarScenario(PushTScenario):
             ],
             dim=-1,
         )  # [E, B, 2]
-        ranges, hit_class, _ = lidar_scan(
+        lid = self.lidar
+        sweep = None
+        if lid.sweep:
+            sweep = (s.vel, s.ang_vel, lid.yaw_bias, lid.stamp_phase, lid.scan_period,
+                     lid.sweep_dir)
+        ranges, hit_class, hit_index = lidar_scan(
             pos,
             s.theta,
             w.agent_radius,
@@ -603,6 +995,8 @@ class PushTLidarScenario(PushTScenario):
             mr,
             body_frame=self.lidar.body_frame,
             angle_start=self.lidar.angle_start,
+            angle_end=self.lidar.angle_end,
+            sweep=sweep,
             obstacle_pos=centres,
             obstacle_radius=self._obs_radius,
             obstacle_shape=self._obs_shape,
@@ -613,8 +1007,15 @@ class PushTLidarScenario(PushTScenario):
             agent_half=w.agent_half_extents,
             return_hits=True,
         )
+        if self.lidar_artefacts:
+            ranges, hit_class = self._artefacts_torch(ranges, hit_class, hit_index, centres)
         if self.sensor_model:
             ranges, hit_class = self._sensor_torch(ranges, hit_class)
+        opos, ovel, oth = pos, vel, s.theta
+        if self.pose_noise_on:
+            opos, ovel, oth = self._observed_pose(env_mask, reset=reset)
+        if self.lidar_label_from_pose:
+            ranges, hit_class = self._relabel_torch(ranges, hit_class, opos, oth)
         is_obj = hit_class == HIT_MOVABLE  # [E, A, R]
         is_ag = hit_class == HIT_AGENT
         ang = self._ray_angles()  # [E, A, R]
@@ -625,9 +1026,6 @@ class PushTLidarScenario(PushTScenario):
         q = self.tee_pos
         g = self.goal_pos
         gth = self.goal_theta.unsqueeze(1).expand(-1, na)
-        opos, ovel, oth = pos, vel, s.theta
-        if self.pose_noise_on:
-            opos, ovel, oth = self._observed_pose(env_mask, reset=reset)
         feats = [
             opos,
             ovel,
@@ -779,6 +1177,8 @@ class PushTLidarScenario(PushTScenario):
             1, perm.unsqueeze(-1).expand(-1, -1, self.state_agent_dim)
         )
         critic = torch.cat([head, sorted_agents.flatten(1)], dim=-1)
+        if self.critic_dr:
+            critic = torch.cat([critic, self._critic_dr_torch(perm)], dim=-1)
         aux = torch.cat(
             [dq * self.aux_scale, torch.stack([ca, sa], -1).unsqueeze(1).expand(-1, na, -1)],
             dim=-1,
@@ -878,12 +1278,106 @@ class PushTLidarScenario(PushTScenario):
         if pass_.is_step:
             self._launch_body_sync()
         self.lidar.launch(self.world, st)
+        if self.lidar_artefacts:
+            self._launch_artefacts(st)
         if self.sensor_model:
             self._launch_sensor(st)
         if self.pose_noise_on:
             self._launch_pose_noise(st, pass_.advance_prev)
+        if self.lidar_label_from_pose:
+            self._launch_relabel(st)
         self._launch_obs(st, pass_.advance_prev)
+        if self.critic_dr:
+            self._launch_critic_dr()
         self._launch_reward(st, pass_.advance_prev, pass_.full_pass)
+
+    def _launch_artefacts(self, st) -> None:
+        """The scan artefacts over the lidar's own buffers, in place."""
+        w = self.world
+        scalar = w.wp_dtype
+        lid = self.lidar
+        sp = w.stepper
+        wp.launch(
+            concrete(lidar_artefact_kernel, scalar),
+            dim=(w.n_envs, self.n_agents),
+            inputs=[
+                st.pos,
+                st.theta,
+                scalar(lid.max_range),
+                scalar(lid.ray_step),
+                scalar(lid.angle_start),
+                wp.int32(int(lid.body_frame)),
+                sp.obs_pos,
+                sp.obs_angle,
+                sp.obs_half,
+                scalar(self.lidar_grazing_cos),
+                scalar(self.agent_radius),
+                self._lidar_art_wp,
+                self._art_rng,
+                lid.wp_ranges,
+                lid.wp_hit_class,
+                lid.wp_hit_index,
+            ],
+            device=w.device,
+            record_tape=False,
+        )
+
+    def _launch_relabel(self, st) -> None:
+        """The deployment's hit classes from the reported poses, in place."""
+        w = self.world
+        scalar = w.wp_dtype
+        lid = self.lidar
+        seen = self._obs_pose_wp if self.pose_noise_on else [st.pos, st.vel, st.theta]
+        wp.launch(
+            concrete(lidar_relabel_kernel, scalar),
+            dim=(w.n_envs, self.n_agents),
+            inputs=[
+                seen[0],
+                seen[2],
+                w.stepper.params.floats,
+                scalar(lid.max_range),
+                scalar(lid.ray_step),
+                scalar(lid.angle_start),
+                wp.int32(int(lid.body_frame)),
+                scalar(min(self.label_bound, 1e30)),
+                scalar(self.lidar_label_margin),
+                lid.wp_ranges,
+                lid.wp_hit_class,
+            ],
+            device=w.device,
+            record_tape=False,
+        )
+
+    def _launch_critic_dr(self) -> None:
+        """The randomised parameters into the critic state's tail."""
+        w = self.world
+        scalar = w.wp_dtype
+        d2 = self._dummy_2d()
+        art = self._lidar_art_wp if self.artefact_dr else self._dummy_3d()
+        lid = self.lidar
+        wp.launch(
+            concrete(pusht_lidar_critic_dr_kernel, scalar),
+            dim=(w.n_envs, self.n_agents),
+            inputs=[
+                self._roles_wp,
+                wp.int32(self.n_pushers),
+                wp.int32(self.state_base_dim),
+                wp.int32(self.dr_env_dim),
+                wp.int32(self.dr_agent_dim),
+                *self._dr_inputs,
+                self._wp["drift_state"] if self.pose_drift_on else self._drift_wp,
+                self._dr_art_wp,
+                art,
+                wp.int32(int(self._sweep_dr)),
+                lid.wp_yaw_bias if self._sweep_dr else d2,
+                lid.wp_stamp_phase if self._sweep_dr else d2,
+                self._dr_mid_wp,
+                self._dr_inv_wp,
+                self._wp["critic"],
+            ],
+            device=w.device,
+            record_tape=False,
+        )
 
     def _launch_sensor(self, st) -> None:
         """The sensor model over the lidar's own scan buffers, in place."""
@@ -1124,7 +1618,14 @@ class PushTLidarScenario(PushTScenario):
     def critic_state(self) -> torch.Tensor:
         """``[E, state_dim]``: the T's pose, goal offset, heading terms, velocity and
         angular velocity, the goal pose, then per agent in role-sorted order its pos, vel
-        and role sign."""
+        and role sign (and heading).
+
+        With ``critic_dr`` the randomised parameters follow (``state_base_dim`` on), each
+        scaled to about ``[-1, 1]`` over its range: the floor friction, then per robot in
+        role-sorted order the drawn drive parameters, command delay, range-noise
+        deviation, pose-noise scale, localisation bias and drift (x, y, heading each),
+        artefact parameters, mount yaw error and stamp phase, each only when a reset draws
+        it."""
         if self.fused_active:
             return self.fb["critic"]
         return self._lcache["critic"]

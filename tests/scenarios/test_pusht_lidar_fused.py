@@ -131,8 +131,24 @@ def test_fused_matches_torch(device, n_agents, obs_level):
             "pose_drift_tau": 0.5, "cmd_latency": (0.0, 0.05), "open_arena": True,
             "oob_margin": 0.0,
         },
+        # The scan artefacts with every draw the two paths share (range scale and bias, a
+        # rotating scan with a mount yaw error and stamp phase; dropouts, spurious and
+        # grazing returns draw per path), a 240-deg span, the deployment's labels from the
+        # reported poses and every randomised parameter in the critic state.
+        {
+            "model": "diff_drive", "agent_shape": "box", "servo_accel": (8.0, 20.0),
+            "servo_ang_accel": (20.0, 60.0), "cmd_gain_v": (0.9, 1.05),
+            "cmd_gain_w": (0.7, 1.0), "floor_friction": (0.2, 0.5),
+            "lidar_mount_offset": 0.03, "lidar_min_range": 0.02,
+            "lidar_fov": 4.2, "lidar_fov_at_mount": True, "lidar_span": 4.2,
+            "pose_noise": (0.5, 1.0), "pose_jitter_std": (0.0, 0.0), "vel_noise_std": 0.0,
+            "pose_drift_tau": 0.5, "cmd_latency": (0.0, 0.05), "open_arena": True,
+            "oob_margin": 0.1, "lidar_range_scale": 0.02, "lidar_range_bias": 0.01,
+            "lidar_scan_period": 0.1, "lidar_yaw_bias": 0.03, "lidar_stamp_phase": (0.0, 1.0),
+            "lidar_label_from_pose": True, "critic_dr": True,
+        },
     ],
-    ids=["unicycle", "box", "unicycle-box", "drive-sensor", "real"],
+    ids=["unicycle", "box", "unicycle-box", "drive-sensor", "real", "artefacts"],
 )
 def test_fleet_fused_matches_torch(device, fleet, obs_level):
     """Unicycles and boxes: heading in the obs and critic, body-frame rays, box hits."""
