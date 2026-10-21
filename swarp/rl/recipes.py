@@ -773,11 +773,13 @@ SPECS["pusht_lidar_limo_slim240_s1"] = replace(
 )
 # Stage 2: the full recipe without the turn-away cost, resumed from stage 1 at full
 # difficulty (--resume <stage 1>_best.pt --start-difficulty 1); the action-rate weight is
-# already at its full value.
+# already at its full value. Half stage 1's learning rate: stage 1 (L8b-s1) held 0.94-0.98
+# greedy from iteration 3000 to 5500 and then collapsed to 0.004 by 6000 at 5e-4, its
+# entropy climbing back from -2.5 to -0.7 with no skipped minibatch.
 SPECS["pusht_lidar_limo_slim240_s2"] = replace(
     SPECS["pusht_lidar_limo_slim240"],
     scen_kwargs={**SPECS["pusht_lidar_limo_slim240"].scen_kwargs, "rot_away_penalty": 0.0},
-    n_envs=2048, minibatches=16, iters=8000, action_rate_ramp_iters=0,
+    n_envs=2048, minibatches=16, iters=8000, action_rate_ramp_iters=0, lr=2.5e-4,
 )
 
 
