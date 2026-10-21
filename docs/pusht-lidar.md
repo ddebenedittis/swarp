@@ -271,3 +271,75 @@ All rows are 512 envs at full difficulty with L6's `_best.pt`; the remaining kno
 L5s ignores AMCL-scale pose noise and 100 ms of latency, but a 240° field of view breaks it, so the rear blind sector is what the real robots needed training for.
 L6 pays about 0.035 greedy in the mocap-like condition for it, while its sampled policy holds 0.99.
 The checkpoint is `runs/L6-real-limo-s0-fromL5s/pusht_lidar_limo_real_best.pt` on davide-cf, pulled to `runs/remote-davide-cf/`.
+
+### Slim T at 240°, from scratch
+
+`SPECS["pusht_lidar_limo_slim240"]` (L8) trains from scratch for the setup the real robots meet, after L6 and L7 solved only 0.05–0.13 in Gazebo at 240° (swarp_gz_test `docs/results.md`).
+It builds on `pusht_lidar_limo_amcl` (L7: the field of view cut at the mount, AMCL-sized localisation drift):
+
+- an open floor (`open_arena`): no walls and no clamp on the T, the robots stopped by the safety bridge's arena stop 0.25 m past the arena, and an episode failed once the T's centroid is 0.5 m past it (`oob_margin`, −0.05 per robot and step from then on);
+- the real T: two 0.50 × 0.04 m bars, the stem hanging from the bar's middle;
+- 43 rays over ±120° (`lidar_span`), the 5.6° spacing of 64 rays over the full circle, with the field of view fixed at 240° and cut at the mount.
+
+The scan gains what a real T-mini Pro and the deployment add (`swarp/scenarios/pusht_lidar_artefacts.py`):
+
+- **Labels from the reported poses** (`lidar_label_from_pose`). The deployment (`label_rays`) can tell a teammate from the T only by the teammate's reported footprint, grown by 3 cm. Under the recipe's pose noise a teammate hit off that footprint reads as the T: in swarp that moves 28% of the teammate hits into the T mask, which training on the true classes never saw.
+- **Lost and spurious returns.** A T hit at incidence cosine `c` is lost with probability `1 − c / cos 80°` (`lidar_grazing_cos`), any hit with a per-robot probability drawn from 0–3% (`lidar_dropout`), and any ray returns a spurious short hit, labelled T as the deployment would, with a per-robot probability drawn from 0–0.5% (`lidar_spurious`).
+- **Range errors.** A per-robot scale error of up to 1% and bias of up to 1 cm (`lidar_range_scale`, `lidar_range_bias`), the datasheet's accuracy.
+- **The rotating scan** (`lidar_scan_period` 0.1 s, the driver's 10 Hz). Each ray is cast from the pose at the time the sensor took it, extrapolated at constant velocity (`swarp.sensors.lidar.sweep_offsets`): at 1.5 rad/s a scan turns by 0.15 rad, nearly three ray spacings. The stamp's place in the sweep is drawn per robot over the whole sweep (`lidar_stamp_phase`), since neither the driver's stamp convention nor the pose's latency is measured, and so is a mount yaw error of up to 2° (`lidar_yaw_bias`). The sweep is counter-clockwise from the rear; the real sensor's direction in time order is still to be measured.
+
+`critic_dr` appends every randomised parameter to the critic state, scaled to about [−1, 1] and in role-sorted order: the floor friction, and per robot the drive's accelerations and gains, the command delay, the range-noise deviation, the pose-noise scale, the localisation bias and drift, and the artefact values.
+The value then no longer has to average over drives, delays and sensors it cannot see.
+
+`action_rate_coef` 0.03 takes `0.03 · mean_i((a_t − a_{t−1}) / half_i)²` off every robot's reward, with `a_{t−1} = 0` on an episode's first step.
+That is 16% of the team term at L7's sampled jitter (0.30 per step against a team term of 0.056 at full difficulty) and 4% at its greedy one (0.055 against 0.043).
+It ramps in over the first 2000 iterations: the initial policy's change is 0.73, a penalty of 0.022 per step against team and approach terms of about 0.001.
+
+From scratch the recipe learns slowly and unstably: run S240-e512-s0 (seed 0, 512 envs, 16000 iterations) peaked at 0.18 greedy and ended at 0.148 (0.123 with the artefacts off, 0.143 with mocap-like poses), where L5 had 0.98 at the same length.
+Its greedy policy is 3.6× smoother than L7's (mean squared normalised action change 0.015 against 0.055; sampled 0.090 against 0.30).
+Pilots at 512 envs unless noted, seed 0, greedy solve at full difficulty (S240-* on davide-cf), separate the causes:
+
+| run | change from the recipe | greedy (iter) |
+|---|---|---|
+| D | the 1.0 / 0.7 × 0.3 m T | 0.037 (1000), then collapses to 0.000 (3000) |
+| N2 | old T, no pose noise or latency | 0.281 (3500), then 0.018 (4000) |
+| N1 | no pose noise or latency | 0.002 (1500) |
+| O3 | N1 with the T's pose observed (obs level 0) | 0.006 (1500) |
+| G1, G3 | curriculum gated at 0.5 | 0.000 (1500, stuck at difficulty 0, two seeds) |
+| R1 | N1 with `rot_away_penalty` 0.25 | 0.021 (3000) |
+| R3 | N1 with `rot_away_penalty` 0 | 0.244 (4000) |
+| R4 | `rot_away_penalty` 0, full noise | 0.000 (2000) |
+| R5 | R3 with 2048 envs (16 minibatches) | 0.209 (1000) |
+
+- **The slim T is a manipulation problem, not a perception one**: the oracle fails as the lidar policy does (O3, N1). It turns 3–6× more per metre pushed than the old T at the same offset (48 against 18°/m at 0.1 m, 266 against 50 at 0.2 m), so with `rot_away_penalty` 1.0 a clumsy push costs 1.5 per radian it turns the T the wrong way and earns 0.5 per radian back. Policies settle on approaching the T and not pushing it: under D's collapsed checkpoint the T travels 0.10 m per episode against 1.55 m at iteration 1000. The out-of-bounds failure is not it (0.2% of episodes).
+- **AMCL-sized pose noise and latency block learning from scratch** with either T (D against N2, R4 against R3). L6 and L7 only ever met them as a fine-tune.
+- More envs help: R5 reaches in 1000 iterations what R3 does in 4000.
+
+The recipe is trained in stages instead, each resumed from the last one's checkpoint (`--resume <checkpoint> --start-difficulty 1` from stage 2 on), 2048 envs and 16 minibatches throughout (L8b-* on davide-cf, seed 0):
+
+| stage | recipe and change | iterations | greedy solve |
+|---|---|---|---|
+| 1 | `pusht_lidar_limo_slim240_s1`: no pose noise or latency, `rot_away_penalty` 0 | 6000 | 0.982 (3500), collapsed to 0.004 by 6000 |
+| 2 | `pusht_lidar_limo_slim240_s2`: the full recipe, `rot_away_penalty` 0, lr 2.5e-4 | 8000 | 0.988 |
+| 3 | stage 2 with `--scen-kwarg rot_away_penalty=1.0` | 4000 | 0.97–0.99 |
+| 4 | stage 3's last checkpoint, `rot_away_penalty` 1.0 again | 4000 | 0.97–0.98 |
+| 4′ | the same with `rot_away_penalty` 2.0 | 4000 | 0.78–0.97, unstable |
+
+Stage 1's noise ranges are `(0, 1e-9)` rather than off, so its critic has the same randomisation columns as stage 2's and the checkpoint resumes as it is.
+With `rot_away_penalty` 0.25 instead of 1.0 stage 3 drifted down to 0.904.
+
+`examples/eval_mappo.py`, 512 envs at full difficulty, greedy, on stage 2's best checkpoint and on stage 4's at iteration 3000:
+
+| condition | stage 2 | stage 4 (3000) |
+|---|---|---|
+| the recipe | 0.992 | 0.973 |
+| artefacts off | 0.996 | 0.980 |
+| mocap-like poses (`pose_noise` 0, `cmd_latency` 0) | 0.996 | 0.973 |
+| the worst AMCL (`pose_noise` 1.25, `cmd_latency` 0.1) | 0.980 | 0.959 |
+| mean squared normalised action change, greedy (L7: 0.055) | 0.033 | 0.034 |
+| net turn of the T before the solve, median | 10.2 rad | 7.7 rad |
+
+Both policies spin the T: the median episode needs 1.57 rad of heading correction and the team turns the T 1.2–1.6 times round in one direction before stopping it on the goal heading (the net signed turn equals the largest excursion, so it is not wobble).
+The reward allows it: `angle_error` is wrapped to [0, π], so heading progress pays back on the way down what it charged on the way up, and a whole turn costs only `rot_away_penalty · π`, about 0.6 m of position progress at 1.0.
+Raising the turn-away cost trades solve rate for little less spin (stage 4′ at 2.0: 6.2 rad at 0.95 greedy, then falling to 0.86), so a penalty on the T's angular speed, which a whole turn cannot repay, is the open lead.
+Stage 2's best checkpoint is the one to deploy until then; stage 4's spins a quarter less at two points of solve rate.
