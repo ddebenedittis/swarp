@@ -900,7 +900,7 @@ def _coerce_one(raw: str, annotation: Any) -> Any:
         raise ValueError(f"{raw!r} is not a boolean")
     if annotation is int or text == "int":
         return int(raw)
-    if annotation is float or "float" in text:
+    if annotation is float or ("float" in text and "tuple" not in text):
         return float(raw)
     if annotation is str or text == "str":
         return raw

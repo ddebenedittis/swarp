@@ -252,6 +252,9 @@ def test_scen_kwarg_coercion():
     }
     assert isinstance(got["n_obstacles"], int)
     assert isinstance(got["agent_radius"], float)
+    # A value-or-range knob takes either (what a checkpoint's stored kwargs hold).
+    got = coerce_scen_kwargs("pusht_lidar", ["lidar_noise=(0.005, 0.02)", "lidar_fov=4.2"])
+    assert got == {"lidar_noise": (0.005, 0.02), "lidar_fov": 4.2}
 
 
 def test_scen_kwarg_rejects_environment_keywords():
