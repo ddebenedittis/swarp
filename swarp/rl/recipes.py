@@ -751,6 +751,36 @@ SPECS["pusht_lidar_limo_slim240"] = replace(
 )
 
 
+# pusht_lidar_limo_slim240 in two stages, both from scratch (L8b), after the pilots in
+# docs/pusht-lidar.md (S240-*): from scratch the slim T neither learns under the AMCL-sized
+# pose noise and latency (as no recipe ever did: L6 and L7 met them as a fine-tune) nor
+# under rot_away_penalty 1.0, which makes a clumsy push net-negative on a T that turns 3-6x
+# more per metre pushed than the old one, so the policies settle on not pushing it. Both
+# stages drop the turn-away cost and run 2048 envs (16 minibatches of the old size), which
+# reached in 1000 iterations what 512 envs did in 4000.
+#
+# Stage 1 learns the pushing without the localisation error and the latency. Their knobs
+# stay declared over a vanishing range (scale up to 1e-9, latency up to 1e-9 s, which rounds
+# to no substep), so the critic state keeps the columns stage 2 fills: stage 2 resumes
+# actor and critic as they are.
+SPECS["pusht_lidar_limo_slim240_s1"] = replace(
+    SPECS["pusht_lidar_limo_slim240"],
+    scen_kwargs={
+        **SPECS["pusht_lidar_limo_slim240"].scen_kwargs,
+        "rot_away_penalty": 0.0, "pose_noise": (0.0, 1e-9), "cmd_latency": (0.0, 1e-9),
+    },
+    n_envs=2048, minibatches=16, iters=6000,
+)
+# Stage 2: the full recipe without the turn-away cost, resumed from stage 1 at full
+# difficulty (--resume <stage 1>_best.pt --start-difficulty 1); the action-rate weight is
+# already at its full value.
+SPECS["pusht_lidar_limo_slim240_s2"] = replace(
+    SPECS["pusht_lidar_limo_slim240"],
+    scen_kwargs={**SPECS["pusht_lidar_limo_slim240"].scen_kwargs, "rot_away_penalty": 0.0},
+    n_envs=2048, minibatches=16, iters=8000, action_rate_ramp_iters=0,
+)
+
+
 def scenario_name(name: str) -> str:
     """The registered scenario behind ``name``: a ``SPECS`` key's ``scenario`` when it
     sets one, else ``name`` itself (a registry name, or a key that is one)."""
