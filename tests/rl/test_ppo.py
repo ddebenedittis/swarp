@@ -884,7 +884,8 @@ def test_rollback_guard_fires_on_the_l8b_s1_dip_and_restores_from_before_it():
     guard = RollbackGuard()
     it = _first_rollback(_l8b_s1_trace(), guard)
     assert it is not None and 5650 <= it <= 5725
-    assert guard.restore_it < 5600 and guard.snaps[-1] == guard.restore_it
+    # Before the fall from 0.88 at 5625, while still within keep * best of the plateau.
+    assert guard.restore_it < 5625 and guard.snaps[-1] == guard.restore_it
     assert len(guard.snaps) <= guard.ring
 
 
@@ -898,6 +899,18 @@ def test_rollback_guard_fires_on_the_final_collapse_and_ignores_wobble():
     # A short excursion (under the patience) is not a collapse.
     short = [0.95] * 400 + [0.4] * 20 + [0.95] * 200
     assert _first_rollback(short, RollbackGuard()) is None
+
+
+def test_rollback_guard_ignores_a_policy_still_learning_around_the_floor():
+    """L9b's trace: rising through 0.2-0.51 with windowed noise of +-0.05 is not a
+    collapse, so nothing is judged until the rate has passed floor + drop."""
+    from swarp.rl.ppo import RollbackGuard
+
+    rising = [0.2 + 0.3 * i / 300 + (0.05 if i % 40 < 20 else -0.05) for i in range(300)]
+    hover = [0.5 + (0.01 if i % 60 < 10 else -0.1) for i in range(600)]
+    guard = RollbackGuard()
+    assert _first_rollback(rising + hover, guard) is None
+    assert not guard.armed
 
 
 def test_rollback_guard_judges_each_ramp_position_on_its_own_best_and_stops_at_the_limit():

@@ -931,9 +931,9 @@ SPECS["pusht_lidar_limo_slim240_1run"] = replace(
 #   -1. At 0.1 an untanhed Gaussian's entropy is -0.88 per action dimension, -1.8 over
 #   the two, so the floor bites only below where those runs went. The greedy action is the
 #   mean, so the floor does not reach the deployment.
-# - rollback restores the trainer from before a collapse of the windowed solve (below
-#   max(0.5, best - 0.25) for 25 iterations) and halves the learning rate; a fifth collapse
-#   stops the run on its best checkpoint.
+# - rollback restores the trainer from before a collapse of the windowed solve (once past
+#   0.75, below max(0.5, best - 0.25) for 25 iterations) and halves the learning rate; a
+#   fifth collapse stops the run on its best checkpoint.
 SPECS["pusht_lidar_limo_slim240_arena"] = replace(
     SPECS["pusht_lidar_limo_slim240_1run"],
     scen_kwargs={

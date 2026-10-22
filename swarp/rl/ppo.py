@@ -1223,6 +1223,9 @@ class RollbackGuard:
     - The best solve rate is kept per ramp position (``bucket``), so a harder condition is
       never held to an easier one's best.
     - Armed once the rate has passed ``arm``; until then nothing is snapshotted or judged.
+      ``arm`` is ``floor + drop`` by default: a collapse is a fall from a mastered level,
+      and a policy still learning around the floor is not judged (L9b, armed at 0.5, rolled
+      back four times in 100 iterations while rising through 0.38-0.51 and stopped).
     - Snapshot every ``every`` iterations while the rate is at least ``keep`` times the
       position's best, keeping the newest ``ring``.
     - Roll back once the rate has stayed below ``max(floor, best - drop)`` for ``patience``
@@ -1243,14 +1246,15 @@ class RollbackGuard:
         every: int = 50,
         ring: int = 4,
         keep: float = 0.9,
-        arm: float = 0.5,
+        arm: float | None = None,
         drop: float = 0.25,
         floor: float = 0.5,
         patience: int = 25,
         lag: int = 25,
         max_rollbacks: int = 4,
     ) -> None:
-        self.every, self.ring, self.keep, self.arm = every, ring, keep, arm
+        self.every, self.ring, self.keep = every, ring, keep
+        self.arm = floor + drop if arm is None else arm
         self.drop, self.floor, self.patience, self.lag = drop, floor, patience, lag
         self.max_rollbacks = max_rollbacks
         self.best: dict[int, float] = {}
