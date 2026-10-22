@@ -328,6 +328,12 @@ The recipe is trained in stages instead, each resumed from the last one's checkp
 Stage 1's noise ranges are `(0, 1e-9)` rather than off, so its critic has the same randomisation columns as stage 2's and the checkpoint resumes as it is.
 With `rot_away_penalty` 0.25 instead of 1.0 stage 3 drifted down to 0.904.
 
+`SPECS["pusht_lidar_limo_slim240_1run"]` runs the same stages as one training (`python -m swarp.rl --scenario pusht_lidar_limo_slim240_1run`, 14000 iterations, about 55 minutes at 230 ms an iteration), with `TrainSpec.ramps` in place of the resumes.
+Stage 1's world holds until iteration 3000, the pose-noise scale and the command delay ramp in by 5000, `rot_away_penalty` by 10000, and the learning rate decays linearly from 5e-4 to 1e-4 over the run.
+Each `Ramp` moves in 20 increments and the trainer recaptures the env's graph on each, because a captured step keeps the reward weights it was captured with.
+The best checkpoint is ranked on ramp progress before the solve rate, so it comes from the final conditions.
+It has not yet been trained to completion.
+
 `examples/eval_mappo.py`, 512 envs at full difficulty, greedy, on stage 2's best checkpoint and on stage 4's at iteration 3000:
 
 | condition | stage 2 | stage 4 (3000) |

@@ -21,7 +21,7 @@ from swarp.rl.ppo import (
     policy_outputs,
     standardize_advantage,
 )
-from swarp.rl.recipes import SPECS, build_env, scenario_name, score
+from swarp.rl.recipes import SPECS, Ramp, build_env, scenario_name, score
 
 SMOKE = [
     "--device", "cpu", "--iters", "2", "--n-envs", "8", "--steps-per-batch", "4",
@@ -130,6 +130,27 @@ def test_train_smoke_writes_metrics_and_a_loadable_checkpoint(tmp_path):
     assert (meta["state_dim"], meta["role_counts"], meta["aux_dim"]) == (0, [], 0)
     obs = torch.randn(3, 4, actor.obs_dim)
     assert torch.equal(actor.greedy(obs), actor.greedy(obs))
+
+
+def test_ramp_quantizes_rounds_and_holds():
+    r = Ramp("x", (0.0, 0), (1.0, 20), start=10, end=20, steps=4)
+    assert r.value(0) == r.value(12) == (0.0, 0)
+    assert r.value(13) == (0.25, 5)
+    assert r.value(20) == r.value(99) == (1.0, 20)
+    assert isinstance(r.value(13)[1], int)
+
+
+def test_train_applies_ramps_and_refuses_a_typo(tmp_path):
+    cfg = parse_args(["--scenario", "pusht", *SMOKE, "--iters", "4", "--lr-final", "1e-5",
+                      "--checkpoint-dir", str(tmp_path)])
+    cfg.spec = replace(cfg.spec, ramps=(Ramp("rot_away_penalty", 0.0, 1.0, 0, 2, steps=2),))
+    train(cfg)
+    with (tmp_path / "metrics.csv").open() as fh:
+        assert [r["ramp"] for r in csv.DictReader(fh)] == ["0.000", "0.500", "1.000", "1.000"]
+
+    cfg.spec = replace(cfg.spec, ramps=(Ramp("no_such_attr", 0.0, 1.0, 0, 2),))
+    with pytest.raises(ValueError, match="no_such_attr"):
+        train(cfg)
 
 
 def test_train_with_a_policynet_and_a_per_agent_critic_round_trips(tmp_path):

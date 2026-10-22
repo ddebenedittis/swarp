@@ -513,7 +513,10 @@ class MAPPO:
             # fused + capturable: a capturable step, and a fused kernel that honours
             # ``found_inf`` by skipping the update and undoing the step increment. Eager
             # CUDA uses it too, so the skip never syncs.
-            self.optim = torch.optim.Adam(params, lr=spec.lr, fused=True, capturable=True)
+            # A scheduled lr is a tensor, filled in place: the minibatch graph would bake
+            # a float in at capture.
+            lr = spec.lr if spec.lr_final is None else torch.tensor(spec.lr, device=dev)
+            self.optim = torch.optim.Adam(params, lr=lr, fused=True, capturable=True)
             self.optim.found_inf = self.found_inf
             self.optim.grad_scale = None
         else:
@@ -1162,6 +1165,7 @@ def parse_args(argv: list[str] | None = None) -> TrainConfig:
     p.add_argument("--epochs", type=int)
     p.add_argument("--minibatches", type=int)
     p.add_argument("--lr", type=float)
+    p.add_argument("--lr-final", type=float, help="linear schedule target")
     p.add_argument("--gamma", type=float)
     p.add_argument("--lmbda", type=float)
     p.add_argument("--entropy-coeff", type=float)
@@ -1220,7 +1224,7 @@ def parse_args(argv: list[str] | None = None) -> TrainConfig:
         f: getattr(a, f)
         for f in (
             "dt", "substeps", "max_steps", "n_agents", "iters", "n_envs",
-            "steps_per_batch", "epochs", "minibatches", "lr", "gamma", "lmbda",
+            "steps_per_batch", "epochs", "minibatches", "lr", "lr_final", "gamma", "lmbda",
             "entropy_coeff", "entropy_coeff_final", "num_cells", "normalize_advantage",
             "curriculum_iters", "curriculum_gate", "actor", "role_params", "critic_input",
             "per_agent_value", "aux_coef", "action_rate_coef", "action_rate_ramp_iters",
@@ -1311,6 +1315,12 @@ def train(cfg: TrainConfig) -> Path:
                 f"curriculum knob {knob.attr!r} is not an attribute of "
                 f"{type(scen).__name__}; the ramp would silently do nothing."
             )
+    for ramp in spec.ramps:
+        if not hasattr(scen, ramp.attr):
+            raise ValueError(
+                f"ramp {ramp.attr!r} is not an attribute of {type(scen).__name__}; "
+                f"the ramp would silently do nothing."
+            )
     # A multiobj_reward key is [n_envs, n_agents, n_obj]; each term gets its own column.
     metrics = {
         k: (info0[k].shape[-1] if k == "multiobj_reward" else 1) for k in spec.metrics
@@ -1351,7 +1361,20 @@ def train(cfg: TrainConfig) -> Path:
             spec.curriculum_fn(scen, difficulty)
         return difficulty
 
+    def set_ramps(it: int) -> float:
+        """Set the ramped attributes for iteration ``it``; return the least progress."""
+        changed = False
+        for ramp in spec.ramps:
+            v = ramp.value(it)
+            if getattr(scen, ramp.attr) != v:
+                setattr(scen, ramp.attr, v)
+                changed = True
+        if changed and env.world.runtime is not None:
+            env.world.runtime.release()  # the next step recaptures with the new values
+        return min((ramp.progress(it) for ramp in spec.ramps), default=1.0)
+
     set_curriculum(None)
+    set_ramps(0)
     algo = MAPPO(
         env, actor, critic, spec, metrics=metrics, graphs=cfg.graphs, compile=cfg.compile
     )
@@ -1363,9 +1386,10 @@ def train(cfg: TrainConfig) -> Path:
     csv_writer = csv.writer(csv_file)
     # loss_aux only when the aux loss is on, so a default run's header is unchanged.
     aux_col = ["loss_aux"] if algo.use_aux else []
+    ramp_col = ["ramp"] if spec.ramps else []
     csv_writer.writerow(
         ["iter", "frames", "wall_s", "env_sps", "reward_per_step", "ep_solve_rate",
-         "ep_ends", "ep_len_mean", "difficulty", "entropy", "loss_objective",
+         "ep_ends", "ep_len_mean", "difficulty", *ramp_col, "entropy", "loss_objective",
          "loss_critic", *aux_col, "grad_skips", "eval_solve_rate", "eval_ci_lo",
          "eval_ci_hi"]
         + metric_cols
@@ -1407,9 +1431,9 @@ def train(cfg: TrainConfig) -> Path:
     n_mb = spec.epochs * spec.minibatches
     window = SolveRateWindow(window=cfg.gate_window)
     total_skips = hot_skip_iters = 0
-    # Ranked on (difficulty, solve rate): a later checkpoint wins only at an equal or
-    # harder difficulty (see train_mappo.py for the caging run that motivated it).
-    best_key = (-1.0, -1.0)
+    # Ranked on (difficulty, ramp progress, solve rate): a later checkpoint wins only at an
+    # equal or harder difficulty (see train_mappo.py for the caging run that motivated it).
+    best_key = (-1.0, -1.0, -1.0)
     print(
         f"{cfg.scenario}: {n_agents} agents, obs_dim {obs_dim}, act_dim {act_dim}, "
         f"{spec.n_envs} envs x {spec.steps_per_batch} steps, dt {spec.dt}, "
@@ -1436,6 +1460,15 @@ def train(cfg: TrainConfig) -> Path:
             coeff = spec.entropy_coeff + frac * (spec.entropy_coeff_final - spec.entropy_coeff)
         else:
             coeff = spec.entropy_coeff
+        progress = set_ramps(it)
+        if spec.lr_final is not None and spec.iters > 1:
+            frac = it / (spec.iters - 1)
+            lr = spec.lr + frac * (spec.lr_final - spec.lr)
+            group = algo.optim.param_groups[0]
+            if isinstance(group["lr"], torch.Tensor):
+                group["lr"].fill_(lr)
+            else:
+                group["lr"] = lr
         if algo.action_rate and spec.action_rate_ramp_iters > 0:
             ramp = min(1.0, (it + 1) / spec.action_rate_ramp_iters)
             algo.rate_coef.fill_(spec.action_rate_coef * ramp)
@@ -1483,6 +1516,7 @@ def train(cfg: TrainConfig) -> Path:
             [it, (it + 1) * frames_per_batch, f"{wall:.3f}", f"{frames_per_batch / wall:.0f}",
              f"{mean_reward:.6f}", "" if rate is None else f"{rate:.4f}", window.ends,
              "" if ep_len is None else f"{ep_len:.1f}", f"{f:.3f}",
+             *(f"{progress:.3f}" for _ in ramp_col),
              f"{ent / updates:.4f}", f"{obj / updates:.4f}", f"{crit / updates:.4f}",
              *(f"{stats[k] / updates:.4f}" for k in aux_col), skips,
              "" if eval_rate is None else f"{eval_rate:.4f}",
@@ -1495,13 +1529,15 @@ def train(cfg: TrainConfig) -> Path:
         print(
             f"iter {it:4d}  reward/step {mean_reward:+.4f}  solve {rate_txt}  "
             f"ends {window.ends:5d}  ep_len {0.0 if ep_len is None else ep_len:6.1f}  "
-            f"diff {f:.2f}  ent {ent / updates:+.3f}  {wall * 1e3:.1f}ms"
+            f"diff {f:.2f}  "
+            + (f"ramp {progress:.2f}  " if ramp_col else "")
+            + f"ent {ent / updates:+.3f}  {wall * 1e3:.1f}ms"
             + (f"  skipped {skips}" if skips else "")
         )
         if cfg.checkpoint_every and (it + 1) % cfg.checkpoint_every == 0:
             save(f"iter{it + 1:05d}")
-        if rate is not None and (f, rate) > best_key:
-            best_key = (f, rate)
+        if rate is not None and (f, progress, rate) > best_key:
+            best_key = (f, progress, rate)
             save("best")
 
     final = save("final")
@@ -1510,7 +1546,7 @@ def train(cfg: TrainConfig) -> Path:
     print(f"\ncheckpoints + metrics.csv in {ckpt_dir}/")
     if best_key[0] >= 0.0:
         print(
-            f"best checkpoint: solve {best_key[1]:.3f} at difficulty {best_key[0]:.2f} "
+            f"best checkpoint: solve {best_key[2]:.3f} at difficulty {best_key[0]:.2f} "
             f"-> {ckpt_dir / f'{cfg.scenario}_best.pt'}"
         )
     if rate is not None:

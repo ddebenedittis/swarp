@@ -61,6 +61,45 @@ class CurriculumKnob:
         return self.lo + (self.hi - self.lo) * f ** self.exponent
 
 
+@dataclass(frozen=True)
+class Ramp:
+    """One scenario attribute the trainer ramps from ``lo`` to ``hi`` over iterations
+    ``[start, end)``: what a staged recipe does by resuming under new keywords, in one run.
+
+    Unlike a :class:`CurriculumKnob` it follows the iteration count, not the solve-gated
+    difficulty, so a cost or a noise can come in only once the policy has learned without
+    it. A value is a float or a tuple of floats; an ``int`` in ``hi`` rounds its entry. The
+    ramp moves in ``steps`` increments, and the trainer recaptures the env's graph on each:
+    a captured step bakes in every scalar it reads by value, so a changed reward weight
+    would otherwise never reach it.
+    """
+
+    attr: str
+    lo: float | tuple[float, ...]
+    hi: float | tuple[float, ...]
+    start: int
+    end: int
+    steps: int = 20
+
+    def progress(self, it: int) -> float:
+        """The quantized fraction of the ramp done at iteration ``it``, in ``[0, 1]``."""
+        if it >= self.end:
+            return 1.0
+        f = max(0.0, (it - self.start) / max(self.end - self.start, 1))
+        return math.floor(f * self.steps) / self.steps
+
+    def value(self, it: int) -> float | tuple[float, ...]:
+        f = self.progress(it)
+
+        def lerp(lo: float, hi: float) -> float:
+            v = lo + (hi - lo) * f
+            return round(v) if isinstance(hi, int) else v
+
+        if isinstance(self.hi, tuple):
+            return tuple(lerp(lo, hi) for lo, hi in zip(self.lo, self.hi, strict=True))
+        return lerp(self.lo, self.hi)
+
+
 #: ``TrainSpec.actor`` values: the obs-only Actor or the role-aware PolicyNet.
 ACTORS = ("mlp", "policynet")
 #: ``TrainSpec.critic_input`` values.
@@ -103,6 +142,8 @@ class TrainSpec:
     epochs: int = 8
     minibatches: int = 4
     lr: float = 1e-3
+    lr_final: float | None = None
+    """When set, ``lr`` decays linearly to this over the run."""
     gamma: float = 0.99
     lmbda: float = 0.95
     entropy_coeff: float = 3e-3
@@ -123,6 +164,10 @@ class TrainSpec:
     curriculum_gate: float = 0.35
     curriculum_fn: Callable[[Scenario, float], None] | None = None
     """Escape hatch for anything the affine knobs cannot express. Applied after them."""
+    ramps: tuple[Ramp, ...] = ()
+    """Scenario attributes on an iteration schedule (:class:`Ramp`). With any, the best
+    checkpoint is ranked on how far they have run before the solve rate, so a policy that
+    solved before the noise came in does not stay "best"."""
     # --- reporting ----------------------------------------------------------------
     metrics: tuple[str, ...] = ()
     """``scenario.info()`` keys to log, mean-reduced. A ``multiobj_reward`` key is
@@ -780,6 +825,22 @@ SPECS["pusht_lidar_limo_slim240_s2"] = replace(
     SPECS["pusht_lidar_limo_slim240"],
     scen_kwargs={**SPECS["pusht_lidar_limo_slim240"].scen_kwargs, "rot_away_penalty": 0.0},
     n_envs=2048, minibatches=16, iters=8000, action_rate_ramp_iters=0, lr=2.5e-4,
+)
+# The same stages as one run (L8c): iteration ramps instead of resumes. Stage 1's world
+# until 3000, the iteration L8b-s1 first held 0.94-0.98 greedy; the pose-noise scale and
+# the command delay (in substeps: 0.125 s at 32 substeps of 6.25 ms is 20) ramp in by 5000;
+# the turn-away cost by 10000, after which stage 3 needed 4000 iterations. The learning
+# rate decays over the run instead of halving at a resume: L8b-s1 collapsed at 5e-4 after
+# 5500 iterations, and this one is below 3.6e-4 by then. Both ramped knobs are built at
+# their full range, so the critic state has their columns from the first iteration.
+SPECS["pusht_lidar_limo_slim240_1run"] = replace(
+    SPECS["pusht_lidar_limo_slim240"],
+    n_envs=2048, minibatches=16, iters=14000, lr=5e-4, lr_final=1e-4,
+    ramps=(
+        Ramp("pose_noise", (0.0, 0.0), (0.0, 1.25), 3000, 5000),
+        Ramp("cmd_delay_substeps", (0, 0), (0, 20), 3000, 5000),
+        Ramp("rot_away_penalty", 0.0, 1.0, 8000, 10000),
+    ),
 )
 
 
