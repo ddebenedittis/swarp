@@ -578,30 +578,51 @@ def test_labels_come_from_the_reported_poses(device):
     *reported* box grown by the margin is an agent hit, anything else in bounds is the T,
     and a hit beyond the bound is a miss. A teammate hit 0.84 m ahead reads as an agent at
     the teammate's true pose and as the T once its reported pose is 0.1 m further off."""
+    assert _label(device, 1.0, 0.84) == (1, pytest.approx(0.84), 0)
+    assert _label(device, 1.1, 0.84) == (3, pytest.approx(0.84), 0)
+    assert _label(device, 1.0, 0.84, bound=0.5) == (0, 3.0, 0)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_per_env_label_bound_is_the_arena_plus_margin_per_axis(device):
+    """With a per-env arena the bound is ``arena_half + margin`` on each axis: a scenery
+    hit 0.84 m ahead along x is a miss in a 1.2 m wide arena (0.6 + 0.2 < 0.84) and the T,
+    a leaked one, in a 2 m wide one; turned along y the narrow arena's 2 m height keeps
+    it."""
+    narrow, wide = (0.6, 1.0), (1.0, 0.6)
+    assert _label(device, 5.0, 0.84, bound=0.2, arena=narrow, cls_in=2) == (0, 3.0, 0)
+    assert _label(device, 5.0, 0.84, bound=0.2, arena=wide, cls_in=2) == (
+        3, pytest.approx(0.84), 1)
+    assert _label(device, 5.0, 0.84, bound=0.2, arena=narrow, cls_in=2, theta=math.pi / 2) == (
+        3, pytest.approx(0.84), 1)
+
+
+def _label(device, mate_x, t, bound=2.0, arena=None, cls_in=1, theta=0.0):
+    """One relabel launch: robot 0 at the origin heading ``theta`` with one ray ahead at
+    range ``t`` and class ``cls_in``, a 0.32 x 0.22 m teammate at ``(mate_x, 0)``; with
+    ``arena`` the bound is per env and per axis. Returns robot 0's class, range and
+    scenery leak count."""
     wp.init()
     v2 = wp.vec2f
-
-    def label(mate_x, t, bound=2.0):
-        opos = torch.tensor([[[0.0, 0.0], [mate_x, 0.0]]])
-        params = torch.zeros(2, NUM_PARAMS)
-        params[:, P_SHAPE], params[:, P_HALF_X], params[:, P_HALF_Y] = 1.0, 0.16, 0.11
-        params[:, P_RADIUS] = 0.195
-        r = torch.tensor([[[t], [3.0]]], device=device)
-        c = torch.tensor([[[1], [0]]], dtype=torch.uint8, device=device)
-        wp.launch(
-            concrete(lidar_relabel_kernel, wp.float32),
-            dim=(1, 2),
-            inputs=[wp.from_torch(opos.to(device), dtype=v2),
-                    wp.from_torch(torch.zeros(1, 2, device=device)),
-                    wp.from_torch(params.to(device)), 3.0, 0.0, 0.0, 1, bound, 0.03,
-                    wp.from_torch(r), wp.from_torch(c)],
-            device=device,
-        )
-        return c[0, 0, 0].item(), r[0, 0, 0].item()
-
-    assert label(1.0, 0.84) == (1, pytest.approx(0.84))
-    assert label(1.1, 0.84) == (3, pytest.approx(0.84))
-    assert label(1.0, 0.84, bound=0.5) == (0, 3.0)
+    opos = torch.tensor([[[0.0, 0.0], [mate_x, 0.0]]])
+    params = torch.zeros(2, NUM_PARAMS)
+    params[:, P_SHAPE], params[:, P_HALF_X], params[:, P_HALF_Y] = 1.0, 0.16, 0.11
+    params[:, P_RADIUS] = 0.195
+    r = torch.tensor([[[t], [3.0]]], device=device)
+    c = torch.tensor([[[cls_in], [0]]], dtype=torch.uint8, device=device)
+    leak = torch.zeros(1, 2, device=device)
+    half = torch.tensor([arena or (0.0, 0.0)], device=device)
+    wp.launch(
+        concrete(lidar_relabel_kernel, wp.float32),
+        dim=(1, 2),
+        inputs=[wp.from_torch(opos.to(device), dtype=v2),
+                wp.from_torch(torch.tensor([[theta, 0.0]], device=device)),
+                wp.from_torch(params.to(device)), 3.0, 0.0, 0.0, 1, bound, 0.03,
+                int(arena is not None), wp.from_torch(half, dtype=v2), 1,
+                wp.from_torch(leak), wp.from_torch(r), wp.from_torch(c)],
+        device=device,
+    )
+    return c[0, 0, 0].item(), r[0, 0, 0].item(), int(leak[0, 0].item())
 
 
 @pytest.mark.parametrize("device", DEVICES)
@@ -657,3 +678,195 @@ def test_span_scans_only_its_sector(device, fused):
             assert off[0].item() == pytest.approx(-2.0 * math.pi / 3.0)
             assert off[-1].item() == pytest.approx(2.0 * math.pi / 3.0)
     assert seen == {False: True, True: False}
+
+
+# ------------------------------------------------------------ per-env arena, scenery
+
+#: The Limo fleet and slim T at real scale, in an open arena with the out-of-bounds check.
+_LIMO = dict(n_agents=2, n_pushers=2, model="diff_drive", agent_shape="box",
+             agent_half_extents=(0.161, 0.110), max_speed=0.4, world_size=2.5,
+             bar_len=0.5, bar_width=0.04, stem_len=0.5, stem_width=0.04, open_arena=True,
+             oob_margin=0.5, lidar_max_range=1.5)
+_LAYOUTS = (0.25, 0.25, 0.25, 0.25)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("arena", [(2.0, 2.0), (2.0, 5.0)])
+def test_per_env_arena_spawns_inside_and_clear(device, arena):
+    """Each env's width and height are drawn from the range independently; the T, its
+    goal and both robots spawn inside that env's arena, the robots clear of the T and of
+    each other even in a 2 x 2 m arena, and the arena stop sits at the env's own edges."""
+    env = _env(device, n_envs=1024, arena_size=arena, **_LIMO)
+    env.reset(seed=0)
+    scen = env.scenario
+    half = scen.arena_half
+    assert (half >= 0.5 * arena[0] - 1e-6).all() and (half <= 0.5 * arena[1] + 1e-6).all()
+    if arena[0] < arena[1]:
+        assert (half[:, 0] - half[:, 1]).abs().max() > 0.5
+    r_t, r_a = scen.tee_radius, scen.agent_radius
+    pos = env.world.state.pos
+    assert (scen.tee_pos.abs() <= half - r_t + 1e-5).all()
+    assert (scen.goal_pos.abs() <= half - r_t + 1e-5).all()
+    assert (pos.abs() <= (half - 2.0 * r_a).unsqueeze(1) + 1e-5).all()
+    assert ((pos - scen.tee_pos.unsqueeze(1)).norm(dim=-1) >= r_t + r_a).all()
+    assert ((pos[:, 0] - pos[:, 1]).norm(dim=-1) >= 2.0 * r_a - 1e-5).all()
+    torch.testing.assert_close(scen._arena_edges, half + scen.arena_stop_margin)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_arena_and_scenery_redraw_only_where_reset(device):
+    """A masked reset redraws the arena and the surroundings of the envs it selects only,
+    and what a trainer's ``Ramp`` writes (``arena_size``, ``scenery_on``) reaches the next
+    reset."""
+    env = _env(device, n_envs=64, arena_size=(2.0, 5.0), scenery_probs=_LAYOUTS, **_LIMO)
+    env.reset(seed=0)
+    scen = env.scenario
+
+    def snap():
+        return [t.clone() for t in (scen.arena_half, scen.scenery_mode, *scen.scenery.tensors())]
+
+    before = snap()
+    mask = torch.zeros(64, dtype=torch.bool, device=device)
+    mask[:8] = True
+    env.reset_at(mask)
+    after = snap()
+    for b, a in zip(before, after, strict=True):
+        assert torch.equal(b[8:], a[8:])
+    assert not torch.equal(before[0][:8], after[0][:8])
+    scen.arena_size = (3.0, 3.0)
+    scen.scenery_on = 0.0
+    env.reset(seed=1)
+    torch.testing.assert_close(scen.arena_half, torch.full_like(scen.arena_half, 1.5))
+    assert (scen.scenery_mode == 0).all() and (scen.scenery.shape < 0).all()
+
+
+def _point_rect(p, fx, fy):
+    """Distance from the points ``p [N, 2]`` to the centred rectangles ``|x| <= fx, |y| <=
+    fy`` (zero inside)."""
+    return torch.hypot((p[:, 0].abs() - fx).clamp(min=0.0), (p[:, 1].abs() - fy).clamp(min=0.0))
+
+
+def _segment_rect(a, b, fx, fy):
+    """Exact distance from the segments ``a -> b`` to the centred rectangles: zero when
+    they cross (Liang-Barsky clip), else the nearest of the endpoints to the rectangle and
+    of the corners to the segment."""
+    d = b - a
+    t0 = torch.zeros_like(fx)
+    t1 = torch.ones_like(fx)
+    hit = torch.ones_like(fx, dtype=torch.bool)
+    for k, f in ((0, fx), (1, fy)):
+        dk, ak = d[:, k], a[:, k]
+        flat = dk.abs() < 1e-12
+        safe = torch.where(flat, torch.ones_like(dk), dk)
+        lo = torch.minimum((-f - ak) / safe, (f - ak) / safe)
+        hi = torch.maximum((-f - ak) / safe, (f - ak) / safe)
+        t0 = torch.where(flat, t0, torch.maximum(t0, lo))
+        t1 = torch.where(flat, t1, torch.minimum(t1, hi))
+        hit &= ~(flat & (ak.abs() > f))
+    hit &= t0 <= t1
+    best = torch.minimum(_point_rect(a, fx, fy), _point_rect(b, fx, fy))
+    for sx in (-1.0, 1.0):
+        for sy in (-1.0, 1.0):
+            c = torch.stack([sx * fx, sy * fy], dim=-1)
+            u = (((c - a) * d).sum(-1) / (d * d).sum(-1).clamp(min=1e-12)).clamp(0.0, 1.0)
+            best = torch.minimum(best, (a + u.unsqueeze(-1) * d - c).norm(dim=-1))
+    return torch.where(hit, torch.zeros_like(best), best)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_scenery_stays_outside_the_free_region(device):
+    """Over every layout, no wall (a capsule) and no clutter shape comes within the free
+    region: the arena grown by the clearance, which defaults to the farther of a robot's
+    and the T's reach past the arena. No layout leaves slots where it has none to fill;
+    perimeter walls are parallel to the arena's sides and a room's are not."""
+    from swarp.core.config import ObstacleShape
+    from swarp.scenarios.pusht_lidar_scenery import N_WALLS
+
+    env = _env(device, n_envs=4096, arena_size=(2.0, 5.0), scenery_probs=_LAYOUTS, **_LIMO)
+    env.reset(seed=0)
+    scen = env.scenario
+    sc = scen.scenery
+    clear = scen.scenery_clearance
+    assert clear == pytest.approx(max(scen.robot_reach(), scen.tee_reach()))
+    assert clear >= scen.oob_margin + scen.tee_radius
+    fx = scen.arena_half[:, 0] + clear
+    fy = scen.arena_half[:, 1] + clear
+    mode = scen.scenery_mode
+    assert set(mode.tolist()) == {0, 1, 2, 3}
+    used = sc.shape >= 0
+    assert not used[mode == 0].any()
+    assert not used[mode != 3][:, N_WALLS:].any()
+    assert used[mode == 3][:, N_WALLS:].any(-1).float().mean() > 0.95
+    walls = used[:, :N_WALLS]
+    tilt = torch.sin(2.0 * sc.angle[:, :N_WALLS]).abs()
+    assert (tilt[walls & (mode == 1).unsqueeze(-1)] < 1e-5).all()
+    assert tilt[walls & (mode == 2).unsqueeze(-1)].mean() > 0.3
+    for s in range(sc.n_slots):
+        u = used[:, s]
+        if s < N_WALLS:
+            ang = sc.angle[:, s]
+            tip = torch.stack([ang.cos(), ang.sin()], -1) * sc.half[:, s, :1]
+            dist = _segment_rect(sc.pos[:, s] - tip, sc.pos[:, s] + tip, fx, fy)
+            need = sc.radius[:, s]
+        else:
+            dist = _point_rect(sc.pos[:, s], fx, fy)
+            is_box = sc.shape[:, s] == int(ObstacleShape.BOX)
+            need = torch.where(is_box, sc.half[:, s].norm(dim=-1), sc.radius[:, s])
+        assert (dist[u] >= need[u] - 1e-5).all(), f"slot {s} enters the free region"
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("fused", [True, False])
+def test_per_env_out_of_bounds_is_per_axis(device, fused):
+    """In a 2 x 5 m arena with ``oob_margin`` 0.5 the T fails 1.6 m out along x (past
+    1.5) but not 1.6 m out along y (inside 3.0)."""
+    env = _env(device, n_envs=2, fused=fused, arena_size=(2.0, 2.0, 5.0, 5.0),
+               oob_penalty=0.3, **_LIMO)
+    env.reset(seed=0)
+    scen = env.scenario
+    with torch.no_grad():
+        scen.tee_pos[0] = torch.tensor([1.6, 0.0], device=device)
+        scen.tee_pos[1] = torch.tensor([0.0, 1.6], device=device)
+        scen.tee_vel.zero_()
+        scen.tee_ang_vel.zero_()
+        scen._install_obstacles()
+        _, rew, *_ = env.step(torch.zeros(2, 2, 2, device=device))
+    assert scen.info()["out_of_bounds"].tolist() == [True, False]
+    assert torch.equal(rew[0], torch.full((2,), -0.3, device=device))
+    assert (rew[1] != -0.3).all()
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("fused", [True, False])
+def test_arena_is_observed_and_in_the_critic_state(device, fused):
+    """The self block ends with the env's arena half-extents, and ``critic_dr`` adds them
+    (normalised over the range) and the layout's one-hot (as -1 / +1) as env columns."""
+    env = _env(device, n_envs=64, fused=fused, arena_size=(2.0, 5.0), scenery_probs=_LAYOUTS,
+               critic_dr=True, **_LIMO)
+    scen = env.scenario
+    assert scen.obs_dim == PushTLidarScenario(**_LIMO).obs_dim + 2
+    lay = scen.obs_layout()
+    assert lay["arena"] == slice(scen.self_dim - 2, scen.self_dim)
+    assert lay["teammates"].start == scen.self_dim
+    env.reset(seed=0)
+    with torch.no_grad():
+        obs, *_ = env.step(torch.zeros(64, 2, 2, device=device))
+    half = scen.arena_half
+    torch.testing.assert_close(obs[:, :, lay["arena"]], half.unsqueeze(1).expand(-1, 2, -1))
+    assert (scen.dr_env_dim, scen.dr_agent_dim) == (6, 0)
+    hot = torch.nn.functional.one_hot(scen.scenery_mode.long(), 4).to(half.dtype) * 2.0 - 1.0
+    want = torch.cat([(half - 1.75) / 0.75, hot], dim=-1)
+    torch.testing.assert_close(scen.critic_state()[:, scen.state_base_dim:], want)
+
+
+def test_arena_and_scenery_validation():
+    with pytest.raises(ValueError, match="open_arena"):
+        PushTLidarScenario(**{**_LIMO, "open_arena": False}, arena_size=(2.0, 5.0))
+    with pytest.raises(ValueError, match="world_size"):
+        PushTLidarScenario(**{**_LIMO, "world_size": 2.0}, arena_size=(2.0, 5.0))
+    with pytest.raises(ValueError, match="no room"):
+        PushTLidarScenario(**_LIMO, arena_size=(0.7, 5.0))
+    with pytest.raises(ValueError, match="arena_size and oob_margin"):
+        PushTLidarScenario(**_LIMO, scenery_probs=_LAYOUTS)
+    with pytest.raises(ValueError, match="sum to 1"):
+        PushTLidarScenario(**_LIMO, arena_size=(2.0, 5.0), scenery_probs=(0.5, 0.5, 0.5, 0.0))

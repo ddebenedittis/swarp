@@ -51,6 +51,7 @@ from swarp.interop.autograd import torch_stream_scope
 from swarp.scenarios.fused import Buf, FusedPass, FusedScenario
 from swarp.scenarios.pusht_kernels import (
     pusht_actuation_reset_kernel,
+    pusht_arena_reset_kernel,
     pusht_friction_reset_kernel,
     pusht_heading_reset_kernel,
     pusht_latency_reset_kernel,
@@ -72,6 +73,24 @@ def _as_range(
     if not 0.0 < lo <= hi:
         raise ValueError(f"{name} must be positive with low <= high, got {v!r}")
     return (lo, hi)
+
+
+def arena_ranges(v: float | tuple[float, ...]) -> tuple[float, float, float, float]:
+    """``(w_lo, w_hi, h_lo, h_hi)`` of an ``arena_size``: one extent for both axes, a
+    ``(lo, hi)`` range drawn for each axis independently, or a range per axis."""
+    if isinstance(v, int | float):
+        r = (float(v),) * 4
+    elif len(v) == 2:
+        r = (float(v[0]), float(v[1])) * 2
+    elif len(v) == 4:
+        r = tuple(float(x) for x in v)
+    else:
+        raise ValueError(
+            f"arena_size takes a value, (lo, hi) or (w_lo, w_hi, h_lo, h_hi), got {v!r}"
+        )
+    if not (0.0 < r[0] <= r[1] and 0.0 < r[2] <= r[3]):
+        raise ValueError(f"arena_size must be positive with low <= high, got {v!r}")
+    return r
 
 
 class PushTScenario(FusedScenario):
@@ -124,6 +143,7 @@ class PushTScenario(FusedScenario):
         cmd_latency: float | tuple[float, float] = 0.0,
         open_arena: bool = False,
         arena_stop_margin: float = 0.25,
+        arena_size: float | tuple[float, ...] | None = None,
     ) -> None:
         """``model="diff_drive"`` makes the robots unicycles commanded by ``(v, omega)``,
         with turn rates up to ``max_ang_vel``; ``agent_shape="box"`` makes them rectangles
@@ -167,7 +187,16 @@ class PushTScenario(FusedScenario):
         clamped inside ``world_size`` and the robots meet no wall. A ``diff_drive`` robot
         instead gets a safety bridge's arena stop (:meth:`Stepper.enable_arena_stop
         <swarp.core.stepper.Stepper.enable_arena_stop>`) at ``world_size +
-        arena_stop_margin``."""
+        arena_stop_margin``.
+
+        ``arena_size`` (metres, full extents; needs ``open_arena``) gives every env its own
+        rectangular arena, drawn on every reset: one value for a fixed square, ``(lo, hi)``
+        for a width and a height each drawn uniformly from it, or ``(w_lo, w_hi, h_lo,
+        h_hi)`` for a range per axis. The spawns, the arena stop (at the env's half-extents
+        plus ``arena_stop_margin``) and, in subclasses, everything else that reads the arena
+        follow the env's :attr:`arena_half`; ``world_size`` must cover the largest. It is
+        read on every reset, so a trainer can move it between resets. ``None`` keeps the
+        one square arena of ``world_size``."""
         self.n_agents = n_agents
         self.model = _coerce(DynamicsModel, model, "model")
         if self.model not in self.supported_models:
@@ -200,6 +229,12 @@ class PushTScenario(FusedScenario):
             raise ValueError("open_arena needs model='diff_drive' (its arena stop)")
         self.open_arena = bool(open_arena)
         self.arena_stop_margin = float(arena_stop_margin)
+        #: Whether every env draws its own arena (``arena_size`` set at construction).
+        self.per_env_arena = arena_size is not None
+        #: The per-env arena's extents (see :func:`arena_ranges`), read on every reset.
+        self.arena_size = arena_size
+        if self.per_env_arena and not self.open_arena:
+            raise ValueError("arena_size needs open_arena: walls and the T's clamp are global")
         self.floor_friction = (
             None if floor_friction is None else _as_range(floor_friction, 0.0, "floor_friction")
         )
@@ -298,6 +333,19 @@ class PushTScenario(FusedScenario):
         self.n_boxes = shape.n_boxes
         self.tee_inertia = shape.inertia
         self.tee_radius = shape.radius
+        if self.per_env_arena:
+            w_lo, w_hi, h_lo, h_hi = arena_ranges(arena_size)
+            if 0.5 * max(w_hi, h_hi) > world_size + 1e-9:
+                raise ValueError(
+                    f"world_size {world_size} must cover the largest arena half-extent "
+                    f"{0.5 * max(w_hi, h_hi)}"
+                )
+            inset = max(self.tee_radius, 2.0 * self.agent_radius)
+            if 0.5 * min(w_lo, h_lo) <= inset:
+                raise ValueError(
+                    f"the smallest arena half-extent {0.5 * min(w_lo, h_lo)} leaves no room "
+                    f"for the T (radius {self.tee_radius}) and the robots"
+                )
         # Staging point for the approach shaping, push_point_offset past the T centre
         # directly away from the goal. 0 = the T centre itself: plain approach shaping.
         # (>0 turned out noisier in practice — the point moves with the T.)
@@ -462,7 +510,16 @@ class PushTScenario(FusedScenario):
             if hi > 0:
                 self.cmd_delay_substeps = (lo, hi)
                 self.world.stepper.enable_command_delay(n_envs, self.world.act_dim, hi)
-        if self.open_arena:
+        if self.per_env_arena:
+            # Pointer-stable [n_envs, 2] buffers the arena reset kernel rewrites in place:
+            # the half-extents every arena-aware kernel reads, and the arena stop's edges.
+            self.arena_half = torch.full((n_envs, 2), float(self.world_size), **tt)
+            self._arena_edges = self.arena_half + self.arena_stop_margin
+            vec2 = VEC2[self.world.wp_dtype]
+            self._arena_half_wp = wp.from_torch(self.arena_half, dtype=vec2)
+            self._arena_edges_wp = wp.from_torch(self._arena_edges, dtype=vec2)
+            self.world.stepper.enable_arena_stop(n_envs, self.world.act_dim, self._arena_edges_wp)
+        elif self.open_arena:
             self.world.stepper.enable_arena_stop(
                 n_envs, self.world.act_dim, self.world_size + self.arena_stop_margin
             )
@@ -564,55 +621,18 @@ class PushTScenario(FusedScenario):
         use_goal_radius = 0 if self.goal_spawn_radius is None else 1
         use_goal_angle = 0 if self.goal_spawn_angle is None else 1
         with torch_stream_scope(w.device):
-            launch = self._reset_launch.get(
-                concrete(pusht_reset_kernel, scalar),
-                dim=w.n_envs,
-                inputs=[
-                    mask,
-                    use_mask,
-                    seed,
-                    scalar(lim),
-                    scalar(tlim),
-                    scalar(clear),
-                    scalar(goal_radius),
-                    scalar(goal_angle),
-                    wp.int32(use_goal_radius),
-                    wp.int32(use_goal_angle),
-                    wp.int32(self.n_agents),
-                    st.pos,
-                    st.vel,
-                    tee_pos,
-                    tee_vel,
-                    tee_theta,
-                    tee_ang_vel,
-                    goal_pos,
-                    goal_theta,
-                ],
-                device=w.device,
-                key=(
-                    w.n_envs,
-                    ptr_key(mask),
-                    lim,
-                    tlim,
-                    clear,
-                    goal_radius,
-                    goal_angle,
-                    use_goal_radius,
-                    use_goal_angle,
-                    self.n_agents,
-                    ptr_key(st.pos),
-                    ptr_key(st.vel),
-                    ptr_key(tee_pos),
-                    ptr_key(tee_vel),
-                    ptr_key(tee_theta),
-                    ptr_key(tee_ang_vel),
-                    ptr_key(goal_pos),
-                    ptr_key(goal_theta),
-                ),
-            )
-            launch.set_param_by_name("use_mask", use_mask)
-            launch.set_param_by_name("seed", seed)
-            launch.launch()
+            if self.per_env_arena:
+                self._launch_arena_spawn(
+                    st, mask, use_mask, seed, clear, goal_radius, goal_angle,
+                    use_goal_radius, use_goal_angle,
+                    (tee_pos, tee_vel, tee_theta, tee_ang_vel, goal_pos, goal_theta),
+                )
+            else:
+                self._launch_square_spawn(
+                    st, mask, use_mask, seed, lim, tlim, clear, goal_radius, goal_angle,
+                    use_goal_radius, use_goal_angle,
+                    (tee_pos, tee_vel, tee_theta, tee_ang_vel, goal_pos, goal_theta),
+                )
             if self.heading_obs:
                 self._launch_heading_reset(st, mask, use_mask)
             if self.actuation_dr:
@@ -621,6 +641,108 @@ class PushTScenario(FusedScenario):
                 self._launch_friction_reset(mask, use_mask)
             if self.cmd_delay_substeps is not None:
                 self._launch_latency_reset(mask, use_mask)
+
+    def _launch_square_spawn(
+        self, st, mask, use_mask, seed, lim, tlim, clear, goal_radius, goal_angle,
+        use_goal_radius, use_goal_angle, body,
+    ) -> None:
+        """The one square arena's spawn: ``pusht_reset_kernel``."""
+        w = self.world
+        scalar = w.wp_dtype
+        tee_pos, tee_vel, tee_theta, tee_ang_vel, goal_pos, goal_theta = body
+        launch = self._reset_launch.get(
+            concrete(pusht_reset_kernel, scalar),
+            dim=w.n_envs,
+            inputs=[
+                mask,
+                use_mask,
+                seed,
+                scalar(lim),
+                scalar(tlim),
+                scalar(clear),
+                scalar(goal_radius),
+                scalar(goal_angle),
+                wp.int32(use_goal_radius),
+                wp.int32(use_goal_angle),
+                wp.int32(self.n_agents),
+                st.pos,
+                st.vel,
+                tee_pos,
+                tee_vel,
+                tee_theta,
+                tee_ang_vel,
+                goal_pos,
+                goal_theta,
+            ],
+            device=w.device,
+            key=(
+                w.n_envs,
+                ptr_key(mask),
+                lim,
+                tlim,
+                clear,
+                goal_radius,
+                goal_angle,
+                use_goal_radius,
+                use_goal_angle,
+                self.n_agents,
+                ptr_key(st.pos),
+                ptr_key(st.vel),
+                ptr_key(tee_pos),
+                ptr_key(tee_vel),
+                ptr_key(tee_theta),
+                ptr_key(tee_ang_vel),
+                ptr_key(goal_pos),
+                ptr_key(goal_theta),
+            ),
+        )
+        launch.set_param_by_name("use_mask", use_mask)
+        launch.set_param_by_name("seed", seed)
+        launch.launch()
+
+    def _launch_arena_spawn(
+        self, st, mask, use_mask, seed, clear, goal_radius, goal_angle, use_goal_radius,
+        use_goal_angle, body,
+    ) -> None:
+        """A per-env arena's draw and spawn: ``pusht_arena_reset_kernel``, which also
+        rewrites :attr:`arena_half` and the arena stop's edges in place."""
+        w = self.world
+        scalar = w.wp_dtype
+        tee_pos, tee_vel, tee_theta, tee_ang_vel, goal_pos, goal_theta = body
+        w_lo, w_hi, h_lo, h_hi = arena_ranges(self.arena_size)
+        agent_inset = 2.0 * self.agent_radius
+        agent_clear = 2.0 * self.agent_radius
+        # The bare clearance a crowded arena falls back to: the T's bounding disc and a
+        # robot's, 2 cm apart.
+        clear_min = self.tee_radius + self.agent_radius + 0.02
+        launch = self._reset_launch.get(
+            concrete(pusht_arena_reset_kernel, scalar),
+            dim=w.n_envs,
+            inputs=[
+                mask, use_mask, seed,
+                scalar(w_lo), scalar(w_hi), scalar(h_lo), scalar(h_hi),
+                scalar(agent_inset), scalar(self.tee_radius), scalar(clear), scalar(clear_min),
+                scalar(agent_clear), scalar(self.arena_stop_margin),
+                scalar(goal_radius), scalar(goal_angle),
+                wp.int32(use_goal_radius), wp.int32(use_goal_angle), wp.int32(self.n_agents),
+                self._arena_half_wp, self._arena_edges_wp,
+                st.pos, st.vel, tee_pos, tee_vel, tee_theta, tee_ang_vel, goal_pos, goal_theta,
+            ],
+            device=w.device,
+            key=(
+                w.n_envs, ptr_key(mask), w_lo, w_hi, h_lo, h_hi, agent_inset,
+                self.tee_radius, clear, clear_min, agent_clear, self.arena_stop_margin,
+                goal_radius,
+                goal_angle, use_goal_radius, use_goal_angle, self.n_agents,
+                ptr_key(self._arena_half_wp), ptr_key(self._arena_edges_wp),
+                ptr_key(st.pos), ptr_key(st.vel), ptr_key(tee_pos), ptr_key(tee_vel),
+                ptr_key(tee_theta), ptr_key(tee_ang_vel), ptr_key(goal_pos),
+                ptr_key(goal_theta),
+            ),
+        )
+        launch.set_param_by_name("use_mask", use_mask)
+        launch.set_param_by_name("seed", seed)
+        launch.launch()
 
     def _launch_heading_reset(self, st, mask, use_mask) -> None:
         """Random headings, zero speed and spin for the respawned robots (only launched

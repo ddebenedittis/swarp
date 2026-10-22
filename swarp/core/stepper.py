@@ -233,6 +233,10 @@ class Stepper:
         # Arena stop, off until enable_arena_stop: the edge, and the filtered command.
         self.arena_edge: float = 0.0
         self._after: wp.array | None = None
+        # Per-env (x, y) edges [n_envs] vec2 when the stop was enabled with an array, and
+        # the stand-in the kernel reads otherwise (never read: per_env_edge is 0 then).
+        self._arena_edges: wp.array | None = None
+        self._zero_edges = wp.zeros(1, dtype=VEC2[dtype], device=device)
 
     # ------------------------------------------------------------------ setup
 
@@ -257,17 +261,31 @@ class Stepper:
         self._delayed = [scratch[k] for k in range(max_delay)]
         self.mutation_version += 1
 
-    def enable_arena_stop(self, n_envs: int, act_dim: int, edge: float) -> None:
+    def enable_arena_stop(self, n_envs: int, act_dim: int, edge: float | wp.array) -> None:
         """Zero a diff-drive's speed command (slot 0) while its centre is beyond ``edge``
         on an axis (``|x| > edge`` or ``|y| > edge``) and the command would drive it further
         out along that axis; turning, and driving back in, pass. A real robot's safety
         bridge does this on every command from the robot's latest pose; here it is judged
         on the pose at the start of each step and holds for the step (also for the
-        delayed command, with :meth:`enable_command_delay`). Untaped steps only."""
-        if edge <= 0.0:
-            raise ValueError(f"edge must be positive, got {edge}")
+        delayed command, with :meth:`enable_command_delay`). Untaped steps only.
+
+        ``edge`` is one positive float for both axes of every env, or an ``[n_envs]`` vec2
+        Warp array of per-env ``(x, y)`` edges, read on every step by pointer: rewrite it
+        in place (a captured step keeps the array it was captured with)."""
         z = {"device": self.device, "dtype": self.dtype}
-        self.arena_edge = float(edge)
+        if isinstance(edge, wp.array):
+            if edge.shape != (n_envs,) or edge.dtype is not VEC2[self.dtype]:
+                raise ValueError(
+                    f"per-env edges must be a [{n_envs}] vec2 array of the world dtype, "
+                    f"got shape {edge.shape} of {edge.dtype}"
+                )
+            self._arena_edges = edge
+            self.arena_edge = 1.0  # positive: the stop is on, the edges come from the array
+        else:
+            if edge <= 0.0:
+                raise ValueError(f"edge must be positive, got {edge}")
+            self._arena_edges = None
+            self.arena_edge = float(edge)
         self._after = wp.zeros((n_envs, self.n_agents, act_dim), **z)
         # Stand-ins for the delay's buffers when only the arena stop is on (never written).
         self._zero_delay = wp.zeros((n_envs, self.n_agents), dtype=wp.int32, device=self.device)
@@ -871,6 +889,8 @@ class Stepper:
                     state_in.theta,
                     wp.int32(len(delayed)),
                     self.dtype(self.arena_edge),
+                    self._arena_edges if self._arena_edges is not None else self._zero_edges,
+                    wp.int32(self._arena_edges is not None),
                     self._delayed_scratch if delayed else self._zero_scratch,
                     after if after is not None else actions,
                 ],

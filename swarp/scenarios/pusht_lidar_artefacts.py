@@ -34,6 +34,7 @@ from swarp.dynamics.base import P_HALF_X, P_HALF_Y, P_RADIUS, P_SHAPE
 wp.set_module_options({"default_grid_stride": False})
 
 _HIT_AGENT = wp.constant(wp.uint8(1))
+_HIT_IMMOVABLE = wp.constant(wp.uint8(2))
 _HIT_MOVABLE = wp.constant(wp.uint8(3))
 
 #: Columns of the per-robot artefact buffer ``[E, A, ART_DIM]``: dropout probability,
@@ -194,6 +195,10 @@ def lidar_relabel_kernel(
     body_frame: wp.int32,
     bound: Any,
     margin: Any,
+    per_env_bound: wp.int32,
+    arena_half: wp.array(dtype=Any),
+    count_leak: wp.int32,
+    leak: wp.array2d(dtype=Any),
     ranges: wp.array3d(dtype=Any),
     hit_class: wp.array3d(dtype=wp.uint8),
 ):
@@ -201,9 +206,11 @@ def lidar_relabel_kernel(
     reported poses alone, in place.
 
     The hit point is placed from this robot's reported pose along the nominal ray. Beyond
-    ``bound`` on either axis it is a miss (``max_range``, class 0); inside a teammate's
-    reported footprint (its box, or its disc, grown by ``margin``) it is an agent; anything
-    else is the movable body."""
+    ``bound`` on either axis (with ``per_env_bound``, beyond ``arena_half[e] + bound`` on
+    its axis) it is a miss (``max_range``, class 0); inside a teammate's reported footprint
+    (its box, or its disc, grown by ``margin``) it is an agent; anything else is the
+    movable body. With ``count_leak``, ``leak[e, a]`` gets the share of the rays that hit
+    scenery (class 2) and leave labelled as the body."""
     e, a = wp.tid()
     n_rays = ranges.shape[2]
     n_agents = obs_pos.shape[1]
@@ -212,14 +219,21 @@ def lidar_relabel_kernel(
     base = zero
     if body_frame != 0:
         base = obs_theta[e, a]
+    bx = bound
+    by = bound
+    if per_env_bound == 1:
+        bx = arena_half[e][0] + bound
+        by = arena_half[e][1] + bound
+    n_leak = wp.int32(0)
     for r in range(n_rays):
-        if hit_class[e, a, r] != wp.uint8(0):
+        c_in = hit_class[e, a, r]
+        if c_in != wp.uint8(0):
             t = ranges[e, a, r]
             ang = base + angle_start + type(max_range)(r) * ray_step
             hx = po[0] + t * wp.cos(ang)
             hy = po[1] + t * wp.sin(ang)
             c = _HIT_MOVABLE
-            if wp.abs(hx) > bound or wp.abs(hy) > bound:
+            if wp.abs(hx) > bx or wp.abs(hy) > by:
                 c = wp.uint8(0)
                 ranges[e, a, r] = max_range
             else:
@@ -242,7 +256,11 @@ def lidar_relabel_kernel(
                             inside = wp.sqrt(dx * dx + dy * dy) <= params[j, P_RADIUS] + margin
                         if inside:
                             c = _HIT_AGENT
+            if c_in == _HIT_IMMOVABLE and c == _HIT_MOVABLE:
+                n_leak += wp.int32(1)
             hit_class[e, a, r] = c
+    if count_leak == 1:
+        leak[e, a] = type(max_range)(n_leak) / type(max_range)(n_rays)
 
 
 @wp.kernel
@@ -255,6 +273,10 @@ def pusht_lidar_critic_dr_kernel(
     use_mu: wp.int32,
     mu_g: wp.array(dtype=Any),
     inv_gravity: Any,
+    use_arena: wp.int32,
+    arena_half: wp.array(dtype=Any),
+    n_modes: wp.int32,
+    scenery_mode: wp.array(dtype=wp.int32),
     act_cols: wp.array(dtype=wp.int32),
     agent_params: wp.array3d(dtype=Any),
     use_delay: wp.int32,
@@ -279,7 +301,9 @@ def pusht_lidar_critic_dr_kernel(
 ):
     """Thread per (env, agent): the randomised parameters, normalised as ``(x - mid) inv``
     per column, from column ``base_col`` of the critic state on. First the env's floor
-    friction (``use_mu``; ``mu_g / g``), then per robot in role-sorted order (the rank rule
+    friction (``use_mu``; ``mu_g / g``), arena half-extents (``use_arena``) and the one-hot
+    of its surroundings' layout (``n_modes`` wide), then per robot in role-sorted order (the
+    rank rule
     of ``pusht_lidar_obs_kernel``), ``agent_cols`` wide: the drive parameters in
     ``act_cols`` (a parameter column, or -1 to skip), the command delay in substeps, the
     range-noise deviation, the pose-noise scale (``use_pose_scale``), the localisation bias
@@ -288,8 +312,21 @@ def pusht_lidar_critic_dr_kernel(
     phase (``use_sweep``). The host decides which columns exist and their ``mid``/``inv``."""
     e, a = wp.tid()
     role = roles[e, a]
-    if a == 0 and use_mu == 1:
-        critic[e, base_col] = (mu_g[e] * inv_gravity - mid[0]) * inv[0]
+    if a == 0:
+        c = wp.int32(0)
+        if use_mu == 1:
+            critic[e, base_col] = (mu_g[e] * inv_gravity - mid[0]) * inv[0]
+            c = wp.int32(1)
+        if use_arena == 1:
+            ah = arena_half[e]
+            critic[e, base_col + c] = (ah[0] - mid[c]) * inv[c]
+            critic[e, base_col + c + 1] = (ah[1] - mid[c + 1]) * inv[c + 1]
+            c += wp.int32(2)
+        for i in range(n_modes):
+            hot = type(inv_gravity)(0.0)
+            if scenery_mode[e] == i:
+                hot = type(inv_gravity)(1.0)
+            critic[e, base_col + c + i] = (hot - mid[c + i]) * inv[c + i]
     rank = wp.int32(0)
     for j in range(a):
         if roles[e, j] == role:
@@ -383,6 +420,10 @@ def _relabel_signature(dtype) -> list:
         wp.int32,  # body_frame
         dtype,  # bound
         dtype,  # margin
+        wp.int32,  # per_env_bound
+        wp.array(dtype=VEC2[dtype]),  # arena_half
+        wp.int32,  # count_leak
+        wp.array2d(dtype=dtype),  # leak
         wp.array3d(dtype=dtype),  # ranges
         wp.array3d(dtype=wp.uint8),  # hit_class
     ]
@@ -397,6 +438,10 @@ def _critic_dr_signature(dtype) -> list:
         i32,  # use_mu
         wp.array(dtype=dtype),  # mu_g
         dtype,  # inv_gravity
+        i32,  # use_arena
+        wp.array(dtype=VEC2[dtype]),  # arena_half
+        i32,  # n_modes
+        wp.array(dtype=wp.int32),  # scenery_mode
         wp.array(dtype=wp.int32),  # act_cols
         wp.array3d(dtype=dtype),  # agent_params
         i32,  # use_delay

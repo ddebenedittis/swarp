@@ -134,6 +134,8 @@ def pusht_lidar_obs_kernel(
     aux_scale: Any,
     contact_dist: Any,
     heading: wp.int32,
+    arena: wp.int32,
+    arena_half: wp.array(dtype=Any),
     advance_prev: wp.int32,
     obs: wp.array3d(dtype=Any),
     ring: wp.array3d(dtype=Any),
@@ -146,7 +148,8 @@ def pusht_lidar_obs_kernel(
 ):
     """Thread per (env, agent). Layout: see ``PushTLidarScenario``'s docstring. The self
     and teammate blocks read the observed poses ``obs_pos``/``obs_vel``/``obs_theta``
-    (the true ones without pose noise); everything else reads the true state."""
+    (the true ones without pose noise); everything else reads the true state. With
+    ``arena`` the self block ends with the env's ``arena_half``."""
     e, a = wp.tid()
     n_agents = pos.shape[1]
     n_rays = ranges.shape[2]
@@ -181,6 +184,11 @@ def pusht_lidar_obs_kernel(
         obs[e, a, 9] = wp.cos(obs_theta[e, a])
         obs[e, a, 10] = wp.sin(obs_theta[e, a])
         k = wp.int32(11)
+    if arena == 1:
+        ah = arena_half[e]
+        obs[e, a, k] = ah[0]
+        obs[e, a, k + 1] = ah[1]
+        k += wp.int32(2)
     # ---- teammates: relative observed position + role sign, ascending index, self skipped
     for j in range(n_agents):
         if j != a:
@@ -394,6 +402,9 @@ def pusht_lidar_reward_kernel(
     contact_penalty: Any,
     oob_limit: Any,
     oob_penalty: Any,
+    oob_margin: Any,
+    per_env_oob: wp.int32,
+    arena_half: wp.array(dtype=Any),
     advance_prev: wp.int32,
     full_pass: wp.int32,
     oob: wp.array(dtype=wp.uint8),
@@ -421,7 +432,8 @@ def pusht_lidar_reward_kernel(
     With ``oob_limit > 0``, a step that leaves the T's centroid beyond it on either axis
     latches ``oob`` until the env respawns: the episode has failed, so it can no longer
     be solved, and every robot's reward is ``-oob_penalty`` (in the team column) on every
-    step from then on.
+    step from then on. With ``per_env_oob`` the limit is the env's own, per axis:
+    ``arena_half[e] + oob_margin``.
     """
     e = wp.tid()
     zero = type(pos_shaping_factor)(0.0)
@@ -457,10 +469,15 @@ def pusht_lidar_reward_kernel(
     # ``oob`` is a one-element stand-in, never touched, without the check.
     failed = wp.uint8(0)
     if oob_limit > zero:
+        lim_x = oob_limit
+        lim_y = oob_limit
+        if per_env_oob == 1:
+            lim_x = arena_half[e][0] + oob_margin
+            lim_y = arena_half[e][1] + oob_margin
         failed = oob[e]
         if reset_hit == 1:
             failed = wp.uint8(0)
-        elif advance_prev == 1 and (wp.abs(tp[0]) > oob_limit or wp.abs(tp[1]) > oob_limit):
+        elif advance_prev == 1 and (wp.abs(tp[0]) > lim_x or wp.abs(tp[1]) > lim_y):
             failed = wp.uint8(1)
         oob[e] = failed
     on_goal = wp.uint8(0)
@@ -627,6 +644,8 @@ def _obs_signature(dtype) -> list:
         dtype,  # aux_scale
         dtype,  # contact_dist
         wp.int32,  # heading
+        wp.int32,  # arena
+        wp.array(dtype=vec2),  # arena_half
         wp.int32,  # advance_prev
         wp.array3d(dtype=dtype),  # obs
         wp.array3d(dtype=dtype),  # ring
@@ -659,6 +678,9 @@ def _reward_signature(dtype) -> list:
         *([dtype] * 16),  # the pusht weights, then the observer weights
         dtype,  # oob_limit
         dtype,  # oob_penalty
+        dtype,  # oob_margin
+        wp.int32,  # per_env_oob
+        wp.array(dtype=vec2),  # arena_half
         wp.int32,  # advance_prev
         wp.int32,  # full_pass
         wp.array(dtype=wp.uint8),  # oob

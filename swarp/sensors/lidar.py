@@ -35,14 +35,21 @@ A real lidar spins: its rays are taken one after the other over a scan period wh
 robot moves, and all are reported against the one pose of the scan's stamp. ``sweep``
 models that (and a mount yaw error) by casting each ray from the pose at its own time,
 extrapolated at constant velocity; see :func:`sweep_offsets`.
+
+``scenery`` (a :class:`Scenery`) adds geometry only the lidar sees: per-env circles, boxes
+and segments that no contact ever touches, scanned after the obstacles and reported as
+``HIT_IMMOVABLE`` with hit index ``-1``.
 """
 
 from __future__ import annotations
+
+from dataclasses import dataclass
 
 import torch
 import warp as wp
 
 from swarp.core.config import ObstacleShape
+from swarp.core.state import VEC2
 from swarp.dynamics.base import AgentShape
 from swarp.interop.autograd import torch_stream_scope
 from swarp.sensors.lidar_kernels import (
@@ -112,6 +119,58 @@ def _ray_capsule(rel, d, ca, sa, half_len, rad, miss: float):
     return torch.where(outside, t, miss)
 
 
+@dataclass
+class Scenery:
+    """Per-env geometry that only the lidar sees: ``n_slots`` shapes per env, each with its
+    own pose *and* size per env (the stepper's obstacles share their sizes across envs).
+
+    The torch tensors ``pos [E, S, 2]``, ``angle [E, S]``, ``half [E, S, 2]`` (a box's
+    half-extents; a segment's core half-length in ``half[..., 0]``), ``radius [E, S]`` (a
+    circle's or a segment's radius) and ``shape [E, S]`` (int32
+    :class:`~swarp.core.config.ObstacleShape`, negative for an empty slot) are zero-copy
+    views of the Warp arrays ``wp_*``, which a capture-safe scan reads by pointer: write
+    either side in place, never rebind them. No contact, collision or body pass reads
+    them, so whatever is placed here must lie where nothing can reach it."""
+
+    pos: torch.Tensor
+    angle: torch.Tensor
+    half: torch.Tensor
+    radius: torch.Tensor
+    shape: torch.Tensor
+    wp_pos: wp.array
+    wp_angle: wp.array
+    wp_half: wp.array
+    wp_radius: wp.array
+    wp_shape: wp.array
+
+    @classmethod
+    def empty(cls, n_envs: int, n_slots: int, device, dtype=wp.float32) -> Scenery:
+        """``n_slots`` empty slots per env (shape ``-1``), allocated once."""
+        vec2 = VEC2[dtype]
+        wa = {
+            "pos": wp.zeros((n_envs, n_slots), dtype=vec2, device=device),
+            "angle": wp.zeros((n_envs, n_slots), dtype=dtype, device=device),
+            "half": wp.zeros((n_envs, n_slots), dtype=vec2, device=device),
+            "radius": wp.zeros((n_envs, n_slots), dtype=dtype, device=device),
+            "shape": wp.full((n_envs, n_slots), -1, dtype=wp.int32, device=device),
+        }
+        views = {k: wp.to_torch(v, requires_grad=False) for k, v in wa.items()}
+        return cls(**views, **{f"wp_{k}": v for k, v in wa.items()})
+
+    @property
+    def n_slots(self) -> int:
+        return self.shape.shape[1]
+
+    def tensors(self) -> tuple:
+        """``(pos, angle, half, radius, shape)``, the ``scenery`` argument of the scans."""
+        return self.pos, self.angle, self.half, self.radius, self.shape
+
+    def arrays(self) -> tuple:
+        """The Warp arrays in the order :func:`~swarp.sensors.lidar_kernels.launch_lidar`
+        takes them."""
+        return self.wp_pos, self.wp_angle, self.wp_half, self.wp_radius, self.wp_shape
+
+
 def sweep_offsets(
     offsets: torch.Tensor,  # [n_rays]
     vel: torch.Tensor,  # [n_envs, n_agents, 2]
@@ -158,6 +217,7 @@ def lidar_scan(
     obstacle_kind: torch.Tensor | None = None,  # [n_obstacles] ObstacleKind
     return_hits: bool = False,
     sweep: tuple | None = None,
+    scenery: tuple | None = None,
 ):
     """Ranges ``[n_envs, n_agents, n_rays]`` in ``[0, max_range]``; see the module docstring.
 
@@ -172,6 +232,9 @@ def lidar_scan(
 
     ``sweep = (vel, ang_vel, yaw_bias, stamp_phase, scan_period, sweep_dir)`` casts every
     ray from the pose at the time the rotating sensor took it (:func:`sweep_offsets`).
+    ``scenery = (pos, angle, half, radius, shape)``, ``[n_envs, n_slots]`` each (see
+    :class:`Scenery`), is scanned after the obstacles; an empty slot (negative shape) is
+    never hit.
     """
     n_envs, n_agents = pos.shape[0], pos.shape[1]
     device, dtype = pos.device, pos.dtype
@@ -255,6 +318,31 @@ def lidar_scan(
         best_ob, idx_ob = t.min(dim=-1)
         rng = torch.minimum(rng, best_ob)
 
+    sc_wins = None
+    if scenery is not None and scenery[0].shape[1] > 0:
+        sc_pos, sc_angle, sc_half, sc_radius, sc_shape = scenery
+        centres = sc_pos[:, None, None, :, :]  # [E, 1, 1, S, 2]
+        ang = sc_angle[:, None, None, :]
+        ca, sa = torch.cos(ang), torch.sin(ang)
+        rad = sc_radius[:, None, None, :]
+        hx = sc_half[:, None, None, :, 0]
+        hy = sc_half[:, None, None, :, 1]
+        rel = origin - centres
+        shape = sc_shape[:, None, None, :]
+        t = torch.where(
+            shape == int(ObstacleShape.BOX),
+            _ray_box(rel, dirs, ca, sa, hx, hy, miss),
+            torch.where(
+                shape == int(ObstacleShape.SEGMENT),
+                _ray_capsule(rel, dirs, ca, sa, hx, rad, miss),
+                _ray_circle(centres - origin, dirs, rad, miss),
+            ),
+        )
+        t = torch.where(shape >= 0, t, miss)
+        best_sc = t.min(dim=-1).values
+        sc_wins = best_sc < rng  # strict: a tie goes to an agent or an obstacle
+        rng = torch.minimum(rng, best_sc)
+
     rng = rng.clamp(max=max_range)
     if not return_hits:
         return rng
@@ -270,6 +358,9 @@ def lidar_scan(
             cls_ob = HIT_IMMOVABLE + kind.index_select(0, idx_ob.reshape(-1)).view_as(idx_ob)
         hit_class = torch.where(obs_wins, cls_ob, hit_class)
         hit_index = torch.where(obs_wins, idx_ob, hit_index)
+    if sc_wins is not None:
+        hit_class = torch.where(sc_wins, HIT_IMMOVABLE, hit_class)
+        hit_index = torch.where(sc_wins, -1, hit_index)
     return rng, hit_class.to(torch.uint8), hit_index.to(torch.int32)
 
 
@@ -360,6 +451,8 @@ class Lidar:
         self.wp_hit_class = None
         self.wp_hit_index = None
         self._box_agents = False
+        #: Lidar-only geometry (:class:`Scenery`), set by :meth:`bind`.
+        self.scenery: Scenery | None = None
 
     def ray_offsets(self, device=None, dtype: torch.dtype = torch.float32) -> torch.Tensor:
         """``[n_rays]`` ray angles relative to the frame (heading or world x axis)."""
@@ -410,6 +503,8 @@ class Lidar:
             yaw = zero if self.yaw_bias is None else self.yaw_bias
             phase = zero if self.stamp_phase is None else self.stamp_phase
             kw["sweep"] = (st.vel, st.ang_vel, yaw, phase, self.scan_period, self.sweep_dir)
+        if self.scenery is not None:
+            kw["scenery"] = self.scenery.tensors()
         return lidar_scan(
             world.state.pos,
             world.state.theta,
@@ -426,7 +521,7 @@ class Lidar:
 
     # --------------------------------------------------------- capture-safe
 
-    def bind(self, world) -> None:
+    def bind(self, world, scenery: Scenery | None = None) -> None:
         """Allocate the output buffers for ``world`` and load the scan kernels.
 
         Call it **outside** any capture (in ``make_world``, or before the first step): it
@@ -437,10 +532,19 @@ class Lidar:
         capture cannot be loaded there. Idempotent: re-binding the same world with the same
         batch size keeps the buffers (and their pointers); anything else reallocates and
         bumps :attr:`version`.
+
+        ``scenery`` (a :class:`Scenery` of the world's batch size) is scanned by every
+        later scan on both backends, read by pointer.
         """
-        key = (id(world), world.n_envs, world.n_agents, world.dtype, world.device)
+        if scenery is not None and scenery.shape.shape[0] != world.n_envs:
+            raise ValueError(
+                f"scenery holds {scenery.shape.shape[0]} envs, the world {world.n_envs}"
+            )
+        key = (id(world), world.n_envs, world.n_agents, world.dtype, world.device,
+               None if scenery is None else id(scenery))
         if self._bound_key == key:
             return
+        self.scenery = scenery
         shape = (world.n_envs, world.n_agents, self.n_rays)
         hit_shape = shape if self.return_hits else (1, 1, 1)
         dev = world.device
@@ -465,6 +569,7 @@ class Lidar:
             self.return_hits,
             self.return_hits,
             self.sweep,
+            scenery is not None,
             device=dev,
         )
         self._bound_key = key
@@ -521,9 +626,10 @@ class Lidar:
                 if self.sweep
                 else None
             ),
+            scenery=None if self.scenery is None else self.scenery.arrays(),
         )
 
     __call__ = scan
 
 
-__all__ = ["Lidar", "lidar_scan", "lidar_scan_warp", "sweep_offsets"]
+__all__ = ["Lidar", "Scenery", "lidar_scan", "lidar_scan_warp", "sweep_offsets"]

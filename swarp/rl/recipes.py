@@ -155,6 +155,24 @@ class TrainSpec:
     """torchrl's ``ClipPPOLoss`` defaults this to ``False``. With a large sparse terminal
     bonus on top of small dense shaping -- which is every scenario here -- unnormalized
     advantages swing the effective step size by orders of magnitude between iterations."""
+    target_kl: float | None = None
+    """When set, an iteration's remaining minibatch steps are skipped on device once one
+    minibatch's approximate KL to the rollout policy, ``mean((r - 1) - log r)``, exceeds
+    ``1.5 * target_kl`` (that minibatch's own step included). A brake on destructive
+    updates: L8b-s1 fell 0.83 -> 0.22 in 60 iterations of 128 steps each, no step
+    non-finite."""
+    adaptive_kl: float | None = None
+    """When set, the learning rate follows the KL (rsl_rl's adaptive schedule, per
+    iteration): its multiplier is divided by 1.5 after an iteration whose mean approximate
+    KL exceeds ``2 * adaptive_kl`` and multiplied by 1.5 after one below ``adaptive_kl / 2``,
+    within ``[1/64, 1]`` of the scheduled rate. A policy that sharpens (its entropy falling)
+    moves further per step; this slows it there instead of freezing the iteration as
+    ``target_kl`` does."""
+    rollback: bool = False
+    """Roll the actor, critic and Adam back to an earlier snapshot when the windowed solve
+    rate collapses, halving the learning rate, instead of training on a dead policy (see
+    :class:`~swarp.rl.ppo.RollbackGuard`). The run stops, its best checkpoint saved, after
+    ``RollbackGuard.max_rollbacks`` of them."""
     # --- curriculum ---------------------------------------------------------------
     curriculum: tuple[CurriculumKnob, ...] = ()
     curriculum_iters: int = 0
@@ -168,6 +186,16 @@ class TrainSpec:
     """Scenario attributes on an iteration schedule (:class:`Ramp`). With any, the best
     checkpoint is ranked on how far they have run before the solve rate, so a policy that
     solved before the noise came in does not stay "best"."""
+    ramp_gate: float | None = None
+    """When set, the ramps follow a gated clock instead of the iteration: it runs freely up
+    to the first ramp's start, and from there advances only on iterations whose windowed
+    solve rate is at least this, so no condition comes in before the policy has mastered
+    the last. The learning rate then decays over that clock (to ``lr_final`` at the last
+    ramp's end plus ``hold_iters``), and the run ends there, ``iters`` being a cap. The
+    entropy schedule stays on the iteration count."""
+    hold_iters: int = 0
+    """With ``ramp_gate``: clock ticks to train at the final conditions after the last ramp
+    ends."""
     # --- reporting ----------------------------------------------------------------
     metrics: tuple[str, ...] = ()
     """``scenario.info()`` keys to log, mean-reduced. A ``multiobj_reward`` key is
@@ -256,6 +284,17 @@ class TrainSpec:
             raise ValueError(
                 f"seq_len {self.seq_len} must divide steps_per_batch {self.steps_per_batch}"
             )
+        if self.target_kl is not None and self.target_kl <= 0:
+            raise ValueError(f"target_kl must be > 0, got {self.target_kl}")
+        if self.adaptive_kl is not None and self.adaptive_kl <= 0:
+            raise ValueError(f"adaptive_kl must be > 0, got {self.adaptive_kl}")
+        if self.ramp_gate is not None and not self.ramps:
+            raise ValueError("ramp_gate gates the ramps' clock: it needs ramps")
+        if self.hold_iters < 0:
+            raise ValueError(f"hold_iters must be >= 0, got {self.hold_iters}")
+        if self.hold_iters and self.ramp_gate is None:
+            raise ValueError("hold_iters counts ticks of the gated ramp clock: it needs "
+                             "ramp_gate")
 
 
 # Scenarios with no success criterion: both inherit the all-False ``Scenario.done``, so an
@@ -841,6 +880,64 @@ SPECS["pusht_lidar_limo_slim240_1run"] = replace(
         Ramp("cmd_delay_substeps", (0, 0), (0, 20), 3000, 5000),
         Ramp("rot_away_penalty", 0.0, 1.0, 8000, 10000),
     ),
+)
+
+# pusht_lidar_limo_slim240_1run on a per-env arena with randomised surroundings, in one run
+# that guards itself against the collapses the staged runs met (L9).
+#
+# - Each env's arena is W x H with W and H drawn from 2-5 m on every reset, observed as
+#   (W/2, H/2) in the self block (the units of the observed position, so half - |x| is the
+#   distance to the edge); the arena stop, the out-of-bounds limit and the label bound are
+#   the env's own, per axis. world_size 2.5 covers the largest.
+# - Surroundings drawn per env from nothing, perimeter walls, a room at a random yaw, or
+#   walls plus clutter, a quarter each. Only the lidar sees them, so they stand outside the
+#   free region, the arena plus max(robot reach, T reach) = max(0.73, 0.89) = 0.89 m: the
+#   0.25 m arena stop, 0.4 m/s over a 0.2 s step and the 0.125 s latency, the 0.13 m stop at
+#   the drive's lowest 0.6 m/s^2 and the 0.195 m circumradius; the 0.5 m out-of-bounds
+#   margin plus the slim T's 0.39 m radius. The deployment drops every hit past the label
+#   bound (the arena plus 0.5 m) by the reported pose, so the surroundings reach the policy
+#   only where the localisation error carries them inside it, labelled as the T
+#   (`scenery_leak`); a real floor must keep the same 0.89 m clear at lidar height.
+# - The arena widens from today's 4 x 4 m between ramp ticks 1000 and 3000, while the
+#   world is still stage 1's clean one; the surroundings come in with the pose noise and the
+#   latency (3000-5000), since only the pose error lets them leak.
+# - The ramps follow a gated clock (ramp_gate 0.75): past tick 1000 a tick needs a windowed
+#   solve of at least 0.75, so no condition comes in before the last is mastered (L8b-s1's
+#   stochastic solve held 0.90-0.96 once learned). The learning rate decays over the clock,
+#   and the run ends 4000 ticks after the last ramp, as _1run does at 10000 -> 14000; 24000
+#   iterations is only the cap.
+# - The lidar sees 220 deg cut at the mount, 40 rays at the 5.6 deg spacing: both Limos'
+#   ydlidar drivers crop the scan to +-110 deg (angle_min/angle_max), with returns at every
+#   bearing inside it.
+# - The learning rate follows the KL (adaptive_kl 0.02: the factor on the schedule is cut
+#   by 1.5 after an iteration whose mean approximate KL exceeds 0.04 and raised back below
+#   0.01). With the brake off the per-iteration KL is 0.010 (median) early in this recipe
+#   and 0.042 on L8b-s2's converged policy. A first run with only a skip brake (target_kl
+#   0.1) froze 71% of iterations 1000-1500, where the entropy fell to -1.6 and two or three
+#   Adam steps at 5e-4 pushed the KL past 0.15: the rate has to fall there, not stop.
+#   target_kl 0.3 stays as the brake on a single destructive iteration: L8b-s1 fell
+#   0.83 -> 0.22 in 60 iterations of 128 steps each, no step non-finite.
+# - rollback restores the trainer from before a collapse of the windowed solve (below
+#   max(0.5, best - 0.25) for 25 iterations) and halves the learning rate; a fifth collapse
+#   stops the run on its best checkpoint.
+SPECS["pusht_lidar_limo_slim240_arena"] = replace(
+    SPECS["pusht_lidar_limo_slim240_1run"],
+    scen_kwargs={
+        **SPECS["pusht_lidar_limo_slim240_1run"].scen_kwargs,
+        "world_size": 2.5, "arena_size": (2.0, 5.0),
+        "scenery_probs": (0.25, 0.25, 0.25, 0.25),
+        "n_rays": 40, "lidar_span": math.radians(220.0), "lidar_fov": math.radians(220.0),
+    },
+    iters=24000,
+    ramps=(
+        Ramp("arena_size", (4.0, 4.0), (2.0, 5.0), 1000, 3000),
+        Ramp("pose_noise", (0.0, 0.0), (0.0, 1.25), 3000, 5000),
+        Ramp("cmd_delay_substeps", (0, 0), (0, 20), 3000, 5000),
+        Ramp("scenery_on", 0.0, 1.0, 3000, 5000),
+        Ramp("rot_away_penalty", 0.0, 1.0, 8000, 10000),
+    ),
+    ramp_gate=0.75, hold_iters=4000, target_kl=0.3, adaptive_kl=0.02, rollback=True,
+    metrics=(*SPECS["pusht_lidar_limo_slim240_1run"].metrics, "out_of_bounds", "scenery_leak"),
 )
 
 

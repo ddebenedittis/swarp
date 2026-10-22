@@ -7,6 +7,16 @@ All notable changes to `swarp`. Newest first. Nothing has been released yet — 
 
 ### Added
 
+- **`pusht`/`pusht_lidar` per-env arena (`arena_size`) and lidar-only surroundings (`scenery_probs`).**
+  `arena_size` draws each env's W and H on every reset (a range, or a range per axis); the spawns, the arena stop (`Stepper.enable_arena_stop` now takes a per-env edge array), the out-of-bounds limit and the label bound become per env and per axis, and `pusht_lidar` observes the half-extents after the heading.
+  `scenery_probs` draws per env nothing, perimeter walls, a rotated room or walls plus circles and boxes, outside the free region (arena plus `scenery_clearance`); only the lidar sees them, through the new `swarp.sensors.Scenery` (`lidar_scan(..., scenery=...)`, `Lidar.bind(world, scenery)`), and `info()["scenery_leak"]` counts the rays they reach the policy through as T.
+  Default worlds launch nothing new.
+
+- **`swarp.rl` single-run guards**, off by default: an adaptive learning rate that follows the KL (`TrainSpec.adaptive_kl`, logged as `kl_lr_mult`), a KL brake (`TrainSpec.target_kl`) that skips an iteration's remaining minibatch steps on device, automatic rollback (`rollback`) to a pre-collapse snapshot with a halved learning rate, and a gated ramp clock (`ramp_gate`, `hold_iters`); `metrics.csv` logs `ramp_clock`, `approx_kl`, `kl_stop_frac`, `rollbacks` and `lr_mult`.
+  The rollout's store graph now fails loudly, naming the outputs, when a scenario's outputs move between steps.
+
+- **`SPECS["pusht_lidar_limo_slim240_arena"]`**: the slim-T recipe on 2–5 m arenas with surroundings, at the robots' measured 220 deg field of view, trained as one guarded run; see the Lidar Push-T page.
+
 - **A rotating lidar: `Lidar(scan_period=..., sweep_dir=...)` and `lidar_scan(..., sweep=...)`.**
   A spinning sensor takes its rays one after the other and reports them against one pose; with the sweep on, ray `r` is cast from the pose `tau_r = (stamp_phase - phi_r) scan_period` before the reported one, at constant velocity, plus a per-agent mount yaw error (`sweep_offsets`).
   A `wp.static` flag of the scan kernel, off by default, so a plain scan compiles to the code it always did; torch and Warp agree on randomized mixed scenes.

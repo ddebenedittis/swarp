@@ -93,6 +93,10 @@ class NonFiniteGradients(RuntimeError):
     """Raised when the run is producing non-finite gradients faster than it can learn."""
 
 
+class RollbackLimit(RuntimeError):
+    """Raised when a run has collapsed more often than :class:`RollbackGuard` rolls back."""
+
+
 # ----------------------------------------------------------------------------- capture
 
 
@@ -213,13 +217,17 @@ def ppo_terms(
     logp_old: torch.Tensor,
     adv: torch.Tensor,
     noise: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    with_kl: bool = False,
+) -> tuple[torch.Tensor, ...]:
     """The policy half of the loss from the actor's outputs: ``(objective, entropy)``.
 
     ``loc``/``scale`` are the actor's Gaussian over the pre-tanh sample, ``u`` the stored
     sample and ``noise`` a standard normal draw for the entropy's reparametrized sample,
     all ``[B, A, act_dim]``; ``logp_old`` and ``adv`` (already normalized, if at all) are
     ``[B, A]``. Network-free, so any actor (role heads, a recurrent core) reuses it.
+    ``with_kl`` appends the detached approximate KL to the rollout policy,
+    ``mean((r - 1) - log r)`` with ``r`` the probability ratio (Schulman's k3 estimator:
+    unbiased and never negative).
     """
     log_w = tanh_normal_log_prob(u, loc, scale) - logp_old
     gain = torch.minimum(
@@ -227,7 +235,10 @@ def ppo_terms(
         log_w.clamp(math.log1p(-_CLIP_EPS), math.log1p(_CLIP_EPS)).exp() * adv,
     )
     entropy = -tanh_normal_log_prob(loc + scale * noise, loc, scale).mean()
-    return -gain.mean(), entropy
+    if not with_kl:
+        return -gain.mean(), entropy
+    log_w = log_w.detach()
+    return -gain.mean(), entropy, (log_w.exp() - 1.0 - log_w).mean()
 
 
 def policy_outputs(
@@ -293,6 +304,7 @@ def ppo_loss(
     h0: torch.Tensor | None = None,
     done: torch.Tensor | None = None,
     comm_mask: torch.Tensor | None = None,
+    with_kl: bool = False,
 ) -> tuple[torch.Tensor, ...]:
     """Clipped surrogate, smooth-L1 value loss and MC entropy for one minibatch.
 
@@ -302,8 +314,9 @@ def ppo_loss(
     :class:`StateCritic`, ``roles`` ``[B, A]`` for role-reading networks, and
     ``aux_target`` ``[B, A, aux_dim]`` for a :class:`PolicyNet`'s aux head. Returns
     ``(objective, critic, entropy)``, plus the unweighted auxiliary MSE when
-    ``aux_target`` is given. With ``roles`` and ``role_counts`` the advantages are
-    normalized per role-sorted slot (:func:`standardize_advantage`). ``comm_mask``
+    ``aux_target`` is given, then the approximate KL with ``with_kl``. With ``roles`` and
+    ``role_counts`` the advantages are normalized per role-sorted slot
+    (:func:`standardize_advantage`). ``comm_mask``
     ``[B, A, A]`` goes to a communicating :class:`PolicyNet`; ``h0`` and ``done`` make the
     ``B`` rows sequences for a recurrent one (see :func:`policy_outputs`), and every other
     input then lists its rows in the same time-major order.
@@ -318,11 +331,11 @@ def ppo_loss(
         actor, obs, roles, with_aux=aux_target is not None, h0=h0, done=done,
         comm_mask=comm_mask,
     )
-    objective, entropy = ppo_terms(loc, scale, u, logp_old, adv, noise)
+    objective, entropy, *kl = ppo_terms(loc, scale, u, logp_old, adv, noise, with_kl)
     value = critic_values(critic, obs, state, roles)
     if aux_target is None:
-        return objective, F.smooth_l1_loss(value, ret), entropy
-    return objective, F.smooth_l1_loss(value, ret), entropy, F.mse_loss(aux, aux_target)
+        return objective, F.smooth_l1_loss(value, ret), entropy, *kl
+    return objective, F.smooth_l1_loss(value, ret), entropy, F.mse_loss(aux, aux_target), *kl
 
 
 # ------------------------------------------------------------------------------ the core
@@ -494,15 +507,22 @@ class MAPPO:
         self.k = z(1, dtype=torch.long)
         self.ent_coef = torch.tensor(spec.entropy_coeff, device=dev)
         # [mean reward, n_terminated, n_done] from prepare, then
-        # [objective, critic, entropy, (aux,) skips] summed over the minibatch steps.
+        # [objective, critic, entropy, (aux,) skips, (KL, KL stops)] summed over the
+        # minibatch steps.
         self.n_losses = 4 if self.use_aux else 3
+        # The KL is measured for the brake and for the adaptive lr; only the brake trips.
+        self.kl_brake = spec.target_kl is not None or spec.adaptive_kl is not None
+        self._kl_trip = 1.5 * spec.target_kl if spec.target_kl is not None else math.inf
         self.prep_stats = z(3)
-        self.mb_stats = z(self.n_losses + 1)
+        self.mb_stats = z(self.n_losses + 1 + (2 if self.kl_brake else 0))
         self.found_inf = z(())
         self.force_skip = z(())
+        # Sticky within an iteration once a minibatch's KL trips the brake; prepare clears it.
+        self.kl_stop = z(()) if self.kl_brake else None
         #: The keys of :meth:`update`'s result, in the order the stats buffers hold them.
         losses = [*LEGACY_STAT_NAMES[:6], *(["loss_aux"] if self.use_aux else [])]
-        self.stat_names = [*losses, "grad_skips", *self.metric_names]
+        kl = ["approx_kl", "kl_stops"] if self.kl_brake else []
+        self.stat_names = [*losses, "grad_skips", *kl, *self.metric_names]
 
         params = [*actor.parameters(), *critic.parameters()]
         self.params = params
@@ -514,8 +534,9 @@ class MAPPO:
             # ``found_inf`` by skipping the update and undoing the step increment. Eager
             # CUDA uses it too, so the skip never syncs.
             # A scheduled lr is a tensor, filled in place: the minibatch graph would bake
-            # a float in at capture.
-            lr = spec.lr if spec.lr_final is None else torch.tensor(spec.lr, device=dev)
+            # a float in at capture. A rollback scales it too.
+            scheduled = spec.lr_final is not None or spec.rollback or spec.adaptive_kl is not None
+            lr = torch.tensor(spec.lr, device=dev) if scheduled else spec.lr
             self.optim = torch.optim.Adam(params, lr=lr, fused=True, capturable=True)
             self.optim.found_inf = self.found_inf
             self.optim.grad_scale = None
@@ -525,6 +546,7 @@ class MAPPO:
         self._out: tuple[Any, ...] | None = None
         self._act_ptrs: tuple[int, ...] = ()  # the buffers the act graph reads
         self.act_recaptures = 0  # act-graph recaptures in the current rollout
+        self.store_recaptures = 0  # store-graph recaptures in the current rollout
         self._sig: tuple[int, ...] | None = None  # the buffers the store graph reads
         # The warm-up runs the bodies for real: the carried hidden state is restored too.
         hidden = (self.h,) if self.recurrent else ()
@@ -533,8 +555,9 @@ class MAPPO:
             self._store_body, self.graphs, carries=(self.t, self.metric_acc, *hidden)
         )
         self._prepare = _Graphed(self._prepare_body, self.graphs, carries=(), warmup=1)
+        kl_carry = (self.kl_stop,) if self.kl_brake else ()
         self._minibatch = _Graphed(
-            self._minibatch_body, self.graphs, carries=(self.k, self.mb_stats),
+            self._minibatch_body, self.graphs, carries=(self.k, self.mb_stats, *kl_carry),
             before_warmup=lambda: self.force_skip.fill_(1.0),
             after_warmup=lambda: self.force_skip.fill_(0.0),
         )
@@ -711,6 +734,7 @@ class MAPPO:
         self.t.zero_()
         self.metric_acc.zero_()
         self.act_recaptures = 0
+        self.store_recaptures = 0
         env, actions = self.env, self.actions
         for _ in range(self.T):
             # The graphs read the env's output buffers by address. They are fixed in
@@ -725,6 +749,7 @@ class MAPPO:
             sig = self._signature(out)
             if sig != self._sig:
                 self._store.invalidate()
+                self._count_store_recapture(sig)
                 self._sig = sig
             self._out = out
             self._fetch_sources()
@@ -757,6 +782,25 @@ class MAPPO:
                 "docs/writing-a-scenario.md)."
             )
 
+    def _count_store_recapture(self, sig: tuple[int, ...]) -> None:
+        """Raise once the store graph recaptures more than twice within one rollout,
+        naming the outputs that moved: as for the act graph, a reward, flag or logged
+        ``info()`` metric handed back at a new address every step would otherwise recapture
+        on every step, reading memory the previous step just freed."""
+        if not self.graphs:
+            return
+        self.store_recaptures += 1
+        if self.store_recaptures > 2:
+            names = ["reward", "terminated", "truncated",
+                     *(k for k in self.metrics if k in self._out[4])]
+            moved = [n for n, a, b in zip(names, sig, self._sig or (), strict=False) if a != b]
+            raise RuntimeError(
+                f"the store graph was recaptured {self.store_recaptures} times in one rollout: "
+                f"{', '.join(moved) or 'an output'} came back at a new address. The reward, "
+                "the done flags and every info() key the recipe logs must be fixed-address "
+                "buffers, updated in place."
+            )
+
     # ---------------------------------------------------------------------- update
 
     def _prepare_body(self) -> None:
@@ -779,6 +823,8 @@ class MAPPO:
             self.prep_stats[2] = torch.maximum(term, self.trunc_buf).sum()
             self.mb_stats.zero_()
             self.k.zero_()
+            if self.kl_brake:
+                self.kl_stop.zero_()
 
     def _value(self, t: int) -> torch.Tensor:
         """The critic over rollout row ``t``, ``[E, A]``."""
@@ -826,10 +872,18 @@ class MAPPO:
             extra["h0"] = h_rows.index_select(0, idx[:n_chunks])
             extra["done"] = self.done_buf.reshape(self.N).index_select(0, idx).view(self.L, -1)
         noise = torch.randn_like(u)  # drawn here, not in the (possibly compiled) loss
+        if self.kl_brake:
+            extra["with_kl"] = True
         losses = self._loss(
             self.actor, self.critic, obs, u, logp_old, adv, ret, noise,
             self.spec.normalize_advantage, **extra,
         )
+        if self.kl_brake:
+            *losses, kl = losses
+            # This minibatch's own step is skipped once its KL trips the brake, and every
+            # later one in the iteration with it.
+            trip = (kl > self._kl_trip).float()
+            torch.maximum(self.kl_stop, trip, out=self.kl_stop)
         loss_obj, loss_crit, entropy = losses[:3]
         loss_ent = -self.ent_coef * entropy
 
@@ -843,16 +897,23 @@ class MAPPO:
         )
         if self.cuda:
             found = torch.maximum((~torch.isfinite(gnorm)).float(), self.force_skip)
-            self.found_inf.copy_(found)
+            skip = torch.maximum(found, self.kl_stop) if self.kl_brake else found
+            self.found_inf.copy_(skip)
             self.optim.step()
         else:
             found = (~torch.isfinite(gnorm)).float()
-            if not found.item():
+            skip = torch.maximum(found, self.kl_stop) if self.kl_brake else found
+            if not skip.item():
                 self.optim.step()
         kept = torch.stack(losses).detach()
         n = self.n_losses
-        self.mb_stats[:n] += torch.where(found > 0, torch.zeros_like(kept), kept)
+        self.mb_stats[:n] += torch.where(skip > 0, torch.zeros_like(kept), kept)
         self.mb_stats[n] += found
+        if self.kl_brake:
+            # The KL over every minibatch with finite gradients, a stopped one included (its
+            # policy is the one the brake froze); stops counted apart from non-finite skips.
+            self.mb_stats[n + 1] += torch.where(found > 0, torch.zeros_like(kl), kl)
+            self.mb_stats[n + 2] += self.kl_stop * (1.0 - found)
         self.k.add_(1)
 
     def update(self, entropy_coeff: float) -> dict[str, float]:
@@ -866,6 +927,28 @@ class MAPPO:
             self._minibatch()
         stats = torch.cat([self.prep_stats, self.mb_stats, self.metric_acc / self.T])
         return dict(zip(self.stat_names, stats.tolist(), strict=True))
+
+    def snapshot(self) -> list[torch.Tensor]:
+        """On-device copies of the weights and the optimizer's per-parameter state, in a
+        fixed order, for :meth:`restore`."""
+        out = [p.detach().clone() for p in self.params]
+        for p in self.params:
+            out += [v.clone() for v in self.optim.state.get(p, {}).values()
+                    if isinstance(v, torch.Tensor)]
+        return out
+
+    def restore(self, snap: Sequence[torch.Tensor]) -> None:
+        """Copy a :meth:`snapshot` back in place: the captured graphs and the fused Adam
+        read these tensors by address, so they must not be replaced."""
+        live = [p.detach() for p in self.params]
+        for p in self.params:
+            live += [v for v in self.optim.state.get(p, {}).values()
+                     if isinstance(v, torch.Tensor)]
+        if len(live) != len(snap):
+            raise ValueError(f"snapshot holds {len(snap)} tensors, the trainer {len(live)}")
+        with torch.no_grad():
+            for dst, src in zip(live, snap, strict=True):
+                dst.copy_(src)
 
 
 def _shape(x: torch.Tensor | None) -> object:
@@ -1103,6 +1186,107 @@ def network_archs(
             "per_agent": spec.per_agent_value,
         }
     return (*actor, *critic)
+
+
+# ---------------------------------------------------------------------------- adaptive KL
+
+#: Per-iteration factor and floor of :func:`adapt_kl_lr`.
+KL_LR_STEP = 1.5
+KL_LR_FLOOR = 1.0 / 64.0
+
+
+def adapt_kl_lr(mult: float, kl: float, target: float) -> float:
+    """rsl_rl's adaptive learning rate, once per iteration: the multiplier on the
+    scheduled rate after an iteration of mean approximate KL ``kl``, divided by
+    :data:`KL_LR_STEP` above ``2 * target`` and multiplied by it below ``target / 2``,
+    within ``[KL_LR_FLOOR, 1]``."""
+    if kl > 2.0 * target:
+        return max(mult / KL_LR_STEP, KL_LR_FLOOR)
+    if kl < 0.5 * target:
+        return min(mult * KL_LR_STEP, 1.0)
+    return mult
+
+
+# ---------------------------------------------------------------------------- rollback
+
+
+class RollbackGuard:
+    """When to snapshot the trainer and when to roll it back, from the windowed solve rate.
+
+    Pure bookkeeping over ``(iteration, solve rate, ramp position)``, so it is tested on a
+    synthetic trace; :func:`train` holds the snapshots themselves. Each call to
+    :meth:`step` returns ``"snapshot"``, ``"rollback"`` (restore :attr:`restore_it`),
+    ``"stop"`` or ``None``.
+
+    - The best solve rate is kept per ramp position (``bucket``), so a harder condition is
+      never held to an easier one's best.
+    - Armed once the rate has passed ``arm``; until then nothing is snapshotted or judged.
+    - Snapshot every ``every`` iterations while the rate is at least ``keep`` times the
+      position's best, keeping the newest ``ring``.
+    - Roll back once the rate has stayed below ``max(floor, best - drop)`` for ``patience``
+      consecutive iterations, to the newest snapshot at least ``lag + patience``
+      iterations old: the rate is a ``lag``-iteration window, so it trails the policy, and
+      a snapshot from inside the run of low rates may already hold the falling policy.
+      Snapshots newer than the one restored are dropped.
+    - After ``max_rollbacks`` rollbacks the next trigger is ``"stop"``.
+
+    On L8b-s1's trace the 5650-5700 dip to 0.53 (a 44-point drop for about 75 iterations,
+    then a partial recovery to 0.90) triggers too: it was the onset of the instability
+    that collapsed the run to 0.04 by 6000, and rolling back there is the cheap reading of
+    it.
+    """
+
+    def __init__(
+        self,
+        every: int = 50,
+        ring: int = 4,
+        keep: float = 0.9,
+        arm: float = 0.5,
+        drop: float = 0.25,
+        floor: float = 0.5,
+        patience: int = 25,
+        lag: int = 25,
+        max_rollbacks: int = 4,
+    ) -> None:
+        self.every, self.ring, self.keep, self.arm = every, ring, keep, arm
+        self.drop, self.floor, self.patience, self.lag = drop, floor, patience, lag
+        self.max_rollbacks = max_rollbacks
+        self.best: dict[int, float] = {}
+        self.snaps: list[int] = []  # snapshot iterations, oldest first
+        self.armed = False
+        self.below = 0
+        self.rollbacks = 0
+        self.restore_it: int | None = None
+
+    def step(self, it: int, solve: float | None, bucket: int) -> str | None:
+        if solve is None:
+            self.below = 0
+            return None
+        best = max(self.best.get(bucket, 0.0), solve)
+        self.best[bucket] = best
+        self.armed = self.armed or solve >= self.arm
+        if not self.armed:
+            return None
+        if solve < max(self.floor, best - self.drop):
+            self.below += 1
+            if self.below < self.patience:
+                return None
+            self.below = 0
+            if self.rollbacks >= self.max_rollbacks:
+                return "stop"
+            old = [s for s in self.snaps if s <= it - self.lag - self.patience]
+            if not old:
+                return None  # nothing from before the drop: keep training
+            self.restore_it = old[-1]
+            self.snaps = old
+            self.rollbacks += 1
+            return "rollback"
+        self.below = 0
+        last = self.snaps[-1] if self.snaps else None
+        if solve >= self.keep * best and (last is None or it - last >= self.every):
+            self.snaps = [*self.snaps, it][-self.ring :]
+            return "snapshot"
+        return None
 
 
 # ----------------------------------------------------------------------------- the CLI
@@ -1387,11 +1571,16 @@ def train(cfg: TrainConfig) -> Path:
     # loss_aux only when the aux loss is on, so a default run's header is unchanged.
     aux_col = ["loss_aux"] if algo.use_aux else []
     ramp_col = ["ramp"] if spec.ramps else []
+    # The guards' columns only when each is on, likewise.
+    clock_col = ["ramp_clock"] if spec.ramp_gate is not None else []
+    kl_col = ["approx_kl", "kl_stop_frac"] if algo.kl_brake else []
+    rollback_col = ["rollbacks", "lr_mult"] if spec.rollback else []
+    adapt_col = ["kl_lr_mult"] if spec.adaptive_kl is not None else []
     csv_writer.writerow(
         ["iter", "frames", "wall_s", "env_sps", "reward_per_step", "ep_solve_rate",
-         "ep_ends", "ep_len_mean", "difficulty", *ramp_col, "entropy", "loss_objective",
-         "loss_critic", *aux_col, "grad_skips", "eval_solve_rate", "eval_ci_lo",
-         "eval_ci_hi"]
+         "ep_ends", "ep_len_mean", "difficulty", *ramp_col, *clock_col, "entropy",
+         "loss_objective", "loss_critic", *aux_col, "grad_skips", *kl_col, *rollback_col,
+         *adapt_col, "eval_solve_rate", "eval_ci_lo", "eval_ci_hi"]
         + metric_cols
     )
     target = spec.target_solve_rate if cfg.target_solve_rate is None else cfg.target_solve_rate
@@ -1434,6 +1623,15 @@ def train(cfg: TrainConfig) -> Path:
     # Ranked on (difficulty, ramp progress, solve rate): a later checkpoint wins only at an
     # equal or harder difficulty (see train_mappo.py for the caging run that motivated it).
     best_key = (-1.0, -1.0, -1.0)
+    # The ramps' clock: the iteration, or with ramp_gate the solve-gated count of ticks.
+    gated = spec.ramp_gate is not None
+    clock = 0
+    first_start = min((r.start for r in spec.ramps), default=0)
+    end_clock = max((r.end for r in spec.ramps), default=0) + spec.hold_iters
+    lr_mult = 1.0
+    kl_mult = 1.0  # the adaptive-KL factor on top of the schedule and the rollbacks
+    guard = RollbackGuard(lag=cfg.gate_window) if spec.rollback else None
+    snaps: dict[int, tuple[list[torch.Tensor], int, float]] = {}
     print(
         f"{cfg.scenario}: {n_agents} agents, obs_dim {obs_dim}, act_dim {act_dim}, "
         f"{spec.n_envs} envs x {spec.steps_per_batch} steps, dt {spec.dt}, "
@@ -1454,21 +1652,32 @@ def train(cfg: TrainConfig) -> Path:
         print(f"  scenario kwargs: {cfg.scen_kwargs}")
 
     for it in range(spec.iters):
+        if gated and clock >= end_clock:
+            print(f"ramp clock reached {end_clock} (last ramp end + hold_iters) at iter {it}")
+            break
         t0 = time.perf_counter()
         if spec.entropy_coeff_final is not None and spec.iters > 1:
             frac = it / (spec.iters - 1)
             coeff = spec.entropy_coeff + frac * (spec.entropy_coeff_final - spec.entropy_coeff)
         else:
             coeff = spec.entropy_coeff
-        progress = set_ramps(it)
-        if spec.lr_final is not None and spec.iters > 1:
+        if not gated:
+            clock = it
+        progress = set_ramps(clock)
+        tick = clock  # the clock this iteration ran at
+        lr = spec.lr
+        if spec.lr_final is not None and gated:
+            frac = min(1.0, clock / max(end_clock, 1))
+            lr = spec.lr + frac * (spec.lr_final - spec.lr)
+        elif spec.lr_final is not None and spec.iters > 1:
             frac = it / (spec.iters - 1)
             lr = spec.lr + frac * (spec.lr_final - spec.lr)
+        if spec.lr_final is not None or spec.rollback or spec.adaptive_kl is not None:
             group = algo.optim.param_groups[0]
             if isinstance(group["lr"], torch.Tensor):
-                group["lr"].fill_(lr)
+                group["lr"].fill_(lr * lr_mult * kl_mult)
             else:
-                group["lr"] = lr
+                group["lr"] = lr * lr_mult * kl_mult
         if algo.action_rate and spec.action_rate_ramp_iters > 0:
             ramp = min(1.0, (it + 1) / spec.action_rate_ramp_iters)
             algo.rate_coef.fill_(spec.action_rate_coef * ramp)
@@ -1481,8 +1690,14 @@ def train(cfg: TrainConfig) -> Path:
         mean_reward, n_term, n_done = stats["mean_reward"], stats["n_terminated"], stats["n_done"]
         obj, crit, ent = stats["loss_objective"], stats["loss_critic"], stats["entropy"]
         skips = int(stats["grad_skips"])
-        updates = max(n_mb - skips, 1)
+        kl_stops = int(stats.get("kl_stops", 0))
+        updates = max(n_mb - skips - kl_stops, 1)
         window.update_counts(int(n_term), int(n_done), frames_per_batch)
+        if spec.adaptive_kl is not None:
+            kl_lr = kl_mult  # the factor this iteration trained at, for the log
+            kl_mult = adapt_kl_lr(
+                kl_mult, stats["approx_kl"] / max(n_mb - skips, 1), spec.adaptive_kl
+            )
         total_skips += skips
         hot_skip_iters = hot_skip_iters + 1 if skips / n_mb > cfg.max_skip_frac else 0
         if hot_skip_iters >= cfg.max_skip_iters:
@@ -1496,6 +1711,36 @@ def train(cfg: TrainConfig) -> Path:
 
         rate, ep_len = window.solve_rate, window.ep_len_mean
         f = set_curriculum(rate)  # difficulty for the next batch's resets
+        if gated and (clock < first_start or (rate is not None and rate >= spec.ramp_gate)):
+            clock += 1
+        if guard is not None:
+            action = guard.step(it, rate, round(progress * 1000))
+            if action == "snapshot":
+                snaps[it] = (algo.snapshot(), clock, difficulty)
+            elif action == "rollback":
+                weights, clock, difficulty = snaps[guard.restore_it]
+                lr_mult = 0.5 ** guard.rollbacks  # halved per rollback, for the rest of the run
+                algo.restore(weights)
+                set_curriculum(None)  # re-applies the restored difficulty
+                set_ramps(clock)
+                algo.reset()  # fresh episodes under the restored policy and conditions
+                window = SolveRateWindow(window=cfg.gate_window)
+                print(
+                    f"  ROLLBACK {guard.rollbacks}/{guard.max_rollbacks} at iter {it}: solve "
+                    f"{rate:.3f} collapsed; restored the iter {guard.restore_it} snapshot "
+                    f"(ramp clock {clock}), lr x{lr_mult:g}"
+                )
+            elif action == "stop":
+                save("collapsed")
+                csv_file.close()
+                raise RollbackLimit(
+                    f"the solve rate collapsed again at iter {it} after "
+                    f"{guard.rollbacks} rollbacks; the best checkpoint is "
+                    f"{ckpt_dir / f'{cfg.scenario}_best.pt'}, the collapsed state "
+                    f"{ckpt_dir / f'{cfg.scenario}_collapsed.pt'}."
+                )
+            for k in [k for k in snaps if k not in guard.snaps]:
+                del snaps[k]
 
         eval_rate = eval_lo = eval_hi = None
         if cfg.eval_every and (it + 1) % cfg.eval_every == 0:
@@ -1516,9 +1761,13 @@ def train(cfg: TrainConfig) -> Path:
             [it, (it + 1) * frames_per_batch, f"{wall:.3f}", f"{frames_per_batch / wall:.0f}",
              f"{mean_reward:.6f}", "" if rate is None else f"{rate:.4f}", window.ends,
              "" if ep_len is None else f"{ep_len:.1f}", f"{f:.3f}",
-             *(f"{progress:.3f}" for _ in ramp_col),
+             *(f"{progress:.3f}" for _ in ramp_col), *(str(tick) for _ in clock_col),
              f"{ent / updates:.4f}", f"{obj / updates:.4f}", f"{crit / updates:.4f}",
              *(f"{stats[k] / updates:.4f}" for k in aux_col), skips,
+             *([f"{stats['approx_kl'] / max(n_mb - skips, 1):.5f}",
+                f"{kl_stops / n_mb:.3f}"] if kl_col else []),
+             *([guard.rollbacks, f"{lr_mult:g}"] if rollback_col else []),
+             *([f"{kl_lr:.4g}"] if adapt_col else []),
              "" if eval_rate is None else f"{eval_rate:.4f}",
              "" if eval_lo is None else f"{eval_lo:.4f}",
              "" if eval_hi is None else f"{eval_hi:.4f}"]
@@ -1531,6 +1780,9 @@ def train(cfg: TrainConfig) -> Path:
             f"ends {window.ends:5d}  ep_len {0.0 if ep_len is None else ep_len:6.1f}  "
             f"diff {f:.2f}  "
             + (f"ramp {progress:.2f}  " if ramp_col else "")
+            + (f"clock {tick}  " if clock_col else "")
+            + (f"kl {stats['approx_kl'] / max(n_mb - skips, 1):.4f}  " if kl_col else "")
+            + (f"lr x{kl_lr:.3g}  " if adapt_col else "")
             + f"ent {ent / updates:+.3f}  {wall * 1e3:.1f}ms"
             + (f"  skipped {skips}" if skips else "")
         )

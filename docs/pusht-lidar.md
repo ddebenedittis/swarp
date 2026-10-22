@@ -349,3 +349,43 @@ Both policies spin the T: the median episode needs 1.57 rad of heading correctio
 The reward allows it: `angle_error` is wrapped to [0, π], so heading progress pays back on the way down what it charged on the way up, and a whole turn costs only `rot_away_penalty · π`, about 0.6 m of position progress at 1.0.
 Raising the turn-away cost trades solve rate for little less spin (stage 4′ at 2.0: 6.2 rad at 0.95 greedy, then falling to 0.86), so a penalty on the T's angular speed, which a whole turn cannot repay, is the open lead.
 Stage 2's best checkpoint is the one to deploy until then; stage 4's spins a quarter less at two points of solve rate.
+
+### Variable arena and surroundings, in one run
+
+`SPECS["pusht_lidar_limo_slim240_arena"]` (L9) trains the slim T across arena sizes and whatever stands around the arena, from scratch and as one run.
+
+**Arena.**
+`arena_size` gives every env its own rectangular arena, redrawn on every reset: `(2.0, 5.0)` draws the width and the height from 2–5 m independently (a 4-tuple gives each axis its own range, a value fixes a square).
+The self block ends with the env's half-extents `(W/2, H/2)` in metres, the units of the observed position, so `half − |x|` is the distance to the edge.
+The spawns, the arena stop (`Stepper.enable_arena_stop` with a per-env edge array), the out-of-bounds limit and the label bound are each env's own, per axis: the half-extents plus `arena_stop_margin`, plus `oob_margin`.
+Robots spawn clear of the T and of each other even in a 2 × 2 m arena (rejection over uniform draws, then rings around the T), and a goal outside the arena is redrawn rather than clamped onto its edge.
+
+**Surroundings.**
+`scenery_probs` draws per env one of four layouts outside the arena: nothing, four walls parallel to its sides, a room at a random yaw that contains it, or walls plus up to `n_clutter` circles and boxes (`swarp/scenarios/pusht_lidar_scenery.py`).
+Each wall stands its own gap (`scenery_gap`, 0–1 m) past the free region and may be missing (`wall_missing`, 0.2).
+Only the lidar sees the surroundings (a `swarp.sensors.Scenery`, per-env shapes the stepper's contacts never read), so they stand outside the free region: the arena grown by the farther of a robot's reach past the arena stop and the T's past the out-of-bounds limit, 0.89 m for the recipe (`scenery_clearance`).
+No robot or T can touch them before its episode fails, which is what makes lidar-only geometry exact; a real floor must keep the same 0.89 m clear at lidar height, or the deployment meets what training never showed.
+`scenery_on` scales the share of envs that have any, so a trainer can ramp them in.
+
+What the surroundings can teach is bounded by the deployment's labels.
+`label_rays` turns every hit past the label bound (the arena plus `oob_margin`, from the robot's reported pose) into a miss, and swarp trains on the same rule, so under mocap-grade poses nothing outside the arena reaches the observation.
+Under AMCL-sized localisation error a wall near the bound lands inside it and is labelled as the T; `info()["scenery_leak"]` is the share of rays where that happens, and that leak is what training with surroundings makes the policy robust to.
+The arena sizes change the task itself: the policy has to keep the T inside an edge that is now its own per env.
+
+**Field of view.**
+Both Limos' ydlidar drivers crop the scan to ±110° (`angle_min`/`angle_max`), read off the running robots, with returns at every bearing inside it.
+The recipe sees 220° cut at the mount with 40 rays (`lidar_span`), the 5.6° spacing of the 240° recipes, so its observation is narrower than theirs and its checkpoint does not load into them.
+The two robots' mount transforms disagree with each other and with the 0.103 m `lidar_mount_offset` from the Gazebo identification (one publishes 0.18 m ahead of `base_footprint`, the other two different `laser_link` poses); the recipe keeps 0.103 m.
+
+**One run.**
+The recipe is `pusht_lidar_limo_slim240_1run`'s, with four guards against the collapses the staged runs met (`swarp.rl`, all off by default):
+
+- the ramps follow a gated clock (`ramp_gate` 0.75): past the first ramp's start a tick needs a windowed solve of at least 0.75, so no condition comes in before the last is mastered; the learning rate decays over that clock, and the run ends `hold_iters` (4000) past the last ramp, `iters` (24000) being a cap;
+- an adaptive learning rate (`adaptive_kl` 0.02, rsl_rl's schedule once per iteration): the factor on the scheduled rate is divided by 1.5 after an iteration whose mean approximate KL to the rollout policy exceeds 0.04 and multiplied by 1.5 (up to 1) after one below 0.01; a first run with only the skip brake at 0.1 froze 71% of iterations 1000–1500, where the entropy fell to −1.6 and two or three Adam steps already pushed the KL past 0.15;
+- a KL brake (`target_kl` 0.3) for a single destructive iteration: once a minibatch's approximate KL exceeds 1.5 times it, the iteration's remaining minibatch steps are skipped on device;
+- automatic rollback (`rollback`): when the windowed solve stays below `max(0.5, best − 0.25)` for 25 iterations, the actor, critic and Adam state return to a snapshot from before the drop, the learning rate halves, and the ramps return to that snapshot's clock; a fifth collapse stops the run on its best checkpoint.
+
+L8b-s1 is the case they answer: it held 0.95–0.97 for 2500 iterations, then fell 0.83 → 0.22 in 60, with no step non-finite and its entropy rising only after the fall.
+The arena widens from 4 × 4 m over ticks 1000–3000, in stage 1's clean world, and the surroundings come in with the pose noise and the latency (3000–5000), since only the pose error lets them leak.
+
+The deployment side (`swarp_gz_test`: the observation's arena block, per-axis bounds in `label_rays`, the safety bridge and the localisation mask) is not updated yet; until it is, this checkpoint cannot run on the robots.

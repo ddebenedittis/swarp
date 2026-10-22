@@ -931,3 +931,79 @@ def test_sweep_casts_each_ray_from_the_pose_at_its_time(device):
     rest = (torch.zeros(1, 1, 2, **f64), zero, zero, zero + 0.3, 0.1, 1.0)
     torch.testing.assert_close(lidar_scan(pos, theta, rad, sweep=rest, **kw),
                                lidar_scan(pos, theta, rad, **kw))
+
+
+# ----------------------------------------------------------------------------- scenery
+
+
+def _scenery(device, dtype, rows):
+    """A one-env :class:`Scenery` tuple from ``(shape, x, y, angle, hx, hy, radius)`` rows."""
+    t = torch.tensor(rows, dtype=torch.float64)
+    return (
+        t[None, :, 1:3].to(device=device, dtype=dtype),
+        t[None, :, 3].to(device=device, dtype=dtype),
+        t[None, :, 4:6].to(device=device, dtype=dtype),
+        t[None, :, 6].to(device=device, dtype=dtype),
+        t[None, :, 0].to(device=device, dtype=torch.int32),
+    )
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("fn", [lidar_scan, lidar_scan_warp])
+def test_scenery_shapes_are_hit_and_empty_slots_are_not(device, fn):
+    """Four rays from the origin, one per slot: a circle (r 0.1 at 1 m) reads 0.9, a box
+    (half 0.1 x 0.2 at 1 m, ray along its 0.2 side) 0.8, an upright capsule (radius 0.05 at
+    -1.5 m) 1.45, and an empty slot is never hit. Scenery is class 2 with index -1, and a
+    circle obstacle at the circle's range wins the tie."""
+    dt = torch.float64
+    sc = _scenery(device, dt, [
+        (0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.1),
+        (1, 0.0, 1.0, 0.0, 0.1, 0.2, 0.0),
+        (2, -1.5, 0.0, math.pi / 2, 0.5, 0.0, 0.05),
+        (-1, 0.0, -0.5, 0.0, 0.0, 0.0, 0.2),
+    ])
+    args = (torch.zeros(1, 1, 2, dtype=dt, device=device), torch.zeros(1, 1, dtype=dt,
+            device=device), torch.tensor([0.05], dtype=dt, device=device))
+    r, c, i = fn(*args, n_rays=4, max_range=MAXR, return_hits=True, scenery=sc)
+    np.testing.assert_allclose(r[0, 0].cpu(), [0.9, 0.8, 1.45, MAXR], atol=1e-12)
+    assert c[0, 0].tolist() == [2, 2, 2, 0] and i[0, 0].tolist() == [-1, -1, -1, -1]
+    tie = dict(obstacle_pos=torch.tensor([[[1.0, 0.0]]], dtype=dt, device=device),
+               obstacle_radius=torch.tensor([0.1], dtype=dt, device=device),
+               obstacle_kind=torch.tensor([1], dtype=torch.int32, device=device))
+    _, c, i = fn(*args, n_rays=4, max_range=MAXR, return_hits=True, scenery=sc, **tie)
+    assert (c[0, 0, 0].item(), i[0, 0, 0].item()) == (3, 0)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("sweep", [False, True])
+def test_warp_matches_torch_with_scenery(device, dtype, sweep):
+    """Per-env scenery (every shape, its own size in each env, some slots empty) over the
+    mixed scenes: the backends agree as they do without it (float64 exactly on what was
+    hit), with and without the sweep."""
+    for seed in range(3):
+        s = _random_scene(seed, device, dtype)
+        pos, theta, rad = s.pop("pos"), s.pop("theta"), s.pop("agent_radius")
+        e, n = pos.shape[0], 6
+        g = torch.Generator(device="cpu").manual_seed(50 + seed)
+
+        def u(*shape, lo=0.0, hi=1.0, g=g):
+            x = torch.rand(*shape, generator=g, dtype=torch.float64) * (hi - lo) + lo
+            return x.to(device=device, dtype=dtype)
+
+        shape = torch.randint(-1, 3, (e, n), generator=g).to(torch.int32).to(device)
+        sc = (u(e, n, 2, lo=-1.2, hi=1.2), u(e, n, lo=0.0, hi=6.28), u(e, n, 2, lo=0.03, hi=0.4),
+              u(e, n, lo=0.02, hi=0.15), shape)
+        kw = dict(n_rays=96, max_range=1.5, return_hits=True, scenery=sc, **s)
+        if sweep:
+            kw["sweep"] = _random_sweep(seed, device, dtype, *pos.shape[:2])
+        r_ref, c_ref, i_ref = lidar_scan(pos, theta, rad, **kw)
+        r_got, c_got, i_got = lidar_scan_warp(pos, theta, rad, **kw)
+        bare = lidar_scan(pos, theta, rad, **{**kw, "scenery": None})[1]
+        assert ((c_ref == 2) & (bare != 2)).any()  # scenery took rays from the rest
+        same = (c_ref == c_got) & (i_ref == i_got)
+        if dtype == torch.float64:
+            assert same.all()
+        else:
+            assert (~same).double().mean() < 2e-3
+        torch.testing.assert_close(r_got[same], r_ref[same], **_TOL[dtype])

@@ -322,6 +322,168 @@ def pusht_reset_kernel(
         goal_theta[e] = (_as(wp.randf(rng), lim) * two - one) * pi
 
 
+#: Tries per robot of the per-env arena spawn: uniform in the arena first, then on a ring
+#: around the T, where a small arena still has room when the uniform draws keep landing
+#: on the T's disc, then on a ring down to the T's bare clearance.
+ARENA_SPAWN_TRIES_UNIFORM = wp.constant(8)
+ARENA_SPAWN_TRIES_RING = wp.constant(24)
+ARENA_SPAWN_TRIES_TIGHT = wp.constant(32)
+ARENA_GOAL_TRIES = wp.constant(16)
+
+
+@wp.kernel
+def pusht_arena_reset_kernel(
+    reset_mask: wp.array(dtype=wp.uint8),
+    use_mask: wp.int32,
+    seed: wp.int32,
+    w_lo: Any,
+    w_hi: Any,
+    h_lo: Any,
+    h_hi: Any,
+    agent_inset: Any,
+    tee_inset: Any,
+    clear: Any,
+    clear_min: Any,
+    agent_clear: Any,
+    stop_margin: Any,
+    goal_radius: Any,
+    goal_angle: Any,
+    use_goal_radius: wp.int32,
+    use_goal_angle: wp.int32,
+    n_agents: wp.int32,
+    arena_half: wp.array(dtype=Any),
+    arena_edges: wp.array(dtype=Any),
+    pos: Any,
+    vel: Any,
+    tee_pos: Any,
+    tee_vel: Any,
+    tee_theta: Any,
+    tee_ang_vel: Any,
+    goal_pos: Any,
+    goal_theta: Any,
+):
+    """Masked episode reset on a per-env arena: its width and height, then the T, robot
+    and goal spawns inside it.
+
+    The arena is ``W x H`` (each uniform in its range), centred on the origin;
+    ``arena_half[e]`` gets ``(W / 2, H / 2)`` and ``arena_edges[e]`` the arena stop's
+    ``(W / 2, H / 2) + stop_margin``. The T is uniform in the arena inset by ``tee_inset``,
+    each robot uniform in it inset by ``agent_inset``, clear of the T's disc (``clear``)
+    and of the robots already placed (``agent_clear``): rejection over
+    ``ARENA_SPAWN_TRIES_UNIFORM`` uniform draws, then ``ARENA_SPAWN_TRIES_RING`` draws on a
+    ring just outside ``clear``, then ``ARENA_SPAWN_TRIES_TIGHT`` on a ring between
+    ``clear_min`` (the T's radius plus a robot's) and ``clear``, and if all miss
+    :func:`pusht_reset_kernel`'s push-out and clamp. The goal is drawn like
+    :func:`pusht_reset_kernel`'s, but a disc draw outside the inset arena is redrawn
+    (``ARENA_GOAL_TRIES``) rather than clamped, so a small arena's goals do not pile up on
+    its edge."""
+    e = wp.tid()
+    if use_mask == 1 and reset_mask[e] == wp.uint8(0):
+        return
+    rng = wp.rand_init(seed, e)
+    zero = _as(0.0, w_lo)
+    two = _as(2.0, w_lo)
+    one = _as(1.0, w_lo)
+    half = _as(0.5, w_lo)
+    pi = _as(3.14159265358979, w_lo)
+
+    hx = half * (w_lo + _as(wp.randf(rng), w_lo) * (w_hi - w_lo))
+    hy = half * (h_lo + _as(wp.randf(rng), w_lo) * (h_hi - h_lo))
+    arena_half[e] = wp.vector(hx, hy)
+    arena_edges[e] = wp.vector(hx + stop_margin, hy + stop_margin)
+    lx = hx - agent_inset
+    ly = hy - agent_inset
+    tlx = hx - tee_inset
+    tly = hy - tee_inset
+
+    tx = (_as(wp.randf(rng), w_lo) * two - one) * tlx
+    ty = (_as(wp.randf(rng), w_lo) * two - one) * tly
+    theta = (_as(wp.randf(rng), w_lo) * two - one) * pi
+    tee_pos[e] = wp.vector(tx, ty)
+    tee_vel[e] = wp.vector(zero, zero)
+    tee_theta[e] = theta
+    tee_ang_vel[e] = zero
+
+    for a in range(n_agents):
+        px = zero
+        py = zero
+        placed = bool(False)  # noqa: UP018 - Warp: a loop-mutated flag must not be a constant
+        n_try = ARENA_SPAWN_TRIES_UNIFORM + ARENA_SPAWN_TRIES_RING + ARENA_SPAWN_TRIES_TIGHT
+        for k in range(n_try):
+            if not placed:
+                qx = zero
+                qy = zero
+                need = clear
+                if k < ARENA_SPAWN_TRIES_UNIFORM:
+                    qx = (_as(wp.randf(rng), w_lo) * two - one) * lx
+                    qy = (_as(wp.randf(rng), w_lo) * two - one) * ly
+                else:
+                    ang = (_as(wp.randf(rng), w_lo) * two - one) * pi
+                    u = _as(wp.randf(rng), w_lo)
+                    rad = clear * (one + half * u)
+                    if k >= ARENA_SPAWN_TRIES_UNIFORM + ARENA_SPAWN_TRIES_RING:
+                        need = clear_min
+                        rad = clear_min + u * (clear - clear_min)
+                    qx = tx + rad * wp.cos(ang)
+                    qy = ty + rad * wp.sin(ang)
+                ok = wp.abs(qx) <= lx and wp.abs(qy) <= ly
+                dx = qx - tx
+                dy = qy - ty
+                if dx * dx + dy * dy < need * need:
+                    ok = False
+                for b in range(a):
+                    ob = pos[e, b]
+                    bx = qx - ob[0]
+                    by = qy - ob[1]
+                    if bx * bx + by * by < agent_clear * agent_clear:
+                        ok = False
+                if ok:
+                    px = qx
+                    py = qy
+                    placed = True
+        if not placed:
+            px = (_as(wp.randf(rng), w_lo) * two - one) * lx
+            py = (_as(wp.randf(rng), w_lo) * two - one) * ly
+            dx = px - tx
+            dy = py - ty
+            dn = wp.sqrt(dx * dx + dy * dy)
+            if dn < clear:
+                if dn > _as(1.0e-9, w_lo):
+                    px = tx + dx / dn * clear
+                    py = ty + dy / dn * clear
+                else:
+                    px = tx
+                    py = ty + clear
+            px = wp.clamp(px, -lx, lx)
+            py = wp.clamp(py, -ly, ly)
+        pos[e, a] = wp.vector(px, py)
+        vel[e, a] = wp.vector(zero, zero)
+
+    gx = zero
+    gy = zero
+    if use_goal_radius == 1:
+        found = bool(False)  # noqa: UP018 - Warp: a loop-mutated flag must not be a constant
+        for _k in range(ARENA_GOAL_TRIES):
+            if not found:
+                gdir = (_as(wp.randf(rng), w_lo) * two - one) * pi
+                grad = goal_radius * wp.sqrt(_as(wp.randf(rng), w_lo))
+                gx = tx + grad * wp.cos(gdir)
+                gy = ty + grad * wp.sin(gdir)
+                if wp.abs(gx) <= tlx and wp.abs(gy) <= tly:
+                    found = True
+        gx = wp.clamp(gx, -tlx, tlx)
+        gy = wp.clamp(gy, -tly, tly)
+    else:
+        gx = (_as(wp.randf(rng), w_lo) * two - one) * tlx
+        gy = (_as(wp.randf(rng), w_lo) * two - one) * tly
+    goal_pos[e] = wp.vector(gx, gy)
+
+    if use_goal_angle == 1:
+        goal_theta[e] = theta + (_as(wp.randf(rng), w_lo) * two - one) * goal_angle
+    else:
+        goal_theta[e] = (_as(wp.randf(rng), w_lo) * two - one) * pi
+
+
 @wp.kernel
 def pusht_heading_reset_kernel(
     reset_mask: wp.array(dtype=wp.uint8),
@@ -489,10 +651,47 @@ def _reset_signature(dtype) -> list:
         a1s,  # goal_theta
     ]
 
+def _arena_reset_signature(dtype) -> list:
+    a1v = wp.array(dtype=VEC2[dtype])
+    a1s = wp.array(dtype=dtype)
+    a2v = wp.array2d(dtype=VEC2[dtype])
+    return [
+        wp.array(dtype=wp.uint8),  # reset_mask
+        wp.int32,  # use_mask
+        wp.int32,  # seed
+        dtype,  # w_lo
+        dtype,  # w_hi
+        dtype,  # h_lo
+        dtype,  # h_hi
+        dtype,  # agent_inset
+        dtype,  # tee_inset
+        dtype,  # clear
+        dtype,  # clear_min
+        dtype,  # agent_clear
+        dtype,  # stop_margin
+        dtype,  # goal_radius
+        dtype,  # goal_angle
+        wp.int32,  # use_goal_radius
+        wp.int32,  # use_goal_angle
+        wp.int32,  # n_agents
+        a1v,  # arena_half
+        a1v,  # arena_edges
+        a2v,  # pos
+        a2v,  # vel
+        a1v,  # tee_pos
+        a1v,  # tee_vel
+        a1s,  # tee_theta
+        a1s,  # tee_ang_vel
+        a1v,  # goal_pos
+        a1s,  # goal_theta
+    ]
+
+
 for _T in (wp.float32, wp.float64):
     register(pusht_obs_kernel, _T, _obs_signature(_T))
     register(pusht_reward_kernel, _T, _reward_signature(_T))
     register(pusht_reset_kernel, _T, _reset_signature(_T))
+    register(pusht_arena_reset_kernel, _T, _arena_reset_signature(_T))
     register(pusht_heading_reset_kernel, _T, _heading_reset_signature(_T))
     register(pusht_actuation_reset_kernel, _T, _actuation_reset_signature(_T))
     register(pusht_friction_reset_kernel, _T, _friction_reset_signature(_T))

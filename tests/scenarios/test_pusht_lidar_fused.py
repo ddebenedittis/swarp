@@ -147,8 +147,21 @@ def test_fused_matches_torch(device, n_agents, obs_level):
             "lidar_scan_period": 0.1, "lidar_yaw_bias": 0.03, "lidar_stamp_phase": (0.0, 1.0),
             "lidar_label_from_pose": True, "critic_dr": True,
         },
+        # A per-env arena with every surroundings layout, the deployment's labels from
+        # noisy reported poses and the arena and layout columns in the critic state. The
+        # clearance is zero and the walls thin and close, so scenery lands inside the label
+        # bound and the leak path fires (physically the walls would be within reach).
+        {
+            "model": "diff_drive", "agent_shape": "box", "open_arena": True,
+            "oob_margin": 0.1, "world_size": 0.6, "arena_size": (0.9, 1.2),
+            "lidar_max_range": 0.6, "scenery_probs": (0.1, 0.3, 0.3, 0.3),
+            "scenery_clearance": 0.0, "scenery_gap": (0.0, 0.05), "wall_radius": (0.01, 0.02),
+            "clutter_radius": (0.02, 0.05), "clutter_half": (0.02, 0.06),
+            "pose_noise": (0.5, 1.0), "pose_jitter_std": (0.0, 0.0), "vel_noise_std": 0.0,
+            "lidar_label_from_pose": True, "critic_dr": True,
+        },
     ],
-    ids=["unicycle", "box", "unicycle-box", "drive-sensor", "real", "artefacts"],
+    ids=["unicycle", "box", "unicycle-box", "drive-sensor", "real", "artefacts", "arena"],
 )
 def test_fleet_fused_matches_torch(device, fleet, obs_level):
     """Unicycles and boxes: heading in the obs and critic, body-frame rays, box hits."""
@@ -170,6 +183,9 @@ def _assert_parity(device, **kw):
         for t in range(1, 5)
     )
     assert moved, "T never moved; contact physics not exercised"
+    extra = tuple(k for k in ("out_of_bounds", "scenery_leak") if k in fused[0])
+    if "scenery_leak" in extra:
+        assert any((s["scenery_leak"] > 0).any() for s in fused), "no scenery hit leaked"
     for t, (f, r) in enumerate(zip(fused, torchp, strict=True)):
         assert torch.equal(f["done"], r["done"]), f"done@{t}"
         assert torch.equal(f["roles"], r["roles"]), f"roles@{t}"
@@ -185,6 +201,7 @@ def _assert_parity(device, **kw):
             "observer_visibility",
             "occlusion",
             "tee_seen",
+            *extra,
         ):
             share = _mismatch(f[key], r[key])
             assert share <= MISMATCH_SHARE, f"{key}@{t}: {share:.4f} of elements differ"

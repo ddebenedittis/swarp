@@ -1689,15 +1689,16 @@ def _signature(dtype, per_env: bool = False) -> list:
 
 
 @wp.func
-def _drives_outward(p: Any, th: Any, v: Any, edge: Any):
-    """Whether a diff-drive centre at ``p`` beyond ``edge`` on an axis would drive further
-    out along it at speed ``v`` and heading ``th`` (the arena stop's test)."""
+def _drives_outward(p: Any, th: Any, v: Any, edge_x: Any, edge_y: Any):
+    """Whether a diff-drive centre at ``p`` beyond its axis's edge (``edge_x`` on x,
+    ``edge_y`` on y) would drive further out along it at speed ``v`` and heading ``th``
+    (the arena stop's test)."""
     vx = v * wp.cos(th)
     vy = v * wp.sin(th)
     out = False
-    if wp.abs(p[0]) > edge and vx * p[0] > type(v)(0.0):
+    if wp.abs(p[0]) > edge_x and vx * p[0] > type(v)(0.0):
         out = True
-    if wp.abs(p[1]) > edge and vy * p[1] > type(v)(0.0):
+    if wp.abs(p[1]) > edge_y and vy * p[1] > type(v)(0.0):
         out = True
     return out
 
@@ -1711,6 +1712,8 @@ def step_commands_kernel(
     theta: wp.array2d(dtype=Any),
     n_delay: wp.int32,
     arena_edge: Any,
+    edges: wp.array(dtype=Any),
+    per_env_edge: wp.int32,
     delayed: wp.array4d(dtype=Any),
     after: wp.array3d(dtype=Any),
 ):
@@ -1720,7 +1723,8 @@ def step_commands_kernel(
     first ``n_delay`` substeps, is ``prev_actions`` while ``k < delay`` and ``actions``
     from then on; ``after`` is ``actions``, for the substeps past ``n_delay``. With
     ``arena_edge > 0`` a command whose speed (slot 0) drives a robot that is beyond the
-    edge further out has its speed zeroed, judged on the step's starting pose."""
+    edge further out has its speed zeroed, judged on the step's starting pose; the edge is
+    ``arena_edge`` on both axes, or ``edges[e]`` per axis with ``per_env_edge``."""
     e, a = wp.tid()
     d = delay[e, a]
     stop_new = False
@@ -1728,8 +1732,13 @@ def step_commands_kernel(
     if arena_edge > type(arena_edge)(0.0):
         p = pos[e, a]
         th = theta[e, a]
-        stop_new = _drives_outward(p, th, actions[e, a, 0], arena_edge)
-        stop_prev = _drives_outward(p, th, prev_actions[e, a, 0], arena_edge)
+        ex = arena_edge
+        ey = arena_edge
+        if per_env_edge != 0:
+            ex = edges[e][0]
+            ey = edges[e][1]
+        stop_new = _drives_outward(p, th, actions[e, a, 0], ex, ey)
+        stop_prev = _drives_outward(p, th, prev_actions[e, a, 0], ex, ey)
         for i in range(actions.shape[2]):
             v = actions[e, a, i]
             if i == 0 and stop_new:
@@ -1754,7 +1763,7 @@ for _T in (wp.float32, wp.float64):
         _T,
         [wp.array3d(dtype=_T), wp.array3d(dtype=_T), wp.array2d(dtype=wp.int32),
          wp.array2d(dtype=VEC2[_T]), wp.array2d(dtype=_T), wp.int32, _T,
-         wp.array4d(dtype=_T), wp.array3d(dtype=_T)],
+         wp.array(dtype=VEC2[_T]), wp.int32, wp.array4d(dtype=_T), wp.array3d(dtype=_T)],
     )
     register(integrate_kernel, _T, _signature(_T))
     register(integrate_kernel_per_env, _T, _signature(_T, per_env=True))

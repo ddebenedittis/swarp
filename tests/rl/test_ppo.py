@@ -21,7 +21,7 @@ from swarp.rl.ppo import (
     policy_outputs,
     standardize_advantage,
 )
-from swarp.rl.recipes import SPECS, Ramp, build_env, scenario_name, score
+from swarp.rl.recipes import SPECS, Ramp, SolveRateWindow, build_env, scenario_name, score
 
 SMOKE = [
     "--device", "cpu", "--iters", "2", "--n-envs", "8", "--steps-per-batch", "4",
@@ -773,3 +773,256 @@ def test_action_rate_penalty_charges_each_step_s_change(device):
     assert ended.any()  # an episode ended inside the rollout
     torch.testing.assert_close(algo.rew_buf, plain.rew_buf - coef * rate)
     torch.testing.assert_close(algo.metric_acc[0], rate.mean(dim=(1, 2)).sum())
+
+
+# ------------------------------------------------------------------- single-run guards
+
+
+def _healthy(algo: MAPPO) -> None:
+    """One ordinary rollout and update, so Adam has state and the graphs are captured."""
+    algo.rollout()
+    algo.update(algo.spec.entropy_coeff)
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda:0", marks=pytest.mark.gpu)])
+def test_kl_brake_freezes_the_rest_of_the_iteration(device):
+    """At a vanishing threshold the first minibatch (KL ~0 against its own rollout) steps,
+    the second trips the brake, and no later step of the iteration moves the weights."""
+    algo = _algo(graphs=device != "cpu", device=device, target_kl=1e-9)
+    _healthy(algo)
+    algo.rollout()
+    algo._prepare()
+    algo._minibatch()
+    after_first = [p.detach().clone() for p in algo.params]
+    n_mb = algo.spec.epochs * algo.M
+    for _ in range(n_mb - 1):
+        algo._minibatch()
+    for p, q in zip(algo.params, after_first, strict=True):
+        assert torch.equal(p, q)
+    n = algo.n_losses
+    assert algo.mb_stats[n].item() == 0  # no non-finite skip: the NaN abort never sees it
+    assert algo.mb_stats[n + 2].item() == n_mb - 1
+    assert algo.mb_stats[n + 1].item() > 0
+    algo.rollout()  # a fresh rollout: its first minibatch steps again, as prepare clears
+    stats = algo.update(algo.spec.entropy_coeff)  # the brake each iteration
+    assert {"approx_kl", "kl_stops"} <= set(stats) and stats["kl_stops"] == n_mb - 1
+
+
+def test_kl_brake_off_leaves_the_update_bit_identical():
+    """The brake's ops are detached: an untripped brake lands on exactly the weights of a
+    run without one, from the same rollout and permutations (CPU, so deterministic)."""
+    plain = _algo(graphs=False, device="cpu")
+    braked = _algo(graphs=False, device="cpu", target_kl=1e9)
+    assert plain.stat_names == list(LEGACY_STAT_NAMES)
+    braked.actor.load_state_dict(plain.actor.state_dict())
+    braked.critic.load_state_dict(plain.critic.state_dict())
+    plain.rollout()
+    _copy_rollout(braked, plain)
+    for algo in (plain, braked):
+        algo.ent_coef.fill_(0.0)
+        algo._prepare_body()
+    braked.perms.copy_(plain.perms)
+    for _ in range(plain.spec.epochs * plain.M):
+        plain._minibatch()
+        braked._minibatch()
+    for a, b in zip(plain.params, braked.params, strict=True):
+        assert torch.equal(a, b)
+    assert braked.mb_stats[braked.n_losses + 2].item() == 0
+
+
+@pytest.mark.gpu
+def test_rollback_restores_weights_and_adam_in_place_and_the_graphs_replay():
+    algo = _algo(graphs=True, rollback=True)
+    _healthy(algo)
+    snap = algo.snapshot()
+    live = [p.detach() for p in algo.params]
+    live += [v for p in algo.params for v in algo.optim.state[p].values()]
+    ptrs = [t.data_ptr() for t in live]
+    graph = algo._minibatch.graph
+    _healthy(algo)  # moves the weights and the moments
+    assert not all(torch.equal(a, b) for a, b in zip(live, snap, strict=True))
+    algo.restore(snap)
+    assert all(torch.equal(a, b) for a, b in zip(live, snap, strict=True))
+    assert [t.data_ptr() for t in live] == ptrs
+    _healthy(algo)
+    assert algo._minibatch.graph is graph  # replayed, not recaptured
+    assert not all(torch.equal(a, b) for a, b in zip(live, snap, strict=True))
+    assert all(torch.isfinite(p).all() for p in algo.params)
+
+
+def _l8b_s1_trace(dip: bool = True) -> list[float]:
+    """A windowed solve rate shaped like L8b-s1's (logged every 25 iterations): learned by
+    3000, a 0.95-0.97 plateau, the 5650-5700 dip and its recovery, then the collapse from
+    0.83 at 5900 to 0.22 at 5960. A small deterministic wobble stands in for the noise."""
+    knots = [(0, 0.0), (3000, 0.9), (3200, 0.95), (5550, 0.97)]
+    if dip:
+        knots += [(5575, 0.92), (5600, 0.89), (5625, 0.88), (5650, 0.625), (5675, 0.537),
+                  (5700, 0.553), (5725, 0.794), (5750, 0.579), (5775, 0.553), (5800, 0.807),
+                  (5850, 0.90)]
+    knots += [(5900, 0.83), (5960, 0.22), (6000, 0.04)]
+    out = []
+    for it in range(6000):
+        pairs = zip(knots[:-1], knots[1:], strict=True)
+        (a, va), (b, vb) = next((k, n) for k, n in pairs if n[0] > it)
+        out.append(va + (vb - va) * (it - a) / (b - a) + 0.015 * math.sin(it / 3.0))
+    return out
+
+
+def _first_rollback(trace: list[float], guard) -> int | None:
+    for it, solve in enumerate(trace):
+        if guard.step(it, solve, 0) == "rollback":
+            return it
+    return None
+
+
+def test_rollback_guard_fires_on_the_l8b_s1_dip_and_restores_from_before_it():
+    """The dip to 0.53 (44 points under the plateau for ~75 iterations) was the onset of
+    the instability that ended the run at 0.04: the guard rolls back there, to a snapshot
+    taken before the rate started falling."""
+    from swarp.rl.ppo import RollbackGuard
+
+    guard = RollbackGuard()
+    it = _first_rollback(_l8b_s1_trace(), guard)
+    assert it is not None and 5650 <= it <= 5725
+    assert guard.restore_it < 5600 and guard.snaps[-1] == guard.restore_it
+    assert len(guard.snaps) <= guard.ring
+
+
+def test_rollback_guard_fires_on_the_final_collapse_and_ignores_wobble():
+    from swarp.rl.ppo import RollbackGuard
+
+    guard = RollbackGuard()
+    it = _first_rollback(_l8b_s1_trace(dip=False), guard)
+    assert it is not None and 5900 < it <= 5960  # never on the plateau's wobble
+    assert guard.restore_it < 5900
+    # A short excursion (under the patience) is not a collapse.
+    short = [0.95] * 400 + [0.4] * 20 + [0.95] * 200
+    assert _first_rollback(short, RollbackGuard()) is None
+
+
+def test_rollback_guard_judges_each_ramp_position_on_its_own_best_and_stops_at_the_limit():
+    from swarp.rl.ppo import RollbackGuard
+
+    # A harder condition (a new bucket) holding 0.7 is not a collapse from the old 0.97.
+    guard = RollbackGuard()
+    for it in range(1000):
+        assert guard.step(it, 0.97 if it < 500 else 0.7, 0 if it < 500 else 1) != "rollback"
+    # Every collapse rolls back until the budget is spent, then the run stops.
+    guard = RollbackGuard(max_rollbacks=2)
+    actions, it = [], 0
+    for _ in range(3):
+        for solve in [0.95] * 300 + [0.2] * 30:
+            a = guard.step(it, solve, 0)
+            if a in ("rollback", "stop"):
+                actions.append(a)
+            it += 1
+    assert actions == ["rollback", "rollback", "stop"]
+
+
+class _SolvedWindow(SolveRateWindow):
+    """A window that always reports a solved policy, so a smoke run can open the gate."""
+
+    @property
+    def solve_rate(self) -> float:
+        return 1.0
+
+
+@pytest.mark.parametrize("gate_open", [False, True])
+def test_gated_ramps_follow_the_clock_and_end_the_run(tmp_path, monkeypatch, gate_open):
+    """Closed, the clock runs to the first ramp's start and holds there for the whole cap;
+    open, the ramp runs on it and the run ends at the last end plus hold_iters."""
+    if gate_open:
+        monkeypatch.setattr("swarp.rl.ppo.SolveRateWindow", _SolvedWindow)
+    cfg = parse_args(["--scenario", "navigation", *SMOKE, "--iters", "10", "--lr-final",
+                      "1e-5", "--checkpoint-dir", str(tmp_path)])
+    cfg.spec = replace(
+        cfg.spec, ramps=(Ramp("pos_shaping_factor", 0.0, 1.0, 2, 4, steps=2),),
+        ramp_gate=0.5, hold_iters=2,
+    )
+    train(cfg)
+    with (tmp_path / "metrics.csv").open() as fh:
+        rows = list(csv.DictReader(fh))
+    clock = [int(r["ramp_clock"]) for r in rows]
+    ramp = [r["ramp"] for r in rows]
+    if gate_open:
+        assert clock == [0, 1, 2, 3, 4, 5]
+        assert ramp == ["0.000", "0.000", "0.000", "0.500", "1.000", "1.000"]
+    else:
+        assert clock == [0, 1, 2, 2, 2, 2, 2, 2, 2, 2]
+        assert set(ramp) == {"0.000"}
+
+
+def test_guard_fields_are_validated():
+    from swarp.rl.recipes import TrainSpec
+
+    with pytest.raises(ValueError, match="target_kl"):
+        TrainSpec(target_kl=0.0)
+    with pytest.raises(ValueError, match="adaptive_kl"):
+        TrainSpec(adaptive_kl=-1.0)
+    with pytest.raises(ValueError, match="needs ramps"):
+        TrainSpec(ramp_gate=0.5)
+    with pytest.raises(ValueError, match="needs ramp_gate"):
+        TrainSpec(ramps=(Ramp("x", 0.0, 1.0, 0, 1),), hold_iters=10)
+
+
+def test_train_rolls_back_halves_the_lr_and_stops_at_the_limit(tmp_path, monkeypatch):
+    """train()'s side of the guard: a scripted solve rate collapses twice; the first
+    collapse restores a snapshot (logged, lr halved), the second exceeds a budget of one
+    and stops the run with its state saved."""
+    from swarp.rl.ppo import RollbackGuard, RollbackLimit
+
+    script = [0.9] * 6 + [0.1] * 20
+    calls = [0]
+
+    class Scripted(SolveRateWindow):
+        def update_counts(self, *args) -> None:
+            super().update_counts(*args)
+            calls[0] += 1
+
+        @property
+        def solve_rate(self) -> float:
+            return script[calls[0] - 1]
+
+    monkeypatch.setattr("swarp.rl.ppo.SolveRateWindow", Scripted)
+    monkeypatch.setattr(
+        "swarp.rl.ppo.RollbackGuard",
+        lambda lag: RollbackGuard(every=1, patience=2, lag=1, max_rollbacks=1),
+    )
+    cfg = parse_args(["--scenario", "navigation", *SMOKE, "--iters", "20",
+                      "--checkpoint-dir", str(tmp_path)])
+    cfg.spec = replace(cfg.spec, rollback=True)
+    with pytest.raises(RollbackLimit, match="after 1 rollbacks"):
+        train(cfg)
+    with (tmp_path / "metrics.csv").open() as fh:
+        rows = list(csv.DictReader(fh))
+    assert [int(r["rollbacks"]) for r in rows] == [0] * 7 + [1, 1]
+    assert [r["lr_mult"] for r in rows] == ["1"] * 7 + ["0.5", "0.5"]
+    assert (tmp_path / "navigation_collapsed.pt").exists()
+
+
+def test_adaptive_kl_lr_steps_within_its_band_and_bounds():
+    from swarp.rl.ppo import KL_LR_FLOOR, KL_LR_STEP, adapt_kl_lr
+
+    assert adapt_kl_lr(1.0, 0.02, 0.02) == 1.0  # inside [target / 2, 2 target]
+    assert adapt_kl_lr(1.0, 0.05, 0.02) == pytest.approx(1.0 / KL_LR_STEP)
+    assert adapt_kl_lr(0.5, 0.005, 0.02) == pytest.approx(0.5 * KL_LR_STEP)
+    assert adapt_kl_lr(1.0, 0.001, 0.02) == 1.0  # never above the schedule
+    assert adapt_kl_lr(KL_LR_FLOOR, 1.0, 0.02) == KL_LR_FLOOR
+
+
+def test_train_adapts_the_lr_to_the_kl_without_braking(tmp_path):
+    """A target far below any real KL cuts the lr every iteration and logs it; with no
+    target_kl the KL is measured but never stops a minibatch."""
+    from swarp.rl.ppo import KL_LR_STEP
+
+    # Two epochs: a minibatch's KL is measured before its own step, so it needs one before.
+    cfg = parse_args(["--scenario", "navigation", *SMOKE, "--iters", "4", "--epochs", "2",
+                      "--checkpoint-dir", str(tmp_path)])
+    cfg.spec = replace(cfg.spec, adaptive_kl=1e-12)
+    train(cfg)
+    with (tmp_path / "metrics.csv").open() as fh:
+        rows = list(csv.DictReader(fh))
+    assert [float(r["kl_lr_mult"]) for r in rows] == pytest.approx(
+        [KL_LR_STEP**-i for i in range(4)], rel=1e-3
+    )
+    assert {r["kl_stop_frac"] for r in rows} == {"0.000"}
