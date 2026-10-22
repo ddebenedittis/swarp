@@ -1164,6 +1164,8 @@ def network_archs(
         # Only when on, as PolicyNet.config writes them.
         if spec.recurrent:
             actor[1].update(recurrent=True, hidden_dim=spec.hidden_dim)
+        if spec.actor_scale_min is not None:
+            actor[1].update(scale_min=spec.actor_scale_min)
         if spec.comm != "none":
             if roles and spec.role_params == "separate":
                 raise ValueError(

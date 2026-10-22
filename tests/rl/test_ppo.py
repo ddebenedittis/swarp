@@ -1026,3 +1026,23 @@ def test_train_adapts_the_lr_to_the_kl_without_braking(tmp_path):
         [KL_LR_STEP**-i for i in range(4)], rel=1e-3
     )
     assert {r["kl_stop_frac"] for r in rows} == {"0.000"}
+
+
+def test_actor_scale_min_floors_the_std_and_round_trips_in_the_config():
+    from swarp.rl.networks import PolicyNet
+    from swarp.rl.recipes import TrainSpec
+
+    net = PolicyNet(6, 2, 8, scale_min=0.1)
+    with torch.no_grad():
+        net.head.bias.fill_(-100.0)  # drive the raw scale to the floor
+    _, scale = net(torch.zeros(3, 2, 6))
+    assert torch.allclose(scale, torch.full_like(scale, 0.1))
+    with torch.no_grad():
+        net.head.weight.zero_()
+        net.head.bias.zero_()
+    _, scale = net(torch.zeros(3, 2, 6))
+    assert torch.allclose(scale, torch.ones_like(scale))  # a zero input still maps to 1
+    assert PolicyNet(**net.config).scale_min == 0.1
+    assert "scale_min" not in PolicyNet(6, 2, 8).config  # default checkpoints unchanged
+    with pytest.raises(ValueError, match="actor_scale_min"):
+        TrainSpec(actor_scale_min=0.1)  # the default mlp actor has no such option

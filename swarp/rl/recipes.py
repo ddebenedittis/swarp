@@ -161,6 +161,10 @@ class TrainSpec:
     ``1.5 * target_kl`` (that minibatch's own step included). A brake on destructive
     updates: L8b-s1 fell 0.83 -> 0.22 in 60 iterations of 128 steps each, no step
     non-finite."""
+    actor_scale_min: float | None = None
+    """When set, the floor under the actor's Gaussian std (``PolicyNet``'s ``scale_min``,
+    0.01 by default). A higher floor keeps a policy from sharpening faster than it learns;
+    the greedy action is the mean, so the deployed policy is unaffected."""
     adaptive_kl: float | None = None
     """When set, the learning rate follows the KL (rsl_rl's adaptive schedule, per
     iteration): its multiplier is divided by 1.5 after an iteration whose mean approximate
@@ -286,6 +290,8 @@ class TrainSpec:
             )
         if self.target_kl is not None and self.target_kl <= 0:
             raise ValueError(f"target_kl must be > 0, got {self.target_kl}")
+        if self.actor_scale_min is not None and self.actor == "mlp":
+            raise ValueError("actor_scale_min is a PolicyNet option: it needs actor != 'mlp'")
         if self.adaptive_kl is not None and self.adaptive_kl <= 0:
             raise ValueError(f"adaptive_kl must be > 0, got {self.adaptive_kl}")
         if self.ramp_gate is not None and not self.ramps:
@@ -917,6 +923,14 @@ SPECS["pusht_lidar_limo_slim240_1run"] = replace(
 #   Adam steps at 5e-4 pushed the KL past 0.15: the rate has to fall there, not stop.
 #   target_kl 0.3 stays as the brake on a single destructive iteration: L8b-s1 fell
 #   0.83 -> 0.22 in 60 iterations of 128 steps each, no step non-finite.
+# - The actor's std is floored at 0.1 (actor_scale_min), not 0.01. With 0.01, the
+#   adaptive-lr run held the KL but sharpened anyway: entropy -0.96 -> -4.2 over iterations
+#   500-3000 (no earlier slim-T run went below -2.6), the lr cut to 6% of its schedule and
+#   the training solve 0.07 -> 0.16 in the clean 4 x 4 m world, where the gate holds the
+#   clock until 0.75. The no-noise pilots that kept learning (S240-R3, S240-N2) stayed near
+#   -1. At 0.1 an untanhed Gaussian's entropy is -0.88 per action dimension, -1.8 over
+#   the two, so the floor bites only below where those runs went. The greedy action is the
+#   mean, so the floor does not reach the deployment.
 # - rollback restores the trainer from before a collapse of the windowed solve (below
 #   max(0.5, best - 0.25) for 25 iterations) and halves the learning rate; a fifth collapse
 #   stops the run on its best checkpoint.
@@ -937,6 +951,7 @@ SPECS["pusht_lidar_limo_slim240_arena"] = replace(
         Ramp("rot_away_penalty", 0.0, 1.0, 8000, 10000),
     ),
     ramp_gate=0.75, hold_iters=4000, target_kl=0.3, adaptive_kl=0.02, rollback=True,
+    actor_scale_min=0.1,
     metrics=(*SPECS["pusht_lidar_limo_slim240_1run"].metrics, "out_of_bounds", "scenery_leak"),
 )
 

@@ -204,6 +204,7 @@ class PolicyNet(nn.Module):
         comm_dim: int = 64,
         low: torch.Tensor | Sequence[float] | None = None,
         high: torch.Tensor | Sequence[float] | None = None,
+        scale_min: float = _SCALE_MIN,
     ) -> None:
         super().__init__()
         if role_params not in ROLE_PARAMS:
@@ -256,6 +257,11 @@ class PolicyNet(nn.Module):
         #: The constructor's arguments as primitives, which is what a checkpoint stores.
         #: Memory and communication appear only when on, so a checkpoint written before
         #: they existed describes the same network as the flags that build it today.
+        # The floor under the Gaussian's std, with the bias that keeps a zero input at 1.0.
+        if not 0.0 < scale_min < 1.0:
+            raise ValueError(f"scale_min must be in (0, 1), got {scale_min}")
+        self.scale_min = float(scale_min)
+        self._scale_bias = math.log(math.expm1(1.0 - self.scale_min))
         self.config = {
             "obs_dim": obs_dim, "act_dim": act_dim, "num_cells": num_cells,
             "role_counts": list(self.role_counts), "role_params": role_params,
@@ -267,6 +273,8 @@ class PolicyNet(nn.Module):
             self.config.update(recurrent=True, hidden_dim=hidden_dim)
         if self.communicates:
             self.config.update(comm=comm, comm_dim=comm_dim)
+        if self.scale_min != _SCALE_MIN:
+            self.config.update(scale_min=self.scale_min)
 
     @property
     def uses_roles(self) -> bool:
@@ -380,7 +388,7 @@ class PolicyNet(nn.Module):
                 index = roles[..., None, None].expand(*roles.shape, 1, two_d)
                 out = out.gather(-2, index).squeeze(-2)
         loc, raw = out.chunk(2, dim=-1)
-        scale = (F.softplus(raw + _SCALE_BIAS) + _SCALE_MIN).clamp_min(_SCALE_LB)
+        scale = (F.softplus(raw + self._scale_bias) + self.scale_min).clamp_min(_SCALE_LB)
         return loc, scale, self.aux_head(feat) if with_aux else None
 
     def _check(self, roles: torch.Tensor | None, with_aux: bool) -> torch.Tensor | None:

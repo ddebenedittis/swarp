@@ -378,10 +378,11 @@ The recipe sees 220° cut at the mount with 40 rays (`lidar_span`), the 5.6° sp
 The two robots' mount transforms disagree with each other and with the 0.103 m `lidar_mount_offset` from the Gazebo identification (one publishes 0.18 m ahead of `base_footprint`, the other two different `laser_link` poses); the recipe keeps 0.103 m.
 
 **One run.**
-The recipe is `pusht_lidar_limo_slim240_1run`'s, with four guards against the collapses the staged runs met (`swarp.rl`, all off by default):
+The recipe is `pusht_lidar_limo_slim240_1run`'s, with five guards against the collapses the staged runs met (`swarp.rl`, all off by default):
 
 - the ramps follow a gated clock (`ramp_gate` 0.75): past the first ramp's start a tick needs a windowed solve of at least 0.75, so no condition comes in before the last is mastered; the learning rate decays over that clock, and the run ends `hold_iters` (4000) past the last ramp, `iters` (24000) being a cap;
 - an adaptive learning rate (`adaptive_kl` 0.02, rsl_rl's schedule once per iteration): the factor on the scheduled rate is divided by 1.5 after an iteration whose mean approximate KL to the rollout policy exceeds 0.04 and multiplied by 1.5 (up to 1) after one below 0.01; a first run with only the skip brake at 0.1 froze 71% of iterations 1000–1500, where the entropy fell to −1.6 and two or three Adam steps already pushed the KL past 0.15;
+- a floor of 0.1 under the actor's std (`actor_scale_min`, 0.01 by default): with the adaptive rate alone the policy still sharpened, its entropy falling from −1 to −4.2 over iterations 500–3000 while the rate fell to 6% of its schedule and the training solve stalled at 0.16 in the clean 4 × 4 m world; the greedy action is the mean, so the floor does not reach the deployment;
 - a KL brake (`target_kl` 0.3) for a single destructive iteration: once a minibatch's approximate KL exceeds 1.5 times it, the iteration's remaining minibatch steps are skipped on device;
 - automatic rollback (`rollback`): when the windowed solve stays below `max(0.5, best − 0.25)` for 25 iterations, the actor, critic and Adam state return to a snapshot from before the drop, the learning rate halves, and the ramps return to that snapshot's clock; a fifth collapse stops the run on its best checkpoint.
 
