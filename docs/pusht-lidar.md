@@ -410,8 +410,9 @@ Two earlier attempts on the same recipe did not get there: with the actor's std 
 | the worst AMCL, walls plus clutter, 5 × 5 m | 0.915 [0.896, 0.931] | 173 |
 
 At 4 × 4 m it matches L8b stage 2 (0.992 on its own fixed arena), at 220° instead of 240°.
-The surroundings cost nothing (0.990 without, 0.989 with walls and clutter), and `scenery_leak` stayed below 1e-4 of the rays over the last 1000 iterations: at the trained pose noise (centimetres) the label bound drops almost every surroundings hit, so the policy is robust to them because the deployment's labels are, not because it learnt to read them.
-A localisation error of tens of centimetres near the bound, as AMCL reaches at its worst, is outside what this training saw.
+The surroundings cost nothing (0.990 without, 0.989 with walls and clutter), and `scenery_leak` stayed below 1e-4 of the rays over the last 1000 iterations, although the trained pose error is AMCL-sized (at scale 1: median 0.12 m, p95 0.55 m, max 3.0 m).
+A leak needs a robot within lidar range of a wall, so near the edge and facing out, while its error carries the hit 0.39 m or more past the label bound toward the arena; the large errors follow shoves, which happen at the T, mostly inside the arena.
+So the policy is robust to the surroundings mostly because the deployment's labels drop them, and the leak it was trained against is rare.
 The 5 × 5 m arena is the weak case (0.92): its goals are the farthest, the median solve takes 157 of the 450 steps, and the failures there are not broken down here.
 
 The deployment side (`swarp_gz_test`: the observation's arena block, per-axis bounds in `label_rays`, the safety bridge and the localisation mask) is not updated yet; until it is, this checkpoint cannot run on the robots.
