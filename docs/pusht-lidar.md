@@ -389,4 +389,29 @@ The recipe is `pusht_lidar_limo_slim240_1run`'s, with five guards against the co
 L8b-s1 is the case they answer: it held 0.95–0.97 for 2500 iterations, then fell 0.83 → 0.22 in 60, with no step non-finite and its entropy rising only after the fall.
 The arena widens from 4 × 4 m over ticks 1000–3000, in stage 1's clean world, and the surroundings come in with the pose noise and the latency (3000–5000), since only the pose error lets them leak.
 
+**Result (L9c).**
+`python -m swarp.rl --scenario pusht_lidar_limo_slim240_arena --eval-every 500` (seed 0, davide-cf) trained in one run of 15323 iterations, about 58 minutes at 227 ms an iteration, with no rollback, no braked minibatch and the learning rate at its schedule for the last 1000 iterations.
+The training solve reached the 0.75 gate at iteration 2000, the arena had widened by 4300, the noise, latency and surroundings were in by 6400 and the turn-away cost by 11400; the in-training greedy eval at the final conditions passed 0.70 at 3500 and held 0.984–0.994 from 8000 on.
+Two earlier attempts on the same recipe did not get there: with the actor's std floored at 0.01 the policy sharpened to an entropy of −4.2 and stalled at 0.16, and L9b, with the floor at 0.1, learned as L9c did until the rollback guard, then armed at 0.5, took its rise through 0.38–0.51 for a collapse and stopped it at iteration 1656 (the guard now arms at 0.75).
+
+`examples/eval_mappo.py`, 1024 envs, greedy, on the best checkpoint (95% Wilson intervals):
+
+| condition | solved | median solve step |
+|---|---|---|
+| the recipe (2–5 m, every layout, the full noise) | 0.987 [0.978, 0.993] | 116 |
+| 2 × 2 m | 0.999 [0.994, 1.000] | 80 |
+| 4 × 4 m | 0.990 [0.982, 0.995] | 130 |
+| 5 × 5 m | 0.922 [0.904, 0.937] | 157 |
+| 2 × 5 m | 0.964 [0.951, 0.974] | 122 |
+| no surroundings | 0.990 [0.982, 0.995] | 116 |
+| walls plus clutter | 0.989 [0.981, 0.994] | 115 |
+| mocap-like (`pose_noise` 0, `cmd_latency` 0) | 0.995 [0.989, 0.998] | 110 |
+| the worst AMCL (`pose_noise` 1.25, `cmd_latency` 0.1) | 0.983 [0.974, 0.990] | 126 |
+| the worst AMCL, walls plus clutter, 5 × 5 m | 0.915 [0.896, 0.931] | 173 |
+
+At 4 × 4 m it matches L8b stage 2 (0.992 on its own fixed arena), at 220° instead of 240°.
+The surroundings cost nothing (0.990 without, 0.989 with walls and clutter), and `scenery_leak` stayed below 1e-4 of the rays over the last 1000 iterations: at the trained pose noise (centimetres) the label bound drops almost every surroundings hit, so the policy is robust to them because the deployment's labels are, not because it learnt to read them.
+A localisation error of tens of centimetres near the bound, as AMCL reaches at its worst, is outside what this training saw.
+The 5 × 5 m arena is the weak case (0.92): its goals are the farthest, the median solve takes 157 of the 450 steps, and the failures there are not broken down here.
+
 The deployment side (`swarp_gz_test`: the observation's arena block, per-axis bounds in `label_rays`, the safety bridge and the localisation mask) is not updated yet; until it is, this checkpoint cannot run on the robots.
