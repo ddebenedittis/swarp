@@ -373,8 +373,8 @@ Under AMCL-sized localisation error a wall near the bound lands inside it and is
 The arena sizes change the task itself: the policy has to keep the T inside an edge that is now its own per env.
 
 **Field of view.**
-Both Limos' ydlidar drivers crop the scan to ±110° (`angle_min`/`angle_max`), read off the running robots, with returns at every bearing inside it.
-The recipe sees 220° cut at the mount with 40 rays (`lidar_span`), the 5.6° spacing of the 240° recipes, so its observation is narrower than theirs and its checkpoint does not load into them.
+The lab's ydlidar configuration delivers −116…+108° on both Limos (`swarp_gz_test` `limo_bridge/config/ydlidar_tmini_pro.yaml`, from `measure_lidar_static`), and lm2591 has no returns at all from +8 to +92°, which no recipe models.
+The recipe sees 220° cut at the mount, the largest symmetric sector inside that short only of +108…+110°, with 40 rays (`lidar_span`), the 5.6° spacing of the 240° recipes, so its observation is narrower than theirs and its checkpoint does not load into them.
 The two robots' mount transforms disagree with each other and with the 0.103 m `lidar_mount_offset` from the Gazebo identification (one publishes 0.18 m ahead of `base_footprint`, the other two different `laser_link` poses); the recipe keeps 0.103 m.
 
 **One run.**

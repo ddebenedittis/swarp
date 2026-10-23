@@ -15,7 +15,7 @@ All notable changes to `swarp`. Newest first. Nothing has been released yet — 
 - **`swarp.rl` single-run guards**, off by default: an adaptive learning rate that follows the KL (`TrainSpec.adaptive_kl`, logged as `kl_lr_mult`), a floor under the actor's std (`TrainSpec.actor_scale_min`, `PolicyNet(scale_min=...)`), a KL brake (`TrainSpec.target_kl`) that skips an iteration's remaining minibatch steps on device, automatic rollback (`rollback`) to a pre-collapse snapshot with a halved learning rate, and a gated ramp clock (`ramp_gate`, `hold_iters`); `metrics.csv` logs `ramp_clock`, `approx_kl`, `kl_stop_frac`, `rollbacks` and `lr_mult`.
   The rollout's store graph now fails loudly, naming the outputs, when a scenario's outputs move between steps.
 
-- **`SPECS["pusht_lidar_limo_slim240_arena"]`**: the slim-T recipe on 2–5 m arenas with surroundings, at the robots' measured 220 deg field of view, trained as one guarded run; see the Lidar Push-T page.
+- **`SPECS["pusht_lidar_limo_slim240_arena"]`**: the slim-T recipe on 2–5 m arenas with surroundings, at a 220 deg field of view (the lab drivers deliver -116..+108 deg), trained as one guarded run; see the Lidar Push-T page.
 
 - **A rotating lidar: `Lidar(scan_period=..., sweep_dir=...)` and `lidar_scan(..., sweep=...)`.**
   A spinning sensor takes its rays one after the other and reports them against one pose; with the sweep on, ray `r` is cast from the pose `tau_r = (stamp_phase - phi_r) scan_period` before the reported one, at constant velocity, plus a per-agent mount yaw error (`sweep_offsets`).

@@ -912,9 +912,10 @@ SPECS["pusht_lidar_limo_slim240_1run"] = replace(
 #   stochastic solve held 0.90-0.96 once learned). The learning rate decays over the clock,
 #   and the run ends 4000 ticks after the last ramp, as _1run does at 10000 -> 14000; 24000
 #   iterations is only the cap.
-# - The lidar sees 220 deg cut at the mount, 40 rays at the 5.6 deg spacing: both Limos'
-#   ydlidar drivers crop the scan to +-110 deg (angle_min/angle_max), with returns at every
-#   bearing inside it.
+# - The lidar sees 220 deg cut at the mount, 40 rays at the 5.6 deg spacing: the largest
+#   symmetric sector of what the lab's ydlidar config delivers on both Limos (-116..+108
+#   deg, swarp_gz_test limo_bridge/config/ydlidar_tmini_pro.yaml), short only of +108..+110.
+#   (lm2591 also has no returns from +8 to +92 deg, which no recipe models.)
 # - The learning rate follows the KL (adaptive_kl 0.02: the factor on the schedule is cut
 #   by 1.5 after an iteration whose mean approximate KL exceeds 0.04 and raised back below
 #   0.01). With the brake off the per-iteration KL is 0.010 (median) early in this recipe
