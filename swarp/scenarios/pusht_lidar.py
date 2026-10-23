@@ -13,6 +13,7 @@ import warp as wp
 
 from swarp._overloads import concrete
 from swarp.core.cached_launch import CachedLaunch, ptr_key
+from swarp.core.config import ObstacleKind, Obstacles, ObstacleShape
 from swarp.core.state import VEC2
 from swarp.core.world import World
 from swarp.dynamics.base import (
@@ -45,17 +46,22 @@ from swarp.scenarios.pusht_lidar_kernels import (
     STATE_AGENT,
     STATE_HEAD,
     TEE_DIM,
+    body_state_gather_roots_kernel,
     lidar_sensor_kernel,
     pose_obs_noise_kernel,
+    pusht_lidar_collision_kernel,
     pusht_lidar_dr_reset_kernel,
     pusht_lidar_obs_kernel,
     pusht_lidar_reward_kernel,
     pusht_lidar_roles_kernel,
+    tee_size_reset_kernel,
 )
 from swarp.scenarios.pusht_lidar_scenery import (
     N_SCENERY_MODES,
     N_WALLS,
     scenery_reset_kernel,
+    scenery_slots_reset_kernel,
+    slot_bank,
 )
 from swarp.scenarios.shapes import CompoundShape
 from swarp.sensors.lidar import Lidar, Scenery, lidar_scan
@@ -68,6 +74,56 @@ def _range(v: float | tuple[float, float], name: str) -> tuple[float, float]:
     if not 0.0 <= lo <= hi:
         raise ValueError(f"{name} must be >= 0 with low <= high, got {v!r}")
     return (lo, hi)
+
+
+def _point_box_dist(x: torch.Tensor, y: torch.Tensor, hx, hy) -> torch.Tensor:
+    """Distance from the points ``(x, y)`` to the centred boxes ``|x| <= hx, |y| <= hy``."""
+    return torch.hypot((x.abs() - hx).clamp(min=0.0), (y.abs() - hy).clamp(min=0.0))
+
+
+def _segment_box_dist(a: torch.Tensor, b: torch.Tensor, hx: float, hy: float) -> torch.Tensor:
+    """Distance from the segments ``a -> b`` (``[..., 2]``, box frame) to the centred box
+    ``|x| <= hx, |y| <= hy``: zero where they cross (a slab clip), else the nearest of the
+    endpoints to the box and of the corners to the segment."""
+    d = b - a
+    t0 = torch.zeros_like(d[..., 0])
+    t1 = torch.ones_like(t0)
+    hit = torch.ones_like(t0, dtype=torch.bool)
+    for k, f in ((0, hx), (1, hy)):
+        dk, ak = d[..., k], a[..., k]
+        flat = dk.abs() < 1e-12
+        safe = torch.where(flat, torch.ones_like(dk), dk)
+        lo = torch.minimum((-f - ak) / safe, (f - ak) / safe)
+        hi = torch.maximum((-f - ak) / safe, (f - ak) / safe)
+        t0 = torch.where(flat, t0, torch.maximum(t0, lo))
+        t1 = torch.where(flat, t1, torch.minimum(t1, hi))
+        hit = hit & ~(flat & (ak.abs() > f))
+    hit = hit & (t0 <= t1)
+    best = torch.minimum(_point_box_dist(a[..., 0], a[..., 1], hx, hy),
+                         _point_box_dist(b[..., 0], b[..., 1], hx, hy))
+    dd = (d * d).sum(-1)
+    for sx in (-hx, hx):
+        for sy in (-hy, hy):
+            c = torch.tensor([sx, sy], device=a.device, dtype=a.dtype)
+            u = torch.where(dd > 0.0, ((c - a) * d).sum(-1) / dd.clamp(min=1e-30), 0.0)
+            u = u.clamp(0.0, 1.0)
+            best = torch.minimum(best, (a + u.unsqueeze(-1) * d - c).norm(dim=-1))
+    return torch.where(hit, torch.zeros_like(best), best)
+
+
+def _box_gap(d, tha, hax, hay, thb, hbx, hby) -> torch.Tensor:
+    """The largest gap between two oriented boxes over their four face axes (SAT; > 0:
+    apart). ``d`` joins their centres; everything broadcasts."""
+    ua = torch.stack([tha.cos(), tha.sin()], -1)
+    va = torch.stack([-tha.sin(), tha.cos()], -1)
+    ub = torch.stack([thb.cos(), thb.sin()], -1)
+    vb = torch.stack([-thb.sin(), thb.cos()], -1)
+    gaps = []
+    for n in (ua, va, ub, vb):
+        ra = hax * (ua * n).sum(-1).abs() + hay * (va * n).sum(-1).abs()
+        rb = hbx * (ub * n).sum(-1).abs() + hby * (vb * n).sum(-1).abs()
+        gaps.append((d * n).sum(-1).abs() - ra - rb)
+    return torch.stack(gaps, -1).amax(-1)
 
 
 class PushTLidarScenario(PushTScenario):
@@ -96,6 +152,8 @@ class PushTLidarScenario(PushTScenario):
                                          cos/sin(theta - goal theta)
     all        lidar, F frames           3 R F: per frame range / max_range (R), object
                                          mask (R), agent mask (R); oldest frame first
+                                         (4 R F with ``lidar_arena_flag``: an outside
+                                         mask (R) after the agent mask)
     2 only     pooled object hits        3 A K: per agent j (self included, ascending),
                                          K hit points relative to own pos, plus a valid
                                          flag
@@ -122,7 +180,10 @@ class PushTLidarScenario(PushTScenario):
     * ``occlusion`` — observers: ``-w_o`` times the fraction of the observer's rays
       inside the T's angular cone (its bounding disc) that hit a robot first;
     * ``contact`` — observers: ``-contact_penalty`` while an object ray is shorter than
-      ``contact_dist`` (default ``0``).
+      ``contact_dist`` (default ``0``);
+    * ``collision`` — every robot: ``-collision_penalty`` while its footprint is within
+      ``collision_margin`` of another robot's or of the surroundings (default ``0``;
+      ``info()["robot_collision"]`` / ``["scenery_collision"]`` flag which).
 
     The observer terms are penalties or potential differences, so prolonging an episode
     never pays. Training hooks: :meth:`critic_state` (role-sorted), :meth:`agent_roles`,
@@ -153,6 +214,11 @@ class PushTLidarScenario(PushTScenario):
     ``lidar_label_from_pose`` the hit classes are the deployment's, from the reported
     poses: a hit inside a teammate's reported footprint grown by ``lidar_label_margin``
     is an agent, a hit beyond ``label_bound`` a miss, anything else the T.
+    With ``lidar_arena_flag`` too, each frame adds an outside mask: the T-labelled hits that
+    lie past the arena's edge (inside the label bound), placed from the reported pose as the
+    labels are. The deployment computes the same mask from what it knows (its pose and the
+    arena), so the policy need not work out each hit's position to tell a wall or crate
+    just outside the arena from the T inside it.
 
     Per-env arena (Push-T's ``arena_size``). The self block ends with the env's arena
     half-extents ``(W / 2, H / 2)``, and the out-of-bounds limit and the label bound become
@@ -168,10 +234,28 @@ class PushTLidarScenario(PushTScenario):
     a gap drawn from ``scenery_gap`` past it per side, each missing with probability
     ``wall_missing``, as capsules of radius drawn from ``wall_radius``; the clutter is
     ``clutter_count`` circles of radius ``clutter_radius`` and boxes of half-extents
-    ``clutter_half`` (``n_clutter`` slots) within lidar range of the free region. A
+    ``clutter_half`` (``n_clutter`` slots) within ``clutter_reach`` (default: the lidar
+    range) of the free region. A
     scenery hit is class 2, which the deployment's labels turn into a miss past the bound
     or the T inside it; ``info()["scenery_leak"]`` is the share of rays where the latter
     happens.
+
+    With ``scenery_collide`` the surroundings are solid: the stepper holds them as
+    immovable obstacles after the T's boxes, so the robots and the T collide with them
+    (the T with the walls and every clutter shape: the clutter is circles and capsules),
+    and they may stand anywhere outside the arena grown by ``scenery_clearance``, which
+    then defaults to 0. The stepper's obstacles share their sizes across envs, so each
+    slot has a fixed shape and size (:func:`~swarp.scenarios.pusht_lidar_scenery.
+    slot_bank`): walls of radii spread over ``wall_radius``, long enough to meet at every
+    corner of the largest room (they run on past it), and ``n_clutter`` clutter shapes of
+    sizes spread over ``clutter_radius`` and ``clutter_half``, of which a reset places
+    ``clutter_count``.
+
+    T size (``tee_scale``, a value or a range; default 1). The stepper's obstacles share
+    their sizes across envs too, so a range is a bank of ``n_tee_sizes`` copies of the T
+    scaled evenly over it (same mass, inertia scaled with the square), each its own movable
+    body; every reset draws one per env uniformly (:attr:`tee_size`) and parks the others
+    far apart. Every bound that keeps the T clear uses the largest size's radius.
     """
 
     #: Two roles: pushers (0) and observers (1).
@@ -237,12 +321,33 @@ class PushTLidarScenario(PushTScenario):
         wall_missing: float = 0.2,
         wall_radius: float | tuple[float, float] = (0.02, 0.1),
         n_clutter: int = 6,
+        clutter_reach: float | None = None,
         clutter_count: tuple[int, int] = (2, 6),
         clutter_radius: float | tuple[float, float] = (0.05, 0.3),
         clutter_half: float | tuple[float, float] = (0.1, 0.6),
+        scenery_collide: bool = False,
+        collision_penalty: float = 0.0,
+        collision_margin: float = 0.01,
+        tee_scale: float | tuple[float, float] = 1.0,
+        n_tee_sizes: int = 5,
+        lidar_arena_flag: bool = False,
         **kwargs: Any,
     ) -> None:
         super().__init__(n_agents=n_agents, shape=shape, **kwargs)
+        t_lo, t_hi = _range(tee_scale, "tee_scale")
+        if t_lo <= 0.0 or (t_lo < t_hi and n_tee_sizes < 2):
+            raise ValueError("tee_scale must be > 0, and a range needs n_tee_sizes >= 2")
+        #: The T's sizes, as scales of ``shape`` (see the class docstring), and whether
+        #: the stepper holds a bank of them.
+        self.tee_scales = (
+            (t_lo,) if t_lo == t_hi
+            else tuple(t_lo + (t_hi - t_lo) * k / (n_tee_sizes - 1) for k in range(n_tee_sizes))
+        )
+        self.n_tee_sizes = len(self.tee_scales)
+        self.tee_sized = self.tee_scales != (1.0,)
+        # Every bound that keeps the T clear (spawn, out-of-bounds reach, the occlusion
+        # cone, the observers' standoff) takes the largest size.
+        self.tee_radius = self.shape.radius * max(self.tee_scales)
         # A unicycle pushes along its heading, so its scan is mounted on the body (the T
         # straight ahead is always the same rays); a holonomic disc keeps world-axis rays.
         self.lidar_body_frame = (
@@ -390,6 +495,12 @@ class PushTLidarScenario(PushTScenario):
         #: one, else the arena (none in an open arena).
         self.lidar_label_from_pose = bool(lidar_label_from_pose)
         self.lidar_label_margin = float(lidar_label_margin)
+        if lidar_arena_flag and not self.lidar_label_from_pose:
+            raise ValueError("lidar_arena_flag needs lidar_label_from_pose")
+        #: Whether each lidar frame carries a fourth mask, the T-labelled hits past the
+        #: arena's edge (see the class docstring), and the masks' count.
+        self.lidar_arena_flag = bool(lidar_arena_flag)
+        self.ray_channels = 4 if self.lidar_arena_flag else 3
         if self.oob_limit > 0.0:
             self.label_bound = self.oob_limit
         else:
@@ -413,11 +524,23 @@ class PushTLidarScenario(PushTScenario):
                 )
             if not 0.0 <= wall_missing <= 1.0:
                 raise ValueError(f"wall_missing must lie in [0, 1], got {wall_missing}")
+        if scenery_collide and not self.has_scenery:
+            raise ValueError("scenery_collide needs scenery_probs")
+        if collision_penalty < 0.0 or collision_margin < 0.0:
+            raise ValueError("collision_penalty and collision_margin must be >= 0")
+        #: Whether the surroundings are solid (see the class docstring).
+        self.scenery_collide = bool(scenery_collide)
+        self.collision_penalty = float(collision_penalty)
+        self.collision_margin = float(collision_margin)
+        #: Whether the collision kernel runs (its flags feed the reward and ``info()``).
+        self.track_collisions = self.collision_penalty > 0.0 or self.scenery_collide
         #: Layout probabilities (none, perimeter, room, clutter), and the share of envs that
         #: draw from them at all (a trainer can ramp it between resets).
         self.scenery_probs = tuple(float(x) for x in (scenery_probs or (1.0, 0.0, 0.0, 0.0)))
         self.scenery_on = float(scenery_on)
         self.scenery_gap = _range(scenery_gap, "scenery_gap")
+        if scenery_clearance is None and self.scenery_collide:
+            scenery_clearance = 0.0
         self.scenery_clearance = scenery_clearance
         self.wall_missing = float(wall_missing)
         self.wall_radius = _range(wall_radius, "wall_radius")
@@ -425,6 +548,8 @@ class PushTLidarScenario(PushTScenario):
         self.clutter_count = (int(clutter_count[0]), int(clutter_count[1]))
         self.clutter_radius = _range(clutter_radius, "clutter_radius")
         self.clutter_half = _range(clutter_half, "clutter_half")
+        #: How far past the free region clutter is placed (default: the lidar range).
+        self.clutter_reach = None if clutter_reach is None else float(clutter_reach)
         #: Whether the critic state carries the randomised parameters (:meth:`critic_state`).
         self.critic_dr = bool(critic_dr)
         self.dr_env_dim, self.dr_agent_dim = self._critic_dr_layout() if critic_dr else (0, 0)
@@ -491,7 +616,7 @@ class PushTLidarScenario(PushTScenario):
     def obs_layout(self) -> dict[str, slice]:
         """Name -> slice of the observation row. ``"_end"`` is the empty slice at
         ``obs_dim``. ``"lidar"`` covers every stacked frame, ``"lidar_newest"`` the last."""
-        na, w = self.n_agents, 3 * self.n_rays
+        na, w = self.n_agents, self.ray_channels * self.n_rays
         out = {
             "self": slice(0, self.self_dim),
             "pos": slice(0, 2),
@@ -535,7 +660,13 @@ class PushTLidarScenario(PushTScenario):
         self._roles_launch = CachedLaunch()
         # The lidar ring (see the class docstring). Adopted by the fused spec; the torch
         # path reassigns it, which the spec's watch catches.
-        self._ring = torch.zeros(n_envs, na, 3 * self.n_rays * self.frame_stack, **tt)
+        self._ring = torch.zeros(
+            n_envs, na, self.ray_channels * self.n_rays * self.frame_stack, **tt
+        )
+        # The outside-the-arena mask the relabel kernel writes (a dummy without it).
+        shape = (n_envs, na, self.n_rays) if self.lidar_arena_flag else (1, 1, 1)
+        self._outside = torch.zeros(*shape, dtype=torch.uint8, device=device)
+        self._outside_wp = wp.from_torch(self._outside, dtype=wp.uint8)
         self._prev_standoff: torch.Tensor | None = None
         # The fused path's lidar: bound here, outside any capture, so launching it inside
         # the captured step is a bare wp.launch on pointer-stable buffers.
@@ -562,12 +693,27 @@ class PushTLidarScenario(PushTScenario):
             if self.scenery_clearance is None:
                 self.scenery_clearance = max(self.robot_reach(), self.tee_reach())
             self._scenery_launch = CachedLaunch()
+        # The T's sizes (n_tee_sizes; the first until a reset draws them) and each one's
+        # body root in the stepper's obstacles.
+        self.tee_size = torch.zeros(n_envs, dtype=torch.int32, device=device)
+        self._tee_root = torch.zeros(n_envs, dtype=torch.int32, device=device)
+        self._tee_size_wp = wp.from_torch(self.tee_size, dtype=wp.int32)
+        self._tee_root_wp = wp.from_torch(self._tee_root, dtype=wp.int32)
+        self._tee_size_launch = CachedLaunch()
+        self._lidar_half = self._obs_half
+        if self.scenery_collide or self.tee_sized:
+            self._build_obstacles(world)
         if self.has_scenery and self.lidar_label_from_pose:
             #: Per robot, the share of its rays whose scenery hit the deployment's labels
             #: call the T; ``info()["scenery_leak"]``, at a fixed address.
             self._leak = torch.zeros(n_envs, na, **tt)
             self._leak_wp = wp.from_torch(self._leak)
-        self.lidar.bind(world, self.scenery)
+        # Solid surroundings are stepper obstacles, which the lidar scans anyway.
+        self.lidar.bind(world, None if self.scenery_collide else self.scenery)
+        self._collision_launch = CachedLaunch()
+        if self.track_collisions and self.scenery is None:
+            # One empty slot per env, for the collision kernel's surroundings arguments.
+            self._no_scenery = Scenery.empty(n_envs, 1, device, world.wp_dtype)
         if self.lidar_sweep:
             self.lidar.stamp_phase.fill_(self.lidar_stamp_phase[0])
         if self.sensor_model:
@@ -633,6 +779,154 @@ class PushTLidarScenario(PushTScenario):
         self._lcache: dict[str, torch.Tensor] | None = None
         return world
 
+    def _build_obstacles(self, world: World) -> None:
+        """Rebuild the stepper's obstacle spec as the T's boxes, once per size of the bank
+        (``tee_scale``; one block without it), followed by one immovable obstacle per
+        surroundings slot when they are solid (:func:`~swarp.scenarios.pusht_lidar_scenery.
+        slot_bank`). Each size is its own movable body; an env's other sizes wait parked
+        far apart, out of everything's reach. Without the bank Push-T's ``_box_*`` buffers
+        become views of the spec's first rows, so its install path is unchanged; the slot
+        reset kernel writes the surroundings' rows in place."""
+        ne, nb = world.n_envs, self.n_boxes
+        kv = self.n_tee_sizes
+        nt = kv * nb
+        ns = self.scenery.n_slots if self.scenery_collide else 0
+        n = nt + ns
+        dev = world.device
+        tt = {"device": dev, "dtype": world.dtype}
+        i32 = {"device": dev, "dtype": torch.int32}
+        vec2 = VEC2[world.wp_dtype]
+        sc = torch.tensor(self.tee_scales, **tt).view(-1, 1)  # [K, 1]
+        self._lidar_half = (sc.unsqueeze(-1) * self._obs_half).reshape(nt, 2)
+        self._lidar_radius = (sc * self._obs_radius).reshape(nt)
+        self._lidar_shape = self._obs_shape.repeat(kv)
+        self._lidar_kind = self._obs_kind.repeat(kv)
+        self._tee_off = (sc.unsqueeze(-1) * self._box_off_t).reshape(nt, 2)
+        #: The size each T box belongs to, and where each size waits when unused.
+        self._tee_box_size = torch.arange(kv, **i32).repeat_interleave(nb)
+        park = torch.tensor([-1.0e3, -1.0e3], **tt)
+        step = torch.tensor([10.0, 0.0], **tt)
+        self._tee_park = park + step * self._tee_box_size.to(world.dtype).unsqueeze(-1)
+        #: Where an unused surroundings slot waits, far beyond any lidar range.
+        self._park = 1.0e3
+        pos = torch.full((ne, n, 2), self._park, **tt)
+        angle = torch.zeros(ne, n, **tt)
+        vel = torch.zeros(ne, n, 2, **tt)
+        ang_vel = torch.zeros(ne, n, **tt)
+        self._t_rows = (pos[:, :nt], angle[:, :nt], vel[:, :nt], ang_vel[:, :nt])
+        if not self.tee_sized:
+            self._box_centers, self._box_angles, self._box_vel, self._box_ang_vel = (
+                self._t_rows
+            )
+        radius = [self._lidar_radius]
+        shape = [self._lidar_shape]
+        half = [self._lidar_half]
+        kind = [self._lidar_kind]
+        mass = [self._obs_mass.repeat(kv)]
+        inertia = [(sc * sc * self._obs_inertia).reshape(nt)]
+        body = [(self._obs_body.view(1, -1) + nb * torch.arange(kv, **i32).view(-1, 1))
+                .reshape(nt)]
+        offset = [self._tee_off]
+        if ns:
+            # Walls long enough to close the largest room: the free region's support
+            # extent at any yaw, plus the farthest gap and the thickest wall, per side.
+            free = float(self.world_size) + self.scenery_clearance
+            wall_len = math.sqrt(2.0) * free + self.scenery_gap[1] + self.wall_radius[1]
+            sh, rad, hf = slot_bank(self.n_clutter, self.wall_radius, wall_len,
+                                    self.clutter_radius, self.clutter_half)
+            self._slot_type = torch.tensor(sh, **i32)
+            self._slot_radius = torch.tensor(rad, **tt)
+            self._slot_half = torch.tensor(hf, **tt)
+            self._slot_wp = [
+                wp.from_torch(self._slot_type, dtype=wp.int32),
+                wp.from_torch(self._slot_radius),
+                wp.from_torch(self._slot_half, dtype=vec2),
+            ]
+            self._eng_pos_wp = wp.from_torch(pos, dtype=vec2)
+            self._eng_angle_wp = wp.from_torch(angle)
+            #: The first surroundings row of the stepper's obstacles.
+            self._scenery_row = nt
+            radius.append(self._slot_radius)
+            shape.append(self._slot_type)
+            half.append(self._slot_half)
+            kind.append(torch.full((ns,), int(ObstacleKind.IMMOVABLE), **i32))
+            mass.append(torch.ones(ns, **tt))
+            inertia.append(torch.ones(ns, **tt))
+            body.append(torch.arange(nt, n, **i32))
+            offset.append(torch.zeros(ns, 2, **tt))
+        self._obstacles = Obstacles(
+            pos,
+            torch.cat(radius),
+            shape=torch.cat(shape),
+            angle=angle,
+            half_extents=torch.cat(half),
+            vel=vel,
+            ang_vel=ang_vel,
+            kind=torch.cat(kind),
+            mass=torch.cat(mass),
+            inertia=torch.cat(inertia),
+            body=torch.cat(body),
+            body_offset=torch.cat(offset),
+        ).resolve(dev, world.dtype)
+
+    def _tee_boxes(self, detach: bool = True) -> tuple[torch.Tensor, ...]:
+        """``(centres [E, M, 2], angles [E, M], vel [E, M, 2], ang_vel [E, M])`` of every T
+        box of the size bank (``M = n_tee_sizes * n_boxes``): the env's own size at the T
+        pose, every other size parked and at rest."""
+        q, th, v, om = self.tee_pos, self.tee_theta, self.tee_vel, self.tee_ang_vel
+        if detach:
+            q, th, v, om = q.detach(), th.detach(), v.detach(), om.detach()
+        ca, sa = torch.cos(th).unsqueeze(1), torch.sin(th).unsqueeze(1)
+        ox, oy = self._tee_off[:, 0], self._tee_off[:, 1]
+        rx, ry = ca * ox - sa * oy, sa * ox + ca * oy  # [E, M]
+        on = self._tee_box_size.unsqueeze(0) == self.tee_size.unsqueeze(1)  # [E, M]
+        centres = torch.where(on.unsqueeze(-1), q.unsqueeze(1) + torch.stack([rx, ry], -1),
+                              self._tee_park)
+        om = om.unsqueeze(1)
+        vel = torch.stack([v[:, :1] - om * ry, v[:, 1:] + om * rx], -1)
+        vel = torch.where(on.unsqueeze(-1), vel, torch.zeros_like(vel))
+        angles = th.unsqueeze(1).expand_as(rx)
+        return centres, angles, vel, torch.where(on, om.expand_as(rx), torch.zeros_like(rx))
+
+    def _install_obstacles(self) -> None:
+        """Push-T's install, or with the size bank every size's boxes (:meth:`_tee_boxes`)
+        written into the spec before the re-install."""
+        if not self.tee_sized:
+            super()._install_obstacles()
+            return
+        for row, value in zip(self._t_rows, self._tee_boxes(), strict=True):
+            row.copy_(value)
+        self.world.set_obstacles(self._obstacles)
+
+    def _sync_from_engine(self) -> None:
+        """Push-T's read-back, from each env's own size of the bank."""
+        if not self.tee_sized:
+            super()._sync_from_engine()
+            return
+        idx = self._tee_root.long()
+        e = torch.arange(idx.shape[0], device=idx.device)
+        b_pos, b_angle, b_vel, b_ang_vel = self.world.obstacle_state_views(body=True)
+        self.tee_pos.copy_(b_pos[e, idx])
+        self.tee_theta.copy_(b_angle[e, idx])
+        self.tee_vel.copy_(b_vel[e, idx])
+        self.tee_ang_vel.copy_(b_ang_vel[e, idx])
+
+    def _launch_body_sync(self) -> None:
+        """Push-T's body sync, from each env's own size of the bank."""
+        if not self.tee_sized:
+            super()._launch_body_sync()
+            return
+        w = self.world
+        st = w.stepper
+        wp.launch(
+            concrete(body_state_gather_roots_kernel, w.wp_dtype),
+            dim=w.n_envs,
+            inputs=[st.body_pos, st.body_angle, st.body_vel, st.body_ang_vel, self._tee_root_wp],
+            outputs=[self._wp[n] for n in ("tee_pos", "tee_theta", "tee_vel", "tee_ang_vel")],
+            device=w.device,
+            record_tape=False,
+        )
+
     def robot_reach(self) -> float:
         """How far past the arena a robot's footprint can get: the arena stop's margin,
         what a robot at full speed covers in the step the stop is judged on and through its
@@ -683,10 +977,33 @@ class PushTLidarScenario(PushTScenario):
                 self._launch_artefact_dr(mask, use_mask)
             if self.has_scenery:
                 self._launch_scenery(mask, use_mask)
+            if self.tee_sized:
+                self._launch_tee_size(mask, use_mask)
+
+    def _launch_tee_size(self, mask, use_mask) -> None:
+        """Draw the respawned envs' T sizes (:func:`~swarp.scenarios.pusht_lidar_kernels.
+        tee_size_reset_kernel`); the reset's install then puts that size at the T pose."""
+        w = self.world
+        seed = wp.int32(w.next_kernel_seed())
+        outs = [self._tee_size_wp, self._tee_root_wp]
+        launch = self._tee_size_launch.get(
+            tee_size_reset_kernel,
+            dim=w.n_envs,
+            inputs=[mask, use_mask, seed, wp.int32(self.n_tee_sizes), wp.int32(self.n_boxes)],
+            outputs=outs,
+            device=w.device,
+            key=(w.n_envs, ptr_key(mask), self.n_tee_sizes, *(ptr_key(o) for o in outs)),
+        )
+        launch.set_param_by_name("use_mask", use_mask)
+        launch.set_param_by_name("seed", seed)
+        launch.launch()
 
     def _launch_scenery(self, mask, use_mask) -> None:
         """Redraw the respawned envs' surroundings around their new arenas
         (:func:`~swarp.scenarios.pusht_lidar_scenery.scenery_reset_kernel`)."""
+        if self.scenery_collide:
+            self._launch_scenery_slots(mask, use_mask)
+            return
         w = self.world
         scalar = w.wp_dtype
         seed = wp.int32(w.next_kernel_seed())
@@ -695,7 +1012,7 @@ class PushTLidarScenario(PushTScenario):
             self.scenery_clearance, self.scenery_on, p_per, p_room, p_clut, *self.scenery_gap,
             self.wall_missing, *self.wall_radius,
         )
-        sizes = (*self.clutter_radius, *self.clutter_half, self.lidar_max_range)
+        sizes = (*self.clutter_radius, *self.clutter_half, self._clutter_reach())
         sc = self.scenery
         outs = [self._scenery_mode_wp, *sc.arrays()]
         launch = self._scenery_launch.get(
@@ -710,6 +1027,39 @@ class PushTLidarScenario(PushTScenario):
             device=w.device,
             key=(w.n_envs, ptr_key(mask), ptr_key(self._arena_half_wp), *values,
                  *self.clutter_count, *sizes, *(ptr_key(o) for o in outs)),
+        )
+        launch.set_param_by_name("use_mask", use_mask)
+        launch.set_param_by_name("seed", seed)
+        launch.launch()
+
+    def _clutter_reach(self) -> float:
+        return self.lidar_max_range if self.clutter_reach is None else self.clutter_reach
+
+    def _launch_scenery_slots(self, mask, use_mask) -> None:
+        """Solid surroundings: the slot bank's layouts, into the lidar's per-env arrays and
+        the stepper's obstacle spec (:func:`~swarp.scenarios.pusht_lidar_scenery.
+        scenery_slots_reset_kernel`), which the reset's install then copies in."""
+        w = self.world
+        scalar = w.wp_dtype
+        seed = wp.int32(w.next_kernel_seed())
+        _, p_per, p_room, p_clut = self.scenery_probs
+        values = (self.scenery_clearance, self.scenery_on, p_per, p_room, p_clut,
+                  *self.scenery_gap, self.wall_missing)
+        tail = (self._clutter_reach(), self._park)
+        sc = self.scenery
+        outs = [self._scenery_mode_wp, *sc.arrays(), self._eng_pos_wp, self._eng_angle_wp]
+        launch = self._scenery_launch.get(
+            concrete(scenery_slots_reset_kernel, scalar),
+            dim=w.n_envs,
+            inputs=[
+                mask, use_mask, seed, self._arena_half_wp, *(scalar(x) for x in values),
+                wp.int32(self.clutter_count[0]), wp.int32(self.clutter_count[1]),
+                *(scalar(x) for x in tail), *self._slot_wp, wp.int32(self._scenery_row),
+            ],
+            outputs=outs,
+            device=w.device,
+            key=(w.n_envs, ptr_key(mask), ptr_key(self._arena_half_wp), *values,
+                 *self.clutter_count, *tail, *(ptr_key(o) for o in (*self._slot_wp, *outs))),
         )
         launch.set_param_by_name("use_mask", use_mask)
         launch.set_param_by_name("seed", seed)
@@ -928,7 +1278,7 @@ class PushTLidarScenario(PushTScenario):
             idx = hit_index.long().clamp(min=0)  # [E, A, R]
             e_idx = torch.arange(idx.shape[0], device=idx.device).view(-1, 1, 1)
             cen = centres[e_idx, idx]  # [E, A, R, 2]
-            half = self._obs_half[idx]
+            half = self._lidar_half[idx]
             th = self.tee_theta.view(-1, 1, 1)
             co, so = torch.cos(th), torch.sin(th)
             rx = p[..., 0] + ranges * dx - cen[..., 0]
@@ -989,6 +1339,12 @@ class PushTLidarScenario(PushTScenario):
         cls = torch.where(mate, HIT_AGENT, HIT_MOVABLE)
         cls = torch.where(hit_any & ~out, cls, 0).to(hit_class.dtype)
         ranges = torch.where(hit_any & out, torch.full_like(ranges, self.lidar_max_range), ranges)
+        if self.lidar_arena_flag:
+            half = (
+                self.arena_half.view(-1, 1, 1, 2) if self.per_env_arena
+                else torch.full_like(hit[..., :1, :1, :], self.world_size)
+            )
+            self._outside_torch = (cls == HIT_MOVABLE) & (hit.abs() > half).any(-1)
         return ranges, cls
 
     def _critic_dr_torch(self, perm: torch.Tensor) -> torch.Tensor:
@@ -1137,14 +1493,20 @@ class PushTLidarScenario(PushTScenario):
         # --- the T's boxes from the body pose, and the scan
         th = self.tee_theta
         ca, sa = torch.cos(th), torch.sin(th)
-        ox, oy = self._box_off_t[:, 0], self._box_off_t[:, 1]
-        centres = self.tee_pos.unsqueeze(1) + torch.stack(
-            [
-                ca.unsqueeze(1) * ox - sa.unsqueeze(1) * oy,
-                sa.unsqueeze(1) * ox + ca.unsqueeze(1) * oy,
-            ],
-            dim=-1,
-        )  # [E, B, 2]
+        if self.tee_sized:
+            centres, angles = self._tee_boxes(detach=False)[:2]  # [E, M, 2], [E, M]
+            tee_geom = (self._lidar_radius, self._lidar_shape, self._lidar_kind)
+        else:
+            ox, oy = self._box_off_t[:, 0], self._box_off_t[:, 1]
+            centres = self.tee_pos.unsqueeze(1) + torch.stack(
+                [
+                    ca.unsqueeze(1) * ox - sa.unsqueeze(1) * oy,
+                    sa.unsqueeze(1) * ox + ca.unsqueeze(1) * oy,
+                ],
+                dim=-1,
+            )  # [E, B, 2]
+            angles = th.unsqueeze(1).expand(-1, self.n_boxes)
+            tee_geom = (self._obs_radius, self._obs_shape, self._obs_kind)
         lid = self.lidar
         sweep = None
         if lid.sweep:
@@ -1161,11 +1523,11 @@ class PushTLidarScenario(PushTScenario):
             angle_end=self.lidar.angle_end,
             sweep=sweep,
             obstacle_pos=centres,
-            obstacle_radius=self._obs_radius,
-            obstacle_shape=self._obs_shape,
-            obstacle_angle=th.unsqueeze(1).expand(-1, self.n_boxes),
-            obstacle_half=self._obs_half,
-            obstacle_kind=self._obs_kind,
+            obstacle_radius=tee_geom[0],
+            obstacle_shape=tee_geom[1],
+            obstacle_angle=angles,
+            obstacle_half=self._lidar_half,
+            obstacle_kind=tee_geom[2],
             agent_shape=w.agent_shape if self.agent_shape == AgentShape.BOX else None,
             agent_half=w.agent_half_extents,
             return_hits=True,
@@ -1217,8 +1579,11 @@ class PushTLidarScenario(PushTScenario):
                 (g - q).unsqueeze(1).expand(-1, na, -1),
                 torch.stack([tth.cos(), tth.sin(), err.cos(), err.sin()], dim=-1),
             ]
-        frame = torch.cat([ranges / mr, is_obj.to(dt), is_ag.to(dt)], dim=-1)  # [E, A, 3R]
-        nf, width = self.frame_stack, 3 * nr
+        masks = [is_obj.to(dt), is_ag.to(dt)]
+        if self.lidar_arena_flag:
+            masks.append(self._outside_torch.to(dt))
+        frame = torch.cat([ranges / mr, *masks], dim=-1)  # [E, A, ray_channels R]
+        nf, width = self.frame_stack, self.ray_channels * nr
         ring = self._ring.view(ne, na, nf, width)
         fresh = frame.detach().unsqueeze(2)
         if reset:
@@ -1267,6 +1632,10 @@ class PushTLidarScenario(PushTScenario):
         onehot = torch.nn.functional.one_hot(sec, N_SECTORS).bool() & is_obj.unsqueeze(-1)
         sectors = onehot.any(dim=2)  # [E, A, 8]
         near = (is_obj & (ranges < self.contact_dist)).any(-1)
+        if self.track_collisions:
+            hit_robot, hit_scenery = self._collisions_torch()
+        else:
+            hit_robot = hit_scenery = torch.zeros_like(near)
 
         # --- rewards
         c = self._cache  # Push-T's refresh, just run by super()
@@ -1311,13 +1680,16 @@ class PushTLidarScenario(PushTScenario):
         )
         occ_t = torch.where(is_obs, -self.occlusion_weight * occl, zero)
         con_t = torch.where(is_obs & near, torch.full_like(zero, -self.contact_penalty), zero)
+        col_t = torch.where(hit_robot | hit_scenery,
+                            torch.full_like(zero, -self.collision_penalty), zero)
         if self.oob_limit > 0.0:
             f = failed.unsqueeze(1)
-            approach, standoff, vis_t, cov_t, occ_t, con_t = (
-                torch.where(f, zero, t) for t in (approach, standoff, vis_t, cov_t, occ_t, con_t)
+            approach, standoff, vis_t, cov_t, occ_t, con_t, col_t = (
+                torch.where(f, zero, t)
+                for t in (approach, standoff, vis_t, cov_t, occ_t, con_t, col_t)
             )
-        terms = (team, approach, standoff, vis_t, cov_t, occ_t, con_t)
-        reward = team + approach + standoff + vis_t + cov_t + occ_t + con_t
+        terms = (team, approach, standoff, vis_t, cov_t, occ_t, con_t, col_t)
+        reward = team + approach + standoff + vis_t + cov_t + occ_t + con_t + col_t
         n_obs = is_obs.sum(-1).clamp(min=1).to(dt)
 
         # --- trainer buffers
@@ -1370,9 +1742,59 @@ class PushTLidarScenario(PushTScenario):
             "aux": aux,
             "ranges": ranges,
             "hit_class": hit_class,
+            "robot_collision": hit_robot,
+            "scenery_collision": hit_scenery,
         }
         if self.has_scenery and leak is not None:
             self._lcache["scenery_leak"] = leak.to(dt) / nr
+
+    def _collisions_torch(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """The torch twin of :func:`~swarp.scenarios.pusht_lidar_kernels.
+        pusht_lidar_collision_kernel`: ``(hit_robot, hit_scenery)``, ``[E, A]`` bool."""
+        s = self.world.state
+        pos, th = s.pos.detach(), s.theta.detach()
+        na, m = self.n_agents, self.collision_margin
+        box = self.agent_shape == AgentShape.BOX
+        hx, hy = self.agent_half_extents if box else (0.0, 0.0)
+        r = self.agent_radius
+        d = pos.unsqueeze(1) - pos.unsqueeze(2)  # [E, A, B, 2]: b's centre - a's
+        if box:
+            touch = _box_gap(d, th.unsqueeze(2), hx, hy, th.unsqueeze(1), hx, hy) <= m
+        else:
+            touch = d.norm(dim=-1) <= 2.0 * r + m
+        eye = torch.eye(na, dtype=torch.bool, device=pos.device)
+        robot = (touch & ~eye).any(-1)
+        if self.scenery is None:
+            return robot, torch.zeros_like(robot)
+        sp, sa, sh, sr, st = self.scenery.tensors()  # [E, S, ...]
+        rel = sp.unsqueeze(1) - pos.unsqueeze(2)  # [E, A, S, 2]
+        tip = torch.stack([sa.cos(), sa.sin()], -1) * sh[..., :1]
+        ea, eb = rel - tip.unsqueeze(1), rel + tip.unsqueeze(1)
+        c, sn = th.cos().view(*th.shape, 1, 1), th.sin().view(*th.shape, 1, 1)
+
+        def local(v):  # world offsets [E, A, S, 2] into each robot's frame
+            return torch.stack([c[..., 0] * v[..., 0] + sn[..., 0] * v[..., 1],
+                                -sn[..., 0] * v[..., 0] + c[..., 0] * v[..., 1]], -1)
+
+        rad = sr.unsqueeze(1)
+        if box:
+            round_ = _segment_box_dist(local(ea), local(eb), hx, hy) <= rad + m
+            boxy = _box_gap(rel, th.unsqueeze(-1), hx, hy, sa.unsqueeze(1),
+                            sh[..., 0].unsqueeze(1), sh[..., 1].unsqueeze(1)) <= m
+        else:
+            dd = ((eb - ea) ** 2).sum(-1)
+            u = torch.where(dd > 0.0, (-ea * (eb - ea)).sum(-1) / dd.clamp(min=1e-30), 0.0)
+            near = ea + u.clamp(0.0, 1.0).unsqueeze(-1) * (eb - ea)
+            round_ = near.norm(dim=-1) <= rad + r + m
+            co, so = sa.cos().unsqueeze(1), sa.sin().unsqueeze(1)
+            lx = -(co * rel[..., 0] + so * rel[..., 1])
+            ly = -(-so * rel[..., 0] + co * rel[..., 1])
+            boxy = _point_box_dist(lx, ly, sh[..., 0].unsqueeze(1), sh[..., 1].unsqueeze(1)) <= (
+                r + m
+            )
+        stu = st.unsqueeze(1)
+        hit = torch.where(stu == int(ObstacleShape.BOX), boxy, round_) & (stu >= 0)
+        return robot, hit.any(-1)
 
     def _pooled_hits(self, pos, hits, is_obj) -> torch.Tensor:
         """``[E, A, 3 A K]``: every agent's K evenly spread object hits, relative to each
@@ -1403,7 +1825,7 @@ class PushTLidarScenario(PushTScenario):
             *super().fused_spec(n_envs),
             Buf(
                 "ring",
-                (ne, na, 3 * self.n_rays * self.frame_stack),
+                (ne, na, self.ray_channels * self.n_rays * self.frame_stack),
                 attr="_ring",
                 alloc="never",
                 carry=True,
@@ -1423,6 +1845,8 @@ class PushTLidarScenario(PushTScenario):
             Buf("occl", (ne, na)),
             Buf("sectors", (ne, na), "uint8"),
             Buf("near", (ne, na), "uint8"),
+            Buf("hit_robot", (ne, na), "uint8", bool_view=True),
+            Buf("hit_scenery", (ne, na), "uint8", bool_view=True),
             Buf("multiobj", (ne, na, N_OBJ)),
             Buf("coverage", (ne,)),
             Buf("visibility", (ne,)),
@@ -1463,6 +1887,8 @@ class PushTLidarScenario(PushTScenario):
         self._launch_obs(st, pass_.advance_prev)
         if self.critic_dr:
             self._launch_critic_dr()
+        if self.track_collisions:
+            self._launch_collisions(st, pass_.full_pass)
         self._launch_reward(st, pass_.advance_prev, pass_.full_pass)
 
     def _launch_artefacts(self, st) -> None:
@@ -1524,8 +1950,11 @@ class PushTLidarScenario(PushTScenario):
                 self._arena_half_wp if per_env else self._dummy_vec2(),
                 wp.int32(int(leak and full_pass)),
                 self._leak_wp if leak else self._dummy_2d(),
+                wp.int32(int(self.lidar_arena_flag)),
+                scalar(self.world_size),
                 lid.wp_ranges,
                 lid.wp_hit_class,
+                self._outside_wp,
             ],
             device=w.device,
             record_tape=False,
@@ -1665,6 +2094,8 @@ class PushTLidarScenario(PushTScenario):
                 self._roles_wp,
                 lid.wp_ranges,
                 lid.wp_hit_class,
+                self._outside_wp,
+                wp.int32(self.ray_channels),
                 resetmask,
                 wp.int32(self.n_pushers),
                 wp.int32(self.obs_level),
@@ -1696,6 +2127,8 @@ class PushTLidarScenario(PushTScenario):
                 ptr_key(self._roles_wp),
                 ptr_key(lid.wp_ranges),
                 ptr_key(lid.wp_hit_class),
+                ptr_key(self._outside_wp),
+                self.ray_channels,
                 ptr_key(resetmask),
                 *cfg,
                 ptr_key(arena),
@@ -1705,12 +2138,36 @@ class PushTLidarScenario(PushTScenario):
         launch.set_param_by_name("advance_prev", wp.int32(advance_prev))
         launch.launch()
 
+    def _launch_collisions(self, st, full_pass: int) -> None:
+        """Which robots touch another robot or the surroundings, on the true poses."""
+        w = self.world
+        scalar = w.wp_dtype
+        box = int(self.agent_shape == AgentShape.BOX)
+        hx, hy = self.agent_half_extents if box else (0.0, 0.0)
+        geom = (hx, hy, self.agent_radius, self.collision_margin)
+        sc = (self.scenery if self.scenery is not None else self._no_scenery).arrays()
+        outs = [self._wp["hit_robot"], self._wp["hit_scenery"]]
+        launch = self._collision_launch.get(
+            concrete(pusht_lidar_collision_kernel, scalar),
+            dim=(w.n_envs, self.n_agents),
+            inputs=[st.pos, st.theta, wp.int32(box), *(scalar(x) for x in geom),
+                    wp.int32(int(self.scenery is not None)), *sc, wp.int32(full_pass)],
+            outputs=outs,
+            device=w.device,
+            key=(w.n_envs, self.n_agents, ptr_key(st.pos), ptr_key(st.theta), box, *geom,
+                 *(ptr_key(x) for x in (*sc, *outs))),
+        )
+        launch.set_param_by_name("full_pass", wp.int32(full_pass))
+        launch.launch()
+
     def _launch_reward(self, st, advance_prev: int, full_pass: int) -> None:
         w = self.world
         scalar = w.wp_dtype
         names = ("tee_pos", "tee_theta", "goal_pos", "goal_theta")
         body = [self._wp[n] for n in names]
-        stats = [self._wp[n] for n in ("n_obj", "occl", "sectors", "near")]
+        stats = [
+            self._wp[n] for n in ("n_obj", "occl", "sectors", "near", "hit_robot", "hit_scenery")
+        ]
         outs = [
             self._wp[n]
             for n in (
@@ -1747,6 +2204,7 @@ class PushTLidarScenario(PushTScenario):
             self.coverage_weight,
             self.occlusion_weight,
             self.contact_penalty,
+            self.collision_penalty,
             self.oob_limit,
             self.oob_penalty,
         )
@@ -1846,7 +2304,7 @@ class PushTLidarScenario(PushTScenario):
         out = super().render_extras(env_idx)
         nr = self.n_rays
         with torch.no_grad():
-            frame = self._ring[env_idx, :, -3 * nr :]
+            frame = self._ring[env_idx, :, -self.ray_channels * nr :]
             ranges = frame[:, :nr] * self.lidar_max_range  # [A, R]
             pos = self.world.state.pos[env_idx]
             ang = self._ray_angles()[env_idx]
@@ -1855,7 +2313,7 @@ class PushTLidarScenario(PushTScenario):
             ends = pos.unsqueeze(1) + ranges.unsqueeze(-1) * dirs
             observers = torch.nonzero(self.roles[env_idx] == 1).squeeze(-1)
             rays = torch.stack((starts, ends), dim=2)[observers]  # [O, R, 2, 2]
-            hit = (frame[:, nr:] > 0.5).reshape(-1, 2, nr).any(dim=1)[observers]
+            hit = (frame[:, nr : 3 * nr] > 0.5).reshape(-1, 2, nr).any(dim=1)[observers]
         rays = rays.cpu().numpy()
         out.update(
             lidar=rays.reshape(-1, 2, 2),
@@ -1881,6 +2339,9 @@ class PushTLidarScenario(PushTScenario):
                 out["out_of_bounds"] = self._oob.view(torch.bool)
             if self.has_scenery and self.lidar_label_from_pose:
                 out["scenery_leak"] = self._leak
+            if self.track_collisions:
+                out["robot_collision"] = self.fb["hit_robot_bool"]
+                out["scenery_collision"] = self.fb["hit_scenery_bool"]
             return out
         c = self._lcache
         out.update(
@@ -1894,6 +2355,9 @@ class PushTLidarScenario(PushTScenario):
             out["out_of_bounds"] = c["out_of_bounds"]
         if "scenery_leak" in c:
             out["scenery_leak"] = c["scenery_leak"]
+        if self.track_collisions:
+            out["robot_collision"] = c["robot_collision"]
+            out["scenery_collision"] = c["scenery_collision"]
         return out
 
 

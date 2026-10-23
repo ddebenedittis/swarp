@@ -49,6 +49,22 @@ wp.set_module_options({"default_grid_stride": False})
 _SHAPE_BOX = wp.constant(int(ObstacleShape.BOX))
 _SHAPE_SEGMENT = wp.constant(int(ObstacleShape.SEGMENT))
 
+
+@wp.func
+def _out_of_range(oc: Any, st: wp.int32, rad: Any, half: Any, max_range: Any):
+    """Whether a shape centred ``oc`` from the ray origin lies wholly beyond
+    ``max_range``: its bounding disc (a circle's radius, a box's half-diagonal, a
+    capsule's half-length plus radius) starts farther out, so no ray reaches it before the
+    range runs out and skipping it leaves every range unchanged (slack: 1e-4 relative,
+    1e-6 absolute)."""
+    b = rad
+    if st == _SHAPE_BOX:
+        b = wp.length(half)
+    elif st == _SHAPE_SEGMENT:
+        b = half[0] + rad
+    lim = (max_range + b) * type(rad)(1.0001) + type(rad)(1.0e-6)
+    return wp.dot(oc, oc) > lim * lim
+
 #: Per-ray ``hit_class`` values.
 HIT_NONE = 0
 HIT_AGENT = 1
@@ -248,6 +264,8 @@ def _make_kernel(
             for o in range(n_obstacles):
                 c = obs_pos[e, o]
                 st = obs_type[o]
+                if _out_of_range(c - p, st, obs_radius[o], obs_half[o], max_range):
+                    continue
                 t = max_range
                 if st == _SHAPE_BOX:
                     h = obs_half[o]
@@ -265,7 +283,9 @@ def _make_kernel(
         if wp.static(scenery):
             for s in range(sc_type.shape[1]):
                 st = sc_type[e, s]
-                if st >= 0:
+                if st >= 0 and not _out_of_range(
+                    sc_pos[e, s] - p, st, sc_radius[e, s], sc_half[e, s], max_range
+                ):
                     c = sc_pos[e, s]
                     t = max_range
                     if st == _SHAPE_BOX:

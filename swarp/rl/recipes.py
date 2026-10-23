@@ -957,6 +957,81 @@ SPECS["pusht_lidar_limo_slim240_arena"] = replace(
 )
 
 
+# pusht_lidar_limo_slim240_arena with solid surroundings closer to the arena and a
+# collision cost (L10). In Gazebo L9c drove out of the arena and pushed the landmarks: the
+# post stood 0.43 m past a 2 m arena, inside the label bound (arena + 0.5 m), so its hits
+# read as the T, and L9c had only ever seen surroundings beyond 0.89 m, where the labels
+# drop them.
+#
+# - The surroundings are stepper obstacles (scenery_collide): robots and the T collide with
+#   them, so they may stand anywhere outside the arena (clearance 0, walls a gap of 0-1 m
+#   past it, clutter within lidar range). Inside the label bound they read as the T, as on
+#   the robots, and they do not move when pushed.
+# - Every robot pays 0.03 per step while its footprint is within 1 cm of the other robot's
+#   or of a surroundings shape: about half the per-step team term at full difficulty, 0.6%
+#   of the goal bonus per step of contact. It ramps in with the surroundings (3000-5000).
+# - The stepper's obstacles share their sizes across envs, so the clutter is a fixed bank
+#   of 12 shapes (6 circles of radius 0.05-0.3, 6 capsules of half-length 0.1-0.6), 2-6 of
+#   them placed per env; capsules instead of boxes because the T collides with them.
+SPECS["pusht_lidar_limo_slim240_solid"] = replace(
+    SPECS["pusht_lidar_limo_slim240_arena"],
+    scen_kwargs={
+        **SPECS["pusht_lidar_limo_slim240_arena"].scen_kwargs,
+        "scenery_collide": True, "n_clutter": 12, "clutter_count": (2, 6),
+        "collision_penalty": 0.03, "collision_margin": 0.01,
+    },
+    ramps=(
+        *SPECS["pusht_lidar_limo_slim240_arena"].ramps,
+        Ramp("collision_penalty", 0.0, 0.03, 3000, 5000),
+    ),
+    metrics=(*SPECS["pusht_lidar_limo_slim240_arena"].metrics, "robot_collision",
+             "scenery_collision"),
+)
+# pusht_lidar_limo_slim240_solid with the T's size randomised by +-10% (L10b): a bank of
+# five copies of the slim T scaled 0.90, 0.95, 1.00, 1.05 and 1.10 (same mass, inertia
+# with the square), one drawn per env on every reset. The real T is cut by hand and
+# measured to a few millimetres; the policy should not hinge on its exact bar lengths.
+SPECS["pusht_lidar_limo_slim240_solid_tsize"] = replace(
+    SPECS["pusht_lidar_limo_slim240_solid"],
+    scen_kwargs={
+        **SPECS["pusht_lidar_limo_slim240_solid"].scen_kwargs,
+        "tee_scale": (0.9, 1.1), "n_tee_sizes": 5,
+    },
+)
+# pusht_lidar_limo_slim240_solid_tsize with a 5 m lidar instead of 1.5 m (L11), and three
+# T sizes (0.9, 1.0, 1.1) instead of five: every parked size still runs its contact and
+# friction loops, so five cost 3.4x L10's iteration time and three about half that.
+#
+# L10 stalled where L9c learned (training solve 0.06 against 0.75 at iteration 2000): its
+# robots lost the T (tee_seen 0.69 -> 0.27 over iterations 100-2000, L9c 0.74 -> 0.79).
+# With 1.5 m in a 4-5 m arena a robot without the T in range has nothing to go on; the real
+# T-mini Pro reaches 12 m, and what lies past the label bound is dropped by the labels
+# whatever the range, so the longer range only adds the far side of the arena. Clutter keeps
+# the 1.5 m reach past the arena it had (clutter_reach), or most of it would land past the
+# label bound.
+SPECS["pusht_lidar_limo_slim240_solid_tsize_r5"] = replace(
+    SPECS["pusht_lidar_limo_slim240_solid_tsize"],
+    scen_kwargs={
+        **SPECS["pusht_lidar_limo_slim240_solid_tsize"].scen_kwargs,
+        "lidar_max_range": 5.0, "clutter_reach": 1.5, "n_tee_sizes": 3,
+    },
+)
+# pusht_lidar_limo_slim240_solid_tsize_r5 with each lidar frame flagging the T-labelled
+# hits past the arena's edge (lidar_arena_flag; L12). L11 learned the clean world (training
+# solve 0.99 at 3000) and lost it to the surroundings: its iteration-5000 checkpoint solves
+# 0.993 at full noise without surroundings, 0.995 with them 0.89 m out (the labels drop
+# them), 0.668 0.3 m out and 0.318 from the arena's edge, where they read as the T. The
+# deployment labels a hit by its position from the reported pose, so it knows which T hits
+# lie outside the arena; the flag hands that to the policy instead of leaving it to infer
+# each hit's position from its own pose, the ray's angle and the range.
+SPECS["pusht_lidar_limo_slim240_solid_tsize_r5_flag"] = replace(
+    SPECS["pusht_lidar_limo_slim240_solid_tsize_r5"],
+    scen_kwargs={
+        **SPECS["pusht_lidar_limo_slim240_solid_tsize_r5"].scen_kwargs,
+        "lidar_arena_flag": True,
+    },
+)
+
 def scenario_name(name: str) -> str:
     """The registered scenario behind ``name``: a ``SPECS`` key's ``scenario`` when it
     sets one, else ``name`` itself (a registry name, or a key that is one)."""

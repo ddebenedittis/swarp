@@ -59,6 +59,32 @@ BOX_MODULE_OPTIONS = {"fuse_fp": False}
 
 
 @wp.func
+def shape_bound(st: wp.int32, r: Any, h: Any):
+    """Radius of the disc about an obstacle's centre that holds the whole shape: a
+    circle's radius, a box's half-diagonal, a capsule's half-length plus its radius."""
+    b = r
+    if st == SHAPE_BOX:
+        b = wp.length(h)
+    elif st == SHAPE_SEGMENT:
+        b = h[0] + r
+    return b
+
+
+@wp.func
+def bounds_apart(d: Any, reach: Any):
+    """Whether two shapes whose bounding discs have centres ``d`` apart are too far to
+    touch, ``reach`` being the two bounding radii plus the contact margin.
+
+    The broad phase of every obstacle loop: each contact function starts from a zero force
+    and adds one only while its overlap is positive, and the overlap is negative whenever
+    the bounding discs are farther apart than ``reach``, so skipping such a pair changes
+    no force. The slack (1e-4 relative, 1e-6 absolute) keeps a pair whose exact test would
+    round to contact inside the loop."""
+    lim = reach * type(reach)(1.0001) + type(reach)(1.0e-6)
+    return wp.dot(d, d) > lim * lim
+
+
+@wp.func
 def _normal_coeff(overlap: Any, vn: Any, k: Any, c: Any, damp_denom: Any, max_overlap: Any):
     """Scalar normal force: linearly-implicit damping, clamped repulsive, depth-saturated.
 
@@ -583,7 +609,13 @@ def _obstacle_forces_box(
     """:func:`_obstacle_forces` for a box agent of half-extents ``ha`` at heading ``th``."""
     zero = type(k)(0.0)
     f = type(p)(zero, zero)
+    ra = wp.length(ha)
     for o in range(n_obstacles):
+        st = obs_type[o]
+        if bounds_apart(
+            p - obs_pos[e, o], ra + margin + shape_bound(st, obs_radius[o], obs_half[o])
+        ):
+            continue
         fo, _x = _box_obstacle_force(
             p, th, v, w, ha, obs_pos[e, o], obs_type[o], obs_angle[e, o], obs_radius[o],
             obs_half[o], obs_vel[e, o], obs_ang_vel[e, o], k, c, margin, damp_denom,
@@ -685,6 +717,8 @@ def _obstacle_forces(
     for o in range(n_obstacles):
         center = obs_pos[e, o]
         st = obs_type[o]
+        if bounds_apart(p - center, ra + margin + shape_bound(st, obs_radius[o], obs_half[o])):
+            continue
         vo = obs_vel[e, o]
         omo = obs_ang_vel[e, o]
         if st == SHAPE_BOX:
@@ -1247,8 +1281,13 @@ def _static_forces_torque(
             bounds_min, bounds_max,
         )
     else:
+        rb = wp.length(ha)
         for o in range(n_obstacles):
             st = obs_type[o]
+            if bounds_apart(
+                p - obs_pos[e, o], rb + margin + shape_bound(st, obs_radius[o], obs_half[o])
+            ):
+                continue
             fo, x = _box_obstacle_force(
                 p, th, v, w, ha, obs_pos[e, o], st, obs_angle[e, o], obs_radius[o],
                 obs_half[o], obs_vel[e, o], obs_ang_vel[e, o], k, c, margin, damp_denom,

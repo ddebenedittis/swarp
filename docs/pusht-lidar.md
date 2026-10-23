@@ -416,3 +416,42 @@ So the policy is robust to the surroundings mostly because the deployment's labe
 The 5 × 5 m arena is the weak case (0.92): its goals are the farthest, the median solve takes 157 of the 450 steps, and the failures there are not broken down here.
 
 The deployment side (`swarp_gz_test`: the observation's arena block, per-axis bounds in `label_rays`, the safety bridge and the localisation mask) is not updated yet; until it is, this checkpoint cannot run on the robots.
+
+### Solid surroundings and a collision cost
+
+In Gazebo, L9c drove out of the arena and pushed the landmarks around it.
+The landmarks stood 0.43–0.65 m past a 2 m arena, and the post sat inside the label bound (arena + 0.5 m), so its hits read as the T.
+L9c had only seen surroundings beyond 0.89 m, where the labels drop them, and none it could touch.
+
+`pusht_lidar_limo_slim240_solid` (L10) makes the surroundings solid and brings them up to the arena's edge:
+
+- `scenery_collide` puts every surroundings slot in the stepper as an immovable obstacle after the T's boxes, so the robots and the T collide with them; the lidar scans them there.
+  The free region shrinks to the arena (`scenery_clearance` 0): walls stand a gap of 0–1 m past it and clutter anywhere within lidar range outside it, so whatever stands inside the label bound reads as the T, as it does on the robots.
+- The stepper's obstacles share their sizes across envs, so each slot has a fixed shape and size (`slot_bank`): four walls long enough to close the largest room, and 12 clutter shapes (6 circles of radius 0.05–0.3 m, 6 capsules of half-length 0.1–0.6 m), 2–6 of them placed per env.
+  The clutter is capsules rather than boxes because the T collides with circles and capsules but not with boxes.
+- A `collision` objective: every robot pays `collision_penalty` (0.03, ramped in with the surroundings) per step while its footprint is within `collision_margin` (1 cm) of the other robot's or of a surroundings shape; `info()["robot_collision"]` and `["scenery_collision"]` flag which.
+
+The contact uses Push-T's spring (`contact_k` 8000, saturating at 3.2 cm at this recipe's substep and mass).
+Driving both robots straight into closed walls for 200 steps with the arena stop off, 0 of 2048 robots crossed a wall of radius 0.02–0.1 m and 1 of 2048 one of 0.1–0.2 m (shoved through by the other robot).
+
+`pusht_lidar_limo_slim240_solid_tsize` (L10b) adds a ±10% randomisation of the T's size (`tee_scale` (0.9, 1.1)).
+The stepper's obstacles share their sizes across envs, so it is a bank of five copies of the slim T scaled 0.90–1.10 (same mass, inertia scaled with the square), each its own movable body; every reset draws one per env and parks the others far apart.
+Every bound that keeps the T clear (spawn, out-of-bounds reach, the occlusion cone) uses the largest size; the size is not in the critic state.
+
+**L10 and L10b stalled; L11 lengthened the lidar range.**
+L10 and L10b trained no better than chance in the clean world: training solve 0.06 at iteration 2000 against L9c's 0.75, with `tee_seen` falling from 0.69 to 0.27, as the robots lost the T and never found it again.
+With a 1.5 m lidar in a 4–5 m arena, a robot without the T in range had nothing to go on.
+L11 (`pusht_lidar_limo_slim240_solid_tsize_r5`) raises the range to 5 m, keeps the clutter within 1.5 m of the arena (`clutter_reach`) and uses three T sizes (0.9, 1.0, 1.1).
+Under random actions the T is then seen on 0.66–0.67 of robot-steps instead of 0.27–0.35, and L11 solved the clean world at 0.99 by iteration 3000.
+
+It did not get through the surroundings.
+Its iteration-5000 checkpoint, greedy over 1024 envs at full noise and latency, solves 0.993 [0.986, 0.997] without surroundings, 0.995 [0.989, 0.998] with them at least 0.89 m outside the arena (the labels drop them), 0.668 [0.639, 0.696] at least 0.3 m out and 0.318 [0.291, 0.348] from the arena's edge, where they read as the T.
+The rollback guard also kept it from trying: it kept its best solve per ramp position, but the position was the least progress over all ramps, which stays 0 until the turn-away cost starts at 8000, so every condition was held to the clean world's 0.99 and the guard rolled the run back three times, the clock never past 3800.
+The guard now keys the best on every ramp's progress.
+
+**L12** (`pusht_lidar_limo_slim240_solid_tsize_r5_flag`) adds `lidar_arena_flag`: each lidar frame carries a fourth mask, the T-labelled hits that lie past the arena's edge, placed from the reported pose as the labels are.
+The deployment knows its pose and the arena, so `swarp_gz_test`'s `obs.py` builds the same mask (its parity test covers it); the policy no longer has to work out each hit's position to tell a wall just outside the arena from the T inside it.
+
+**Broad phase.**
+Every obstacle loop now skips a shape whose bounding disc cannot reach the agent, the other body or the lidar range, and the floor friction skips a body at rest; the forces and scans are bit-identical (16 rollouts of 8 scenarios, both paths).
+At 2048 envs the solid recipe's environment step went from 8.1 to 4.5 ms and the three-size one from 23.0 to 9.1 ms (RTX 3070 laptop, before the lidar's own cull).

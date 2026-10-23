@@ -199,8 +199,11 @@ def lidar_relabel_kernel(
     arena_half: wp.array(dtype=Any),
     count_leak: wp.int32,
     leak: wp.array2d(dtype=Any),
+    flag_outside: wp.int32,
+    flag_half: Any,
     ranges: wp.array3d(dtype=Any),
     hit_class: wp.array3d(dtype=wp.uint8),
+    outside: wp.array3d(dtype=wp.uint8),
 ):
     """Thread per (env, agent): classify every hit as the deployment does, from the
     reported poses alone, in place.
@@ -210,7 +213,10 @@ def lidar_relabel_kernel(
     its axis) it is a miss (``max_range``, class 0); inside a teammate's reported footprint
     (its box, or its disc, grown by ``margin``) it is an agent; anything else is the
     movable body. With ``count_leak``, ``leak[e, a]`` gets the share of the rays that hit
-    scenery (class 2) and leave labelled as the body."""
+    scenery (class 2) and leave labelled as the body. With ``flag_outside``,
+    ``outside[e, a, r]`` is 1 where a hit labelled as the body lies past the arena on
+    either axis (``arena_half[e]`` with ``per_env_bound``, else ``flag_half``), between the
+    arena's edge and the bound, and 0 everywhere else."""
     e, a = wp.tid()
     n_rays = ranges.shape[2]
     n_agents = obs_pos.shape[1]
@@ -224,8 +230,15 @@ def lidar_relabel_kernel(
     if per_env_bound == 1:
         bx = arena_half[e][0] + bound
         by = arena_half[e][1] + bound
+    ax = flag_half
+    ay = flag_half
+    if per_env_bound == 1:
+        ax = arena_half[e][0]
+        ay = arena_half[e][1]
     n_leak = wp.int32(0)
     for r in range(n_rays):
+        if flag_outside == 1:
+            outside[e, a, r] = wp.uint8(0)
         c_in = hit_class[e, a, r]
         if c_in != wp.uint8(0):
             t = ranges[e, a, r]
@@ -258,6 +271,8 @@ def lidar_relabel_kernel(
                             c = _HIT_AGENT
             if c_in == _HIT_IMMOVABLE and c == _HIT_MOVABLE:
                 n_leak += wp.int32(1)
+            if flag_outside == 1 and c == _HIT_MOVABLE and (wp.abs(hx) > ax or wp.abs(hy) > ay):
+                outside[e, a, r] = wp.uint8(1)
             hit_class[e, a, r] = c
     if count_leak == 1:
         leak[e, a] = type(max_range)(n_leak) / type(max_range)(n_rays)
@@ -424,8 +439,11 @@ def _relabel_signature(dtype) -> list:
         wp.array(dtype=VEC2[dtype]),  # arena_half
         wp.int32,  # count_leak
         wp.array2d(dtype=dtype),  # leak
+        wp.int32,  # flag_outside
+        dtype,  # flag_half
         wp.array3d(dtype=dtype),  # ranges
         wp.array3d(dtype=wp.uint8),  # hit_class
+        wp.array3d(dtype=wp.uint8),  # outside
     ]
 
 

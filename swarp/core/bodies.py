@@ -59,9 +59,11 @@ from swarp.core.collisions import (
     SHAPE_CIRCLE,
     SHAPE_SEGMENT,
     _box_obstacle_force,
+    bounds_apart,
     box_force,
     closest_on_segment,
     pair_force,
+    shape_bound,
 )
 from swarp.core.config import ObstacleKind
 from swarp.core.state import VEC2
@@ -466,8 +468,18 @@ def _make_obstacle_dynamics(boxes: bool) -> wp.Kernel:
             elif st == SHAPE_SEGMENT:
                 reach = wp.sqrt((ax + half[0]) * (ax + half[0]) + ay * ay) + obs_r
             ext = wp.max(ext, reach)
+            bound = shape_bound(st, obs_r, half)
 
             for a in range(n_agents):
+                # The agent's bounding disc: a box's half-diagonal, a disc's radius.
+                ra = params[a, P_RADIUS]
+                if wp.static(boxes):  # noqa: SIM102
+                    if params[a, P_SHAPE] > type(ra)(0.5):
+                        hx = params[a, P_HALF_X]
+                        hy = params[a, P_HALF_Y]
+                        ra = wp.max(ra, wp.sqrt(hx * hx + hy * hy))
+                if bounds_apart(pos[e, a] - cs, ra + bound + margin):
+                    continue
                 if wp.static(boxes):
                     f, r = _reaction_shaped(
                         pos[e, a], vel[e, a], theta[e, a], ang_vel[e, a], params[a, P_SHAPE],
@@ -490,7 +502,10 @@ def _make_obstacle_dynamics(boxes: bool) -> wp.Kernel:
             # Contacts with shapes of *other* bodies, so a pushed body stops at scenery
             # instead of sliding through it. Shapes of the same body never self-collide.
             for o2 in range(n_obstacles):
-                if obs_body[o2] != o:
+                if obs_body[o2] != o and not bounds_apart(
+                    obs_pos[e, o2] - cs,
+                    bound + shape_bound(obs_type[o2], obs_radius[o2], obs_half[o2]) + margin,
+                ):
                     f2, r2v = _body_body(
                         cs, vs, th, om, st, obs_r, half,
                         obs_pos[e, o2], obs_vel[e, o2], obs_angle[e, o2], obs_ang_vel[e, o2],
@@ -605,6 +620,10 @@ def body_friction_kernel(
     q = body_pos[e, o]
     v = body_vel[e, o]
     om = body_ang_vel[e, o]
+    if v[0] == zero and v[1] == zero and om == zero:
+        # At rest every lattice point's friction is zero, the velocity stays zero and the
+        # pose moves by (0 - 0) * sub_dt: the pass would rewrite the state it found.
+        return
     ca = wp.cos(th)
     sa = wp.sin(th)
     m = obs_mass[o]

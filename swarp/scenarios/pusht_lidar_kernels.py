@@ -1,6 +1,6 @@
 """Fused Warp kernels for :class:`~swarp.scenarios.pusht_lidar.PushTLidarScenario`.
 
-Four launches per pass, in this order (see
+Four or five launches per pass, in this order (see
 :meth:`~swarp.scenarios.pusht_lidar.PushTLidarScenario.launch_fused`), after Push-T's own
 body sync on a step:
 
@@ -10,6 +10,9 @@ body sync on a step:
   frame-stack ring, the role-sorted critic state, the auxiliary targets, and the
   per-agent reward inputs read off the agent's own rays (object-ray count, occlusion
   fraction, coverage sectors, near-contact flag).
+* ``pusht_lidar_collision_kernel`` (thread per ``(env, agent)``, only with a collision
+  penalty or collidable surroundings) — whether each robot touches another robot or the
+  surroundings, the reward kernel's collision input.
 * ``pusht_lidar_reward_kernel`` (thread per env) — Push-T's team shaping and per-agent
   approach term (copied below as ``wp.func`` so ``pusht_kernels`` stays untouched), the
   observer terms, the objective vector and the per-env diagnostics. Sequential agent
@@ -34,6 +37,7 @@ from typing import Any
 import warp as wp
 
 from swarp._overloads import register
+from swarp.core.config import ObstacleShape
 from swarp.core.state import VEC2
 
 # Lean launches (no grid-stride loop); see docs/performance.md.
@@ -48,8 +52,18 @@ OBJ_VISIBILITY = 3
 OBJ_COVERAGE = 4
 OBJ_OCCLUSION = 5
 OBJ_CONTACT = 6
-N_OBJ = 7
-OBJECTIVES = ("team", "approach", "standoff", "visibility", "coverage", "occlusion", "contact")
+OBJ_COLLISION = 7
+N_OBJ = 8
+OBJECTIVES = (
+    "team",
+    "approach",
+    "standoff",
+    "visibility",
+    "coverage",
+    "occlusion",
+    "contact",
+    "collision",
+)
 
 #: Width of the per-env head of the critic state (T pose, goal, T velocity).
 STATE_HEAD = 15
@@ -69,6 +83,7 @@ FOV_EPS = wp.constant(1e-4)
 
 _HIT_AGENT = wp.constant(wp.uint8(1))
 _HIT_MOVABLE = wp.constant(wp.uint8(3))
+_SHAPE_BOX = wp.constant(int(ObstacleShape.BOX))
 
 
 @wp.func
@@ -120,6 +135,8 @@ def pusht_lidar_obs_kernel(
     roles: wp.array2d(dtype=wp.int32),
     ranges: wp.array3d(dtype=Any),
     hit_class: wp.array3d(dtype=wp.uint8),
+    outside: wp.array3d(dtype=wp.uint8),
+    n_channels: wp.int32,
     reset_mask: wp.array(dtype=wp.uint8),
     n_pushers: wp.int32,
     obs_level: wp.int32,
@@ -213,10 +230,11 @@ def pusht_lidar_obs_kernel(
         obs[e, a, k + 7] = wp.sin(err)
         k += wp.int32(8)
 
-    # ---- lidar frame ring: [range / max_range | object mask | agent mask] per frame,
-    # oldest first. A step shifts it by one frame; a reset zeroes it; the reset pass
-    # leaves an env it did not reset alone (its newest frame is already this scan).
-    width = wp.int32(3) * n_rays
+    # ---- lidar frame ring: [range / max_range | object mask | agent mask] per frame, and
+    # with n_channels 4 the outside-the-arena mask, oldest first. A step shifts it by one
+    # frame; a reset zeroes it; the reset pass leaves an env it did not reset alone (its
+    # newest frame is already this scan).
+    width = n_channels * n_rays
     newest = (frame_stack - wp.int32(1)) * width
     write_now = wp.int32(0)
     if reset_mask[e] == wp.uint8(1):
@@ -239,6 +257,11 @@ def pusht_lidar_obs_kernel(
                 m_ag = one
             ring[e, a, newest + n_rays + r] = m_obj
             ring[e, a, newest + wp.int32(2) * n_rays + r] = m_ag
+            if n_channels == 4:
+                m_out = zero
+                if outside[e, a, r] == wp.uint8(1):
+                    m_out = one
+                ring[e, a, newest + wp.int32(3) * n_rays + r] = m_out
     for i in range(frame_stack * width):
         obs[e, a, k + i] = ring[e, a, i]
     k += frame_stack * width
@@ -370,6 +393,174 @@ def pusht_lidar_obs_kernel(
         critic[e, 14] = wp.sin(gth)
 
 
+@wp.func
+def _point_box(px: Any, py: Any, hx: Any, hy: Any):
+    """Distance from ``(px, py)`` to the centred box ``|x| <= hx, |y| <= hy`` (0 inside)."""
+    zero = type(hx)(0.0)
+    dx = wp.max(wp.abs(px) - hx, zero)
+    dy = wp.max(wp.abs(py) - hy, zero)
+    return wp.sqrt(dx * dx + dy * dy)
+
+
+@wp.func
+def _point_segment(p: Any, a: Any, b: Any):
+    """Distance from ``p`` to the segment ``a -> b`` (a point when ``a == b``)."""
+    d = b - a
+    dd = wp.dot(d, d)
+    u = type(dd)(0.0)
+    if dd > type(dd)(0.0):
+        u = wp.clamp(wp.dot(p - a, d) / dd, type(dd)(0.0), type(dd)(1.0))
+    return wp.length(p - (a + u * d))
+
+
+@wp.func
+def _segment_box(a: Any, b: Any, hx: Any, hy: Any):
+    """Distance from the segment ``a -> b`` to the centred box ``|x| <= hx, |y| <= hy``:
+    zero when they meet (Liang-Barsky clip), else the nearest of the endpoints to the box
+    and of the box's corners to the segment."""
+    zero = type(hx)(0.0)
+    eps = type(hx)(1.0e-12)
+    d = b - a
+    t0 = zero
+    t1 = type(hx)(1.0)
+    hit = bool(True)  # noqa: UP018 - Warp: a branch-mutated flag must not be a constant
+    if wp.abs(d[0]) < eps:
+        if wp.abs(a[0]) > hx:
+            hit = False
+    else:
+        ta = (-hx - a[0]) / d[0]
+        tb = (hx - a[0]) / d[0]
+        t0 = wp.max(t0, wp.min(ta, tb))
+        t1 = wp.min(t1, wp.max(ta, tb))
+    if wp.abs(d[1]) < eps:
+        if wp.abs(a[1]) > hy:
+            hit = False
+    else:
+        ta = (-hy - a[1]) / d[1]
+        tb = (hy - a[1]) / d[1]
+        t0 = wp.max(t0, wp.min(ta, tb))
+        t1 = wp.min(t1, wp.max(ta, tb))
+    best = zero
+    if not (hit and t0 <= t1):
+        best = wp.min(_point_box(a[0], a[1], hx, hy), _point_box(b[0], b[1], hx, hy))
+        best = wp.min(best, _point_segment(type(a)(hx, hy), a, b))
+        best = wp.min(best, _point_segment(type(a)(-hx, hy), a, b))
+        best = wp.min(best, _point_segment(type(a)(hx, -hy), a, b))
+        best = wp.min(best, _point_segment(type(a)(-hx, -hy), a, b))
+    return best
+
+
+@wp.func
+def _axis_gap(
+    d: Any, n: Any, ua: Any, va: Any, hax: Any, hay: Any, ub: Any, vb: Any, hbx: Any, hby: Any
+):
+    """Gap between two oriented boxes along the axis ``n`` (negative: they overlap on it);
+    ``d`` joins their centres, ``u``/``v`` are their axes and ``h`` their half-extents."""
+    ra = hax * wp.abs(wp.dot(ua, n)) + hay * wp.abs(wp.dot(va, n))
+    rb = hbx * wp.abs(wp.dot(ub, n)) + hby * wp.abs(wp.dot(vb, n))
+    return wp.abs(wp.dot(d, n)) - ra - rb
+
+
+@wp.func
+def _boxes_touch(
+    pa: Any, tha: Any, hax: Any, hay: Any, pb: Any, thb: Any, hbx: Any, hby: Any, margin: Any
+):
+    """Whether two oriented boxes come within ``margin`` on all four face axes (SAT)."""
+    d = pb - pa
+    ua = type(pa)(wp.cos(tha), wp.sin(tha))
+    va = type(pa)(-ua[1], ua[0])
+    ub = type(pa)(wp.cos(thb), wp.sin(thb))
+    vb = type(pa)(-ub[1], ub[0])
+    g = _axis_gap(d, ua, ua, va, hax, hay, ub, vb, hbx, hby)
+    g = wp.max(g, _axis_gap(d, va, ua, va, hax, hay, ub, vb, hbx, hby))
+    g = wp.max(g, _axis_gap(d, ub, ua, va, hax, hay, ub, vb, hbx, hby))
+    g = wp.max(g, _axis_gap(d, vb, ua, va, hax, hay, ub, vb, hbx, hby))
+    return g <= margin
+
+
+@wp.kernel
+def pusht_lidar_collision_kernel(
+    pos: wp.array2d(dtype=Any),
+    theta: wp.array2d(dtype=Any),
+    box: wp.int32,
+    hx: Any,
+    hy: Any,
+    radius: Any,
+    margin: Any,
+    scenery: wp.int32,
+    sc_pos: wp.array2d(dtype=Any),
+    sc_angle: wp.array2d(dtype=Any),
+    sc_half: wp.array2d(dtype=Any),
+    sc_radius: wp.array2d(dtype=Any),
+    sc_type: wp.array2d(dtype=wp.int32),
+    full_pass: wp.int32,
+    hit_robot: wp.array2d(dtype=wp.uint8),
+    hit_scenery: wp.array2d(dtype=wp.uint8),
+):
+    """Thread per ``(env, agent)``: whether the robot's footprint is within ``margin`` of
+    another robot's (``hit_robot``) or of a surroundings shape (``hit_scenery``, with
+    ``scenery``), on the true poses. A box robot (``box``) is the box of half-extents
+    ``(hx, hy)``, else a disc of ``radius``; two boxes touch when they come within the
+    margin on all four face axes, a circle or a capsule when its spine comes within its
+    radius plus the margin of the footprint. Written on a full pass only, so an obs-only
+    auto-reset leaves the transition's flags intact."""
+    e, a = wp.tid()
+    if full_pass == 0:
+        return
+    p = pos[e, a]
+    th = theta[e, a]
+    robot = wp.uint8(0)
+    for b in range(pos.shape[1]):
+        if b != a:
+            q = pos[e, b]
+            if box == 1:
+                if _boxes_touch(p, th, hx, hy, q, theta[e, b], hx, hy, margin):
+                    robot = wp.uint8(1)
+            elif wp.length(q - p) <= radius + radius + margin:
+                robot = wp.uint8(1)
+    hit_robot[e, a] = robot
+    if scenery == 0:
+        return
+    c = wp.cos(th)
+    s = wp.sin(th)
+    near = wp.uint8(0)
+    for k in range(sc_type.shape[1]):
+        st = sc_type[e, k]
+        if st >= 0:
+            cen = sc_pos[e, k]
+            ang = sc_angle[e, k]
+            h = sc_half[e, k]
+            touch = bool(False)  # noqa: UP018 - Warp: a branch-mutated flag must not be a constant
+            if st == _SHAPE_BOX:
+                if box == 1:
+                    touch = _boxes_touch(p, th, hx, hy, cen, ang, h[0], h[1], margin)
+                else:
+                    r = p - cen
+                    co = wp.cos(ang)
+                    so = wp.sin(ang)
+                    touch = (
+                        _point_box(co * r[0] + so * r[1], -so * r[0] + co * r[1], h[0], h[1])
+                        <= radius + margin
+                    )
+            else:
+                # A circle is a capsule with a zero-length spine.
+                tip = type(p)(wp.cos(ang) * h[0], wp.sin(ang) * h[0])
+                ea = cen - tip - p
+                eb = cen + tip - p
+                if box == 1:
+                    la = type(p)(c * ea[0] + s * ea[1], -s * ea[0] + c * ea[1])
+                    lb = type(p)(c * eb[0] + s * eb[1], -s * eb[0] + c * eb[1])
+                    touch = _segment_box(la, lb, hx, hy) <= sc_radius[e, k] + margin
+                else:
+                    zero = type(radius)(0.0)
+                    touch = _point_segment(type(p)(zero, zero), ea, eb) <= (
+                        sc_radius[e, k] + radius + margin
+                    )
+            if touch:
+                near = wp.uint8(1)
+    hit_scenery[e, a] = near
+
+
 @wp.kernel
 def pusht_lidar_reward_kernel(
     pos: wp.array2d(dtype=Any),
@@ -383,6 +574,8 @@ def pusht_lidar_reward_kernel(
     occl: wp.array2d(dtype=Any),
     sectors: wp.array2d(dtype=wp.uint8),
     near: wp.array2d(dtype=wp.uint8),
+    hit_robot: wp.array2d(dtype=wp.uint8),
+    hit_scenery: wp.array2d(dtype=wp.uint8),
     n_agents: wp.int32,
     pos_shaping_factor: Any,
     rot_shaping_factor: Any,
@@ -400,6 +593,7 @@ def pusht_lidar_reward_kernel(
     coverage_weight: Any,
     occlusion_weight: Any,
     contact_penalty: Any,
+    collision_penalty: Any,
     oob_limit: Any,
     oob_penalty: Any,
     oob_margin: Any,
@@ -427,7 +621,10 @@ def pusht_lidar_reward_kernel(
     The carries (Push-T's three plus the standoff error) advance on a step and rebase on
     a reset exactly as in ``pusht_reward_kernel``; the outputs are written on a full pass
     only, so an obs-only auto-reset leaves the transition's reward and info intact.
-    ``reward`` is written as one addition of the seven ``multiobj`` columns.
+    ``reward`` is written as one addition of the eight ``multiobj`` columns.
+
+    Every robot (either role) pays ``collision_penalty`` on a step that ends with it
+    touching another robot or the surroundings (``hit_robot`` / ``hit_scenery``).
 
     With ``oob_limit > 0``, a step that leaves the T's centroid beyond it on either axis
     latches ``oob`` until the env respawns: the episode has failed, so it can no longer
@@ -533,6 +730,11 @@ def pusht_lidar_reward_kernel(
         cov_t = zero
         occ_t = zero
         con_t = zero
+        col_t = zero
+        if failed == wp.uint8(0) and (
+            hit_robot[e, a] == wp.uint8(1) or hit_scenery[e, a] == wp.uint8(1)
+        ):
+            col_t = -collision_penalty
         if roles[e, a] == 0:
             if failed == wp.uint8(0):
                 approach = ash
@@ -561,7 +763,8 @@ def pusht_lidar_reward_kernel(
             multiobj[e, a, 4] = cov_t
             multiobj[e, a, 5] = occ_t
             multiobj[e, a, 6] = con_t
-            reward[e, a] = team + approach + standoff + vis_t + cov_t + occ_t + con_t
+            multiobj[e, a, 7] = col_t
+            reward[e, a] = team + approach + standoff + vis_t + cov_t + occ_t + con_t + col_t
             seen = wp.uint8(0)
             if n_obj[e, a] > zero:
                 seen = wp.uint8(1)
@@ -610,6 +813,49 @@ def pusht_lidar_roles_kernel(
         i -= 1
 
 
+@wp.kernel
+def tee_size_reset_kernel(
+    reset_mask: wp.array(dtype=wp.uint8),
+    use_mask: wp.int32,
+    seed: wp.int32,
+    n_sizes: wp.int32,
+    n_boxes: wp.int32,
+    size_out: wp.array(dtype=wp.int32),
+    root_out: wp.array(dtype=wp.int32),
+):
+    """Thread per env (masked): a size of the T bank drawn uniformly, and its body root in
+    the stepper's obstacles (each size's boxes follow the previous size's)."""
+    e = wp.tid()
+    if use_mask == 1 and reset_mask[e] == wp.uint8(0):
+        return
+    rng = wp.rand_init(seed, e)
+    k = wp.min(wp.int32(wp.randf(rng) * float(n_sizes)), n_sizes - wp.int32(1))
+    size_out[e] = k
+    root_out[e] = k * n_boxes
+
+
+@wp.kernel
+def body_state_gather_roots_kernel(
+    body_pos: wp.array2d(dtype=Any),
+    body_angle: wp.array2d(dtype=Any),
+    body_vel: wp.array2d(dtype=Any),
+    body_ang_vel: wp.array2d(dtype=Any),
+    root: wp.array(dtype=wp.int32),
+    out_pos: wp.array(dtype=Any),
+    out_angle: wp.array(dtype=Any),
+    out_vel: wp.array(dtype=Any),
+    out_ang_vel: wp.array(dtype=Any),
+):
+    """Thread per env: ``swarp.core.bodies.body_state_gather_kernel`` with a body root of
+    the env's own (the T size it drew)."""
+    e = wp.tid()
+    r = root[e]
+    out_pos[e] = body_pos[e, r]
+    out_angle[e] = body_angle[e, r]
+    out_vel[e] = body_vel[e, r]
+    out_ang_vel[e] = body_ang_vel[e, r]
+
+
 def _obs_signature(dtype) -> list:
     vec2 = VEC2[dtype]
     a1s = wp.array(dtype=dtype)
@@ -630,6 +876,8 @@ def _obs_signature(dtype) -> list:
         wp.array2d(dtype=wp.int32),  # roles
         wp.array3d(dtype=dtype),  # ranges
         wp.array3d(dtype=wp.uint8),  # hit_class
+        wp.array3d(dtype=wp.uint8),  # outside
+        wp.int32,  # n_channels
         wp.array(dtype=wp.uint8),  # reset_mask
         wp.int32,  # n_pushers
         wp.int32,  # obs_level
@@ -658,6 +906,29 @@ def _obs_signature(dtype) -> list:
     ]
 
 
+def _collision_signature(dtype) -> list:
+    vec2 = VEC2[dtype]
+    a2s = wp.array2d(dtype=dtype)
+    return [
+        wp.array2d(dtype=vec2),  # pos
+        a2s,  # theta
+        wp.int32,  # box
+        dtype,  # hx
+        dtype,  # hy
+        dtype,  # radius
+        dtype,  # margin
+        wp.int32,  # scenery
+        wp.array2d(dtype=vec2),  # sc_pos
+        a2s,  # sc_angle
+        wp.array2d(dtype=vec2),  # sc_half
+        a2s,  # sc_radius
+        wp.array2d(dtype=wp.int32),  # sc_type
+        wp.int32,  # full_pass
+        wp.array2d(dtype=wp.uint8),  # hit_robot
+        wp.array2d(dtype=wp.uint8),  # hit_scenery
+    ]
+
+
 def _reward_signature(dtype) -> list:
     vec2 = VEC2[dtype]
     a1s = wp.array(dtype=dtype)
@@ -674,8 +945,10 @@ def _reward_signature(dtype) -> list:
         a2s,  # occl
         wp.array2d(dtype=wp.uint8),  # sectors
         wp.array2d(dtype=wp.uint8),  # near
+        wp.array2d(dtype=wp.uint8),  # hit_robot
+        wp.array2d(dtype=wp.uint8),  # hit_scenery
         wp.int32,  # n_agents
-        *([dtype] * 16),  # the pusht weights, then the observer weights
+        *([dtype] * 17),  # the pusht weights, the observer weights, collision_penalty
         dtype,  # oob_limit
         dtype,  # oob_penalty
         dtype,  # oob_margin
@@ -975,3 +1248,20 @@ for _T in (wp.float32, wp.float64):
     register(lidar_sensor_kernel, _T, _sensor_signature(_T))
     register(pusht_lidar_obs_kernel, _T, _obs_signature(_T))
     register(pusht_lidar_reward_kernel, _T, _reward_signature(_T))
+    register(pusht_lidar_collision_kernel, _T, _collision_signature(_T))
+    _vec2 = VEC2[_T]
+    register(
+        body_state_gather_roots_kernel,
+        _T,
+        [
+            wp.array2d(dtype=_vec2),
+            wp.array2d(dtype=_T),
+            wp.array2d(dtype=_vec2),
+            wp.array2d(dtype=_T),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=_vec2),
+            wp.array(dtype=_T),
+            wp.array(dtype=_vec2),
+            wp.array(dtype=_T),
+        ],
+    )

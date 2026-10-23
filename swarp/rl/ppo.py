@@ -38,7 +38,7 @@ import argparse
 import csv
 import math
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Hashable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -1220,8 +1220,8 @@ class RollbackGuard:
     :meth:`step` returns ``"snapshot"``, ``"rollback"`` (restore :attr:`restore_it`),
     ``"stop"`` or ``None``.
 
-    - The best solve rate is kept per ramp position (``bucket``), so a harder condition is
-      never held to an easier one's best.
+    - The best solve rate is kept per ramp position (``bucket``: :func:`train` passes every
+      ramp's progress), so a harder condition is never held to an easier one's best.
     - Armed once the rate has passed ``arm``; until then nothing is snapshotted or judged.
       ``arm`` is ``floor + drop`` by default: a collapse is a fall from a mastered level,
       and a policy still learning around the floor is not judged (L9b, armed at 0.5, rolled
@@ -1264,7 +1264,7 @@ class RollbackGuard:
         self.rollbacks = 0
         self.restore_it: int | None = None
 
-    def step(self, it: int, solve: float | None, bucket: int) -> str | None:
+    def step(self, it: int, solve: float | None, bucket: Hashable) -> str | None:
         if solve is None:
             self.below = 0
             return None
@@ -1670,6 +1670,10 @@ def train(cfg: TrainConfig) -> Path:
         if not gated:
             clock = it
         progress = set_ramps(clock)
+        # The guard's ramp position: every ramp's progress, not the least of them, which
+        # stays 0 until the last ramp starts (L11's turn-away cost at 8000 held every
+        # condition before it to the clean world's best, and rolled the run back three times).
+        position = tuple(round(r.progress(clock) * 1000) for r in spec.ramps)
         tick = clock  # the clock this iteration ran at
         lr = spec.lr
         if spec.lr_final is not None and gated:
@@ -1720,7 +1724,7 @@ def train(cfg: TrainConfig) -> Path:
         if gated and (clock < first_start or (rate is not None and rate >= spec.ramp_gate)):
             clock += 1
         if guard is not None:
-            action = guard.step(it, rate, round(progress * 1000))
+            action = guard.step(it, rate, position)
             if action == "snapshot":
                 snaps[it] = (algo.snapshot(), clock, difficulty)
             elif action == "rollback":

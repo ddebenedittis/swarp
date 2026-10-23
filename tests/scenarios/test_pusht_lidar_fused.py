@@ -160,8 +160,24 @@ def test_fused_matches_torch(device, n_agents, obs_level):
             "pose_noise": (0.5, 1.0), "pose_jitter_std": (0.0, 0.0), "vel_noise_std": 0.0,
             "lidar_label_from_pose": True, "critic_dr": True,
         },
+        # Solid surroundings at the arena's edge with the collision penalty, a bank of three
+        # T sizes and the outside-the-arena mask: the stepper's obstacles carry both banks,
+        # the lidar scans them there (fused) and in the per-env arrays (torch), and robots
+        # touching each other or a wall pay.
+        {
+            "model": "diff_drive", "agent_shape": "box", "open_arena": True,
+            "oob_margin": 0.1, "world_size": 0.6, "arena_size": (0.9, 1.2),
+            "lidar_max_range": 0.6, "scenery_probs": (0.1, 0.3, 0.3, 0.3),
+            "scenery_collide": True, "scenery_gap": (0.0, 0.05), "wall_radius": (0.02, 0.04),
+            "clutter_radius": (0.02, 0.05), "clutter_half": (0.02, 0.06),
+            "collision_penalty": 0.05, "collision_margin": 0.02,
+            "tee_scale": (0.8, 1.2), "n_tee_sizes": 3, "lidar_arena_flag": True,
+            "pose_noise": (0.5, 1.0), "pose_jitter_std": (0.0, 0.0), "vel_noise_std": 0.0,
+            "lidar_label_from_pose": True, "critic_dr": True,
+        },
     ],
-    ids=["unicycle", "box", "unicycle-box", "drive-sensor", "real", "artefacts", "arena"],
+    ids=["unicycle", "box", "unicycle-box", "drive-sensor", "real", "artefacts", "arena",
+         "solid"],
 )
 def test_fleet_fused_matches_torch(device, fleet, obs_level):
     """Unicycles and boxes: heading in the obs and critic, body-frame rays, box hits."""
@@ -183,7 +199,13 @@ def _assert_parity(device, **kw):
         for t in range(1, 5)
     )
     assert moved, "T never moved; contact physics not exercised"
-    extra = tuple(k for k in ("out_of_bounds", "scenery_leak") if k in fused[0])
+    extra = tuple(
+        k for k in ("out_of_bounds", "scenery_leak", "robot_collision", "scenery_collision")
+        if k in fused[0]
+    )
+    for k in ("robot_collision", "scenery_collision"):
+        if k in extra:
+            assert any(s[k].any() for s in fused), f"no {k} ever flagged"
     if "scenery_leak" in extra:
         assert any((s["scenery_leak"] > 0).any() for s in fused), "no scenery hit leaked"
     for t, (f, r) in enumerate(zip(fused, torchp, strict=True)):

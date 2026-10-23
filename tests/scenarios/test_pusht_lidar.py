@@ -619,7 +619,8 @@ def _label(device, mate_x, t, bound=2.0, arena=None, cls_in=1, theta=0.0):
                 wp.from_torch(torch.tensor([[theta, 0.0]], device=device)),
                 wp.from_torch(params.to(device)), 3.0, 0.0, 0.0, 1, bound, 0.03,
                 int(arena is not None), wp.from_torch(half, dtype=v2), 1,
-                wp.from_torch(leak), wp.from_torch(r), wp.from_torch(c)],
+                wp.from_torch(leak), 0, 0.0, wp.from_torch(r), wp.from_torch(c),
+                wp.zeros((1, 1, 1), dtype=wp.uint8, device=device)],
         device=device,
     )
     return c[0, 0, 0].item(), r[0, 0, 0].item(), int(leak[0, 0].item())
@@ -813,6 +814,147 @@ def test_scenery_stays_outside_the_free_region(device):
             is_box = sc.shape[:, s] == int(ObstacleShape.BOX)
             need = torch.where(is_box, sc.half[:, s].norm(dim=-1), sc.radius[:, s])
         assert (dist[u] >= need[u] - 1e-5).all(), f"slot {s} enters the free region"
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("solid", [True, False])
+def test_solid_scenery_stops_robots_and_is_penalised(device, solid):
+    """Robots driving straight out of a 2 x 2 m arena with no arena stop, into closed
+    perimeter walls at its edge: solid walls hold every robot centre inside them and flag
+    the contact (paid as ``collision_penalty``), lidar-only walls let them through. Solid
+    scenery is also stepper obstacles after the T's boxes, and its clutter keeps clear of
+    the arena grown by the clearance (0 by default)."""
+    kw = {"scenery_collide": True, "collision_penalty": 0.05} if solid else {
+        "scenery_clearance": 0.0}
+    env = _env(device, n_envs=64, arena_size=(2.0, 2.0), scenery_probs=(0.0, 1.0, 0.0, 0.0),
+               wall_missing=0.0, scenery_gap=(0.0, 0.1), wall_radius=(0.05, 0.1),
+               **{**_LIMO, "arena_stop_margin": 5.0}, **kw)
+    env.reset(seed=0)
+    scen = env.scenario
+    sc = scen.scenery
+    flagged = torch.zeros(64, 2, dtype=torch.bool, device=device)
+    paid = False
+    with torch.no_grad():
+        for _ in range(60):
+            a = torch.zeros(64, 2, 2, device=device)
+            a[..., 0] = 1.0
+            env.step(a)
+            if solid:
+                info = scen.info()
+                touch = info["scenery_collision"] | info["robot_collision"]
+                flagged |= info["scenery_collision"]
+                col = info["multiobj_reward"][..., OBJECTIVES.index("collision")]
+                torch.testing.assert_close(col, torch.where(touch, -0.05, 0.0) * (col != 0))
+                paid |= bool((col == -0.05).any())
+    p = env.world.state.pos
+    inner_x = (sc.pos[:, 0, 0] - sc.radius[:, 0]).unsqueeze(1)
+    inner_y = (sc.pos[:, 2, 1] - sc.radius[:, 2]).unsqueeze(1)
+    inside = (p[..., 0] < inner_x + 1e-3) & (p[..., 1] < inner_y + 1e-3)
+    if solid:
+        assert inside.all(), "a robot crossed a solid wall"
+        assert flagged.float().mean() > 0.5 and paid
+        assert env.world.stepper.n_obstacles == scen.n_boxes + sc.n_slots
+    else:
+        assert not inside.all(), "no robot crossed a lidar-only wall"
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_tee_size_bank_draws_per_env_and_parks_the_rest(device):
+    """``tee_scale`` (0.8, 1.2) over three sizes: every size is drawn, a masked reset
+    redraws only the envs it selects, the stepper holds each size's boxes scaled (inertia
+    with the square), and after a step the env's own size is the T while the others stay
+    parked at rest."""
+    env = _env(device, n_envs=256, tee_scale=(0.8, 1.2), n_tee_sizes=3, **_LIMO)
+    env.reset(seed=0)
+    scen = env.scenario
+    nb = scen.n_boxes
+    assert scen.tee_scales == pytest.approx((0.8, 1.0, 1.2))
+    assert scen.tee_radius == pytest.approx(1.2 * scen.shape.radius)
+    assert set(scen.tee_size.tolist()) == {0, 1, 2}
+    sp = env.world.stepper
+    assert sp.n_obstacles == 3 * nb
+    half = wp.to_torch(sp.obs_half).view(3, nb, 2)
+    base = torch.tensor(scen.box_half, device=device, dtype=half.dtype)
+    for k, f in enumerate((0.8, 1.0, 1.2)):
+        torch.testing.assert_close(half[k], f * base)
+    inertia = wp.to_torch(sp.obs_inertia).view(3, nb)[:, 0]
+    torch.testing.assert_close(inertia, scen.tee_inertia * torch.tensor(
+        [0.64, 1.0, 1.44], device=device, dtype=inertia.dtype))
+    before = scen.tee_size.clone()
+    mask = torch.zeros(256, dtype=torch.bool, device=device)
+    mask[:64] = True
+    env.reset_at(mask)
+    assert torch.equal(scen.tee_size[64:], before[64:])
+    assert not torch.equal(scen.tee_size[:64], before[:64])
+    gen = torch.Generator(device=device).manual_seed(0)
+    with torch.no_grad():
+        for _ in range(5):
+            env.step(_actions(env, gen))
+    bpos = wp.to_torch(sp.body_pos)
+    e = torch.arange(256, device=device)
+    torch.testing.assert_close(bpos[e, scen._tee_root.long()], scen.tee_pos)
+    other = (scen.tee_size.long() + 1) % 3
+    assert (bpos[e, other * nb].abs() > 900.0).all()
+    assert (wp.to_torch(sp.body_vel)[e, other * nb] == 0.0).all()
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("fused", [True, False])
+def test_arena_flag_marks_the_t_hits_past_the_arena(device, fused):
+    """``lidar_arena_flag`` adds a fourth mask per frame: exactly the T-labelled rays whose
+    hit, placed from the reported pose, lies past the env's arena on either axis. With
+    surroundings at the arena's edge it fires, and never on a ray the T mask leaves out."""
+    kw = dict(arena_size=(2.0, 3.0), scenery_probs=(0.0, 0.5, 0.0, 0.5), scenery_collide=True,
+              lidar_label_from_pose=True, lidar_arena_flag=True, **_LIMO)
+    env = _env(device, n_envs=128, fused=fused, **kw)
+    scen = env.scenario
+    nr = scen.n_rays
+    plain = PushTLidarScenario(**{**kw, "lidar_arena_flag": False})
+    assert scen.obs_dim == plain.obs_dim + nr
+    env.reset(seed=0)
+    gen = torch.Generator(device=device).manual_seed(0)
+    fired = False
+    with torch.no_grad():
+        for _ in range(10):
+            obs, *_ = env.step(_actions(env, gen))
+            frame = obs[..., scen.obs_layout()["lidar_newest"]]
+            rng, t_mask, out = frame[..., :nr], frame[..., nr : 2 * nr], frame[..., 3 * nr :]
+            assert not ((out > 0.5) & (t_mask < 0.5)).any()
+            ang = scen._ray_angles()
+            hit = env.world.state.pos.unsqueeze(2) + (rng * scen.lidar_max_range).unsqueeze(
+                -1) * torch.stack([ang.cos(), ang.sin()], -1)
+            past_by = (hit.abs() - scen.arena_half.view(-1, 1, 1, 2)).amax(-1)
+            past = (past_by > 0.0) & (t_mask > 0.5)
+            # Rebuilt from the observed range / max_range: exact but at the edge itself.
+            edge = past_by.abs() < 1e-4
+            assert torch.equal(past[~edge], (out > 0.5)[~edge])
+            fired |= bool(past.any())
+    assert fired, "no T-labelled hit past the arena"
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_solid_clutter_stays_outside_the_arena(device):
+    from swarp.core.config import ObstacleShape
+    from swarp.scenarios.pusht_lidar_scenery import N_WALLS
+
+    env = _env(device, n_envs=2048, arena_size=(2.0, 5.0), scenery_probs=(0.0, 0.0, 0.0, 1.0),
+               scenery_collide=True, n_clutter=12, clutter_count=(2, 6), **_LIMO)
+    env.reset(seed=0)
+    scen = env.scenario
+    sc = scen.scenery
+    assert scen.scenery_clearance == 0.0
+    used = sc.shape[:, N_WALLS:] >= 0
+    n = used.sum(-1)
+    assert n.max() <= 6 and (n >= 1).float().mean() > 0.95
+    assert used.float().mean(0).min() > 0.1, "a clutter slot is never drawn"
+    assert not (sc.shape[:, N_WALLS:] == int(ObstacleShape.BOX)).any()
+    for s in range(N_WALLS, sc.n_slots):
+        u = sc.shape[:, s] >= 0
+        need = sc.half[:, s, 0] + sc.radius[:, s]
+        dist = _point_rect(sc.pos[:, s], scen.arena_half[:, 0], scen.arena_half[:, 1])
+        assert (dist[u] >= need[u] - 1e-5).all(), f"slot {s} enters the arena"
+    eng = wp.to_torch(env.world.stepper.obs_pos)[:, scen.n_boxes:]
+    torch.testing.assert_close(eng[sc.shape >= 0], sc.pos[sc.shape >= 0])
 
 
 @pytest.mark.parametrize("device", DEVICES)
