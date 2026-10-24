@@ -240,6 +240,19 @@ def test_hold_fused_matches_torch(device):
 
 
 @pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("obs_level", [1, 2])
+def test_blackout_and_aux_goal_fused_match_torch(device, obs_level):
+    """Dead lidars and the on-goal aux target, with the hold's critic column before the
+    blackout flags, on the deployment's labels and the outside mask."""
+    _assert_parity(
+        device, obs_level=obs_level, lidar_blackout=0.3, aux_goal=True, hold_steps=2,
+        hold_reward=0.5, goal_tolerance=0.3, model="diff_drive", agent_shape="box",
+        open_arena=True, oob_margin=0.1, world_size=0.6, arena_size=(0.9, 1.2),
+        lidar_max_range=0.6, lidar_label_from_pose=True, lidar_arena_flag=True,
+    )
+
+
+@pytest.mark.parametrize("device", DEVICES)
 def test_fused_seeded_determinism(device):
     def run():
         env = _env(device, True, obs_level=2)

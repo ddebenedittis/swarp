@@ -249,8 +249,11 @@ def policy_outputs(
     h0: torch.Tensor | None = None,
     done: torch.Tensor | None = None,
     comm_mask: torch.Tensor | None = None,
+    msg: Mapping[str, torch.Tensor | None] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """``(loc, scale, aux)`` from either actor: :class:`Actor` reads only ``obs``.
+    ``msg`` holds a delayed-message :class:`PolicyNet`'s ``msg_obs``, ``msg_mask`` and
+    ``msg_noise``, row-aligned with ``obs``.
 
     With ``h0`` ``[S, A, H]`` and ``done`` ``[L, S]``, the rows of ``obs`` (and of
     ``roles``, ``comm_mask``) are ``S`` sequences of ``L`` steps, time-major (row
@@ -265,11 +268,14 @@ def policy_outputs(
             return None if x is None else x.view(L, -1, *x.shape[1:])
 
         loc, scale, aux, _ = actor.unroll(
-            seq(obs), seq(roles), h0, done, with_aux=with_aux, comm_mask=seq(comm_mask)
+            seq(obs), seq(roles), h0, done, with_aux=with_aux, comm_mask=seq(comm_mask),
+            **{k: seq(v) for k, v in (msg or {}).items()},
         )
         return loc.flatten(0, 1), scale.flatten(0, 1), None if aux is None else aux.flatten(0, 1)
     if isinstance(actor, PolicyNet):
-        loc, scale, aux, _ = actor.step(obs, roles, with_aux=with_aux, comm_mask=comm_mask)
+        loc, scale, aux, _ = actor.step(
+            obs, roles, with_aux=with_aux, comm_mask=comm_mask, **(msg or {})
+        )
         return loc, scale, aux
     loc, scale = actor(obs)
     return loc, scale, None
@@ -305,6 +311,10 @@ def ppo_loss(
     done: torch.Tensor | None = None,
     comm_mask: torch.Tensor | None = None,
     with_kl: bool = False,
+    msg: Mapping[str, torch.Tensor | None] | None = None,
+    msg_target: torch.Tensor | None = None,
+    msg_valid: torch.Tensor | None = None,
+    msg_beta: float = 0.0,
 ) -> tuple[torch.Tensor, ...]:
     """Clipped surrogate, smooth-L1 value loss and MC entropy for one minibatch.
 
@@ -319,7 +329,10 @@ def ppo_loss(
     (:func:`standardize_advantage`). ``comm_mask``
     ``[B, A, A]`` goes to a communicating :class:`PolicyNet`; ``h0`` and ``done`` make the
     ``B`` rows sequences for a recurrent one (see :func:`policy_outputs`), and every other
-    input then lists its rows in the same time-major order.
+    input then lists its rows in the same time-major order. ``msg`` feeds a delayed-message
+    actor; with ``msg_target`` (the senders' aux targets for ``msg["msg_obs"]``) and
+    ``msg_valid`` ``[B, A]`` the message's own loss (:meth:`PolicyNet.message_loss`)
+    follows the aux MSE.
 
     A thin wrapper over :func:`ppo_terms` that keeps the original op order (advantages,
     actor, policy terms, critic), so a default run launches the same kernels in the same
@@ -329,13 +342,16 @@ def ppo_loss(
         adv = standardize_advantage(adv, roles, role_counts)
     loc, scale, aux = policy_outputs(
         actor, obs, roles, with_aux=aux_target is not None, h0=h0, done=done,
-        comm_mask=comm_mask,
+        comm_mask=comm_mask, msg=msg,
     )
     objective, entropy, *kl = ppo_terms(loc, scale, u, logp_old, adv, noise, with_kl)
     value = critic_values(critic, obs, state, roles)
-    if aux_target is None:
-        return objective, F.smooth_l1_loss(value, ret), entropy, *kl
-    return objective, F.smooth_l1_loss(value, ret), entropy, F.mse_loss(aux, aux_target), *kl
+    extra = [] if aux_target is None else [F.mse_loss(aux, aux_target)]
+    if msg_target is not None:
+        extra.append(actor.message_loss(
+            msg["msg_obs"], roles, msg_target, msg_valid, msg_beta, msg.get("msg_noise")
+        ))
+    return objective, F.smooth_l1_loss(value, ret), entropy, *extra, *kl
 
 
 # ------------------------------------------------------------------------------ the core
@@ -477,6 +493,26 @@ class MAPPO:
         self.recurrent = self.policy_net and actor.recurrent
         self.use_mask = self.policy_net and actor.communicates and env.comm_mask() is not None
         self.mask_buf = z(T, E, A, A, dtype=torch.bool) if self.use_mask else None
+        # Delayed messages: the previous step's observation (what each agent encoded its
+        # message from), whether it belongs to the current episode, and per step what was
+        # heard (with the packet loss drawn here), the VAE's noise and the message loss's
+        # targets, the senders' aux targets for that observation.
+        self.delayed = self.policy_net and actor.delayed
+        self.msg_loss = self.delayed and actor.comm in ("vae", "pose")
+        self.prev_obs = self.prev_valid = self.prev_aux = None
+        self.msg_obs_buf = self.msg_mask_buf = self.msg_noise_buf = None
+        self.msg_aux_buf = self.msg_valid_buf = None
+        if self.delayed:
+            self.prev_obs = z(E, A, Ob)
+            self.prev_valid = z(E)
+            self.msg_obs_buf = z(T, E, A, Ob)
+            self.msg_mask_buf = z(T, E, A, A, dtype=torch.bool)
+            if actor.comm == "vae":
+                self.msg_noise_buf = z(T, E, A, actor.comm_dim)
+            if self.msg_loss:
+                self.prev_aux = z(E, A, env.aux_dim)
+                self.msg_aux_buf = z(T, E, A, env.aux_dim)
+                self.msg_valid_buf = z(T, E)
         self.h = self.h_buf = self.done_buf = None
         # The update draws minibatches of ``mb_units`` units out of ``n_units``: samples,
         # or (recurrent) chunks of L consecutive steps of one env.
@@ -509,7 +545,7 @@ class MAPPO:
         # [mean reward, n_terminated, n_done] from prepare, then
         # [objective, critic, entropy, (aux,) skips, (KL, KL stops)] summed over the
         # minibatch steps.
-        self.n_losses = 4 if self.use_aux else 3
+        self.n_losses = 3 + int(self.use_aux) + int(self.msg_loss)
         # The KL is measured for the brake and for the adaptive lr; only the brake trips.
         self.kl_brake = spec.target_kl is not None or spec.adaptive_kl is not None
         self._kl_trip = 1.5 * spec.target_kl if spec.target_kl is not None else math.inf
@@ -520,7 +556,8 @@ class MAPPO:
         # Sticky within an iteration once a minibatch's KL trips the brake; prepare clears it.
         self.kl_stop = z(()) if self.kl_brake else None
         #: The keys of :meth:`update`'s result, in the order the stats buffers hold them.
-        losses = [*LEGACY_STAT_NAMES[:6], *(["loss_aux"] if self.use_aux else [])]
+        losses = [*LEGACY_STAT_NAMES[:6], *(["loss_aux"] if self.use_aux else []),
+                  *(["loss_msg"] if self.msg_loss else [])]
         kl = ["approx_kl", "kl_stops"] if self.kl_brake else []
         self.stat_names = [*losses, "grad_skips", *kl, *self.metric_names]
 
@@ -550,9 +587,11 @@ class MAPPO:
         self._sig: tuple[int, ...] | None = None  # the buffers the store graph reads
         # The warm-up runs the bodies for real: the carried hidden state is restored too.
         hidden = (self.h,) if self.recurrent else ()
-        self._act = _Graphed(self._act_body, self.graphs, carries=(self.t, *hidden))
+        sent = tuple(x for x in (self.prev_obs, self.prev_aux) if x is not None)
+        valid = (self.prev_valid,) if self.delayed else ()
+        self._act = _Graphed(self._act_body, self.graphs, carries=(self.t, *hidden, *sent))
         self._store = _Graphed(
-            self._store_body, self.graphs, carries=(self.t, self.metric_acc, *hidden)
+            self._store_body, self.graphs, carries=(self.t, self.metric_acc, *hidden, *valid)
         )
         self._prepare = _Graphed(self._prepare_body, self.graphs, carries=(), warmup=1)
         kl_carry = (self.kl_stop,) if self.kl_brake else ()
@@ -582,6 +621,8 @@ class MAPPO:
         obs = self.env.reset()
         if self.recurrent:
             self.h.zero_()
+        if self.delayed:
+            self.prev_valid.zero_()
         if self.action_rate:
             self.prev_actions.zero_()
         horizon = self.env.max_steps or 0
@@ -592,11 +633,12 @@ class MAPPO:
                 for t in range(horizon):
                     obs, _, term, trunc, _ = self.env.step(self._greedy(obs))
                     restart = offset == t
-                    if self.recurrent:
-                        done = torch.logical_or(torch.logical_or(term, trunc), restart)
+                    done = torch.logical_or(torch.logical_or(term, trunc), restart)
                     obs = self.env.reset_at(restart)
                     if self.recurrent:
                         self.h.masked_fill_(done.view(-1, 1, 1), 0.0)
+                    if self.delayed:
+                        self.prev_valid.copy_((~done).float())
         self._out = (obs, None, None, None, None)
         self._fetch_sources()
         if self.use_roles:
@@ -629,17 +671,24 @@ class MAPPO:
         )
 
     def _greedy(self, obs: torch.Tensor) -> torch.Tensor:
-        """The greedy action; a recurrent policy advances ``self.h``."""
-        if not (self.recurrent or self.use_mask):
+        """The greedy action; a recurrent policy advances ``self.h``, a delayed-message one
+        sends this observation's messages for the next step."""
+        if not (self.recurrent or self.use_mask or self.delayed):
             if self.actor_roles:
                 return self.actor.greedy(obs, self.env.agent_roles())
             return self.actor.greedy(obs)
         roles = self.env.agent_roles() if self.actor_roles else None
         mask = self.env.comm_mask() if self.use_mask else None
+        msg = {}
+        if self.delayed:
+            heard = (self.prev_valid > 0).view(-1, 1, 1).expand(-1, self.A, self.A)
+            msg = {"msg_obs": self.prev_obs, "msg_mask": heard if mask is None else heard & mask}
         with torch.no_grad():
-            loc, _, _, h = self.actor.step(obs, roles, self.h, comm_mask=mask)
+            loc, _, _, h = self.actor.step(obs, roles, self.h, comm_mask=mask, **msg)
         if self.recurrent:
             self.h.copy_(h)
+        if self.delayed:
+            self.prev_obs.copy_(obs)
         return self.actor.squash(loc)
 
     def _fetch_sources(self) -> None:
@@ -690,12 +739,33 @@ class MAPPO:
             self.aux_buf.index_copy_(0, self.t, aux.unsqueeze(0))
         if self.mask_buf is not None:
             self.mask_buf.index_copy_(0, self.t, mask.unsqueeze(0))
+        msg = {}
+        if self.delayed:
+            E, A = self.E, self.A
+            heard = torch.rand(E, A, A, device=self.device) >= self.spec.msg_drop
+            heard = heard & (self.prev_valid > 0).view(E, 1, 1)
+            if mask is not None:
+                heard = heard & mask
+            self.msg_obs_buf.index_copy_(0, self.t, self.prev_obs.unsqueeze(0))
+            self.msg_mask_buf.index_copy_(0, self.t, heard.unsqueeze(0))
+            noise = None
+            if self.msg_noise_buf is not None:
+                noise = torch.randn(E, A, self.actor.comm_dim, device=self.device)
+                self.msg_noise_buf.index_copy_(0, self.t, noise.unsqueeze(0))
+            if self.msg_loss:
+                self.msg_aux_buf.index_copy_(0, self.t, self.prev_aux.unsqueeze(0))
+                self.msg_valid_buf.index_copy_(0, self.t, self.prev_valid.unsqueeze(0))
+            msg = {"msg_obs": self.prev_obs, "msg_mask": heard, "msg_noise": noise}
         if self.recurrent:
             self.h_buf.index_copy_(0, self.t, self.h.unsqueeze(0))
-            loc, scale, _, h = self.actor.step(obs, roles, self.h, comm_mask=mask)
+            loc, scale, _, h = self.actor.step(obs, roles, self.h, comm_mask=mask, **msg)
             self.h.copy_(h)
         else:
-            loc, scale, _ = policy_outputs(self.actor, obs, roles, comm_mask=mask)
+            loc, scale, _ = policy_outputs(self.actor, obs, roles, comm_mask=mask, msg=msg)
+        if self.delayed:
+            self.prev_obs.copy_(obs)
+            if self.msg_loss:
+                self.prev_aux.copy_(aux)
         u = loc + scale * torch.randn_like(loc)
         self.actions.copy_(self.actor.squash(u))
         self.u_buf.index_copy_(0, self.t, u.unsqueeze(0))
@@ -724,6 +794,9 @@ class MAPPO:
         if self.recurrent:
             # The observation after a done already belongs to the next episode.
             self.h.masked_fill_(torch.logical_or(term, trunc).view(-1, 1, 1), 0.0)
+        if self.delayed:
+            # So does its message's source: the next step hears nothing from this one.
+            self.prev_valid.copy_(1.0 - torch.logical_or(term, trunc).float())
         self.t.add_(1)
 
     @torch.no_grad()
@@ -871,6 +944,20 @@ class MAPPO:
             h_rows = self.h_buf.reshape(self.N, A, -1)
             extra["h0"] = h_rows.index_select(0, idx[:n_chunks])
             extra["done"] = self.done_buf.reshape(self.N).index_select(0, idx).view(self.L, -1)
+        if self.delayed:
+            N = self.N
+            msg = {
+                "msg_obs": self.msg_obs_buf.reshape(N, A, -1).index_select(0, idx),
+                "msg_mask": self.msg_mask_buf.reshape(N, A, A).index_select(0, idx),
+                "msg_noise": None if self.msg_noise_buf is None
+                else self.msg_noise_buf.reshape(N, A, -1).index_select(0, idx),
+            }
+            extra["msg"] = msg
+            if self.msg_loss:
+                extra["msg_target"] = self.msg_aux_buf.reshape(N, A, -1).index_select(0, idx)
+                valid = self.msg_valid_buf.reshape(N).index_select(0, idx)
+                extra["msg_valid"] = valid.unsqueeze(-1).expand(-1, A)
+                extra["msg_beta"] = self.spec.msg_beta
         noise = torch.randn_like(u)  # drawn here, not in the (possibly compiled) loss
         if self.kl_brake:
             extra["with_kl"] = True
@@ -891,6 +978,8 @@ class MAPPO:
         total = loss_obj + loss_crit + loss_ent
         if self.use_aux:
             total = total + self.spec.aux_coef * losses[3]
+        if self.msg_loss:
+            total = total + self.spec.msg_coef * losses[3 + int(self.use_aux)]
         total.backward()
         gnorm = torch.nn.utils.clip_grad_norm_(
             self.params, _MAX_GRAD_NORM, foreach=self.cuda or None
@@ -1047,9 +1136,11 @@ def _network_flags(cls: str, kwargs: Mapping[str, Any]) -> list[str]:
     return ["--critic-input", critic_input, per_agent, *flags]
 
 
-#: Network keywords that ``--resume-widen`` lets grow: input widths, whose new columns
-#: (appended at the end) load with zero weights.
-WIDENABLE = ("obs_dim", "state_dim")
+#: Network keywords that ``--resume-widen`` lets grow: input and aux widths, whose new
+#: columns (appended at the end) load with zero weights. It also accepts an option the
+#: checkpoint's network does not record at all (communication added to a policy trained
+#: without), whose new parameters keep their fresh initialisation.
+WIDENABLE = ("obs_dim", "state_dim", "aux_dim")
 
 
 def check_resume(
@@ -1070,7 +1161,10 @@ def check_resume(
         (cls_s, kw_s), (cls_b, kw_b) = saved[i : i + 2], built[i : i + 2]
         keys = [k for k in sorted(set(kw_s) | set(kw_b)) if kw_s.get(k) != kw_b.get(k)]
         if widen:
-            keys = [k for k in keys if not (k in WIDENABLE and kw_b.get(k, 0) > kw_s.get(k, 0))]
+            keys = [
+                k for k in keys
+                if k in kw_s and not (k in WIDENABLE and kw_b.get(k, 0) > kw_s.get(k, 0))
+            ]
         if cls_s == cls_b and not keys:
             continue
         diffs = [f"class {cls_s} vs {cls_b}"] if cls_s != cls_b else []
@@ -1086,26 +1180,34 @@ def check_resume(
         )
 
 
-def load_widened(module: torch.nn.Module, state: Mapping[str, torch.Tensor]) -> None:
-    """Load ``state`` into ``module``, a tensor that grew along its last axis (an input
-    layer's weight after the scenario appended input columns) taking the saved values in
-    its leading slice and zeros past it, so the widened network computes what the saved
-    one did."""
+def load_widened(module: torch.nn.Module, state: Mapping[str, torch.Tensor]) -> list[str]:
+    """Load ``state`` into ``module``, widening where the module grew.
+
+    A tensor that grew along any axis (an input layer after the scenario appended input
+    columns, or an output layer after it appended aux targets) takes the saved values in
+    its leading corner and zeros elsewhere, so the widened network computes what the saved
+    one did on the old inputs and outputs. A parameter the saved network lacks (a message
+    encoder added since) keeps its fresh initialisation. Returns those names."""
     own = module.state_dict()
-    out = {}
+    out, fresh = {}, []
     for name, cur in own.items():
+        if name not in state:
+            out[name] = cur
+            fresh.append(name)
+            continue
         old = state[name]
         if old.shape == cur.shape:
             out[name] = old
-        elif old.dim() == cur.dim() and old.shape[:-1] == cur.shape[:-1] and (
-            old.shape[-1] < cur.shape[-1]
+        elif old.dim() == cur.dim() and all(
+            a <= b for a, b in zip(old.shape, cur.shape, strict=True)
         ):
             new = torch.zeros_like(cur)
-            new[..., : old.shape[-1]] = old
+            new[tuple(slice(0, n) for n in old.shape)] = old
             out[name] = new
         else:
             raise ValueError(f"{name}: saved {tuple(old.shape)} cannot widen to {tuple(cur.shape)}")
     module.load_state_dict(out)
+    return fresh
 
 
 def load_policy(path: str | Path, device: str = "cpu") -> torch.nn.Module:
@@ -1138,13 +1240,21 @@ def greedy_env_arm(actor: torch.nn.Module) -> Callable[[Environment], ActionFn]:
             return actor.greedy
         h: torch.Tensor | None = None
 
+        prev: torch.Tensor | None = None
+
         @torch.no_grad()
         def act(obs: torch.Tensor) -> torch.Tensor:
-            nonlocal h
+            nonlocal h, prev
             roles = env.agent_roles() if uses_roles else None
             mask = env.comm_mask() if actor.communicates else None
-            loc, _, _, h_next = actor.step(obs, roles, h, comm_mask=mask)
+            msg = {}
+            if getattr(actor, "delayed", False) and prev is not None:
+                n = obs.shape[-2]
+                heard = torch.ones(*obs.shape[:-2], n, n, dtype=torch.bool, device=obs.device)
+                msg = {"msg_obs": prev, "msg_mask": heard if mask is None else heard & mask}
+            loc, _, _, h_next = actor.step(obs, roles, h, comm_mask=mask, **msg)
             h = h_next if actor.recurrent else None
+            prev = obs.clone() if getattr(actor, "delayed", False) else None
             return actor.squash(loc)
 
         return act
@@ -1420,6 +1530,9 @@ def parse_args(argv: list[str] | None = None) -> TrainConfig:
     p.add_argument("--comm", choices=COMMS,
                    help="attn: one round of attention over teammates before the trunk")
     p.add_argument("--comm-dim", type=int, help="message width (with --comm attn)")
+    p.add_argument("--msg-coef", type=float, help="weight of a delayed message's own loss")
+    p.add_argument("--msg-beta", type=float, help="KL weight of a 'vae' message")
+    p.add_argument("--msg-drop", type=float, help="per-step packet loss of delayed messages")
     p.add_argument("--normalize-advantage", action="store_true", default=None)
     p.add_argument("--no-normalize-advantage", dest="normalize_advantage",
                    action="store_false")
@@ -1459,7 +1572,8 @@ def parse_args(argv: list[str] | None = None) -> TrainConfig:
             "entropy_coeff", "entropy_coeff_final", "num_cells", "normalize_advantage",
             "curriculum_iters", "curriculum_gate", "actor", "role_params", "critic_input",
             "per_agent_value", "aux_coef", "action_rate_coef", "action_rate_ramp_iters",
-            "recurrent", "hidden_dim", "seq_len", "comm", "comm_dim",
+            "recurrent", "hidden_dim", "seq_len", "comm", "comm_dim", "msg_coef",
+            "msg_beta", "msg_drop",
         )
         if getattr(a, f) is not None
     }
@@ -1573,11 +1687,11 @@ def train(cfg: TrainConfig) -> Path:
         built = (actor_cls, actor_kwargs, critic_cls, critic_kwargs)
         check_resume(cfg.resume, ckpt, built, critic_only=cfg.resume_critic_only,
                      widen=cfg.resume_widen)
-        if not cfg.resume_critic_only:
-            load_widened(actor, a.state_dict())
-        load_widened(critic, c.state_dict())
+        fresh = [] if cfg.resume_critic_only else load_widened(actor, a.state_dict())
+        fresh += load_widened(critic, c.state_dict())
         what = "critic" if cfg.resume_critic_only else "actor + critic"
-        print(f"resumed {what} from {cfg.resume}")
+        print(f"resumed {what} from {cfg.resume}"
+              + (f"; freshly initialised: {', '.join(fresh)}" if fresh else ""))
     actor.train()
     critic.train()
 
@@ -1620,7 +1734,7 @@ def train(cfg: TrainConfig) -> Path:
     csv_file = (ckpt_dir / "metrics.csv").open("w", newline="")
     csv_writer = csv.writer(csv_file)
     # loss_aux only when the aux loss is on, so a default run's header is unchanged.
-    aux_col = ["loss_aux"] if algo.use_aux else []
+    aux_col = (["loss_aux"] if algo.use_aux else []) + (["loss_msg"] if algo.msg_loss else [])
     ramp_col = ["ramp"] if spec.ramps else []
     # The guards' columns only when each is on, likewise.
     clock_col = ["ramp_clock"] if spec.ramp_gate is not None else []
@@ -1697,6 +1811,7 @@ def train(cfg: TrainConfig) -> Path:
             f"roles {list(env.role_counts)}, aux_coef {spec.aux_coef}"
             + (f", GRU {spec.hidden_dim} (BPTT {algo.L} steps)" if algo.recurrent else "")
             + (f", comm {spec.comm} {spec.comm_dim}" if spec.comm != "none" else "")
+            + (f" (drop {spec.msg_drop}, msg_coef {spec.msg_coef})" if algo.delayed else "")
             + (" over comm_mask()" if algo.use_mask else "")
         )
     if cfg.scen_kwargs:

@@ -614,6 +614,8 @@ def pusht_lidar_reward_kernel(
     hold_col: wp.int32,
     hold: wp.array(dtype=wp.uint8),
     critic: wp.array2d(dtype=Any),
+    aux_goal: wp.int32,
+    aux: wp.array3d(dtype=Any),
     prev_dist: wp.array(dtype=Any),
     prev_ang: wp.array(dtype=Any),
     prev_adist: wp.array2d(dtype=Any),
@@ -651,6 +653,10 @@ def pusht_lidar_reward_kernel(
     ``min(hold, hold_steps) / hold_steps``, so breaking a hold gives back what it earned;
     ``critic[e, hold_col]`` is that fraction, written on every pass. ``hold`` and
     ``critic`` are one-element stand-ins, never touched, without the hold.
+
+    With ``aux_goal`` the last auxiliary target of every robot, ``aux[e, a, 4]``, is 1
+    while the T is on goal (within both tolerances, not failed) and 0 otherwise, written on
+    every pass, as the observation kernel writes the others.
     """
     e = wp.tid()
     zero = type(pos_shaping_factor)(0.0)
@@ -697,6 +703,12 @@ def pusht_lidar_reward_kernel(
     on_goal = wp.uint8(0)
     if d < goal_tolerance and ang < angle_tolerance and failed == wp.uint8(0):
         on_goal = wp.uint8(1)
+    if aux_goal == 1:
+        flag = zero
+        if on_goal == wp.uint8(1):
+            flag = one
+        for a in range(n_agents):
+            aux[e, a, 4] = flag
     hold_t = zero
     if hold_steps > 0:
         settled = on_goal == wp.uint8(1)
@@ -903,6 +915,59 @@ def body_state_gather_roots_kernel(
     out_ang_vel[e] = body_ang_vel[e, r]
 
 
+@wp.kernel
+def lidar_blackout_reset_kernel(
+    reset_mask: wp.array(dtype=wp.uint8),
+    use_mask: wp.int32,
+    seed: wp.int32,
+    prob: float,
+    blackout: wp.array2d(dtype=wp.uint8),
+):
+    """Thread per ``(env, agent)`` (masked): whether the robot's lidar is dead for the
+    episode, with probability ``prob``."""
+    e, a = wp.tid()
+    if use_mask == 1 and reset_mask[e] == wp.uint8(0):
+        return
+    rng = wp.rand_init(seed, e * blackout.shape[1] + a)
+    b = wp.uint8(0)
+    if wp.randf(rng) < prob:
+        b = wp.uint8(1)
+    blackout[e, a] = b
+
+
+@wp.kernel
+def lidar_blackout_kernel(
+    blackout: wp.array2d(dtype=wp.uint8),
+    roles: wp.array2d(dtype=wp.int32),
+    max_range: Any,
+    ranges: wp.array3d(dtype=Any),
+    hit_class: wp.array3d(dtype=wp.uint8),
+    flag: wp.int32,
+    outside: wp.array3d(dtype=wp.uint8),
+    col: wp.int32,
+    critic: wp.array2d(dtype=Any),
+):
+    """Thread per ``(env, agent, ray)``: a dead lidar's rays read as misses (range
+    ``max_range``, no class, no outside flag). Ray 0 writes the robot's blackout flag into
+    the critic state at ``col`` plus its role-sorted rank."""
+    e, a, r = wp.tid()
+    if r == 0:
+        rank = wp.int32(0)
+        for b in range(roles.shape[1]):
+            if roles[e, b] < roles[e, a] or (roles[e, b] == roles[e, a] and b < a):
+                rank += wp.int32(1)
+        dead = type(max_range)(0.0)
+        if blackout[e, a] == wp.uint8(1):
+            dead = type(max_range)(1.0)
+        critic[e, col + rank] = dead
+    if blackout[e, a] == wp.uint8(0):
+        return
+    ranges[e, a, r] = max_range
+    hit_class[e, a, r] = wp.uint8(0)
+    if flag == 1:
+        outside[e, a, r] = wp.uint8(0)
+
+
 def _obs_signature(dtype) -> list:
     vec2 = VEC2[dtype]
     a1s = wp.array(dtype=dtype)
@@ -1012,6 +1077,8 @@ def _reward_signature(dtype) -> list:
         wp.int32,  # hold_col
         wp.array(dtype=wp.uint8),  # hold
         a2s,  # critic
+        wp.int32,  # aux_goal
+        wp.array3d(dtype=dtype),  # aux
         a1s,  # prev_dist
         a1s,  # prev_ang
         a2s,  # prev_adist
@@ -1288,6 +1355,21 @@ for _T in (wp.float32, wp.float64):
     register(pusht_lidar_obs_kernel, _T, _obs_signature(_T))
     register(pusht_lidar_reward_kernel, _T, _reward_signature(_T))
     register(pusht_lidar_collision_kernel, _T, _collision_signature(_T))
+    register(
+        lidar_blackout_kernel,
+        _T,
+        [
+            wp.array2d(dtype=wp.uint8),
+            wp.array2d(dtype=wp.int32),
+            _T,
+            wp.array3d(dtype=_T),
+            wp.array3d(dtype=wp.uint8),
+            wp.int32,
+            wp.array3d(dtype=wp.uint8),
+            wp.int32,
+            wp.array2d(dtype=_T),
+        ],
+    )
     _vec2 = VEC2[_T]
     register(
         body_state_gather_roots_kernel,

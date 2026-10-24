@@ -1051,3 +1051,29 @@ def test_arena_and_scenery_validation():
                            scenery_probs=_LAYOUTS)
     with pytest.raises(ValueError, match="sum to 1"):
         PushTLidarScenario(**_LIMO, arena_size=(2.0, 5.0), scenery_probs=(0.5, 0.5, 0.5, 0.0))
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("fused", [True, False])
+def test_blackout_blinds_whole_robots_and_flags_them_for_the_critic(device, fused):
+    """A dead lidar's scan holds no hit for the whole episode, the critic state ends with
+    the role-sorted flags, and the on-goal aux target is 1 exactly while the T is on goal."""
+    env = _env(device, n_envs=64, fused=fused, n_agents=3, world_size=0.5,
+               lidar_blackout=0.5, aux_goal=True, goal_tolerance=10.0, angle_tolerance=4.0)
+    env.reset(seed=0)
+    scen = env.scenario
+    gen = torch.Generator(device=device).manual_seed(0)
+    lid = scen.obs_layout()["lidar_newest"]
+    nr = scen.n_rays
+    dead = scen._blackout.bool()
+    assert 0 < dead.float().mean().item() < 1
+    for _ in range(3):
+        obs, *_ = env.step(_actions(env, gen))
+        frame = obs[..., lid]
+        assert (frame[..., :nr][dead] == 1.0).all() and (frame[..., nr:][dead] == 0.0).all()
+        assert (frame[..., nr : 2 * nr][~dead] > 0).any()
+        perm = torch.argsort(scen.agent_roles(), dim=-1, stable=True)
+        flags = scen.critic_state()[:, -scen.n_agents :]
+        assert torch.equal(flags, dead.gather(1, perm).float())
+        assert (scen.aux_targets()[..., 4] == 1.0).all()
+    assert scen.aux_dim == 5

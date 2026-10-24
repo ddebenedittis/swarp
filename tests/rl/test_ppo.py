@@ -565,7 +565,8 @@ _COMM = {"actor": "policynet", "comm": "attn", "comm_dim": 8, "patch": _patch_co
 
 
 _ROLLOUT = ("obs_buf", "u_buf", "logp_buf", "rew_buf", "term_buf", "trunc_buf",
-            "state_buf", "role_buf", "aux_buf", "h_buf", "mask_buf")
+            "state_buf", "role_buf", "aux_buf", "h_buf", "mask_buf", "msg_obs_buf",
+            "msg_mask_buf", "msg_noise_buf", "msg_aux_buf", "msg_valid_buf")
 
 
 def _copy_rollout(dst: MAPPO, src: MAPPO) -> None:
@@ -582,9 +583,10 @@ def _copy_rollout(dst: MAPPO, src: MAPPO) -> None:
         (False, {**_MEMORY, "seq_len": 4}), (False, _COMM),
         (True, {**_MEMORY, "seq_len": 2, "comm": "attn", "comm_dim": 8}),
         (True, {**_MEMORY, "role_params": "separate"}),
+        (True, {"comm": "vae", "comm_dim": 4, "msg_drop": 0.3, "max_steps": 3}),
     ],
     ids=["default", "features", "reset-roles", "recurrent", "comm", "recurrent-comm-features",
-         "recurrent-separate"],
+         "recurrent-separate", "vae-message"],
 )
 def test_captured_update_matches_eager_update(features, kw):
     """Same weights, same rollout, same permutations: the graphed update lands where the
@@ -1075,3 +1077,65 @@ def test_load_widened_keeps_the_function_of_the_saved_network():
     torch.testing.assert_close(new(obs, state), old(obs, state[:, :3]))
     with pytest.raises(ValueError, match="cannot widen"):
         load_widened(StateCritic(2, 5, 2, 16, per_agent=True), old.state_dict())
+
+
+@pytest.mark.parametrize("comm", ["latent", "vae", "pose"])
+@pytest.mark.parametrize("recurrent", [False, True], ids=["mlp", "gru"])
+def test_delayed_messages_come_from_the_last_step_and_recompute_the_log_probs(comm, recurrent):
+    """Each step hears what the teammates encoded from the previous step's observation of
+    the same episode (nothing after a done, a dropped packet now and then), and the update
+    recomputes the rollout's log-probabilities from the stored inputs and noise."""
+    kw = {"comm": comm, "comm_dim": 4, "msg_drop": 0.3, "max_steps": 3}
+    if recurrent:
+        kw.update(recurrent=True, hidden_dim=HIDDEN, seq_len=4)
+    algo = _algo(graphs=False, device="cpu", features=True, **kw)
+    algo.rollout()
+    T, A, N = algo.T, algo.A, algo.N
+    ended = torch.maximum(algo.term_buf, algo.trunc_buf) > 0  # [T, E]
+    heard = algo.msg_mask_buf & ~torch.eye(A, dtype=torch.bool)  # [T, E, A, A]
+    assert not heard[1:][ended[:-1]].any()  # nothing from the last episode
+    assert torch.equal(algo.msg_obs_buf[1:][~ended[:-1]], algo.obs_buf[: T - 1][~ended[:-1]])
+    live = heard[1:][~ended[:-1]]
+    pair = ~torch.eye(A, dtype=torch.bool).expand_as(live)
+    assert 0.5 < live[pair].float().mean() < 0.9  # about 1 - msg_drop got through
+    assert (algo.msg_noise_buf is not None) is (comm == "vae")
+    assert (algo.msg_aux_buf is not None) is (comm != "latent")
+    algo._prepare_body()
+    rows = algo._sequence_rows(torch.arange(algo.n_units)) if recurrent else torch.arange(N)
+    msg = {
+        "msg_obs": algo.msg_obs_buf.reshape(N, A, -1)[rows],
+        "msg_mask": algo.msg_mask_buf.reshape(N, A, A)[rows],
+        "msg_noise": None if algo.msg_noise_buf is None
+        else algo.msg_noise_buf.reshape(N, A, -1)[rows],
+    }
+    mem = {}
+    if recurrent:
+        mem = {"h0": algo.h_buf.reshape(N, A, -1)[rows[: algo.n_units]],
+               "done": algo.done_buf.reshape(N)[rows].view(algo.L, -1)}
+    roles = algo.role_buf[:T].reshape(N, A)[rows]
+    with torch.no_grad():
+        loc, scale, _ = policy_outputs(algo.actor, algo.obs_buf[:T].reshape(N, A, -1)[rows],
+                                       roles, msg=msg, **mem)
+    logp = tanh_normal_log_prob(algo.u_buf.reshape(N, A, -1)[rows], loc, scale)
+    assert torch.allclose(logp, algo.logp_buf.reshape(N, A)[rows], atol=1e-5)
+    stats = algo.update(algo.spec.entropy_coeff)
+    assert stats["grad_skips"] == 0 and math.isfinite(stats["loss_objective"])
+    assert ("loss_msg" in stats) is (comm != "latent")
+
+
+def test_a_heard_message_changes_the_listener_and_a_policy_widens_into_messages():
+    """Only a received message moves the listener's action, and a policy without messages
+    widened into one acts as before until its message weights move."""
+    torch.manual_seed(0)
+    plain = PolicyNet(6, 2, 16, aux_dim=3)
+    talk = PolicyNet(6, 2, 16, aux_dim=3, comm="latent", comm_dim=4)
+    load_widened(talk, plain.state_dict())
+    obs, prev = torch.randn(5, 3, 6), torch.randn(5, 3, 6)
+    mask = torch.zeros(5, 3, 3, dtype=torch.bool)
+    mask[:, 0, 1] = True  # agent 0 hears agent 1
+    torch.testing.assert_close(talk.step(obs, msg_obs=prev, msg_mask=mask)[0], plain.step(obs)[0])
+    with torch.no_grad():
+        talk.trunk[0].weight.normal_()
+    a = talk.step(obs, msg_obs=prev, msg_mask=mask)[0]
+    b = talk.step(obs, msg_obs=prev + 1.0, msg_mask=mask)[0]
+    assert not torch.allclose(a[:, 0], b[:, 0]) and torch.equal(a[:, 1:], b[:, 1:])

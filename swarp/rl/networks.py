@@ -142,8 +142,19 @@ def _take(x: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
 # ------------------------------------------------------------------------------ actors
 
 ROLE_PARAMS = ("shared", "heads", "separate")
-#: ``PolicyNet.comm`` values: no communication, or one round of attention over teammates.
-COMMS = ("none", "attn")
+#: ``PolicyNet.comm`` values: no communication, one round of attention over teammates'
+#: current inputs, or a message each agent encodes from its own observation and its
+#: teammates hear one step later (:data:`DELAYED_COMMS`).
+COMMS = ("none", "attn", "latent", "vae", "pose")
+#: The delayed messages: ``"latent"`` a learned ``tanh`` code trained end to end through
+#: the listeners' losses, ``"vae"`` a Gaussian code sampled with stored noise, bottlenecked
+#: by a KL to the unit Gaussian and grounded by decoding the sender's aux targets, and
+#: ``"pose"`` the sender's own estimate of its aux targets with their log-variances,
+#: trained by a Gaussian likelihood and detached from the listeners.
+DELAYED_COMMS = ("latent", "vae", "pose")
+#: Width of the message encoder's (and the VAE decoder's) hidden layer.
+MSG_HIDDEN = 128
+_LOGVAR_RANGE = (-8.0, 4.0)
 
 
 def _trunk(n_in: int, num_cells: int, depth: int = 2) -> nn.Sequential:
@@ -183,6 +194,21 @@ class PolicyNet(nn.Module):
     ``comm_mask`` ``[*, A, A]`` allows: ``comm_mask[..., i, j]`` means ``i`` hears ``j``),
     and the trunk reads ``cat(e, message)``. Communication needs one shared trunk, so it
     is refused with ``"separate"`` roles.
+
+    A delayed message (``comm`` in :data:`DELAYED_COMMS`) is what a deployment can send
+    over a network at the policy rate: agent ``j`` encodes its own observation into
+    ``msg_dim`` numbers with ``msg_enc`` (a one-hidden-layer MLP over the observation and
+    role one-hot, never its recurrent state), broadcasts them, and its teammates read them
+    on their next step. :meth:`step` therefore takes ``msg_obs`` ``[*, A, obs_dim]``, each
+    agent's observation of the previous step, and ``msg_mask`` ``[*, A, A]``
+    (``msg_mask[..., i, j]``: ``i`` received ``j``'s message; false after an episode start
+    or a dropped packet), and agent ``i``'s trunk reads ``cat(obs, role, mean of the
+    received messages, any received)``. Those columns come last, so a checkpoint without
+    communication widens into this network with zero weights on them
+    (:func:`swarp.rl.ppo.load_widened`). ``"vae"`` samples its code with ``msg_noise``
+    ``[*, A, comm_dim]`` (the trainer stores the rollout's draw, so the update recomputes
+    the same log-probabilities; ``None`` sends the mean, the greedy message), and
+    :meth:`message_loss` is the encoder's own objective.
 
     :meth:`step` is the one-step entry point, ``(obs, roles, h) -> (loc, scale, aux, h)``;
     without ``recurrent`` the hidden state is passed through untouched. :meth:`unroll` runs
@@ -226,9 +252,14 @@ class PolicyNet(nn.Module):
         self.communicates = comm != "none"
         if self.communicates and self.separate:
             raise ValueError(
-                "comm='attn' needs one shared trunk: use role_params 'heads' or 'shared' "
+                f"comm={comm!r} needs one shared trunk: use role_params 'heads' or 'shared' "
                 "with roles, not 'separate'"
             )
+        self.delayed = comm in DELAYED_COMMS
+        if comm == "pose" and not aux_dim:
+            raise ValueError("comm='pose' sends the aux estimate: it needs aux_dim > 0")
+        #: Width of one delayed message (0 without).
+        self.msg_dim = {"latent": comm_dim, "vae": comm_dim, "pose": 2 * aux_dim}.get(comm, 0)
         feat_dim = hidden_dim if self.recurrent else num_cells
         if self.separate:
             self.trunks = nn.ModuleList(_trunk(obs_dim, num_cells) for _ in range(R))
@@ -239,10 +270,21 @@ class PolicyNet(nn.Module):
             self._spans = list(zip(offsets, self.role_counts, strict=True))
         else:
             n_in = obs_dim + (R if self.role_input else 0)
-            if self.communicates:
+            if comm == "attn":
                 self.comm_enc = nn.Linear(n_in, comm_dim)
                 self.comm_qkv = nn.Linear(comm_dim, 3 * comm_dim)
                 n_in = 2 * comm_dim
+            elif self.delayed:
+                self.msg_dec = None
+                width = 2 * comm_dim if comm == "vae" else self.msg_dim
+                self.msg_enc = nn.Sequential(
+                    nn.Linear(n_in, MSG_HIDDEN), nn.Tanh(), nn.Linear(MSG_HIDDEN, width)
+                )
+                if comm == "vae" and aux_dim:
+                    self.msg_dec = nn.Sequential(
+                        nn.Linear(comm_dim, MSG_HIDDEN), nn.Tanh(), nn.Linear(MSG_HIDDEN, aux_dim)
+                    )
+                n_in += self.msg_dim + 1
             self.trunk = _trunk(n_in, num_cells)
             if self.recurrent:
                 self.gru = nn.GRUCell(num_cells, hidden_dim)
@@ -283,8 +325,8 @@ class PolicyNet(nn.Module):
 
     @property
     def stateful(self) -> bool:
-        """Whether acting needs more than ``(obs, roles)``: a hidden state to carry, or a
-        communication mask to read from the env."""
+        """Whether acting needs more than ``(obs, roles)``: a hidden state to carry, a
+        communication mask to read from the env, or the previous step's messages."""
         return self.recurrent or self.communicates
 
     # ------------------------------------------------------------------ the pieces
@@ -322,7 +364,75 @@ class PolicyNet(nn.Module):
         w = torch.softmax(scores, -1) * allowed
         return torch.cat([e, torch.matmul(w, v)], -1), w
 
-    def _pre(self, obs, roles, route, comm_mask):
+    def encode(
+        self, msg_obs: torch.Tensor, roles: torch.Tensor | None
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """The encoder's ``(mean, log-variance)`` ``[*, A, *]`` for each agent's own
+        observation (``"latent"``: the pre-``tanh`` code and ``None``)."""
+        out = self.msg_enc(self._with_role(msg_obs, roles))
+        if self.comm == "latent":
+            return out, None
+        mean, logvar = out.chunk(2, -1)
+        return mean, logvar.clamp(*_LOGVAR_RANGE)
+
+    def messages(
+        self,
+        msg_obs: torch.Tensor,
+        roles: torch.Tensor | None,
+        msg_noise: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """``[*, A, msg_dim]``: what each agent sends for the observation ``msg_obs``."""
+        mean, logvar = self.encode(msg_obs, roles)
+        if self.comm == "latent":
+            return torch.tanh(mean)
+        if self.comm == "vae":
+            return mean if msg_noise is None else mean + torch.exp(0.5 * logvar) * msg_noise
+        return torch.cat([mean, logvar], -1).detach()
+
+    def _listen(self, obs, roles, msg_obs, msg_mask, msg_noise):
+        """``[*, A, msg_dim + 1]``: the mean of the messages each agent received, and
+        whether it received any (zeros when ``msg_obs`` is ``None``)."""
+        if msg_obs is None or msg_mask is None:
+            return obs.new_zeros(*obs.shape[:-1], self.msg_dim + 1)
+        m = self.messages(msg_obs, roles, msg_noise)
+        n = obs.shape[-2]
+        heard = (msg_mask.bool() & ~torch.eye(n, dtype=torch.bool, device=obs.device)).to(m.dtype)
+        count = heard.sum(-1, keepdim=True)
+        pooled = torch.matmul(heard, m) / count.clamp(min=1.0)
+        return torch.cat([pooled, (count > 0).to(m.dtype)], -1)
+
+    def message_loss(
+        self,
+        msg_obs: torch.Tensor,
+        roles: torch.Tensor | None,
+        target: torch.Tensor,
+        valid: torch.Tensor,
+        beta: float = 0.0,
+        msg_noise: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """The encoder's own objective over the senders ``valid`` ``[*, A]`` marks:
+        ``"pose"`` the Gaussian negative log-likelihood of ``target`` ``[*, A, aux_dim]``
+        (the senders' aux targets for ``msg_obs``) under its estimate, ``"vae"`` the
+        decoder's squared error on it from the code sampled with ``msg_noise`` (the one the
+        listeners heard; the mean when ``None``) plus ``beta`` times the KL to the unit
+        Gaussian, ``"latent"`` zero (it learns only through the listeners)."""
+        if self.comm == "latent":
+            return msg_obs.new_zeros(())
+        mean, logvar = self.encode(msg_obs, roles)
+        w = valid.to(mean.dtype).unsqueeze(-1)
+        denom = w.sum().clamp(min=1.0)
+        if self.comm == "pose":
+            nll = 0.5 * ((target - mean).square() * torch.exp(-logvar) + logvar)
+            return (nll * w).sum() / (denom * nll.shape[-1])
+        z = mean if msg_noise is None else mean + torch.exp(0.5 * logvar) * msg_noise
+        kl = 0.5 * (mean.square() + logvar.exp() - 1.0 - logvar).sum(-1, keepdim=True)
+        loss = beta * (kl * w).sum() / denom
+        if self.msg_dec is not None:
+            err = (self.msg_dec(z) - target).square()
+            loss = loss + (err * w).sum() / (denom * err.shape[-1])
+        return loss
+
+    def _pre(self, obs, roles, route, comm_mask, msg=(None, None, None)):
         """Everything before the recurrent core: it never reads ``h``."""
         if self.separate:
             o = _take(obs, route[1])
@@ -331,8 +441,10 @@ class PolicyNet(nn.Module):
                 for trunk, (off, n) in zip(self.trunks, self._spans, strict=True)
             ]
         x = self._with_role(obs, roles)
-        if self.communicates:
+        if self.comm == "attn":
             x = self._communicate(x, comm_mask)[0]
+        elif self.delayed:
+            x = torch.cat([x, self._listen(obs, roles, *msg)], -1)
         return self.trunk(x)
 
     def _input_gates(self, feat):
@@ -408,14 +520,19 @@ class PolicyNet(nn.Module):
         *,
         with_aux: bool = False,
         comm_mask: torch.Tensor | None = None,
+        msg_obs: torch.Tensor | None = None,
+        msg_mask: torch.Tensor | None = None,
+        msg_noise: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         """``(loc, scale, aux, h)``: the Gaussian over the pre-tanh action, ``[*, A,
         act_dim]`` each, the auxiliary prediction ``[*, A, aux_dim]`` when ``with_aux``
         (else ``None``), and the hidden state: the GRU's output when ``recurrent`` (from
-        zeros when ``h`` is ``None``), else ``h`` passed through."""
+        zeros when ``h`` is ``None``), else ``h`` passed through. ``msg_*`` are the
+        delayed messages' inputs (see the class docstring); without them nothing is
+        heard."""
         roles = self._check(roles, with_aux)
         route = self._route(roles)
-        feat = self._pre(obs, roles, route, comm_mask)
+        feat = self._pre(obs, roles, route, comm_mask, (msg_obs, msg_mask, msg_noise))
         if self.recurrent:
             if h is None:
                 h = obs.new_zeros(*obs.shape[:-1], self.hidden_dim)
@@ -432,6 +549,9 @@ class PolicyNet(nn.Module):
         *,
         with_aux: bool = False,
         comm_mask: torch.Tensor | None = None,
+        msg_obs: torch.Tensor | None = None,
+        msg_mask: torch.Tensor | None = None,
+        msg_noise: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         """:meth:`step` over a sequence: ``obs`` ``[L, *, A, obs_dim]`` (``roles`` and
         ``comm_mask`` with the same leading ``[L, *]``), from the hidden state ``h``
@@ -443,11 +563,13 @@ class PolicyNet(nn.Module):
         sequence; only the hidden-to-hidden half of the GRU steps one at a time. Returns
         ``[L, ...]`` outputs and the hidden state after step ``L - 1`` (not reset).
         """
+        msg = (msg_obs, msg_mask, msg_noise)
         if not self.recurrent:
-            return self.step(obs, roles, h, with_aux=with_aux, comm_mask=comm_mask)
+            return self.step(obs, roles, h, with_aux=with_aux, comm_mask=comm_mask,
+                             msg_obs=msg_obs, msg_mask=msg_mask, msg_noise=msg_noise)
         roles = self._check(roles, with_aux)
         route = self._route(roles)
-        gi = self._input_gates(self._pre(obs, roles, route, comm_mask))
+        gi = self._input_gates(self._pre(obs, roles, route, comm_mask, msg))
         if h is None:
             h = obs.new_zeros(*obs.shape[1:-1], self.hidden_dim)
         keep = None if done is None else (1.0 - done.to(obs.dtype))[..., None, None].unbind(0)
@@ -479,8 +601,8 @@ class PolicyNet(nn.Module):
         """The attention weights ``[*, A, A]`` (row ``i``: what agent ``i`` hears from each
         teammate), for inspection. Zero on the diagonal and wherever ``comm_mask`` is
         ``False``."""
-        if not self.communicates:
-            raise ValueError("this PolicyNet does not communicate (comm='none')")
+        if self.comm != "attn":
+            raise ValueError("only comm='attn' has attention weights")
         roles = self._check(roles, False)
         return self._communicate(self._with_role(obs, roles), comm_mask)[1]
 
@@ -502,11 +624,15 @@ class PolicyNet(nn.Module):
         roles: torch.Tensor | None = None,
         h: torch.Tensor | None = None,
         comm_mask: torch.Tensor | None = None,
+        msg_obs: torch.Tensor | None = None,
+        msg_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """The deterministic action ``squash(loc)``: consumes no RNG. A recurrent net acts
-        from ``h`` (zeros when ``None``) and the new hidden state is dropped; carry it with
-        :meth:`step`, as :func:`swarp.rl.ppo.greedy_env_arm` does."""
-        return self.squash(self.step(obs, roles, h, comm_mask=comm_mask)[0])
+        """The deterministic action ``squash(loc)``: consumes no RNG (a ``"vae"`` message
+        is its mean). A recurrent net acts from ``h`` (zeros when ``None``) and the new
+        hidden state is dropped; carry it, and the previous observation a delayed message
+        is encoded from, with :meth:`step`, as :func:`swarp.rl.ppo.greedy_env_arm` does."""
+        out = self.step(obs, roles, h, comm_mask=comm_mask, msg_obs=msg_obs, msg_mask=msg_mask)
+        return self.squash(out[0])
 
 
 # ----------------------------------------------------------------------------- critics

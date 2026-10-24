@@ -47,6 +47,8 @@ from swarp.scenarios.pusht_lidar_kernels import (
     STATE_HEAD,
     TEE_DIM,
     body_state_gather_roots_kernel,
+    lidar_blackout_kernel,
+    lidar_blackout_reset_kernel,
     lidar_sensor_kernel,
     pose_obs_noise_kernel,
     pusht_lidar_collision_kernel,
@@ -197,6 +199,11 @@ class PushTLidarScenario(PushTScenario):
     ``hold_steps``), a potential difference, so a broken hold gives back what it earned.
     The critic state ends with that progress; the robots do not observe it.
 
+    Sensor failure (``lidar_blackout``; off by default). Every reset kills each robot's
+    lidar for the episode with that probability: all its rays read as misses, so a blind
+    robot knows the T only from what its teammates tell it. The critic state ends with the
+    role-sorted flags.
+
     Training hooks: :meth:`critic_state` (role-sorted), :meth:`agent_roles`,
     :meth:`aux_targets` (the T in each robot's frame), all written by the observation
     pass.
@@ -339,6 +346,8 @@ class PushTLidarScenario(PushTScenario):
         settle_tee_ang_vel: float = math.inf,
         settle_robot_speed: float = math.inf,
         settle_robot_ang_vel: float = math.inf,
+        lidar_blackout: float = 0.0,
+        aux_goal: bool = False,
         **kwargs: Any,
     ) -> None:
         super().__init__(n_agents=n_agents, shape=shape, **kwargs)
@@ -566,6 +575,14 @@ class PushTLidarScenario(PushTScenario):
         self.hold_reward = float(hold_reward)
         self.settle_tee_speed, self.settle_tee_ang_vel = settle[0], settle[1]
         self.settle_robot_speed, self.settle_robot_ang_vel = settle[2], settle[3]
+        if not 0.0 <= lidar_blackout <= 1.0:
+            raise ValueError(f"lidar_blackout must lie in [0, 1], got {lidar_blackout}")
+        #: The probability that a robot's lidar is dead for a whole episode (every ray a
+        #: miss), drawn per robot on every reset; the critic state ends with the flags.
+        self.lidar_blackout = float(lidar_blackout)
+        self.blackout_on = self.lidar_blackout > 0.0
+        #: Whether the auxiliary targets end with the on-goal flag (see :meth:`aux_targets`).
+        self.aux_goal = bool(aux_goal)
 
     @property
     def settle(self) -> tuple[float, float, float, float]:
@@ -589,8 +606,17 @@ class PushTLidarScenario(PushTScenario):
 
     @property
     def state_dim(self) -> int:  # type: ignore[override]
-        dr = self.dr_env_dim + self.dr_agent_dim * self.n_agents
-        return self.state_base_dim + dr + int(self.hold_on)
+        return self._blackout_col + (self.n_agents if self.blackout_on else 0)
+
+    @property
+    def _hold_col(self) -> int:
+        """The critic-state column of the hold's progress (past the randomised block)."""
+        return self.state_base_dim + self.dr_env_dim + self.dr_agent_dim * self.n_agents
+
+    @property
+    def _blackout_col(self) -> int:
+        """The first critic-state column of the role-sorted blackout flags."""
+        return self._hold_col + int(self.hold_on)
 
     @property
     def state_base_dim(self) -> int:
@@ -631,7 +657,7 @@ class PushTLidarScenario(PushTScenario):
 
     @property
     def aux_dim(self) -> int:  # type: ignore[override]
-        return 4
+        return 4 + int(self.aux_goal)
 
     @property
     def obs_dim(self) -> int:
@@ -785,6 +811,11 @@ class PushTLidarScenario(PushTScenario):
         self._hold = torch.zeros(n_envs if self.hold_on else 1, dtype=torch.uint8,
                                  device=device)
         self._hold_wp = wp.from_torch(self._hold)
+        # Which robots' lidars are dead this episode, rewritten in place by every reset.
+        shape = (n_envs, na) if self.blackout_on else (1, 1)
+        self._blackout = torch.zeros(*shape, dtype=torch.uint8, device=device)
+        self._blackout_wp = wp.from_torch(self._blackout)
+        self._blackout_launch = CachedLaunch()
         if self.artefact_dr:
             # Per-robot artefact values (ART_* columns), at the ranges' low ends until a
             # reset redraws them in place, and their RNG streams.
@@ -986,6 +1017,24 @@ class PushTLidarScenario(PushTScenario):
                 self._launch_scenery(mask, use_mask)
             if self.tee_sized:
                 self._launch_tee_size(mask, use_mask)
+            if self.blackout_on:
+                self._launch_blackout_draw(mask, use_mask)
+
+    def _launch_blackout_draw(self, mask, use_mask) -> None:
+        """Draw which respawned robots' lidars are dead for the episode."""
+        w = self.world
+        seed = wp.int32(w.next_kernel_seed())
+        launch = self._blackout_launch.get(
+            lidar_blackout_reset_kernel,
+            dim=(w.n_envs, self.n_agents),
+            inputs=[mask, use_mask, seed, float(self.lidar_blackout)],
+            outputs=[self._blackout_wp],
+            device=w.device,
+            key=(w.n_envs, ptr_key(mask), self.lidar_blackout, ptr_key(self._blackout_wp)),
+        )
+        launch.set_param_by_name("use_mask", use_mask)
+        launch.set_param_by_name("seed", seed)
+        launch.launch()
 
     def _launch_tee_size(self, mask, use_mask) -> None:
         """Draw the respawned envs' T sizes (:func:`~swarp.scenarios.pusht_lidar_kernels.
@@ -1512,6 +1561,12 @@ class PushTLidarScenario(PushTScenario):
             seen = hit_class
             ranges, hit_class = self._relabel_torch(ranges, hit_class, opos, oth)
             leak = ((seen == HIT_IMMOVABLE) & (hit_class == HIT_MOVABLE)).sum(-1)
+        if self.blackout_on:
+            dead = self._blackout.bool().unsqueeze(-1)
+            ranges = torch.where(dead, torch.full_like(ranges, mr), ranges)
+            hit_class = torch.where(dead, torch.zeros_like(hit_class), hit_class)
+            if self.lidar_arena_flag:
+                self._outside_torch = self._outside_torch & ~dead
         is_obj = hit_class == HIT_MOVABLE  # [E, A, R]
         is_ag = hit_class == HIT_AGENT
         ang = self._ray_angles()  # [E, A, R]
@@ -1714,10 +1769,12 @@ class PushTLidarScenario(PushTScenario):
         if self.hold_on:
             frac = self._hold.long().clamp(max=self.hold_steps).to(dt) / float(self.hold_steps)
             critic = torch.cat([critic, frac.unsqueeze(-1)], dim=-1)
-        aux = torch.cat(
-            [dq * self.aux_scale, torch.stack([ca, sa], -1).unsqueeze(1).expand(-1, na, -1)],
-            dim=-1,
-        )
+        if self.blackout_on:
+            critic = torch.cat([critic, self._blackout.gather(1, perm).to(dt)], dim=-1)
+        aux = [dq * self.aux_scale, torch.stack([ca, sa], -1).unsqueeze(1).expand(-1, na, -1)]
+        if self.aux_goal:
+            aux.append(on_goal.to(dt).view(-1, 1, 1).expand(-1, na, 1))
+        aux = torch.cat(aux, dim=-1)
 
         self._lcache = {
             "done": done,
@@ -1881,6 +1938,8 @@ class PushTLidarScenario(PushTScenario):
             self._launch_pose_noise(st, pass_.advance_prev)
         if self.lidar_label_from_pose:
             self._launch_relabel(st, pass_.full_pass)
+        if self.blackout_on:
+            self._launch_blackout()
         self._launch_obs(st, pass_.advance_prev)
         if self.critic_dr:
             self._launch_critic_dr()
@@ -1952,6 +2011,28 @@ class PushTLidarScenario(PushTScenario):
                 lid.wp_ranges,
                 lid.wp_hit_class,
                 self._outside_wp,
+            ],
+            device=w.device,
+            record_tape=False,
+        )
+
+    def _launch_blackout(self) -> None:
+        """Dead lidars' rays to misses, and the flags into the critic state."""
+        w = self.world
+        lid = self.lidar
+        wp.launch(
+            concrete(lidar_blackout_kernel, w.wp_dtype),
+            dim=(w.n_envs, self.n_agents, self.n_rays),
+            inputs=[
+                self._blackout_wp,
+                self._roles_wp,
+                w.wp_dtype(lid.max_range),
+                lid.wp_ranges,
+                lid.wp_hit_class,
+                wp.int32(int(self.lidar_arena_flag)),
+                self._outside_wp,
+                wp.int32(self._blackout_col),
+                self._wp["critic"],
             ],
             device=w.device,
             record_tape=False,
@@ -2210,7 +2291,8 @@ class PushTLidarScenario(PushTScenario):
         hold = self._wp["hold"] if self.hold_on else self._hold_wp
         critic = self._wp["critic"] if self.hold_on else self._dummy_2d()
         motion = [st.vel, st.ang_vel, self._wp["tee_vel"], self._wp["tee_ang_vel"]]
-        hold_cfg = (self.hold_steps, self.hold_reward, *self.settle, self.state_dim - 1)
+        hold_cfg = (self.hold_steps, self.hold_reward, *self.settle, self._hold_col)
+        aux = self._wp["aux"] if self.aux_goal else self._dummy_3d()
         launch = self._lidar_reward_launch.get(
             concrete(pusht_lidar_reward_kernel, scalar),
             dim=w.n_envs,
@@ -2231,9 +2313,11 @@ class PushTLidarScenario(PushTScenario):
                 *motion,
                 wp.int32(self.hold_steps),
                 *(scalar(x) for x in (self.hold_reward, *self.settle)),
-                wp.int32(self.state_dim - 1),
+                wp.int32(self._hold_col),
                 hold,
                 critic,
+                wp.int32(int(self.aux_goal)),
+                aux,
             ],
             outputs=outs,
             device=w.device,
@@ -2254,6 +2338,8 @@ class PushTLidarScenario(PushTScenario):
                 *hold_cfg,
                 ptr_key(hold),
                 ptr_key(critic),
+                self.aux_goal,
+                ptr_key(aux),
                 *(ptr_key(o) for o in outs),
             ),
         )
@@ -2302,7 +2388,8 @@ class PushTLidarScenario(PushTScenario):
 
     def aux_targets(self) -> torch.Tensor:
         """``[E, A, 4]``: the T's position relative to each agent (world axes) divided by
-        the lidar range, and the cos/sin of its heading."""
+        the lidar range, and the cos/sin of its heading. With ``aux_goal`` a fifth column is
+        1 while the T is on goal (within both tolerances) and 0 otherwise."""
         if self.fused_active:
             return self.fb["aux"]
         return self._lcache["aux"]

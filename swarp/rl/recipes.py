@@ -253,11 +253,22 @@ class TrainSpec:
     """Length of the update's BPTT chunks; 0 means ``steps_per_batch`` (one chunk per env
     and rollout). Must divide ``steps_per_batch``. Ignored unless ``recurrent``."""
     comm: str = "none"
-    """``"none"``, or ``"attn"``: one round of attention over teammates' encoded inputs
-    before the trunk, restricted by the scenario's ``comm_mask()`` when it has one."""
+    """``"none"``; ``"attn"``: one round of attention over teammates' encoded inputs
+    before the trunk, restricted by the scenario's ``comm_mask()`` when it has one; or a
+    delayed message (``"latent"``, ``"vae"``, ``"pose"``; see
+    :class:`~swarp.rl.networks.PolicyNet`), encoded by each agent from its own observation
+    and heard by its teammates on the next step."""
     comm_dim: int = 64
-    """Width of the encoded input, the keys, the values and the message. Ignored unless
-    ``comm="attn"``."""
+    """Width of the encoded input, the keys, the values and the message (``"attn"``), or
+    of the code (``"latent"``, ``"vae"``)."""
+    msg_coef: float = 1.0
+    """Weight of a delayed message's own loss (``PolicyNet.message_loss``): the ``"pose"``
+    likelihood or the ``"vae"`` reconstruction and KL."""
+    msg_beta: float = 1e-3
+    """``"vae"``: the KL's weight inside the message loss."""
+    msg_drop: float = 0.1
+    """Delayed messages: the probability that a packet from one teammate to another is lost
+    on a step, drawn independently per pair and step in the rollout."""
 
     def __post_init__(self) -> None:
         for name, allowed in (
@@ -277,6 +288,11 @@ class TrainSpec:
         if self.comm != "none" and self.actor != "policynet":
             raise ValueError(f"comm={self.comm!r} needs actor='policynet' (the attention "
                              "lives there)")
+        if self.comm in ("vae", "pose") and self.aux_coef <= 0:
+            raise ValueError(f"comm={self.comm!r} grounds the message in the aux targets: "
+                             "it needs aux_coef > 0")
+        if not 0.0 <= self.msg_drop < 1.0 or self.msg_coef < 0 or self.msg_beta < 0:
+            raise ValueError("msg_drop must lie in [0, 1); msg_coef and msg_beta must be >= 0")
         for name in ("hidden_dim", "comm_dim"):
             if getattr(self, name) < 1:
                 raise ValueError(f"{name} must be >= 1, got {getattr(self, name)}")
