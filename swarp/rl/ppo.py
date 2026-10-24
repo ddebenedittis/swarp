@@ -1047,22 +1047,30 @@ def _network_flags(cls: str, kwargs: Mapping[str, Any]) -> list[str]:
     return ["--critic-input", critic_input, per_agent, *flags]
 
 
+#: Network keywords that ``--resume-widen`` lets grow: input widths, whose new columns
+#: (appended at the end) load with zero weights.
+WIDENABLE = ("obs_dim", "state_dim")
+
+
 def check_resume(
     path: str | Path,
     ckpt: Mapping[str, Any],
     built: tuple[str, dict[str, Any], str, dict[str, Any]],
     critic_only: bool = False,
+    widen: bool = False,
 ) -> None:
     """Raise unless the checkpoint's networks are the ones ``built`` (what
     :func:`network_archs` gives for the current flags) describes, naming the mismatch and
     the flags that rebuild the checkpoint's networks. With ``critic_only`` only the critic
-    must match."""
+    must match; with ``widen`` an input width (:data:`WIDENABLE`) may have grown."""
     saved = checkpoint_archs(ckpt)
     nets = [("critic", 2)] if critic_only else [("actor", 0), ("critic", 2)]
     problems: list[str] = []
     for which, i in nets:
         (cls_s, kw_s), (cls_b, kw_b) = saved[i : i + 2], built[i : i + 2]
         keys = [k for k in sorted(set(kw_s) | set(kw_b)) if kw_s.get(k) != kw_b.get(k)]
+        if widen:
+            keys = [k for k in keys if not (k in WIDENABLE and kw_b.get(k, 0) > kw_s.get(k, 0))]
         if cls_s == cls_b and not keys:
             continue
         diffs = [f"class {cls_s} vs {cls_b}"] if cls_s != cls_b else []
@@ -1076,6 +1084,28 @@ def check_resume(
             f"--resume {path}: the checkpoint's networks differ from the ones these flags "
             f"build: " + "; ".join(problems)
         )
+
+
+def load_widened(module: torch.nn.Module, state: Mapping[str, torch.Tensor]) -> None:
+    """Load ``state`` into ``module``, a tensor that grew along its last axis (an input
+    layer's weight after the scenario appended input columns) taking the saved values in
+    its leading slice and zeros past it, so the widened network computes what the saved
+    one did."""
+    own = module.state_dict()
+    out = {}
+    for name, cur in own.items():
+        old = state[name]
+        if old.shape == cur.shape:
+            out[name] = old
+        elif old.dim() == cur.dim() and old.shape[:-1] == cur.shape[:-1] and (
+            old.shape[-1] < cur.shape[-1]
+        ):
+            new = torch.zeros_like(cur)
+            new[..., : old.shape[-1]] = old
+            out[name] = new
+        else:
+            raise ValueError(f"{name}: saved {tuple(old.shape)} cannot widen to {tuple(cur.shape)}")
+    module.load_state_dict(out)
 
 
 def load_policy(path: str | Path, device: str = "cpu") -> torch.nn.Module:
@@ -1311,6 +1341,12 @@ class TrainConfig:
     resume: str | None = None
     resume_critic_only: bool = False
     """With ``resume``: load only the critic's weights and start a fresh actor."""
+    resume_widen: bool = False
+    """With ``resume``: accept networks whose input grew (:data:`WIDENABLE`), the new
+    columns' weights starting at zero."""
+    start_clock: int = 0
+    """With ``ramp_gate``: the ramps' clock at the first iteration, e.g. a fine-tune that
+    resumes at the final conditions."""
     start_difficulty: float = 0.0
     checkpoint_every: int = 250
     eval_every: int = 500
@@ -1396,6 +1432,10 @@ def parse_args(argv: list[str] | None = None) -> TrainConfig:
     p.add_argument("--resume", help="checkpoint to continue from (actor + critic weights)")
     p.add_argument("--resume-critic-only", action="store_true",
                    help="with --resume: load only the critic, start a fresh actor")
+    p.add_argument("--resume-widen", action="store_true",
+                   help="with --resume: zero-initialise input columns the networks gained")
+    p.add_argument("--start-clock", type=int, default=0,
+                   help="with ramp_gate: the ramps' clock at the first iteration")
     p.add_argument("--checkpoint-every", type=int, default=250, help="0 disables")
     p.add_argument("--eval-every", type=int, default=500, help="0 disables")
     p.add_argument("--eval-envs", type=int, default=512)
@@ -1429,8 +1469,10 @@ def parse_args(argv: list[str] | None = None) -> TrainConfig:
         p.error(str(exc))
     if spec.n_agents < 1:
         p.error("--n-agents must be >= 1")
-    if a.resume_critic_only and not a.resume:
-        p.error("--resume-critic-only needs --resume")
+    if (a.resume_critic_only or a.resume_widen) and not a.resume:
+        p.error("--resume-critic-only and --resume-widen need --resume")
+    if a.start_clock and spec.ramp_gate is None:
+        p.error("--start-clock sets the gated ramp clock: the spec needs ramp_gate")
     scen_kwargs = dict(spec.scen_kwargs)
     try:
         scen_kwargs.update(coerce_scen_kwargs(a.scenario, a.scen_kwarg))
@@ -1440,8 +1482,9 @@ def parse_args(argv: list[str] | None = None) -> TrainConfig:
     return TrainConfig(
         scenario=a.scenario, spec=spec, scen_kwargs=scen_kwargs, device=a.device,
         checkpoint_dir=Path(a.checkpoint_dir or f"runs/{a.scenario}"), resume=a.resume,
-        resume_critic_only=a.resume_critic_only,
-        start_difficulty=a.start_difficulty, checkpoint_every=a.checkpoint_every,
+        resume_critic_only=a.resume_critic_only, resume_widen=a.resume_widen,
+        start_clock=a.start_clock, start_difficulty=a.start_difficulty,
+        checkpoint_every=a.checkpoint_every,
         eval_every=a.eval_every, eval_envs=a.eval_envs, seed=a.seed,
         gate_window=a.gate_window, max_skip_frac=a.max_skip_frac,
         max_skip_iters=a.max_skip_iters, target_solve_rate=a.target_solve_rate,
@@ -1528,10 +1571,11 @@ def train(cfg: TrainConfig) -> Path:
     if cfg.resume:
         a, c, ckpt = load_checkpoint(cfg.resume, device)
         built = (actor_cls, actor_kwargs, critic_cls, critic_kwargs)
-        check_resume(cfg.resume, ckpt, built, critic_only=cfg.resume_critic_only)
+        check_resume(cfg.resume, ckpt, built, critic_only=cfg.resume_critic_only,
+                     widen=cfg.resume_widen)
         if not cfg.resume_critic_only:
-            actor.load_state_dict(a.state_dict())
-        critic.load_state_dict(c.state_dict())
+            load_widened(actor, a.state_dict())
+        load_widened(critic, c.state_dict())
         what = "critic" if cfg.resume_critic_only else "actor + critic"
         print(f"resumed {what} from {cfg.resume}")
     actor.train()
@@ -1565,7 +1609,7 @@ def train(cfg: TrainConfig) -> Path:
         return min((ramp.progress(it) for ramp in spec.ramps), default=1.0)
 
     set_curriculum(None)
-    set_ramps(0)
+    set_ramps(cfg.start_clock)
     algo = MAPPO(
         env, actor, critic, spec, metrics=metrics, graphs=cfg.graphs, compile=cfg.compile
     )
@@ -1632,7 +1676,7 @@ def train(cfg: TrainConfig) -> Path:
     best_key = (-1.0, -1.0, -1.0)
     # The ramps' clock: the iteration, or with ramp_gate the solve-gated count of ticks.
     gated = spec.ramp_gate is not None
-    clock = 0
+    clock = cfg.start_clock
     first_start = min((r.start for r in spec.ramps), default=0)
     end_clock = max((r.end for r in spec.ramps), default=0) + spec.hold_iters
     lr_mult = 1.0

@@ -482,6 +482,47 @@ def test_out_of_bounds_fails_the_episode_until_respawn(device, fused):
     assert (rew[0] != -0.3).any()
 
 
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("fused", [True, False])
+def test_settled_hold_succeeds_only_after_hold_steps(device, fused):
+    """With ``hold_steps`` a T at rest on its goal succeeds only on the hold's last step,
+    each settled step pays the hold's potential, the critic sees the progress, and a robot
+    that moves breaks the hold and gives back what it earned."""
+    env = _env(device, n_envs=2, fused=fused, n_agents=2, n_pushers=2, hold_steps=3,
+               hold_reward=0.6, settle_robot_speed=0.05)
+    env.reset(seed=0)
+    scen = env.scenario
+    with torch.no_grad():
+        scen.tee_pos.copy_(scen.goal_pos)
+        scen.tee_theta.copy_(scen.goal_theta)
+        scen.tee_vel.zero_()
+        scen.tee_ang_vel.zero_()
+        scen._install_obstacles()
+    zero = torch.zeros(2, 2, 2, device=device)
+    team = []
+    for t in range(3):
+        a = zero.clone()
+        if t == 1:
+            a[1, 0, 0] = 1.0  # env 1: a robot drives off on the second step
+        _, _, term, _, info = env.step(a)
+        team.append(info["multiobj_reward"][:, 0, 0].clone())
+        assert term[0] == (t == 2) and not term[1]
+        frac = scen.critic_state()[:, -1]
+        assert frac[0].item() == pytest.approx((t + 1) / 3)
+        assert frac[1].item() == pytest.approx([1 / 3, 0.0, 1 / 3][t])
+    # The first step also pays the pose shaping of the T placed on its goal.
+    team = torch.stack(team).cpu()
+    assert team[1:, 0].tolist() == pytest.approx([0.2, 0.2 + scen.goal_reward], abs=1e-4)
+    assert team[1, 1].item() == pytest.approx(-0.2, abs=1e-4)
+
+
+def test_hold_validation():
+    with pytest.raises(ValueError, match="hold_steps"):
+        PushTLidarScenario(hold_steps=256)
+    with pytest.raises(ValueError, match="settle"):
+        PushTLidarScenario(hold_steps=3, settle_tee_speed=0.0)
+
+
 # ------------------------------------------------------------------- lidar artefacts
 
 

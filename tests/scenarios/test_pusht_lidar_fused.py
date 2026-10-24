@@ -226,6 +226,20 @@ def _assert_parity(device, **kw):
 
 
 @pytest.mark.parametrize("device", DEVICES)
+def test_hold_fused_matches_torch(device):
+    """The settled hold: goal tolerances wide enough that the T is always on goal, so only
+    the settle thresholds decide, and holds both complete and break."""
+    kw = {"goal_tolerance": 10.0, "angle_tolerance": 4.0, "hold_steps": 2, "hold_reward": 0.5,
+          "settle_tee_speed": 0.02, "settle_tee_ang_vel": 0.2}
+    _assert_parity(device, **kw)
+    fused = _rollout(_env(device, True, **kw), 20, device)
+    # done also fires on the 5-step time limit, so a completed hold shows as its bonus
+    bonus = 0.5 * PushTLidarScenario().goal_reward
+    assert any((s["multiobj_reward"][..., 0] > bonus).any() for s in fused), "no hold completed"
+    assert any((s["critic"][:, -1] == 0).any() for s in fused[1:]), "no hold ever broke"
+
+
+@pytest.mark.parametrize("device", DEVICES)
 def test_fused_seeded_determinism(device):
     def run():
         env = _env(device, True, obs_level=2)

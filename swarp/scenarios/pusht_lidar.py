@@ -185,7 +185,19 @@ class PushTLidarScenario(PushTScenario):
       ``info()["robot_collision"]`` / ``["scenery_collision"]`` flag which).
 
     The observer terms are penalties or potential differences, so prolonging an episode
-    never pays. Training hooks: :meth:`critic_state` (role-sorted), :meth:`agent_roles`,
+    never pays.
+
+    Settled hold (``hold_steps > 0``; off by default). The episode succeeds only once the T
+    has stayed on goal for ``hold_steps`` steps in a row with the T and every robot settled:
+    the T slower than ``settle_tee_speed`` and turning slower than ``settle_tee_ang_vel``,
+    every robot slower than ``settle_robot_speed`` and turning slower than
+    ``settle_robot_ang_vel``. Passing through the goal no longer counts, and neither does
+    stopping the T while still pushing it. The goal bonus is paid on that step, and the team
+    term adds ``hold_reward`` times the change of the hold's progress (its count over
+    ``hold_steps``), a potential difference, so a broken hold gives back what it earned.
+    The critic state ends with that progress; the robots do not observe it.
+
+    Training hooks: :meth:`critic_state` (role-sorted), :meth:`agent_roles`,
     :meth:`aux_targets` (the T in each robot's frame), all written by the observation
     pass.
 
@@ -321,6 +333,12 @@ class PushTLidarScenario(PushTScenario):
         tee_scale: float | tuple[float, float] = 1.0,
         n_tee_sizes: int = 5,
         lidar_arena_flag: bool = False,
+        hold_steps: int = 0,
+        hold_reward: float = 0.0,
+        settle_tee_speed: float = math.inf,
+        settle_tee_ang_vel: float = math.inf,
+        settle_robot_speed: float = math.inf,
+        settle_robot_ang_vel: float = math.inf,
         **kwargs: Any,
     ) -> None:
         super().__init__(n_agents=n_agents, shape=shape, **kwargs)
@@ -531,6 +549,22 @@ class PushTLidarScenario(PushTScenario):
         #: Whether the critic state carries the randomised parameters (:meth:`critic_state`).
         self.critic_dr = bool(critic_dr)
         self.dr_env_dim, self.dr_agent_dim = self._critic_dr_layout() if critic_dr else (0, 0)
+        if not 0 <= int(hold_steps) <= 255:
+            raise ValueError(
+                f"hold_steps must lie in [0, 255], got {hold_steps}: the hold counter is a "
+                "saturating byte per env"
+            )
+        settle = (settle_tee_speed, settle_tee_ang_vel, settle_robot_speed, settle_robot_ang_vel)
+        if min(settle) <= 0.0:
+            raise ValueError(f"the settle thresholds must be > 0, got {settle}")
+        #: The settled hold (see the class docstring): steps the T must stay on goal and
+        #: settled for the episode to succeed (0: on goal is enough), the weight of the
+        #: hold's potential, and the speed thresholds below which the T and every robot
+        #: count as settled (the T's speed and turn rate, each robot's speed and turn rate).
+        self.hold_steps = int(hold_steps)
+        self.hold_on = self.hold_steps > 0
+        self.hold_reward = float(hold_reward)
+        self.settle = tuple(min(float(x), 1e30) for x in settle)
 
     # ------------------------------------------------------------- dimensions
 
@@ -544,7 +578,8 @@ class PushTLidarScenario(PushTScenario):
 
     @property
     def state_dim(self) -> int:  # type: ignore[override]
-        return self.state_base_dim + self.dr_env_dim + self.dr_agent_dim * self.n_agents
+        dr = self.dr_env_dim + self.dr_agent_dim * self.n_agents
+        return self.state_base_dim + dr + int(self.hold_on)
 
     @property
     def state_base_dim(self) -> int:
@@ -735,6 +770,10 @@ class PushTLidarScenario(PushTScenario):
         self._oob = torch.zeros(n_envs if self.oob_on else 1, dtype=torch.uint8,
                                 device=device)
         self._oob_wp = wp.from_torch(self._oob)
+        # The settled-hold counter (a fused carry when the hold is on).
+        self._hold = torch.zeros(n_envs if self.hold_on else 1, dtype=torch.uint8,
+                                 device=device)
+        self._hold_wp = wp.from_torch(self._hold)
         if self.artefact_dr:
             # Per-robot artefact values (ART_* columns), at the ranges' low ends until a
             # reset redraws them in place, and their RNG streams.
@@ -1567,7 +1606,31 @@ class PushTLidarScenario(PushTScenario):
                 failed = self._oob.bool() | out
             self._oob = failed.to(torch.uint8)
             on_goal = on_goal & ~failed
-        team = (c["shaping"] + self.goal_reward * on_goal.to(dt)).unsqueeze(1).expand(-1, na)
+        done = on_goal
+        hold_t = torch.zeros_like(c["shaping"])
+        if self.hold_on:
+            vt, wt, vr, wr = self.settle
+            settled = (
+                on_goal
+                & (self.tee_vel.detach().norm(dim=-1) < vt)
+                & (self.tee_ang_vel.detach().abs() < wt)
+                & (vel.detach().norm(dim=-1) < vr).all(-1)
+                & (s.ang_vel.detach().abs() < wr).all(-1)
+            )
+            old = self._hold.long()
+            if reset:
+                fresh = torch.ones_like(settled) if env_mask is None else env_mask
+                new = torch.where(fresh, torch.zeros_like(old), old)
+            else:
+                new = torch.where(settled, (old + 1).clamp(max=255), torch.zeros_like(old))
+            self._hold = new.to(torch.uint8)
+            n = self.hold_steps
+            if not reset:
+                dh = new.clamp(max=n) - old.clamp(max=n)
+                hold_t = self.hold_reward * dh.to(dt) / float(n)
+            done = new >= n
+        bonus = self.goal_reward * done.to(dt)
+        team = (c["shaping"] + hold_t + bonus).unsqueeze(1).expand(-1, na)
         team = torch.where(failed.unsqueeze(1), torch.full_like(team, -self.oob_penalty), team)
         zero = torch.zeros_like(team)
         approach = torch.where(is_obs, zero, c["agent_shaping"])
@@ -1637,13 +1700,16 @@ class PushTLidarScenario(PushTScenario):
         critic = torch.cat([head, sorted_agents.flatten(1)], dim=-1)
         if self.critic_dr:
             critic = torch.cat([critic, self._critic_dr_torch(perm)], dim=-1)
+        if self.hold_on:
+            frac = self._hold.long().clamp(max=self.hold_steps).to(dt) / float(self.hold_steps)
+            critic = torch.cat([critic, frac.unsqueeze(-1)], dim=-1)
         aux = torch.cat(
             [dq * self.aux_scale, torch.stack([ca, sa], -1).unsqueeze(1).expand(-1, na, -1)],
             dim=-1,
         )
 
         self._lcache = {
-            "done": on_goal,
+            "done": done,
             "out_of_bounds": failed,
             "obs": obs,
             "reward": reward,
@@ -1776,6 +1842,12 @@ class PushTLidarScenario(PushTScenario):
                 (Buf("drift_state", (ne, na, 8), attr="_drift_state", alloc="never",
                      carry=True, watch=True),)
                 if self.pose_drift_on
+                else ()
+            ),
+            *(
+                (Buf("hold", (ne,), "uint8", attr="_hold", alloc="never", carry=True,
+                     watch=True),)
+                if self.hold_on
                 else ()
             ),
         )
@@ -2124,6 +2196,10 @@ class PushTLidarScenario(PushTScenario):
         per_env = self.oob_on
         arena = self._arena_half_wp if per_env else self._dummy_vec2()
         margin = self.oob_margin if per_env else 0.0
+        hold = self._wp["hold"] if self.hold_on else self._hold_wp
+        critic = self._wp["critic"] if self.hold_on else self._dummy_2d()
+        motion = [st.vel, st.ang_vel, self._wp["tee_vel"], self._wp["tee_ang_vel"]]
+        hold_cfg = (self.hold_steps, self.hold_reward, *self.settle, self.state_dim - 1)
         launch = self._lidar_reward_launch.get(
             concrete(pusht_lidar_reward_kernel, scalar),
             dim=w.n_envs,
@@ -2141,6 +2217,12 @@ class PushTLidarScenario(PushTScenario):
                 wp.int32(advance_prev),
                 wp.int32(full_pass),
                 oob,
+                *motion,
+                wp.int32(self.hold_steps),
+                *(scalar(x) for x in (self.hold_reward, *self.settle)),
+                wp.int32(self.state_dim - 1),
+                hold,
+                critic,
             ],
             outputs=outs,
             device=w.device,
@@ -2157,6 +2239,10 @@ class PushTLidarScenario(PushTScenario):
                 per_env,
                 ptr_key(arena),
                 ptr_key(oob),
+                *(ptr_key(m) for m in motion),
+                *hold_cfg,
+                ptr_key(hold),
+                ptr_key(critic),
                 *(ptr_key(o) for o in outs),
             ),
         )
@@ -2177,7 +2263,8 @@ class PushTLidarScenario(PushTScenario):
         return self._lcache["reward"]
 
     def done(self) -> torch.Tensor:
-        """The goal pose reached, in an episode not failed out of bounds."""
+        """The goal pose reached (and held, with ``hold_steps``), in an episode not failed
+        out of bounds."""
         if self.fused_active:
             return self.fb["done_bool"]
         return self._lcache["done"]
@@ -2192,7 +2279,8 @@ class PushTLidarScenario(PushTScenario):
         role-sorted order the drawn drive parameters, command delay, range-noise
         deviation, pose-noise scale, localisation bias and drift (x, y, heading each),
         artefact parameters, mount yaw error and stamp phase, each only when a reset draws
-        it."""
+        it. With ``hold_steps`` the last column is the hold's progress, its count over
+        ``hold_steps`` capped at 1."""
         if self.fused_active:
             return self.fb["critic"]
         return self._lcache["critic"]

@@ -601,6 +601,19 @@ def pusht_lidar_reward_kernel(
     advance_prev: wp.int32,
     full_pass: wp.int32,
     oob: wp.array(dtype=wp.uint8),
+    vel: wp.array2d(dtype=Any),
+    ang_vel: wp.array2d(dtype=Any),
+    tee_vel: wp.array(dtype=Any),
+    tee_ang_vel: wp.array(dtype=Any),
+    hold_steps: wp.int32,
+    hold_reward: Any,
+    settle_tee_speed: Any,
+    settle_tee_ang_vel: Any,
+    settle_robot_speed: Any,
+    settle_robot_ang_vel: Any,
+    hold_col: wp.int32,
+    hold: wp.array(dtype=wp.uint8),
+    critic: wp.array2d(dtype=Any),
     prev_dist: wp.array(dtype=Any),
     prev_ang: wp.array(dtype=Any),
     prev_adist: wp.array2d(dtype=Any),
@@ -629,6 +642,15 @@ def pusht_lidar_reward_kernel(
     ``arena_half[e] + oob_margin`` per axis, latches ``oob`` until the env respawns: the
     episode has failed, so it can no longer be solved, and every robot's reward is
     ``-oob_penalty`` (in the team column) on every step from then on.
+
+    With ``hold_steps > 0`` the episode succeeds only once the T has been on goal and
+    settled (the T and every robot below the settle speeds) for ``hold_steps`` steps in a
+    row: ``hold`` counts them, advancing on a step, cleared by a reset or by any step that
+    is not settled, and the goal bonus is paid while it is at least ``hold_steps``. The
+    team column adds the hold's potential difference, ``hold_reward`` times the change of
+    ``min(hold, hold_steps) / hold_steps``, so breaking a hold gives back what it earned;
+    ``critic[e, hold_col]`` is that fraction, written on every pass. ``hold`` and
+    ``critic`` are one-element stand-ins, never touched, without the hold.
     """
     e = wp.tid()
     zero = type(pos_shaping_factor)(0.0)
@@ -675,10 +697,40 @@ def pusht_lidar_reward_kernel(
     on_goal = wp.uint8(0)
     if d < goal_tolerance and ang < angle_tolerance and failed == wp.uint8(0):
         on_goal = wp.uint8(1)
+    hold_t = zero
+    if hold_steps > 0:
+        settled = on_goal == wp.uint8(1)
+        tv = tee_vel[e]
+        if wp.sqrt(tv[0] * tv[0] + tv[1] * tv[1]) >= settle_tee_speed:
+            settled = False
+        if wp.abs(tee_ang_vel[e]) >= settle_tee_ang_vel:
+            settled = False
+        for a in range(n_agents):
+            v = vel[e, a]
+            if wp.sqrt(v[0] * v[0] + v[1] * v[1]) >= settle_robot_speed:
+                settled = False
+            if wp.abs(ang_vel[e, a]) >= settle_robot_ang_vel:
+                settled = False
+        old = wp.int32(hold[e])
+        h = old
+        if reset_hit == 1:
+            h = wp.int32(0)
+        elif advance_prev == 1:
+            if settled:
+                h = wp.min(old + wp.int32(1), wp.int32(255))
+            else:
+                h = wp.int32(0)
+            dh = wp.min(h, hold_steps) - wp.min(old, hold_steps)
+            hold_t = hold_reward * type(zero)(dh) / type(zero)(hold_steps)
+        hold[e] = wp.uint8(h)
+        critic[e, hold_col] = type(zero)(wp.min(h, hold_steps)) / type(zero)(hold_steps)
+        on_goal = wp.uint8(0)
+        if h >= hold_steps:
+            on_goal = wp.uint8(1)
     bonus = zero
     if on_goal == wp.uint8(1):
         bonus = goal_reward
-    team = shaping + bonus
+    team = shaping + hold_t + bonus
     if failed == wp.uint8(1):
         team = -oob_penalty
 
@@ -951,6 +1003,15 @@ def _reward_signature(dtype) -> list:
         wp.int32,  # advance_prev
         wp.int32,  # full_pass
         wp.array(dtype=wp.uint8),  # oob
+        wp.array2d(dtype=vec2),  # vel
+        a2s,  # ang_vel
+        wp.array(dtype=vec2),  # tee_vel
+        a1s,  # tee_ang_vel
+        wp.int32,  # hold_steps
+        *([dtype] * 5),  # hold_reward and the four settle thresholds
+        wp.int32,  # hold_col
+        wp.array(dtype=wp.uint8),  # hold
+        a2s,  # critic
         a1s,  # prev_dist
         a1s,  # prev_ang
         a2s,  # prev_adist

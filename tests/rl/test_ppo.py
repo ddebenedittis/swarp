@@ -17,6 +17,7 @@ from swarp.rl.ppo import (
     gae,
     greedy_env_arm,
     greedy_score_kwargs,
+    load_widened,
     network_archs,
     policy_outputs,
     standardize_advantage,
@@ -1060,3 +1061,17 @@ def test_actor_scale_min_floors_the_std_and_round_trips_in_the_config():
     assert "scale_min" not in PolicyNet(6, 2, 8).config  # default checkpoints unchanged
     with pytest.raises(ValueError, match="actor_scale_min"):
         TrainSpec(actor_scale_min=0.1)  # the default mlp actor has no such option
+
+
+def test_load_widened_keeps_the_function_of_the_saved_network():
+    """A critic whose state gained a column computes what the saved one did, whatever the
+    new column holds; a shape that cannot widen is refused."""
+    torch.manual_seed(0)
+    old = StateCritic(3, 5, 2, 16, per_agent=True)
+    new = StateCritic(4, 5, 2, 16, per_agent=True)
+    load_widened(new, old.state_dict())
+    state = torch.randn(7, 4)
+    obs = torch.zeros(7, 2, 5)
+    torch.testing.assert_close(new(obs, state), old(obs, state[:, :3]))
+    with pytest.raises(ValueError, match="cannot widen"):
+        load_widened(StateCritic(2, 5, 2, 16, per_agent=True), old.state_dict())

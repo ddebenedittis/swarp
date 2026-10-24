@@ -420,6 +420,13 @@ SPECS: dict[str, TrainSpec] = {
     # and lmbda 0.95 are 20 s / 4 s credit horizons. The length-based shaping is halved
     # (pos 2.5, approach 0.5) so an episode's shaping keeps Push-T's ratio to the goal bonus.
     #
+    # Success is a settled hold: the T on goal for 1 s (5 steps) with the T below 3 cm/s and
+    # 0.1 rad/s and both robots below 0.1 m/s and 0.4 rad/s, each settled step paying a fifth
+    # of hold_reward 1.0 that a broken hold gives back. Without it the policy crossed the goal
+    # at 0.09 m/s with the robots at 0.32 m/s, and 10 s later 9% of the solved T were still on
+    # it. The robots' thresholds sit 2.5 sigma above the jitter the actor's std floor (0.1)
+    # puts on a stopped robot's command, so a sampled stop still completes the hold.
+    #
     # Drive and contacts, from a Gazebo sysid (swarp_gz_test out/sysid). ControlMode.SERVO
     # with accelerations and command gains drawn per env and robot around Gazebo's Limo
     # (1 m/s^2, 3 rad/s^2, gains 1.0 / 0.79). The T on a Coulomb floor (mu 0.2-0.5, no
@@ -484,6 +491,8 @@ SPECS: dict[str, TrainSpec] = {
             "tee_scale": (0.9, 1.1), "n_tee_sizes": 3,
             "goal_tolerance": 0.15, "angle_tolerance": 0.25, "obs_level": 1,
             "frame_stack": 4, "standoff_dist": 1.0,
+            "hold_steps": 5, "hold_reward": 1.0, "settle_tee_speed": 0.03,
+            "settle_tee_ang_vel": 0.1, "settle_robot_speed": 0.1, "settle_robot_ang_vel": 0.4,
             "pos_shaping_factor": 2.5, "rot_shaping_factor": 0.5, "rot_away_penalty": 1.0,
             "agent_dist_shaping": 0.5,
             # Drive and contacts.
