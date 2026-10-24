@@ -139,7 +139,6 @@ class PushTScenario(FusedScenario):
         wheel_contacts: bool = False,
         wheel_lateral_friction: float = 0.2,
         wheel_turn_torque: float = 0.0,
-        wheel_drive_force: float = math.inf,
         cmd_latency: float | tuple[float, float] = 0.0,
         open_arena: bool = False,
         arena_stop_margin: float = 0.25,
@@ -174,7 +173,7 @@ class PushTScenario(FusedScenario):
         ``wheel_contacts`` gives ``diff_drive`` robots wheel-faithful contacts
         (``WorldConfig.wheel_contacts``): a contact turns a box robot through its torque
         past the drive's ``wheel_turn_torque``, pushes it sideways only past the wheels'
-        grip ``wheel_lateral_friction``, and stalls its drive past ``wheel_drive_force``.
+        grip ``wheel_lateral_friction``.
 
         ``cmd_latency`` (seconds, a value or a ``(low, high)`` range drawn per env and
         robot on every reset) delays every command: for that long into each step, rounded
@@ -186,8 +185,8 @@ class PushTScenario(FusedScenario):
         ``open_arena`` removes the arena's walls, as on a real floor: the T is no longer
         clamped inside ``world_size`` and the robots meet no wall. A ``diff_drive`` robot
         instead gets a safety bridge's arena stop (:meth:`Stepper.enable_arena_stop
-        <swarp.core.stepper.Stepper.enable_arena_stop>`) at ``world_size +
-        arena_stop_margin``.
+        <swarp.core.stepper.Stepper.enable_arena_stop>`) ``arena_stop_margin`` past the
+        arena's edge. It needs ``arena_size``.
 
         ``arena_size`` (metres, full extents; needs ``open_arena``) gives every env its own
         rectangular arena, drawn on every reset: one value for a fixed square, ``(lo, hi)``
@@ -196,7 +195,7 @@ class PushTScenario(FusedScenario):
         plus ``arena_stop_margin``) and, in subclasses, everything else that reads the arena
         follow the env's :attr:`arena_half`; ``world_size`` must cover the largest. It is
         read on every reset, so a trainer can move it between resets. ``None`` keeps the
-        one square arena of ``world_size``."""
+        one walled square arena of ``world_size``."""
         self.n_agents = n_agents
         self.model = _coerce(DynamicsModel, model, "model")
         if self.model not in self.supported_models:
@@ -219,7 +218,6 @@ class PushTScenario(FusedScenario):
         self.wheel_contacts = bool(wheel_contacts)
         self.wheel_lateral_friction = wheel_lateral_friction
         self.wheel_turn_torque = wheel_turn_torque
-        self.wheel_drive_force = wheel_drive_force
         lat = (cmd_latency, cmd_latency) if isinstance(cmd_latency, int | float) else cmd_latency
         if not 0.0 <= lat[0] <= lat[1]:
             raise ValueError(f"cmd_latency must be >= 0 with low <= high, got {cmd_latency!r}")
@@ -233,8 +231,11 @@ class PushTScenario(FusedScenario):
         self.per_env_arena = arena_size is not None
         #: The per-env arena's extents (see :func:`arena_ranges`), read on every reset.
         self.arena_size = arena_size
-        if self.per_env_arena and not self.open_arena:
-            raise ValueError("arena_size needs open_arena: walls and the T's clamp are global")
+        if self.per_env_arena != self.open_arena:
+            raise ValueError(
+                "open_arena and arena_size go together: walls and the T's clamp are global, "
+                "and an open floor's arena is per env (a value fixes one square)"
+            )
         self.floor_friction = (
             None if floor_friction is None else _as_range(floor_friction, 0.0, "floor_friction")
         )
@@ -419,7 +420,6 @@ class PushTScenario(FusedScenario):
             wheel_contacts=self.wheel_contacts,
             wheel_lateral_friction=self.wheel_lateral_friction,
             wheel_turn_torque=self.wheel_turn_torque,
-            wheel_drive_force=self.wheel_drive_force,
             contact_max_overlap=self.max_overlap,
         ).override_with(world_config)
         self.dt = dt
@@ -519,10 +519,6 @@ class PushTScenario(FusedScenario):
             self._arena_half_wp = wp.from_torch(self.arena_half, dtype=vec2)
             self._arena_edges_wp = wp.from_torch(self._arena_edges, dtype=vec2)
             self.world.stepper.enable_arena_stop(n_envs, self.world.act_dim, self._arena_edges_wp)
-        elif self.open_arena:
-            self.world.stepper.enable_arena_stop(
-                n_envs, self.world.act_dim, self.world_size + self.arena_stop_margin
-            )
         if self.friction_dr:
             # A per-env mu * g, allocated here (outside any capture) and redrawn in place.
             g = self.world.config.gravity

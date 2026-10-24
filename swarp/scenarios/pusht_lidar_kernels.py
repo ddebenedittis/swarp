@@ -594,10 +594,9 @@ def pusht_lidar_reward_kernel(
     occlusion_weight: Any,
     contact_penalty: Any,
     collision_penalty: Any,
-    oob_limit: Any,
     oob_penalty: Any,
     oob_margin: Any,
-    per_env_oob: wp.int32,
+    check_oob: wp.int32,
     arena_half: wp.array(dtype=Any),
     advance_prev: wp.int32,
     full_pass: wp.int32,
@@ -626,11 +625,10 @@ def pusht_lidar_reward_kernel(
     Every robot (either role) pays ``collision_penalty`` on a step that ends with it
     touching another robot or the surroundings (``hit_robot`` / ``hit_scenery``).
 
-    With ``oob_limit > 0``, a step that leaves the T's centroid beyond it on either axis
-    latches ``oob`` until the env respawns: the episode has failed, so it can no longer
-    be solved, and every robot's reward is ``-oob_penalty`` (in the team column) on every
-    step from then on. With ``per_env_oob`` the limit is the env's own, per axis:
-    ``arena_half[e] + oob_margin``.
+    With ``check_oob``, a step that leaves the T's centroid beyond the env's own limit,
+    ``arena_half[e] + oob_margin`` per axis, latches ``oob`` until the env respawns: the
+    episode has failed, so it can no longer be solved, and every robot's reward is
+    ``-oob_penalty`` (in the team column) on every step from then on.
     """
     e = wp.tid()
     zero = type(pos_shaping_factor)(0.0)
@@ -665,12 +663,9 @@ def pusht_lidar_reward_kernel(
         shaping = ps
     # ``oob`` is a one-element stand-in, never touched, without the check.
     failed = wp.uint8(0)
-    if oob_limit > zero:
-        lim_x = oob_limit
-        lim_y = oob_limit
-        if per_env_oob == 1:
-            lim_x = arena_half[e][0] + oob_margin
-            lim_y = arena_half[e][1] + oob_margin
+    if check_oob == 1:
+        lim_x = arena_half[e][0] + oob_margin
+        lim_y = arena_half[e][1] + oob_margin
         failed = oob[e]
         if reset_hit == 1:
             failed = wp.uint8(0)
@@ -949,10 +944,9 @@ def _reward_signature(dtype) -> list:
         wp.array2d(dtype=wp.uint8),  # hit_scenery
         wp.int32,  # n_agents
         *([dtype] * 17),  # the pusht weights, the observer weights, collision_penalty
-        dtype,  # oob_limit
         dtype,  # oob_penalty
         dtype,  # oob_margin
-        wp.int32,  # per_env_oob
+        wp.int32,  # check_oob
         wp.array(dtype=vec2),  # arena_half
         wp.int32,  # advance_prev
         wp.int32,  # full_pass
@@ -982,8 +976,7 @@ def lidar_sensor_kernel(
     body_frame: wp.int32,
     mount_offset: Any,
     min_range: Any,
-    half_fov: wp.array2d(dtype=Any),
-    fov_at_mount: wp.int32,
+    half_fov: Any,
     noise_std: wp.array2d(dtype=Any),
     rng_state: wp.array2d(dtype=wp.uint32),
     ranges: wp.array3d(dtype=Any),
@@ -991,18 +984,15 @@ def lidar_sensor_kernel(
 ):
     """Thread per (env, agent): turn the centre-ray scan into what the mounted sensor
     returns, in place. A hit within ``min_range`` of the mount (``mount_offset`` ahead of
-    the centre along the heading) or on a ray more than this robot's ``half_fov`` (plus
-    ``FOV_EPS``) off the heading reads as a miss (``max_range``, class 0); the remaining
+    the centre along the heading), or whose bearing from the mount is more than
+    ``half_fov`` (plus ``FOV_EPS``) off the heading, reads as a miss (``max_range``,
+    class 0): the sensor's own crop, as a body hiding the rear makes it. The remaining
     hits get Gaussian range noise of this robot's ``noise_std``, clamped to
-    ``[0, max_range]``, from this thread's own RNG stream. A body-frame ray's angle off
-    the heading is its fixed offset ``angle_start + r ray_step`` wrapped to
-    ``(-pi, pi]``, so which rays a field of view keeps does not depend on the heading.
-    With ``fov_at_mount`` the field of view is the sensor's instead: a hit is blanked when
-    its bearing from the mount, off the heading, exceeds ``half_fov``."""
+    ``[0, max_range]``, from this thread's own RNG stream."""
     e, a = wp.tid()
     n_rays = ranges.shape[2]
     zero = type(max_range)(0.0)
-    hf = half_fov[e, a] + type(max_range)(FOV_EPS)
+    hf = half_fov + type(max_range)(FOV_EPS)
     sigma = noise_std[e, a]
     th = theta[e, a]
     base = zero
@@ -1018,12 +1008,7 @@ def lidar_sensor_kernel(
             hx = t * wp.cos(ang) - mx
             hy = t * wp.sin(ang) - my
             blind = hx * hx + hy * hy < min_range * min_range
-            off = ang - th
-            if fov_at_mount != 0:
-                off = wp.atan2(hy, hx) - th
-            elif body_frame != 0:
-                off = angle_start + type(max_range)(r) * ray_step
-            if wp.abs(_wrap(off)) > hf:
+            if wp.abs(_wrap(wp.atan2(hy, hx) - th)) > hf:
                 blind = True
             if blind:
                 ranges[e, a, r] = max_range
@@ -1039,9 +1024,7 @@ def _sensor_signature(dtype) -> list:
         wp.array2d(dtype=dtype),  # theta
         *([dtype] * 3),  # max_range, ray_step, angle_start
         wp.int32,  # body_frame
-        *([dtype] * 2),  # mount_offset, min_range
-        wp.array2d(dtype=dtype),  # half_fov
-        wp.int32,  # fov_at_mount
+        *([dtype] * 3),  # mount_offset, min_range, half_fov
         wp.array2d(dtype=dtype),  # noise_std
         wp.array2d(dtype=wp.uint32),  # rng_state
         wp.array3d(dtype=dtype),  # ranges
@@ -1063,31 +1046,27 @@ def pusht_lidar_dr_reset_kernel(
     reset_mask: wp.array(dtype=wp.uint8),
     use_mask: wp.int32,
     seed: wp.int32,
-    fov_lo: Any,
-    fov_hi: Any,
     noise_lo: Any,
     noise_hi: Any,
     scale_lo: Any,
     scale_hi: Any,
     bias_pos_std: Any,
     bias_theta_std: Any,
-    half_fov: wp.array2d(dtype=Any),
     noise_std: wp.array2d(dtype=Any),
     pose_scale: wp.array2d(dtype=Any),
     bias_pos: wp.array2d(dtype=Any),
     bias_theta: wp.array2d(dtype=Any),
 ):
-    """Thread per (env, robot), respawned envs only: this robot's half field of view and
-    range-noise deviation, each uniform in its range (left alone when fixed); the env's
+    """Thread per (env, robot), respawned envs only: this robot's range-noise deviation,
+    uniform in its range (left alone when fixed); the env's
     pose-noise scale (one draw per env, so every robot of the env reads the same), and
     this robot's localisation bias for the episode, Gaussian with the scale times
     ``bias_pos_std`` per axis and ``bias_theta_std``."""
     e, a = wp.tid()
     if use_mask == 1 and reset_mask[e] == wp.uint8(0):
         return
-    na = half_fov.shape[1]
+    na = noise_std.shape[1]
     rng = wp.rand_init(seed, e * (na + 1) + 1 + a)
-    half_fov[e, a] = _draw_range(wp.randf(rng), fov_lo, fov_hi, half_fov[e, a])
     noise_std[e, a] = _draw_range(wp.randf(rng), noise_lo, noise_hi, noise_std[e, a])
     env_rng = wp.rand_init(seed, e * (na + 1))
     u = _draw_range(wp.randf(env_rng), scale_lo, scale_hi, scale_lo)
@@ -1208,8 +1187,7 @@ def _dr_reset_signature(dtype) -> list:
         wp.array(dtype=wp.uint8),  # reset_mask
         wp.int32,  # use_mask
         wp.int32,  # seed
-        *([dtype] * 8),  # fov, noise, scale ranges; bias deviations
-        a2s,  # half_fov
+        *([dtype] * 6),  # noise, scale ranges; bias deviations
         a2s,  # noise_std
         a2s,  # pose_scale
         wp.array2d(dtype=VEC2[dtype]),  # bias_pos

@@ -7,15 +7,17 @@ All notable changes to `swarp`. Newest first. Nothing has been released yet — 
 
 ### Added
 
-- **`pusht`/`pusht_lidar` per-env arena (`arena_size`) and lidar-only surroundings (`scenery_probs`).**
-  `arena_size` draws each env's W and H on every reset (a range, or a range per axis); the spawns, the arena stop (`Stepper.enable_arena_stop` now takes a per-env edge array), the out-of-bounds limit and the label bound become per env and per axis, and `pusht_lidar` observes the half-extents after the heading.
-  `scenery_probs` draws per env nothing, perimeter walls, a rotated room or walls plus circles and boxes, outside the free region (arena plus `scenery_clearance`); only the lidar sees them, through the new `swarp.sensors.Scenery` (`lidar_scan(..., scenery=...)`, `Lidar.bind(world, scenery)`), and `info()["scenery_leak"]` counts the rays they reach the policy through as T.
+- **`pusht`/`pusht_lidar` per-env arena (`arena_size`), solid surroundings (`scenery_probs`) and T sizes (`tee_scale`).**
+  `arena_size` draws each env's W and H on every reset (a value, a range, or a range per axis); the spawns, the arena stop (`Stepper.enable_arena_stop` now takes a per-env edge array), the out-of-bounds limit and the label bound become per env and per axis, and `pusht_lidar` observes the half-extents after the heading.
+  `scenery_probs` draws per env nothing, perimeter walls, a rotated room or walls plus circles and capsules outside the arena (plus `scenery_clearance`), held by the stepper as immovable obstacles of a fixed slot bank, so the robots and the T collide with them and the lidar scans them; their per-env poses are mirrored in the new `swarp.sensors.Scenery`, which `lidar_scan(..., scenery=...)` and `lidar_scan_warp` also take.
+  `info()["scenery_leak"]` counts the rays they reach the policy through as T, `collision_penalty` charges a robot touching the other robot or a surroundings shape, and `tee_scale` draws the T per env from a bank of `n_tee_sizes` scaled copies.
+  Every obstacle loop skips a shape whose bounding disc cannot reach, bit-identically.
   Default worlds launch nothing new.
 
 - **`swarp.rl` single-run guards**, off by default: an adaptive learning rate that follows the KL (`TrainSpec.adaptive_kl`, logged as `kl_lr_mult`), a floor under the actor's std (`TrainSpec.actor_scale_min`, `PolicyNet(scale_min=...)`), a KL brake (`TrainSpec.target_kl`) that skips an iteration's remaining minibatch steps on device, automatic rollback (`rollback`) to a pre-collapse snapshot with a halved learning rate, and a gated ramp clock (`ramp_gate`, `hold_iters`); `metrics.csv` logs `ramp_clock`, `approx_kl`, `kl_stop_frac`, `rollbacks` and `lr_mult`.
   The rollout's store graph now fails loudly, naming the outputs, when a scenario's outputs move between steps.
 
-- **`SPECS["pusht_lidar_limo_slim240_arena"]`**: the slim-T recipe on 2–5 m arenas with surroundings, at a 220 deg field of view (the lab drivers deliver -116..+108 deg), trained as one guarded run; see the Lidar Push-T page.
+- **`SPECS["pusht_lidar_limo"]`**: lidar Push-T for two real AgileX Limos, from scratch in one guarded run: the slim T on 2–5 m open arenas with solid surroundings, a 220 deg field of view cut at the mount, AMCL-sized localisation error, command latency, the scan artefacts and the outside-the-arena mask; 0.97 greedy on its own distribution. See the Lidar Push-T page.
 
 - **A rotating lidar: `Lidar(scan_period=..., sweep_dir=...)` and `lidar_scan(..., sweep=...)`.**
   A spinning sensor takes its rays one after the other and reports them against one pose; with the sweep on, ray `r` is cast from the pose `tau_r = (stamp_phase - phi_r) scan_period` before the reported one, at constant velocity, plus a per-agent mount yaw error (`sweep_offsets`).
@@ -23,17 +25,14 @@ All notable changes to `swarp`. Newest first. Nothing has been released yet — 
 
 - **`pusht_lidar` scan artefacts, deployment labels and a critic that sees the randomisation**, all opt-in (`swarp/scenarios/pusht_lidar_artefacts.py`).
   `lidar_span` spans the rays over less than the full circle; `lidar_grazing_cos`, `lidar_dropout`, `lidar_spurious`, `lidar_range_scale` and `lidar_range_bias` lose, add and distort returns per robot; `lidar_scan_period`, `lidar_stamp_phase` and `lidar_yaw_bias` turn on the rotating scan.
-  `lidar_label_from_pose` classes every hit by the deployment's rule on the reported poses, so a teammate hit off its reported footprint reads as the T.
+  `lidar_label_from_pose` classes every hit by the deployment's rule on the reported poses, so a teammate hit off its reported footprint reads as the T, and `lidar_arena_flag` adds a mask of the T-labelled hits past the arena.
   `critic_dr` appends every randomised parameter, scaled to about [-1, 1] and role-sorted, to `critic_state()`.
   Default worlds launch nothing new, and their step times are unchanged.
 
-- **`pusht`/`pusht_lidar` `open_arena`**: no walls, the T is not clamped, and a diff-drive robot meets a safety bridge's arena stop (`Stepper.enable_arena_stop`) instead; `pusht_lidar`'s `oob_margin` fails an episode whose T leaves the arena by that much.
+- **`pusht`/`pusht_lidar` `open_arena`** (with `arena_size`): no walls, the T is not clamped, and a diff-drive robot meets a safety bridge's arena stop (`Stepper.enable_arena_stop`) instead; `pusht_lidar`'s `oob_margin` fails an episode whose T leaves the arena by that much.
 
 - **`swarp.rl` action-rate penalty** (`TrainSpec.action_rate_coef`, `action_rate_ramp_iters`; `--action-rate-coef`, `--action-rate-ramp-iters`): each agent's reward loses the weight times the mean squared change of its normalised action, logged as `action_rate`.
   Off by default, and then training is byte-identical.
-
-- **`SPECS["pusht_lidar_limo_slim240"]`**: the Limo Push-T with the real slim T, trained from scratch at a fixed 240 deg with 43 rays and all of the above; see the Lidar Push-T page.
-  It trains in stages, `pusht_lidar_limo_slim240_s1` without pose noise, latency or turn-away cost, then `pusht_lidar_limo_slim240_s2` with the noise, to 0.99 greedy at full noise; the policy still spins the T about one and a half turns before stopping it on the goal heading.
 
 - **`pusht_lidar`, a twelfth scenario: multi-robot Push-T observed through lidar, with pusher and observer roles.**
   Five identical robots, two pushers and three observers by default, with the roles redrawn per env per episode at fixed counts; every robot can push, and the roles differ only in their rewards.

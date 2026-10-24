@@ -316,24 +316,23 @@ def test_lidar_blind_zone_hides_a_touching_face(device, fused):
 @pytest.mark.parametrize("device", DEVICES)
 @pytest.mark.parametrize(("fov_deg", "kept"), [(240.0, 10), (270.0, 12), (360.0, 16)])
 def test_field_of_view_keeps_the_rays_within_half_of_it(device, fov_deg, kept):
-    """Body-frame ray ``r`` sits ``r 2 pi / 32`` off the heading, wrapped to (-pi, pi]; it
-    is kept iff that offset is within half the field of view (inclusive), whatever the
-    heading: 240 deg keeps rays -10..10, 270 deg -12..12 (the edge rays at +-135 deg
-    included), 360 deg all."""
+    """With the lidar at the centre, a hit on body-frame ray ``r`` bears ``r 2 pi / 32``
+    off the heading, wrapped to (-pi, pi]; it is kept iff that bearing is within half the
+    field of view (inclusive), whatever the heading: 240 deg keeps rays -10..10, 270 deg
+    -12..12 (the edge rays at +-135 deg included), 360 deg all."""
     wp.init()
     nr, n_agents = 32, 3
     theta = torch.tensor([[0.0, 1.234, -2.9]], dtype=torch.float32)
     wp_th = wp.from_torch(theta.to(device))
     ranges = wp.from_torch(torch.full((1, n_agents, nr), 0.5, device=device))
     hit = wp.from_torch(torch.full((1, n_agents, nr), 3, dtype=torch.uint8, device=device))
-    half = wp.from_torch(torch.full((1, n_agents), math.radians(fov_deg) / 2, device=device))
     sigma = wp.from_torch(torch.zeros(1, n_agents, device=device))
     rng = wp.zeros((1, n_agents), dtype=wp.uint32, device=device)
     wp.launch(
         concrete(lidar_sensor_kernel, wp.float32),
         dim=(1, n_agents),
-        inputs=[wp_th, 1.5, 2.0 * math.pi / nr, 0.0, 1, 0.1, 0.02, half, 0, sigma, rng,
-                ranges, hit],
+        inputs=[wp_th, 1.5, 2.0 * math.pi / nr, 0.0, 1, 0.0, 0.02, math.radians(fov_deg) / 2,
+                sigma, rng, ranges, hit],
         device=device,
     )
     k = torch.arange(nr)
@@ -420,10 +419,10 @@ def test_pose_drift_misses_a_shove_then_decays(device, fused):
 
 @pytest.mark.parametrize("device", DEVICES)
 def test_field_of_view_at_the_mount_hides_close_side_hits(device):
-    """With ``fov_at_mount`` the 240 deg field of view is the sensor's, centred on the mount
-    0.1 m ahead: a hit 0.2 m away on ray 10 (112.5 deg off the heading from the centre)
-    is 134 deg off it from the mount and reads as a miss, while a hit 1.4 m away on the
-    same ray (118 deg from the mount) stays."""
+    """The 240 deg field of view is the sensor's, centred on the mount 0.1 m ahead: a hit
+    0.2 m away on ray 10 (112.5 deg off the heading from the centre) is 134 deg off it from
+    the mount and reads as a miss, while a hit 1.4 m away on the same ray (118 deg from the
+    mount) stays."""
     wp.init()
     nr = 32
     th = wp.from_torch(torch.zeros(1, 2, device=device))
@@ -431,14 +430,13 @@ def test_field_of_view_at_the_mount_hides_close_side_hits(device):
     r[0, 1] = 1.4
     ranges = wp.from_torch(r)
     hit = wp.from_torch(torch.full((1, 2, nr), 3, dtype=torch.uint8, device=device))
-    half = wp.from_torch(torch.full((1, 2), math.radians(120.0), device=device))
     sigma = wp.from_torch(torch.zeros(1, 2, device=device))
     rng = wp.zeros((1, 2), dtype=wp.uint32, device=device)
     wp.launch(
         concrete(lidar_sensor_kernel, wp.float32),
         dim=(1, 2),
-        inputs=[th, 1.5, 2.0 * math.pi / nr, 0.0, 1, 0.1, 0.02, half, 1, sigma, rng,
-                ranges, hit],
+        inputs=[th, 1.5, 2.0 * math.pi / nr, 0.0, 1, 0.1, 0.02, math.radians(120.0), sigma,
+                rng, ranges, hit],
         device=device,
     )
     seen = wp.to_torch(hit).cpu()[0] == 3
@@ -450,12 +448,12 @@ def test_field_of_view_at_the_mount_hides_close_side_hits(device):
 @pytest.mark.parametrize("device", DEVICES)
 @pytest.mark.parametrize("fused", [True, False])
 def test_out_of_bounds_fails_the_episode_until_respawn(device, fused):
-    """In an open arena a T whose centroid passes ``world_size + oob_margin`` fails its
+    """On an open floor a T whose centroid passes its arena plus ``oob_margin`` fails its
     episode: from that step on every robot earns ``-oob_penalty`` and the goal no longer
     counts, even with the T brought back onto it; a respawn clears it."""
     env = _env(device, n_envs=2, fused=fused, n_agents=2, n_pushers=2, model="diff_drive",
                agent_shape="box", agent_half_extents=(0.05, 0.03), open_arena=True,
-               oob_margin=0.5, oob_penalty=0.3)
+               arena_size=2.0, oob_margin=0.5, oob_penalty=0.3)
     env.reset(seed=0)
     scen = env.scenario
     zero = torch.zeros(2, 2, 2, device=device)
@@ -683,7 +681,8 @@ def test_span_scans_only_its_sector(device, fused):
 
 # ------------------------------------------------------------ per-env arena, scenery
 
-#: The Limo fleet and slim T at real scale, in an open arena with the out-of-bounds check.
+#: The Limo fleet and slim T at real scale, on an open floor with the out-of-bounds check
+#: (every test adds its own ``arena_size``).
 _LIMO = dict(n_agents=2, n_pushers=2, model="diff_drive", agent_shape="box",
              agent_half_extents=(0.161, 0.110), max_speed=0.4, world_size=2.5,
              bar_len=0.5, bar_width=0.04, stem_len=0.5, stem_width=0.04, open_arena=True,
@@ -776,20 +775,19 @@ def _segment_rect(a, b, fx, fy):
 
 @pytest.mark.parametrize("device", DEVICES)
 def test_scenery_stays_outside_the_free_region(device):
-    """Over every layout, no wall (a capsule) and no clutter shape comes within the free
-    region: the arena grown by the clearance, which defaults to the farther of a robot's
-    and the T's reach past the arena. No layout leaves slots where it has none to fill;
-    perimeter walls are parallel to the arena's sides and a room's are not."""
+    """Over every layout, no wall (a capsule) and no clutter shape (a circle or a capsule)
+    comes within the free region: the arena grown by the clearance. No layout leaves
+    slots where it has none to fill; perimeter walls are parallel to the arena's sides and
+    a room's are not."""
     from swarp.core.config import ObstacleShape
     from swarp.scenarios.pusht_lidar_scenery import N_WALLS
 
-    env = _env(device, n_envs=4096, arena_size=(2.0, 5.0), scenery_probs=_LAYOUTS, **_LIMO)
+    env = _env(device, n_envs=4096, arena_size=(2.0, 5.0), scenery_probs=_LAYOUTS,
+               scenery_clearance=0.3, **_LIMO)
     env.reset(seed=0)
     scen = env.scenario
     sc = scen.scenery
     clear = scen.scenery_clearance
-    assert clear == pytest.approx(max(scen.robot_reach(), scen.tee_reach()))
-    assert clear >= scen.oob_margin + scen.tee_radius
     fx = scen.arena_half[:, 0] + clear
     fy = scen.arena_half[:, 1] + clear
     mode = scen.scenery_mode
@@ -811,21 +809,18 @@ def test_scenery_stays_outside_the_free_region(device):
             need = sc.radius[:, s]
         else:
             dist = _point_rect(sc.pos[:, s], fx, fy)
-            is_box = sc.shape[:, s] == int(ObstacleShape.BOX)
-            need = torch.where(is_box, sc.half[:, s].norm(dim=-1), sc.radius[:, s])
+            is_seg = sc.shape[:, s] == int(ObstacleShape.SEGMENT)
+            need = torch.where(is_seg, sc.half[:, s, 0] + sc.radius[:, s], sc.radius[:, s])
         assert (dist[u] >= need[u] - 1e-5).all(), f"slot {s} enters the free region"
 
 
 @pytest.mark.parametrize("device", DEVICES)
-@pytest.mark.parametrize("solid", [True, False])
-def test_solid_scenery_stops_robots_and_is_penalised(device, solid):
+def test_scenery_stops_robots_and_is_penalised(device):
     """Robots driving straight out of a 2 x 2 m arena with no arena stop, into closed
-    perimeter walls at its edge: solid walls hold every robot centre inside them and flag
-    the contact (paid as ``collision_penalty``), lidar-only walls let them through. Solid
-    scenery is also stepper obstacles after the T's boxes, and its clutter keeps clear of
-    the arena grown by the clearance (0 by default)."""
-    kw = {"scenery_collide": True, "collision_penalty": 0.05} if solid else {
-        "scenery_clearance": 0.0}
+    perimeter walls at its edge: the walls hold every robot centre inside them and flag
+    the contact (paid as ``collision_penalty``). The surroundings are stepper obstacles
+    after the T's boxes."""
+    kw = {"collision_penalty": 0.05}
     env = _env(device, n_envs=64, arena_size=(2.0, 2.0), scenery_probs=(0.0, 1.0, 0.0, 0.0),
                wall_missing=0.0, scenery_gap=(0.0, 0.1), wall_radius=(0.05, 0.1),
                **{**_LIMO, "arena_stop_margin": 5.0}, **kw)
@@ -839,23 +834,19 @@ def test_solid_scenery_stops_robots_and_is_penalised(device, solid):
             a = torch.zeros(64, 2, 2, device=device)
             a[..., 0] = 1.0
             env.step(a)
-            if solid:
-                info = scen.info()
-                touch = info["scenery_collision"] | info["robot_collision"]
-                flagged |= info["scenery_collision"]
-                col = info["multiobj_reward"][..., OBJECTIVES.index("collision")]
-                torch.testing.assert_close(col, torch.where(touch, -0.05, 0.0) * (col != 0))
-                paid |= bool((col == -0.05).any())
+            info = scen.info()
+            touch = info["scenery_collision"] | info["robot_collision"]
+            flagged |= info["scenery_collision"]
+            col = info["multiobj_reward"][..., OBJECTIVES.index("collision")]
+            torch.testing.assert_close(col, torch.where(touch, -0.05, 0.0) * (col != 0))
+            paid |= bool((col == -0.05).any())
     p = env.world.state.pos
     inner_x = (sc.pos[:, 0, 0] - sc.radius[:, 0]).unsqueeze(1)
     inner_y = (sc.pos[:, 2, 1] - sc.radius[:, 2]).unsqueeze(1)
     inside = (p[..., 0] < inner_x + 1e-3) & (p[..., 1] < inner_y + 1e-3)
-    if solid:
-        assert inside.all(), "a robot crossed a solid wall"
-        assert flagged.float().mean() > 0.5 and paid
-        assert env.world.stepper.n_obstacles == scen.n_boxes + sc.n_slots
-    else:
-        assert not inside.all(), "no robot crossed a lidar-only wall"
+    assert inside.all(), "a robot crossed a wall"
+    assert flagged.float().mean() > 0.5 and paid
+    assert env.world.stepper.n_obstacles == scen.n_boxes + sc.n_slots
 
 
 @pytest.mark.parametrize("device", DEVICES)
@@ -864,7 +855,8 @@ def test_tee_size_bank_draws_per_env_and_parks_the_rest(device):
     redraws only the envs it selects, the stepper holds each size's boxes scaled (inertia
     with the square), and after a step the env's own size is the T while the others stay
     parked at rest."""
-    env = _env(device, n_envs=256, tee_scale=(0.8, 1.2), n_tee_sizes=3, **_LIMO)
+    env = _env(device, n_envs=256, tee_scale=(0.8, 1.2), n_tee_sizes=3, arena_size=4.0,
+               **_LIMO)
     env.reset(seed=0)
     scen = env.scenario
     nb = scen.n_boxes
@@ -904,7 +896,7 @@ def test_arena_flag_marks_the_t_hits_past_the_arena(device, fused):
     """``lidar_arena_flag`` adds a fourth mask per frame: exactly the T-labelled rays whose
     hit, placed from the reported pose, lies past the env's arena on either axis. With
     surroundings at the arena's edge it fires, and never on a ray the T mask leaves out."""
-    kw = dict(arena_size=(2.0, 3.0), scenery_probs=(0.0, 0.5, 0.0, 0.5), scenery_collide=True,
+    kw = dict(arena_size=(2.0, 3.0), scenery_probs=(0.0, 0.5, 0.0, 0.5),
               lidar_label_from_pose=True, lidar_arena_flag=True, **_LIMO)
     env = _env(device, n_envs=128, fused=fused, **kw)
     scen = env.scenario
@@ -933,12 +925,12 @@ def test_arena_flag_marks_the_t_hits_past_the_arena(device, fused):
 
 
 @pytest.mark.parametrize("device", DEVICES)
-def test_solid_clutter_stays_outside_the_arena(device):
+def test_clutter_stays_outside_the_arena(device):
     from swarp.core.config import ObstacleShape
     from swarp.scenarios.pusht_lidar_scenery import N_WALLS
 
     env = _env(device, n_envs=2048, arena_size=(2.0, 5.0), scenery_probs=(0.0, 0.0, 0.0, 1.0),
-               scenery_collide=True, n_clutter=12, clutter_count=(2, 6), **_LIMO)
+               n_clutter=12, clutter_count=(2, 6), **_LIMO)
     env.reset(seed=0)
     scen = env.scenario
     sc = scen.scenery
@@ -986,7 +978,8 @@ def test_arena_is_observed_and_in_the_critic_state(device, fused):
     env = _env(device, n_envs=64, fused=fused, arena_size=(2.0, 5.0), scenery_probs=_LAYOUTS,
                critic_dr=True, **_LIMO)
     scen = env.scenario
-    assert scen.obs_dim == PushTLidarScenario(**_LIMO).obs_dim + 2
+    walled = {k: v for k, v in _LIMO.items() if k not in ("open_arena", "oob_margin")}
+    assert scen.obs_dim == PushTLidarScenario(**walled).obs_dim + 2
     lay = scen.obs_layout()
     assert lay["arena"] == slice(scen.self_dim - 2, scen.self_dim)
     assert lay["teammates"].start == scen.self_dim
@@ -1008,7 +1001,12 @@ def test_arena_and_scenery_validation():
         PushTLidarScenario(**{**_LIMO, "world_size": 2.0}, arena_size=(2.0, 5.0))
     with pytest.raises(ValueError, match="no room"):
         PushTLidarScenario(**_LIMO, arena_size=(0.7, 5.0))
+    with pytest.raises(ValueError, match="open_arena and arena_size"):
+        PushTLidarScenario(**_LIMO)
+    with pytest.raises(ValueError, match="oob_margin needs open_arena"):
+        PushTLidarScenario(n_agents=2, n_pushers=2, model="diff_drive", oob_margin=0.5)
     with pytest.raises(ValueError, match="arena_size and oob_margin"):
-        PushTLidarScenario(**_LIMO, scenery_probs=_LAYOUTS)
+        PushTLidarScenario(**{**_LIMO, "oob_margin": None}, arena_size=(2.0, 5.0),
+                           scenery_probs=_LAYOUTS)
     with pytest.raises(ValueError, match="sum to 1"):
         PushTLidarScenario(**_LIMO, arena_size=(2.0, 5.0), scenery_probs=(0.5, 0.5, 0.5, 0.0))

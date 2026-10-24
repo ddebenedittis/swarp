@@ -8,7 +8,6 @@ below therefore allow a small share of elements outside the declared parity boun
 (:data:`MISMATCH_SHARE`) rather than none; in practice the share is zero.
 """
 
-import math
 
 import pytest
 import torch
@@ -119,17 +118,16 @@ def test_fused_matches_torch(device, n_agents, obs_level):
             "servo_ang_accel": (20.0, 60.0), "cmd_gain_w": (0.7, 1.0),
             "lidar_mount_offset": 0.03, "lidar_min_range": 0.06, "lidar_fov": 4.5,
         },
-        # The real-robot knobs, with every draw the two paths share: per-robot fields of
-        # view, a localisation bias and slip drift (jitter, velocity noise and the drift's
-        # random kicks off, as their streams differ by path) and a command latency.
+        # The real-robot knobs, with every draw the two paths share: a localisation bias and
+        # slip drift (jitter, velocity noise and the drift's random kicks off, as their
+        # streams differ by path) and a command latency.
         {
             "model": "diff_drive", "agent_shape": "box", "servo_accel": (8.0, 20.0),
             "servo_ang_accel": (20.0, 60.0), "lidar_mount_offset": 0.03,
-            "lidar_min_range": 0.02, "lidar_fov": (4.2, 2.0 * math.pi),
-            "lidar_fov_at_mount": True,
+            "lidar_min_range": 0.02, "lidar_fov": 4.2,
             "pose_noise": (0.5, 1.0), "pose_jitter_std": (0.0, 0.0), "vel_noise_std": 0.0,
             "pose_drift_tau": 0.5, "cmd_latency": (0.0, 0.05), "open_arena": True,
-            "oob_margin": 0.0,
+            "arena_size": 1.0, "oob_margin": 0.0,
         },
         # The scan artefacts with every draw the two paths share (range scale and bias, a
         # rotating scan with a mount yaw error and stamp phase; dropouts, spurious and
@@ -140,35 +138,33 @@ def test_fused_matches_torch(device, n_agents, obs_level):
             "servo_ang_accel": (20.0, 60.0), "cmd_gain_v": (0.9, 1.05),
             "cmd_gain_w": (0.7, 1.0), "floor_friction": (0.2, 0.5),
             "lidar_mount_offset": 0.03, "lidar_min_range": 0.02,
-            "lidar_fov": 4.2, "lidar_fov_at_mount": True, "lidar_span": 4.2,
+            "lidar_fov": 4.2, "lidar_span": 4.2,
             "pose_noise": (0.5, 1.0), "pose_jitter_std": (0.0, 0.0), "vel_noise_std": 0.0,
             "pose_drift_tau": 0.5, "cmd_latency": (0.0, 0.05), "open_arena": True,
-            "oob_margin": 0.1, "lidar_range_scale": 0.02, "lidar_range_bias": 0.01,
+            "arena_size": 1.0, "oob_margin": 0.1, "lidar_range_scale": 0.02,
+            "lidar_range_bias": 0.01,
             "lidar_scan_period": 0.1, "lidar_yaw_bias": 0.03, "lidar_stamp_phase": (0.0, 1.0),
             "lidar_label_from_pose": True, "critic_dr": True,
         },
-        # A per-env arena with every surroundings layout, the deployment's labels from
-        # noisy reported poses and the arena and layout columns in the critic state. The
-        # clearance is zero and the walls thin and close, so scenery lands inside the label
-        # bound and the leak path fires (physically the walls would be within reach).
+        # A per-env arena without surroundings, the deployment's labels from noisy reported
+        # poses and the arena columns in the critic state.
         {
             "model": "diff_drive", "agent_shape": "box", "open_arena": True,
             "oob_margin": 0.1, "world_size": 0.6, "arena_size": (0.9, 1.2),
-            "lidar_max_range": 0.6, "scenery_probs": (0.1, 0.3, 0.3, 0.3),
-            "scenery_clearance": 0.0, "scenery_gap": (0.0, 0.05), "wall_radius": (0.01, 0.02),
-            "clutter_radius": (0.02, 0.05), "clutter_half": (0.02, 0.06),
+            "lidar_max_range": 0.6,
             "pose_noise": (0.5, 1.0), "pose_jitter_std": (0.0, 0.0), "vel_noise_std": 0.0,
             "lidar_label_from_pose": True, "critic_dr": True,
         },
-        # Solid surroundings at the arena's edge with the collision penalty, a bank of three
-        # T sizes and the outside-the-arena mask: the stepper's obstacles carry both banks,
-        # the lidar scans them there (fused) and in the per-env arrays (torch), and robots
-        # touching each other or a wall pay.
+        # Surroundings at the arena's edge with every layout and the collision penalty, a
+        # bank of three T sizes and the outside-the-arena mask: the stepper's obstacles carry
+        # both banks, the lidar scans them there (fused) and in the per-env arrays (torch),
+        # robots touching each other or a wall pay, and walls inside the label bound make the
+        # leak path fire.
         {
             "model": "diff_drive", "agent_shape": "box", "open_arena": True,
             "oob_margin": 0.1, "world_size": 0.6, "arena_size": (0.9, 1.2),
             "lidar_max_range": 0.6, "scenery_probs": (0.1, 0.3, 0.3, 0.3),
-            "scenery_collide": True, "scenery_gap": (0.0, 0.05), "wall_radius": (0.02, 0.04),
+            "scenery_gap": (0.0, 0.05), "wall_radius": (0.02, 0.04),
             "clutter_radius": (0.02, 0.05), "clutter_half": (0.02, 0.06),
             "collision_penalty": 0.05, "collision_margin": 0.02,
             "tee_scale": (0.8, 1.2), "n_tee_sizes": 3, "lidar_arena_flag": True,

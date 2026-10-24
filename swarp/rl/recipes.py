@@ -19,7 +19,7 @@ import inspect
 import math
 from collections import deque
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
@@ -159,8 +159,8 @@ class TrainSpec:
     """When set, an iteration's remaining minibatch steps are skipped on device once one
     minibatch's approximate KL to the rollout policy, ``mean((r - 1) - log r)``, exceeds
     ``1.5 * target_kl`` (that minibatch's own step included). A brake on destructive
-    updates: L8b-s1 fell 0.83 -> 0.22 in 60 iterations of 128 steps each, no step
-    non-finite."""
+    updates: a staged slim-T Limo run fell 0.83 -> 0.22 in 60 iterations of 128 steps
+    each, no step non-finite."""
     actor_scale_min: float | None = None
     """When set, the floor under the actor's Gaussian std (``PolicyNet``'s ``scale_min``,
     0.01 by default). A higher floor keeps a policy from sharpening faster than it learns;
@@ -408,73 +408,132 @@ SPECS: dict[str, TrainSpec] = {
         actor="policynet", role_params="heads", critic_input="state",
         per_agent_value=True, aux_coef=0.0,
     ),
-    # Lidar Push-T at the physical scale of two AgileX Limo robots, in metres and seconds,
-    # for deployment in Gazebo: 0.322 x 0.220 m unicycle boxes at up to 0.4 m/s and
-    # 1.5 rad/s, a 1 m T in a 4 x 4 m arena, a 1.5 m lidar, and a 5 Hz policy acting on the
-    # latest 10 Hz scan. Otherwise the U-H1 run (two pushers, own lidar, frame_stack 4, aux
-    # 0.1), which reached 0.99 greedy at the default scale.
+    # Lidar Push-T on two real AgileX Limos (EAI T-mini Pro lidar, localised by mocap or nav2
+    # AMCL), in metres and seconds; notes/pusht-lidar-limo.md records how each value below
+    # was arrived at, and docs/pusht-lidar.md what the recipe trains to.
     #
-    # dt=0.2, not the lidar's 0.1. At 10 Hz one action moves a robot 0.04 m (4% of the T)
-    # and turns it 0.15 rad, against 12.5% of the T and 0.31 rad per action in U-H1, and
-    # PPO kept a near-random policy for thousands of iterations: greedy solve 0.04 at
-    # iteration 1000, 0.36 at 6000, 0.54 after 12000, with the greedy robots stalled
-    # (|v| < 0.04 m/s) in 63% of robot-steps while the sampled policy solved 0.93 in
-    # 1800 steps. Neither entropy_coeff 1e-3, normalized advantages, the per-step discount
-    # (gamma 0.99) nor a 0.8 m/s robot helped (0.06-0.15 greedy at iteration 2000). At
-    # dt=0.2 the same recipe reaches 0.56 greedy at iteration 1000 and 0.85 at 2000. The
-    # deployed policy holds each command for 0.2 s, and its frame stack advances once per
-    # policy step, so the four frames span 0.8 s.
+    # Scale and timing. 0.322 x 0.220 m unicycle boxes at up to 0.4 m/s and 1.5 rad/s, the
+    # real slim T (two 0.50 x 0.04 m bars), a 5 Hz policy on the latest 10 Hz scan: at
+    # dt 0.1 one action moves a robot 4% of the T and PPO kept a near-random policy for
+    # thousands of iterations. 32 substeps keep Push-T's validated 6.25 ms contact sub-step;
+    # 450 steps (90 s) are Push-T's episode scaled by the task's ~4.5x duration; gamma 0.99
+    # and lmbda 0.95 are 20 s / 4 s credit horizons. The length-based shaping is halved
+    # (pos 2.5, approach 0.5) so an episode's shaping keeps Push-T's ratio to the goal bonus.
     #
-    # substeps=32 keeps Push-T's validated sub_dt of 6.25 ms, so the contact law (k 8000,
-    # c 100, unit robot and T masses, drag 40/s) is the same per second as there. At
-    # 12.5 ms (k sub_dt^2 / m = 1.25) a straight push chatters: the robot's speed swings
-    # 0.1-0.3 m/s and the T crawls at half speed. At 6.25 ms the T follows a centred push
-    # at 0.30 m/s (two pushers: 0.34), the robot sits ~2 mm inside the 12.5 mm contact
-    # margin, and the T stops within 0.1 s of contact ending.
+    # Drive and contacts, from a Gazebo sysid (swarp_gz_test out/sysid). ControlMode.SERVO
+    # with accelerations and command gains drawn per env and robot around Gazebo's Limo
+    # (1 m/s^2, 3 rad/s^2, gains 1.0 / 0.79). The T on a Coulomb floor (mu 0.2-0.5, no
+    # viscous drag), which turns an off-centre push as the quasi-static reference does
+    # (60 / 142 deg/m at 0.2 / 0.4 m, reference 64 / 145); robots of mass 2, so a pusher
+    # keeps 0.95-0.98 of its command in contact. Wheel-faithful contacts: a contact torque
+    # turns a robot only past the drive's 3.5 N m, and its wheels grip sideways with mu 0.2,
+    # so two robots squeezing the T from opposite faces cannot spin in place as a Limo
+    # cannot. A command delay of 0-125 ms per robot stands in for WiFi and processing.
     #
-    # The masses stay at 1, not 4.2 kg and ~0.5 kg: a velocity-mode robot has no inertia
-    # in contact, so its mass only sets the contact depth, and the T's response is set by
-    # mass * drag. A lighter T is kicked ahead of its pusher by the stiff contact (0.42-0.47
-    # m/s against the robot's 0.4 at tee_mass 0.12-0.3) and pushes in bounces.
+    # Sensor. The lidar sits 0.103 m ahead of the centre, returns from 0.02 m with 5-20 mm
+    # of range noise, and sees 220 deg cut at the mount (the lab's drivers deliver
+    # -116..+108 deg on both robots), 40 rays at a 5.6 deg spacing, out to 5 m: at 1.5 m a
+    # robot without the T in range in a 4-5 m arena had nothing to go on and training
+    # stalled. What the real scan and the deployment add (pusht_lidar_artefacts.py): labels
+    # from the reported poses (a teammate hit off its reported footprint reads as the T),
+    # grazing-incidence losses on the T, 0-3% dropouts, 0-0.5% spurious short returns, a
+    # 1% scale and 1 cm bias error, the 10 Hz rotating sweep with its stamp anywhere in it
+    # and a 2 deg mount yaw error. lidar_arena_flag adds a fourth mask per frame, the
+    # T-labelled hits past the arena's edge, which the deployment builds from the reported
+    # pose as it builds the labels.
     #
-    # Lengths are 2x (arena) to 2.5x (T) Push-T's and the robot 2.5x slower, so a task
-    # takes ~4.5x as long: max_steps 450 (90 s) is Push-T's 400 x 0.05 s scaled by that.
-    # gamma 0.99 and lmbda 0.95 at this dt are 20 s / 4 s credit horizons, about the time
-    # one push of the T across the arena takes; stagger_starts because untrained episodes
-    # all run the full 450 steps. The length-based shaping weights are halved (pos 2.5,
-    # approach 0.5) so a whole episode's shaping keeps Push-T's ratio to the dimensionless
-    # goal bonus and joint crater (pos 2.5 x 1.43 m mean goal distance = 3.6, U-H1
-    # 5 x 0.79 = 3.9). Measured at dt 0.1 over 512 envs with robots driving at the T, the
-    # per-step position shaping (0.023) and turn-away cost (0.0089) matched U-H1's (0.024,
-    # 0.0083).
-    # Curriculum: the goal radius starts at 0.4 (Push-T's 2.5 goal tolerances) and ramps
-    # to the 3.8 m diagonal of the T's spawn square, over 500 iterations rather than 250
-    # because an episode is longer in steps than Push-T's.
+    # Localisation. pose_noise on the observation only, sized from nav2 AMCL in Gazebo:
+    # per-episode bias, jitter and a slip-driven, decaying drift (position decorrelates in
+    # 3.6 s, heading in 1.6 s; the slip gain is 2 because AMCL amplifies a shove), at a
+    # scale drawn per env from 0 (mocap) to 1.25 (worse than tuned AMCL). Reward, success,
+    # the critic and the auxiliary targets read the true state; critic_dr appends every
+    # randomised parameter to the critic state.
     #
-    # standoff_dist 1.0 is H2b's 1.5 T corner radii, so the same recipe with observers
-    # (--n-agents 5) clears the scenario's standoff check; two pushers never read it.
+    # Arena and surroundings. An open floor: each env's arena is W x H with W, H in 2-5 m,
+    # observed as its half-extents; the robots meet the safety bridge's stop 0.25 m past
+    # it, and a T centroid 0.5 m past it fails the episode (-0.05 per robot and step, no
+    # solve). Outside it, per env, nothing, perimeter walls, a rotated room or walls plus
+    # 2-6 circle and capsule clutter shapes within 1.5 m, all solid: the robots and the T
+    # collide with them, and every robot pays 0.03 per step within 1 cm of the other robot
+    # or a surroundings shape. The T's size is drawn per env from three copies scaled 0.9,
+    # 1.0 and 1.1.
+    #
+    # Training. From scratch in one run of 2048 envs and 16 minibatches, the world made
+    # hard in ramps on a gated clock (a tick needs a windowed solve of 0.75, so no condition
+    # comes in before the last is mastered): the arena widens from 4 x 4 m over ticks
+    # 1000-3000; the pose noise, the command delay, the surroundings and the collision cost
+    # come in over 3000-5000; the turn-away cost over 8000-10000, since from scratch it made
+    # a clumsy push of the slim T net-negative and the policies stopped pushing. The run
+    # ends 4000 ticks after the last ramp (24000 iterations is a cap). Guards against the
+    # late collapses unguarded runs met: the learning rate decays 5e-4 -> 1e-4 over the
+    # clock and follows the KL (adaptive_kl), a KL brake skips the rest of a destructive
+    # iteration, the actor's std is floored at 0.1 (the greedy action is the mean, so the
+    # floor does not reach the deployment), and rollback restores a pre-collapse snapshot at
+    # half the learning rate. An action-rate penalty of 0.03 ramps in over the first 2000
+    # iterations. Two pushers on their own lidar, frame_stack 4 and aux loss 0.1, which
+    # solved 0.99 at the default scale; standoff_dist 1.0 only clears the scenario's check,
+    # since pushers never read it.
     "pusht_lidar_limo": TrainSpec(
         scenario="pusht_lidar",
         dt=0.2, substeps=32, max_steps=450, n_agents=2,
         scen_kwargs={
+            # Robots and task.
             "n_pushers": 2, "model": "diff_drive", "agent_shape": "box",
             "agent_half_extents": (0.161, 0.110), "max_speed": 0.4, "max_ang_vel": 1.5,
-            "world_size": 2.0, "bar_len": 1.0, "bar_width": 0.3, "stem_len": 0.7,
-            "stem_width": 0.3, "lidar_max_range": 1.5, "goal_tolerance": 0.15,
-            "angle_tolerance": 0.25, "obs_level": 1, "frame_stack": 4, "standoff_dist": 1.0,
+            "bar_len": 0.5, "bar_width": 0.04, "stem_len": 0.5, "stem_width": 0.04,
+            "tee_scale": (0.9, 1.1), "n_tee_sizes": 3,
+            "goal_tolerance": 0.15, "angle_tolerance": 0.25, "obs_level": 1,
+            "frame_stack": 4, "standoff_dist": 1.0,
             "pos_shaping_factor": 2.5, "rot_shaping_factor": 0.5, "rot_away_penalty": 1.0,
             "agent_dist_shaping": 0.5,
+            # Drive and contacts.
+            "agent_mass": 2.0, "servo_accel": (0.6, 2.0), "servo_ang_accel": (2.0, 6.0),
+            "cmd_gain_v": (0.9, 1.05), "cmd_gain_w": (0.7, 1.0),
+            "floor_friction": (0.2, 0.5), "linear_damping": 0.0, "angular_damping": 0.0,
+            "wheel_contacts": True, "wheel_lateral_friction": 0.2, "wheel_turn_torque": 3.5,
+            "cmd_latency": (0.0, 0.125),
+            # Sensor.
+            "n_rays": 40, "lidar_span": math.radians(220.0), "lidar_fov": math.radians(220.0),
+            "lidar_max_range": 5.0, "lidar_mount_offset": 0.103, "lidar_min_range": 0.02,
+            "lidar_noise": (0.005, 0.02),
+            "lidar_label_from_pose": True, "lidar_grazing_cos": math.cos(math.radians(80.0)),
+            "lidar_dropout": (0.0, 0.03), "lidar_spurious": (0.0, 0.005),
+            "lidar_range_scale": 0.01, "lidar_range_bias": 0.01, "lidar_scan_period": 0.1,
+            "lidar_stamp_phase": (0.0, 1.0), "lidar_yaw_bias": math.radians(2.0),
+            "lidar_arena_flag": True,
+            # Localisation.
+            "pose_noise": (0.0, 1.25), "pose_bias_std": (0.04, 0.015),
+            "pose_jitter_std": (0.01, 0.005), "vel_noise_std": 0.02,
+            "pose_drift_tau": (3.6, 1.6), "pose_drift_std": (0.05, 0.015),
+            "pose_slip_gain": (2.0, 0.1), "critic_dr": True,
+            # Arena and surroundings.
+            "world_size": 2.5, "open_arena": True, "arena_size": (2.0, 5.0),
+            "arena_stop_margin": 0.25, "oob_margin": 0.5, "oob_penalty": 0.05,
+            "scenery_probs": (0.25, 0.25, 0.25, 0.25), "n_clutter": 12,
+            "clutter_count": (2, 6), "clutter_reach": 1.5,
+            "collision_penalty": 0.03, "collision_margin": 0.01,
         },
-        iters=4000, n_envs=512, steps_per_batch=32, epochs=8, minibatches=4,
-        lr=5e-4, gamma=0.99, lmbda=0.95, entropy_coeff=3e-3, num_cells=256,
+        iters=24000, n_envs=2048, steps_per_batch=32, epochs=8, minibatches=16,
+        lr=5e-4, lr_final=1e-4, gamma=0.99, lmbda=0.95, entropy_coeff=3e-3, num_cells=256,
         normalize_advantage=False,
         curriculum=(
             CurriculumKnob("goal_spawn_radius", 0.4, 3.8),
             CurriculumKnob("goal_spawn_angle", 0.4, math.pi),
         ),
         curriculum_iters=500, curriculum_gate=0.0,
+        ramps=(
+            Ramp("arena_size", (4.0, 4.0), (2.0, 5.0), 1000, 3000),
+            Ramp("pose_noise", (0.0, 0.0), (0.0, 1.25), 3000, 5000),
+            Ramp("cmd_delay_substeps", (0, 0), (0, 20), 3000, 5000),
+            Ramp("scenery_on", 0.0, 1.0, 3000, 5000),
+            Ramp("rot_away_penalty", 0.0, 1.0, 8000, 10000),
+            Ramp("collision_penalty", 0.0, 0.03, 3000, 5000),
+        ),
+        ramp_gate=0.75, hold_iters=4000, target_kl=0.3, adaptive_kl=0.02, rollback=True,
+        actor_scale_min=0.1, action_rate_coef=0.03, action_rate_ramp_iters=2000,
         metrics=("tee_dist_to_goal", "tee_angle_error", "team_coverage",
-                 "observer_visibility", "occlusion", "tee_seen", "multiobj_reward"),
+                 "observer_visibility", "occlusion", "tee_seen", "multiobj_reward",
+                 "out_of_bounds", "scenery_leak", "robot_collision", "scenery_collision"),
         stagger_starts=True,
         actor="policynet", role_params="heads", critic_input="state",
         per_agent_value=True, aux_coef=0.1,
@@ -630,407 +689,6 @@ SPECS: dict[str, TrainSpec] = {
     ),
 }
 
-# The Limo recipe with the gaps a Gazebo sysid (swarp_gz_test/out/sysid/report.md) found
-# between swarp and the velocity-servoed Limo, which Gazebo stands in for:
-#
-# - Robots of mass 6.7 instead of 1. A velocity-mode pusher gives up
-#   T mass * drag * sub_dt / robot mass of its speed to the contact, 25% at mass 1: the T
-#   moved at 0.75 of the command where Gazebo's moves at 1.00, and the robot slid 0.02 m/s
-#   sideways on an off-centre push. At 6.7 the T moves at 0.95 of the command with
-#   0.003-0.005 m/s of slip and stops where Gazebo's does (0.020/0.078/0.044 m against
-#   0.020/0.080/0.045). The price is a contact that cannot give way deflecting the robot
-#   6.7x deeper: two robots driving head-on overlap 5 cm instead of 0.6. Lowering the T's
-#   drag to 6/s instead matched the push speed (0.96) but let the T coast and spin on, and
-#   it cost the most learning of any change here: 0.08 greedy at iteration 2000 with the
-#   drag alone, against 0.67 without it and 0.98 with the mass alone.
-# - A rate-limited drive (ControlMode.SERVO), drawn per env and robot on every reset.
-#   Gazebo's Limo accelerates at 1 m/s^2 and 3 rad/s^2 (0.4 s to 0.4 m/s, stopping in
-#   8 cm) and turns at 0.79 of the commanded rate (skid-steer). At those values swarp
-#   reproduces every robot-alone row of the sysid (steady rates, rise times, stopping
-#   distances, arc radii, reversal time) to within one 0.1 s sample; the ranges bracket
-#   them, with Gazebo's numbers between the two ends on every row.
-# - The lidar 0.103 m ahead of the centre with nothing returned within 0.10 m of it: a
-#   face touching the bumper is invisible to the forward rays, as on the real sensor
-#   (sysid: 8 T rays where Gazebo has 7, against 13 without the blind zone), plus the
-#   Gaussian range noise of Gazebo's sensor model, 0.01 m.
-SPECS["pusht_lidar_limo_dr"] = replace(
-    SPECS["pusht_lidar_limo"],
-    scen_kwargs={
-        **SPECS["pusht_lidar_limo"].scen_kwargs,
-        "agent_mass": 6.7,
-        "servo_accel": (0.6, 2.0), "servo_ang_accel": (2.0, 6.0),
-        "cmd_gain_v": (0.9, 1.05), "cmd_gain_w": (0.7, 1.0),
-        "lidar_mount_offset": 0.103, "lidar_min_range": 0.10, "lidar_noise": 0.01,
-    },
-)
-
-
-# pusht_lidar_limo_dr with the T on a Coulomb floor instead of a viscous one: the
-# quasi-static pushing reference (uniform-pressure Coulomb floor, swarp_gz_test
-# out/sysid/reference.md) turns the bar 64 deg/m on a push 0.2 m off-centre and 145 at
-# 0.4 m, which a viscous drag of 40/s under-rotates at 39 and 113. On floor_friction 0.3
-# with no drag, the sysid gives -60 / -142 / -48 deg/m against the reference's -64 / -145
-# / -48 and Gazebo's -62 / -143 / -50, and the T stops where Gazebo's does
-# (0.018/0.077/0.042 m against 0.020/0.080/0.045). A Coulomb T needs only mu m g (about
-# 3 N) to slide, against 16 N of drag at 0.4 m/s, so the robots' mass comes down from 6.7
-# to 2: at mass 1 a 0.2 m/s push still lost 9% of its speed, at 2 the pusher keeps
-# 0.95-0.98 of the command (Gazebo 1.00) and two robots driving head-on overlap 1.2 cm.
-# mu is drawn per env on every reset, 0.2-0.5 around Gazebo's 0.3. 8000 iterations: the
-# drive's randomisation roughly halves the sample efficiency, and iterations are cheap.
-SPECS["pusht_lidar_limo_dr_coulomb"] = replace(
-    SPECS["pusht_lidar_limo_dr"],
-    scen_kwargs={
-        **SPECS["pusht_lidar_limo_dr"].scen_kwargs,
-        "agent_mass": 2.0, "floor_friction": (0.2, 0.5),
-        "linear_damping": 0.0, "angular_damping": 0.0,
-    },
-    iters=8000,
-)
-
-
-# pusht_lidar_limo_dr_coulomb with wheel-faithful contacts (WorldConfig.wheel_contacts).
-# In Gazebo, L3b (greedy 0.99 in swarp) solved 0.35: its robots squeezed the T head-on
-# from opposite faces and spun in place, which swarp allowed because contacts only
-# translated a robot, and which a real Limo cannot do: its flush front corner would have to
-# swing through a face the other robot holds. The sysid (swarp_gz_test 3a33337,
-# out/sysid/variants/contact): two robots pressing the T from opposite faces at 0.28 m/s
-# and commanded to turn at 0.9 rad/s hold their yaw (swarp -4/-5 deg, Gazebo 0, swarp
-# without wheel contacts +258); one robot turning against the free T, or two that do not
-# press, still turn (+199 deg, Gazebo +198 and +183). The drive holds its turn rate
-# against 3.5 N m (the skid-steer torque from the sysid), so an off-centre push leaves the
-# pusher's heading alone (0 deg, Gazebo 0) and the T turns as before (-58 / -141 / -47
-# deg/m at 0.2 / 0.4 m off-centre and a 30 deg glance); the wheels grip sideways with
-# mu 0.2 (Gazebo's), and no push in the sysid slides a robot sideways any more.
-SPECS["pusht_lidar_limo_dr_wheel"] = replace(
-    SPECS["pusht_lidar_limo_dr_coulomb"],
-    scen_kwargs={
-        **SPECS["pusht_lidar_limo_dr_coulomb"].scen_kwargs,
-        "wheel_contacts": True, "wheel_lateral_friction": 0.2, "wheel_turn_torque": 3.5,
-    },
-    iters=16000,
-)
-
-
-# pusht_lidar_limo_dr_wheel for the real AgileX Limos (EAI T-mini Pro lidar, localised by
-# mocap or by nav2 AMCL), with what Gazebo did not have:
-#
-# - The T-mini Pro's 0.02 m minimum range (Gazebo's sensor was cut at 0.10) and its range
-#   noise drawn per env and robot from 5-20 mm (the datasheet's ~20 mm accuracy at the
-#   top). The field of view is drawn per env and robot from 240-360 deg centred on the
-#   heading, so the policy works whatever the chassis hides of the rear; the deployment
-#   blanks the same rays for its measured field of view (lidar_sensor_kernel's rule).
-# - Localisation noise on the observed pose only (pose_noise): a per-episode bias per
-#   robot (3 cm per axis, 0.03 rad at scale 1) and per-step jitter (2 cm, 0.02 rad), the
-#   velocity turned by the heading error plus 2 cm/s, all times a scale drawn per env
-#   from 0-1, so mocap (scale ~0) and AMCL (scale ~1) are both in the distribution. A
-#   teammate's position is its own reported one, so the relative positions carry both
-#   robots' errors. Reward, success and the critic keep the true state.
-# - A command latency (WiFi plus processing, 30-120 ms) drawn per env and robot from
-#   0-125 ms: that many of the step's 32 substeps (0-20) still apply the previous command.
-SPECS["pusht_lidar_limo_real"] = replace(
-    SPECS["pusht_lidar_limo_dr_wheel"],
-    scen_kwargs={
-        **SPECS["pusht_lidar_limo_dr_wheel"].scen_kwargs,
-        "lidar_min_range": 0.02, "lidar_noise": (0.005, 0.02),
-        "lidar_fov": (math.radians(240.0), 2.0 * math.pi),
-        "pose_noise": (0.0, 1.0), "pose_bias_std": (0.03, 0.03),
-        "pose_jitter_std": (0.02, 0.02), "vel_noise_std": 0.02,
-        "cmd_latency": (0.0, 0.125),
-    },
-)
-
-
-# pusht_lidar_limo_real with the localisation error sized from nav2 AMCL in Gazebo
-# (swarp_gz_test, tuned AMCL, L6 at a 240 deg field of view, 40 robot-episodes): position
-# error median 0.091 m, p95 0.58, max 2.8; heading p95 0.060 rad; per-episode bias 0.10 m
-# mean; decorrelation 3.6 s (position) and 1.6 s (heading); 89% of the excursions above
-# 0.3 m start within 5 s of a shove the odometry missed. At pose-noise scale 1 these knobs
-# give, under L6 in swarp: median 0.12, p95 0.55, max 3.0 m; heading p95 0.059 rad; bias
-# 0.13 m mean. The slip gain is 2 rather than 1 because AMCL amplifies a shove (median
-# 0.15 m, p95 1.5 m after one) more than the shove alone accounts for. The scale is drawn
-# up to 1.25 for margin, and down to 0 for mocap.
-#
-# The field of view is also cropped at the mount, as the sensor (and a body hiding its
-# rear) does, not per centre ray: L6, trained per ray, solved 0.84 greedy at 240 deg per
-# ray but 0.10 cropped at the mount (Gazebo: 1/20), because a hit close beside the robot
-# lies within 112.5 deg of the heading from the centre and 125-135 deg from the mount.
-SPECS["pusht_lidar_limo_amcl"] = replace(
-    SPECS["pusht_lidar_limo_real"],
-    scen_kwargs={
-        **SPECS["pusht_lidar_limo_real"].scen_kwargs,
-        "lidar_fov_at_mount": True,
-        "pose_noise": (0.0, 1.25), "pose_bias_std": (0.04, 0.015),
-        "pose_jitter_std": (0.01, 0.005), "pose_drift_tau": (3.6, 1.6),
-        "pose_drift_std": (0.05, 0.015), "pose_slip_gain": (2.0, 0.1),
-    },
-)
-
-
-# pusht_lidar_limo_amcl on an open floor, as the real arena and Gazebo are: no walls, so
-# the T is no longer clamped inside the 4 x 4 m arena (L6 in swarp had its T at the clamp
-# before solving in 18% of episodes at 360 deg and 61% at 240 deg per ray, where Gazebo
-# lost the T out of the arena), and the robots meet the safety bridge's arena stop at
-# 2.25 m instead of a spring wall. A T centroid beyond 2.5 m on either axis fails the
-# episode: -0.05 per robot and step from then on (about the goal bonus over the ~90 steps
-# a failed episode has left at gamma 0.99), and no solve.
-SPECS["pusht_lidar_limo_open"] = replace(
-    SPECS["pusht_lidar_limo_amcl"],
-    scen_kwargs={
-        **SPECS["pusht_lidar_limo_amcl"].scen_kwargs,
-        "open_arena": True, "arena_stop_margin": 0.25, "oob_margin": 0.5,
-        "oob_penalty": 0.05,
-    },
-)
-
-
-# pusht_lidar_limo_open with a slim T: two 0.50 x 0.04 m bars, the stem hanging from the
-# bar's middle (0.50 x 0.54 m overall). 64 rays, not 32: against 32 centre rays the slim T
-# takes half the hits of the 1.0 / 0.7 x 0.3 m T (2.2 against 4.6 on average with its
-# centroid 1.0-1.5 m away, one hit or none in 14% of those views), and 64 rays give it the
-# coverage the old T had at 32. The observation changes width, so this trains from scratch.
-SPECS["pusht_lidar_limo_slim"] = replace(
-    SPECS["pusht_lidar_limo_open"],
-    scen_kwargs={
-        **SPECS["pusht_lidar_limo_open"].scen_kwargs,
-        "bar_len": 0.5, "bar_width": 0.04, "stem_len": 0.5, "stem_width": 0.04,
-        "n_rays": 64,
-    },
-)
-
-
-# pusht_lidar_limo_slim trained from scratch at the real robots' 240 deg, with what the
-# real sensor and the deployment add and a smoothness cost (L8):
-#
-# - 43 rays spanning +-120 deg from the centre (lidar_span), the 5.6 deg spacing of 64 rays
-#   over the full circle: from the mount nothing further back is ever visible, so the
-#   observation drops the rear rays a 360 deg ring would always blank. The field of view is
-#   fixed at 240 deg cut at the mount (not drawn from 240-360): the chassis hides the rear
-#   on every real Limo, and L6/L7, trained on the range, solved 0.05-0.13 at 240 deg in
-#   Gazebo.
-# - Labels from the reported poses (lidar_label_from_pose): the deployment can only tell a
-#   teammate from the T by the teammate's reported footprint, so under the pose noise a
-#   teammate hit off its reported box reads as the T. In swarp at this recipe's noise that
-#   relabels 28% of the teammate hits; training on the true classes never saw it.
-# - Returns lost on the T's faces at grazing incidence (probability 1 - cos / cos 80 deg),
-#   random dropouts (0-3% per robot) and spurious short returns (0-0.5% of the rays per
-#   robot), which the deployment labels as T. A per-robot range scale error of up to 1% and
-#   bias of up to 1 cm (the T-mini Pro's datasheet accuracy).
-# - The rotating scan (10 Hz, as the driver is set): at 1.5 rad/s one scan turns by 0.15
-#   rad, nearly three ray spacings, and the policy reads it against one pose. The stamp's
-#   place in the sweep is drawn per robot over the whole sweep (the driver's stamp and the
-#   pose's own latency are not measured), and a mount yaw error of up to 2 deg per robot.
-# - Every randomised parameter in the critic state (critic_dr), so the value no longer has
-#   to average over drives, delays and sensors it cannot see.
-# - An action-rate penalty of 0.03 times the mean squared change of the normalised action:
-#   16% of the team term at L7's sampled jitter (0.30 per step against |team| 0.056 at full
-#   difficulty) and 4% at its greedy one (0.055 against 0.043). It ramps in over the first
-#   2000 iterations: the initial policy's change is 0.73, a penalty of 0.022 per step
-#   against team and approach terms of about 0.001 there.
-SPECS["pusht_lidar_limo_slim240"] = replace(
-    SPECS["pusht_lidar_limo_slim"],
-    scen_kwargs={
-        **SPECS["pusht_lidar_limo_slim"].scen_kwargs,
-        "n_rays": 43, "lidar_span": 4.0 * math.pi / 3.0, "lidar_fov": 4.0 * math.pi / 3.0,
-        "lidar_label_from_pose": True, "lidar_grazing_cos": math.cos(math.radians(80.0)),
-        "lidar_dropout": (0.0, 0.03), "lidar_spurious": (0.0, 0.005),
-        "lidar_range_scale": 0.01, "lidar_range_bias": 0.01, "lidar_scan_period": 0.1,
-        "lidar_stamp_phase": (0.0, 1.0), "lidar_yaw_bias": math.radians(2.0),
-        "critic_dr": True,
-    },
-    action_rate_coef=0.03, action_rate_ramp_iters=2000,
-)
-
-
-# pusht_lidar_limo_slim240 in two stages, both from scratch (L8b), after the pilots in
-# docs/pusht-lidar.md (S240-*): from scratch the slim T neither learns under the AMCL-sized
-# pose noise and latency (as no recipe ever did: L6 and L7 met them as a fine-tune) nor
-# under rot_away_penalty 1.0, which makes a clumsy push net-negative on a T that turns 3-6x
-# more per metre pushed than the old one, so the policies settle on not pushing it. Both
-# stages drop the turn-away cost and run 2048 envs (16 minibatches of the old size), which
-# reached in 1000 iterations what 512 envs did in 4000.
-#
-# Stage 1 learns the pushing without the localisation error and the latency. Their knobs
-# stay declared over a vanishing range (scale up to 1e-9, latency up to 1e-9 s, which rounds
-# to no substep), so the critic state keeps the columns stage 2 fills: stage 2 resumes
-# actor and critic as they are.
-SPECS["pusht_lidar_limo_slim240_s1"] = replace(
-    SPECS["pusht_lidar_limo_slim240"],
-    scen_kwargs={
-        **SPECS["pusht_lidar_limo_slim240"].scen_kwargs,
-        "rot_away_penalty": 0.0, "pose_noise": (0.0, 1e-9), "cmd_latency": (0.0, 1e-9),
-    },
-    n_envs=2048, minibatches=16, iters=6000,
-)
-# Stage 2: the full recipe without the turn-away cost, resumed from stage 1 at full
-# difficulty (--resume <stage 1>_best.pt --start-difficulty 1); the action-rate weight is
-# already at its full value. Half stage 1's learning rate: stage 1 (L8b-s1) held 0.94-0.98
-# greedy from iteration 3000 to 5500 and then collapsed to 0.004 by 6000 at 5e-4, its
-# entropy climbing back from -2.5 to -0.7 with no skipped minibatch.
-SPECS["pusht_lidar_limo_slim240_s2"] = replace(
-    SPECS["pusht_lidar_limo_slim240"],
-    scen_kwargs={**SPECS["pusht_lidar_limo_slim240"].scen_kwargs, "rot_away_penalty": 0.0},
-    n_envs=2048, minibatches=16, iters=8000, action_rate_ramp_iters=0, lr=2.5e-4,
-)
-# The same stages as one run (L8c): iteration ramps instead of resumes. Stage 1's world
-# until 3000, the iteration L8b-s1 first held 0.94-0.98 greedy; the pose-noise scale and
-# the command delay (in substeps: 0.125 s at 32 substeps of 6.25 ms is 20) ramp in by 5000;
-# the turn-away cost by 10000, after which stage 3 needed 4000 iterations. The learning
-# rate decays over the run instead of halving at a resume: L8b-s1 collapsed at 5e-4 after
-# 5500 iterations, and this one is below 3.6e-4 by then. Both ramped knobs are built at
-# their full range, so the critic state has their columns from the first iteration.
-SPECS["pusht_lidar_limo_slim240_1run"] = replace(
-    SPECS["pusht_lidar_limo_slim240"],
-    n_envs=2048, minibatches=16, iters=14000, lr=5e-4, lr_final=1e-4,
-    ramps=(
-        Ramp("pose_noise", (0.0, 0.0), (0.0, 1.25), 3000, 5000),
-        Ramp("cmd_delay_substeps", (0, 0), (0, 20), 3000, 5000),
-        Ramp("rot_away_penalty", 0.0, 1.0, 8000, 10000),
-    ),
-)
-
-# pusht_lidar_limo_slim240_1run on a per-env arena with randomised surroundings, in one run
-# that guards itself against the collapses the staged runs met (L9).
-#
-# - Each env's arena is W x H with W and H drawn from 2-5 m on every reset, observed as
-#   (W/2, H/2) in the self block (the units of the observed position, so half - |x| is the
-#   distance to the edge); the arena stop, the out-of-bounds limit and the label bound are
-#   the env's own, per axis. world_size 2.5 covers the largest.
-# - Surroundings drawn per env from nothing, perimeter walls, a room at a random yaw, or
-#   walls plus clutter, a quarter each. Only the lidar sees them, so they stand outside the
-#   free region, the arena plus max(robot reach, T reach) = max(0.73, 0.89) = 0.89 m: the
-#   0.25 m arena stop, 0.4 m/s over a 0.2 s step and the 0.125 s latency, the 0.13 m stop at
-#   the drive's lowest 0.6 m/s^2 and the 0.195 m circumradius; the 0.5 m out-of-bounds
-#   margin plus the slim T's 0.39 m radius. The deployment drops every hit past the label
-#   bound (the arena plus 0.5 m) by the reported pose, so the surroundings reach the policy
-#   only where the localisation error carries them inside it, labelled as the T
-#   (`scenery_leak`); a real floor must keep the same 0.89 m clear at lidar height.
-# - The arena widens from today's 4 x 4 m between ramp ticks 1000 and 3000, while the
-#   world is still stage 1's clean one; the surroundings come in with the pose noise and the
-#   latency (3000-5000), since only the pose error lets them leak.
-# - The ramps follow a gated clock (ramp_gate 0.75): past tick 1000 a tick needs a windowed
-#   solve of at least 0.75, so no condition comes in before the last is mastered (L8b-s1's
-#   stochastic solve held 0.90-0.96 once learned). The learning rate decays over the clock,
-#   and the run ends 4000 ticks after the last ramp, as _1run does at 10000 -> 14000; 24000
-#   iterations is only the cap.
-# - The lidar sees 220 deg cut at the mount, 40 rays at the 5.6 deg spacing: the largest
-#   symmetric sector of what the lab's ydlidar config delivers on both Limos (-116..+108
-#   deg, swarp_gz_test limo_bridge/config/ydlidar_tmini_pro.yaml), short only of +108..+110.
-#   (lm2591 also has no returns from +8 to +92 deg, which no recipe models.)
-# - The learning rate follows the KL (adaptive_kl 0.02: the factor on the schedule is cut
-#   by 1.5 after an iteration whose mean approximate KL exceeds 0.04 and raised back below
-#   0.01). With the brake off the per-iteration KL is 0.010 (median) early in this recipe
-#   and 0.042 on L8b-s2's converged policy. A first run with only a skip brake (target_kl
-#   0.1) froze 71% of iterations 1000-1500, where the entropy fell to -1.6 and two or three
-#   Adam steps at 5e-4 pushed the KL past 0.15: the rate has to fall there, not stop.
-#   target_kl 0.3 stays as the brake on a single destructive iteration: L8b-s1 fell
-#   0.83 -> 0.22 in 60 iterations of 128 steps each, no step non-finite.
-# - The actor's std is floored at 0.1 (actor_scale_min), not 0.01. With 0.01, the
-#   adaptive-lr run held the KL but sharpened anyway: entropy -0.96 -> -4.2 over iterations
-#   500-3000 (no earlier slim-T run went below -2.6), the lr cut to 6% of its schedule and
-#   the training solve 0.07 -> 0.16 in the clean 4 x 4 m world, where the gate holds the
-#   clock until 0.75. The no-noise pilots that kept learning (S240-R3, S240-N2) stayed near
-#   -1. At 0.1 an untanhed Gaussian's entropy is -0.88 per action dimension, -1.8 over
-#   the two, so the floor bites only below where those runs went. The greedy action is the
-#   mean, so the floor does not reach the deployment.
-# - rollback restores the trainer from before a collapse of the windowed solve (once past
-#   0.75, below max(0.5, best - 0.25) for 25 iterations) and halves the learning rate; a
-#   fifth collapse stops the run on its best checkpoint.
-SPECS["pusht_lidar_limo_slim240_arena"] = replace(
-    SPECS["pusht_lidar_limo_slim240_1run"],
-    scen_kwargs={
-        **SPECS["pusht_lidar_limo_slim240_1run"].scen_kwargs,
-        "world_size": 2.5, "arena_size": (2.0, 5.0),
-        "scenery_probs": (0.25, 0.25, 0.25, 0.25),
-        "n_rays": 40, "lidar_span": math.radians(220.0), "lidar_fov": math.radians(220.0),
-    },
-    iters=24000,
-    ramps=(
-        Ramp("arena_size", (4.0, 4.0), (2.0, 5.0), 1000, 3000),
-        Ramp("pose_noise", (0.0, 0.0), (0.0, 1.25), 3000, 5000),
-        Ramp("cmd_delay_substeps", (0, 0), (0, 20), 3000, 5000),
-        Ramp("scenery_on", 0.0, 1.0, 3000, 5000),
-        Ramp("rot_away_penalty", 0.0, 1.0, 8000, 10000),
-    ),
-    ramp_gate=0.75, hold_iters=4000, target_kl=0.3, adaptive_kl=0.02, rollback=True,
-    actor_scale_min=0.1,
-    metrics=(*SPECS["pusht_lidar_limo_slim240_1run"].metrics, "out_of_bounds", "scenery_leak"),
-)
-
-
-# pusht_lidar_limo_slim240_arena with solid surroundings closer to the arena and a
-# collision cost (L10). In Gazebo L9c drove out of the arena and pushed the landmarks: the
-# post stood 0.43 m past a 2 m arena, inside the label bound (arena + 0.5 m), so its hits
-# read as the T, and L9c had only ever seen surroundings beyond 0.89 m, where the labels
-# drop them.
-#
-# - The surroundings are stepper obstacles (scenery_collide): robots and the T collide with
-#   them, so they may stand anywhere outside the arena (clearance 0, walls a gap of 0-1 m
-#   past it, clutter within lidar range). Inside the label bound they read as the T, as on
-#   the robots, and they do not move when pushed.
-# - Every robot pays 0.03 per step while its footprint is within 1 cm of the other robot's
-#   or of a surroundings shape: about half the per-step team term at full difficulty, 0.6%
-#   of the goal bonus per step of contact. It ramps in with the surroundings (3000-5000).
-# - The stepper's obstacles share their sizes across envs, so the clutter is a fixed bank
-#   of 12 shapes (6 circles of radius 0.05-0.3, 6 capsules of half-length 0.1-0.6), 2-6 of
-#   them placed per env; capsules instead of boxes because the T collides with them.
-SPECS["pusht_lidar_limo_slim240_solid"] = replace(
-    SPECS["pusht_lidar_limo_slim240_arena"],
-    scen_kwargs={
-        **SPECS["pusht_lidar_limo_slim240_arena"].scen_kwargs,
-        "scenery_collide": True, "n_clutter": 12, "clutter_count": (2, 6),
-        "collision_penalty": 0.03, "collision_margin": 0.01,
-    },
-    ramps=(
-        *SPECS["pusht_lidar_limo_slim240_arena"].ramps,
-        Ramp("collision_penalty", 0.0, 0.03, 3000, 5000),
-    ),
-    metrics=(*SPECS["pusht_lidar_limo_slim240_arena"].metrics, "robot_collision",
-             "scenery_collision"),
-)
-# pusht_lidar_limo_slim240_solid with the T's size randomised by +-10% (L10b): a bank of
-# five copies of the slim T scaled 0.90, 0.95, 1.00, 1.05 and 1.10 (same mass, inertia
-# with the square), one drawn per env on every reset. The real T is cut by hand and
-# measured to a few millimetres; the policy should not hinge on its exact bar lengths.
-SPECS["pusht_lidar_limo_slim240_solid_tsize"] = replace(
-    SPECS["pusht_lidar_limo_slim240_solid"],
-    scen_kwargs={
-        **SPECS["pusht_lidar_limo_slim240_solid"].scen_kwargs,
-        "tee_scale": (0.9, 1.1), "n_tee_sizes": 5,
-    },
-)
-# pusht_lidar_limo_slim240_solid_tsize with a 5 m lidar instead of 1.5 m (L11), and three
-# T sizes (0.9, 1.0, 1.1) instead of five: every parked size still runs its contact and
-# friction loops, so five cost 3.4x L10's iteration time and three about half that.
-#
-# L10 stalled where L9c learned (training solve 0.06 against 0.75 at iteration 2000): its
-# robots lost the T (tee_seen 0.69 -> 0.27 over iterations 100-2000, L9c 0.74 -> 0.79).
-# With 1.5 m in a 4-5 m arena a robot without the T in range has nothing to go on; the real
-# T-mini Pro reaches 12 m, and what lies past the label bound is dropped by the labels
-# whatever the range, so the longer range only adds the far side of the arena. Clutter keeps
-# the 1.5 m reach past the arena it had (clutter_reach), or most of it would land past the
-# label bound.
-SPECS["pusht_lidar_limo_slim240_solid_tsize_r5"] = replace(
-    SPECS["pusht_lidar_limo_slim240_solid_tsize"],
-    scen_kwargs={
-        **SPECS["pusht_lidar_limo_slim240_solid_tsize"].scen_kwargs,
-        "lidar_max_range": 5.0, "clutter_reach": 1.5, "n_tee_sizes": 3,
-    },
-)
-# pusht_lidar_limo_slim240_solid_tsize_r5 with each lidar frame flagging the T-labelled
-# hits past the arena's edge (lidar_arena_flag; L12). L11 learned the clean world (training
-# solve 0.99 at 3000) and lost it to the surroundings: its iteration-5000 checkpoint solves
-# 0.993 at full noise without surroundings, 0.995 with them 0.89 m out (the labels drop
-# them), 0.668 0.3 m out and 0.318 from the arena's edge, where they read as the T. The
-# deployment labels a hit by its position from the reported pose, so it knows which T hits
-# lie outside the arena; the flag hands that to the policy instead of leaving it to infer
-# each hit's position from its own pose, the ray's angle and the range.
-SPECS["pusht_lidar_limo_slim240_solid_tsize_r5_flag"] = replace(
-    SPECS["pusht_lidar_limo_slim240_solid_tsize_r5"],
-    scen_kwargs={
-        **SPECS["pusht_lidar_limo_slim240_solid_tsize_r5"].scen_kwargs,
-        "lidar_arena_flag": True,
-    },
-)
 
 def scenario_name(name: str) -> str:
     """The registered scenario behind ``name``: a ``SPECS`` key's ``scenario`` when it

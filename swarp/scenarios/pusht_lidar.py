@@ -59,7 +59,6 @@ from swarp.scenarios.pusht_lidar_kernels import (
 from swarp.scenarios.pusht_lidar_scenery import (
     N_SCENERY_MODES,
     N_WALLS,
-    scenery_reset_kernel,
     scenery_slots_reset_kernel,
     slot_bank,
 )
@@ -194,7 +193,8 @@ class PushTLidarScenario(PushTScenario):
     lidar sits ``lidar_mount_offset`` ahead of it and returns nothing closer than
     ``lidar_min_range`` to itself, so a hit within that distance of the mount reads as a
     miss (range ``lidar_max_range``, no class). ``lidar_fov`` below ``2 pi`` also blanks
-    the rays more than half of it off the heading (a body blocking the rear), and
+    every hit whose bearing from the mount is more than half of it off the heading (the
+    sensor's own crop, as a body blocking the rear makes it), and
     ``lidar_noise`` adds Gaussian noise of that standard deviation to every remaining
     hit's range (clamped to ``[0, lidar_max_range]``). These edit the scan itself, so the
     observation, the auxiliary targets' visibility statistics and the reward inputs all
@@ -228,28 +228,20 @@ class PushTLidarScenario(PushTScenario):
     :mod:`swarp.scenarios.pusht_lidar_scenery`). Every reset draws per env one layout
     outside the arena, with probabilities ``scenery_probs`` over (nothing, perimeter walls,
     a room at a random yaw, walls plus clutter), all of it scaled by ``scenery_on`` (0: no
-    env has any). Only the lidar sees it, so it is placed outside the free region: the arena
-    grown by ``scenery_clearance`` (default: the farthest a robot's footprint gets past the
-    arena stop, or the T's past the out-of-bounds limit, whichever is larger). Walls stand
-    a gap drawn from ``scenery_gap`` past it per side, each missing with probability
-    ``wall_missing``, as capsules of radius drawn from ``wall_radius``; the clutter is
-    ``clutter_count`` circles of radius ``clutter_radius`` and boxes of half-extents
-    ``clutter_half`` (``n_clutter`` slots) within ``clutter_reach`` (default: the lidar
-    range) of the free region. A
-    scenery hit is class 2, which the deployment's labels turn into a miss past the bound
-    or the T inside it; ``info()["scenery_leak"]`` is the share of rays where the latter
-    happens.
-
-    With ``scenery_collide`` the surroundings are solid: the stepper holds them as
-    immovable obstacles after the T's boxes, so the robots and the T collide with them
-    (the T with the walls and every clutter shape: the clutter is circles and capsules),
-    and they may stand anywhere outside the arena grown by ``scenery_clearance``, which
-    then defaults to 0. The stepper's obstacles share their sizes across envs, so each
-    slot has a fixed shape and size (:func:`~swarp.scenarios.pusht_lidar_scenery.
-    slot_bank`): walls of radii spread over ``wall_radius``, long enough to meet at every
-    corner of the largest room (they run on past it), and ``n_clutter`` clutter shapes of
-    sizes spread over ``clutter_radius`` and ``clutter_half``, of which a reset places
-    ``clutter_count``.
+    env has any). The surroundings are solid: the stepper holds them as immovable obstacles
+    after the T's boxes, so the robots and the T collide with them (the T with the walls and
+    every clutter shape: the clutter is circles and capsules), and the lidar scans them
+    there. They stand outside the free region, the arena grown by ``scenery_clearance``
+    (default 0). Walls stand a gap drawn from ``scenery_gap`` past it per side, each missing
+    with probability ``wall_missing``; the clutter is ``clutter_count`` of the ``n_clutter``
+    slots, placed within ``clutter_reach`` (default: the lidar range) of the free region.
+    The stepper's obstacles share their sizes across envs, so each slot has a fixed shape
+    and size (:func:`~swarp.scenarios.pusht_lidar_scenery.slot_bank`): walls of radii
+    spread over ``wall_radius``, long enough to meet at every corner of the largest room
+    (they run on past it), and clutter of sizes spread over ``clutter_radius`` and
+    ``clutter_half``. A scenery hit is class 2, which the deployment's labels turn into a
+    miss past the bound or the T inside it; ``info()["scenery_leak"]`` is the share of rays
+    where the latter happens.
 
     T size (``tee_scale``, a value or a range; default 1). The stepper's obstacles share
     their sizes across envs too, so a range is a bank of ``n_tee_sizes`` copies of the T
@@ -289,9 +281,8 @@ class PushTLidarScenario(PushTScenario):
         lidar_body_frame: bool | None = None,
         lidar_mount_offset: float = 0.0,
         lidar_min_range: float = 0.0,
-        lidar_fov: float | tuple[float, float] = 2.0 * math.pi,
+        lidar_fov: float = 2.0 * math.pi,
         lidar_noise: float | tuple[float, float] = 0.0,
-        lidar_fov_at_mount: bool = False,
         pose_noise: float | tuple[float, float] = 0.0,
         pose_bias_std: tuple[float, float] = (0.03, 0.03),
         pose_jitter_std: tuple[float, float] = (0.02, 0.02),
@@ -317,7 +308,7 @@ class PushTLidarScenario(PushTScenario):
         scenery_probs: tuple[float, float, float, float] | None = None,
         scenery_on: float = 1.0,
         scenery_gap: float | tuple[float, float] = (0.0, 1.0),
-        scenery_clearance: float | None = None,
+        scenery_clearance: float = 0.0,
         wall_missing: float = 0.2,
         wall_radius: float | tuple[float, float] = (0.02, 0.1),
         n_clutter: int = 6,
@@ -325,7 +316,6 @@ class PushTLidarScenario(PushTScenario):
         clutter_count: tuple[int, int] = (2, 6),
         clutter_radius: float | tuple[float, float] = (0.05, 0.3),
         clutter_half: float | tuple[float, float] = (0.1, 0.6),
-        scenery_collide: bool = False,
         collision_penalty: float = 0.0,
         collision_margin: float = 0.01,
         tee_scale: float | tuple[float, float] = 1.0,
@@ -396,25 +386,22 @@ class PushTLidarScenario(PushTScenario):
         self.contact_dist = 2.0 * self.agent_radius if contact_dist is None else contact_dist
         # The auxiliary T offset is scaled by the lidar range, so an in-range T is in [-1, 1].
         self.aux_scale = 1.0 / self.lidar_max_range
-        fov = _range(lidar_fov, "lidar_fov")
         noise = _range(lidar_noise, "lidar_noise")
         pose = _range(pose_noise, "pose_noise")
         if lidar_min_range < 0.0:
             raise ValueError("lidar_min_range must be >= 0")
-        if not (fov[0] > 0.0 and fov[1] <= 2.0 * math.pi):
+        if not 0.0 < lidar_fov <= 2.0 * math.pi:
             raise ValueError(f"lidar_fov must lie in (0, 2 pi], got {lidar_fov}")
         self.lidar_mount_offset = float(lidar_mount_offset)
         self.lidar_min_range = float(lidar_min_range)
-        #: ``(low, high)`` of the field of view and of the range noise's deviation, drawn
-        #: per env and robot on every reset when ``low < high``.
-        self.lidar_fov = fov
+        #: The field of view, measured at the mount.
+        self.lidar_fov = float(lidar_fov)
+        #: ``(low, high)`` of the range noise's deviation, drawn per env and robot on every
+        #: reset when ``low < high``.
         self.lidar_noise = noise
-        #: Whether the field of view is measured at the mount (the sensor's own crop) rather
-        #: than per centre ray.
-        self.lidar_fov_at_mount = bool(lidar_fov_at_mount)
         #: Whether the scan goes through :func:`lidar_sensor_kernel` (and its torch twin).
         self.sensor_model = (
-            self.lidar_min_range > 0.0 or noise[1] > 0.0 or fov[0] < 2.0 * math.pi
+            self.lidar_min_range > 0.0 or noise[1] > 0.0 or self.lidar_fov < 2.0 * math.pi
         )
         #: ``(low, high)`` of the per-env pose-noise scale; ``pose_bias_std``,
         #: ``pose_jitter_std`` (position, heading) and ``vel_noise_std`` are at scale 1.
@@ -439,16 +426,16 @@ class PushTLidarScenario(PushTScenario):
         self.pose_drift_std = (float(pose_drift_std[0]), float(pose_drift_std[1]))
         self.pose_slip_gain = (float(pose_slip_gain[0]), float(pose_slip_gain[1]))
         self.pose_drift_on = self.pose_noise_on and tau[0] > 0.0
-        #: Out of bounds: once the T's centroid is more than ``world_size + oob_margin``
-        #: from the centre on either axis, the episode has failed (see
+        if oob_margin is not None and not self.open_arena:
+            raise ValueError("oob_margin needs open_arena: walls keep the T inside")
+        #: Out of bounds: once the T's centroid is more than ``oob_margin`` past the env's
+        #: arena on either axis, the episode has failed (see
         #: :func:`pusht_lidar_reward_kernel`); ``None`` never fails it.
-        self.oob_limit = 0.0 if oob_margin is None else self.world_size + float(oob_margin)
-        self.oob_penalty = float(oob_penalty)
-        #: How far past the arena the T fails (``None``: never); with a per-env arena the
-        #: limit is each env's half-extents plus this.
         self.oob_margin = None if oob_margin is None else float(oob_margin)
+        self.oob_on = self.oob_margin is not None
+        self.oob_penalty = float(oob_penalty)
         #: Whether a reset draws per-robot sensor or pose-noise values.
-        self.sensor_dr = fov[0] < fov[1] or noise[0] < noise[1] or self.pose_noise_on
+        self.sensor_dr = noise[0] < noise[1] or self.pose_noise_on
         if not 0.0 < lidar_span <= 2.0 * math.pi:
             raise ValueError(f"lidar_span must lie in (0, 2 pi], got {lidar_span}")
         #: The angle the rays span, centred on the heading (``2 pi``: the full circle).
@@ -490,9 +477,9 @@ class PushTLidarScenario(PushTScenario):
         self.artefact_dr = self.lidar_artefacts or self.lidar_sweep
         #: Whether the hit classes come from the deployment's rule on the reported poses
         #: (:func:`~swarp.scenarios.pusht_lidar_artefacts.lidar_relabel_kernel`), with the
-        #: teammates' footprints grown by ``lidar_label_margin`` and hits beyond
-        #: ``label_bound`` on either axis dropped: the out-of-bounds limit when there is
-        #: one, else the arena (none in an open arena).
+        #: teammates' footprints grown by ``lidar_label_margin`` and hits beyond a bound
+        #: on either axis dropped: the env's out-of-bounds limit when there is one, else
+        #: ``label_bound``, the walled arena (none on an open floor).
         self.lidar_label_from_pose = bool(lidar_label_from_pose)
         self.lidar_label_margin = float(lidar_label_margin)
         if lidar_arena_flag and not self.lidar_label_from_pose:
@@ -501,10 +488,7 @@ class PushTLidarScenario(PushTScenario):
         #: arena's edge (see the class docstring), and the masks' count.
         self.lidar_arena_flag = bool(lidar_arena_flag)
         self.ray_channels = 4 if self.lidar_arena_flag else 3
-        if self.oob_limit > 0.0:
-            self.label_bound = self.oob_limit
-        else:
-            self.label_bound = math.inf if self.open_arena else float(self.world_size)
+        self.label_bound = math.inf if self.open_arena else float(self.world_size)
         #: Whether every env draws surroundings outside its arena (see the class docstring).
         self.has_scenery = scenery_probs is not None
         if self.has_scenery:
@@ -524,24 +508,18 @@ class PushTLidarScenario(PushTScenario):
                 )
             if not 0.0 <= wall_missing <= 1.0:
                 raise ValueError(f"wall_missing must lie in [0, 1], got {wall_missing}")
-        if scenery_collide and not self.has_scenery:
-            raise ValueError("scenery_collide needs scenery_probs")
         if collision_penalty < 0.0 or collision_margin < 0.0:
             raise ValueError("collision_penalty and collision_margin must be >= 0")
-        #: Whether the surroundings are solid (see the class docstring).
-        self.scenery_collide = bool(scenery_collide)
         self.collision_penalty = float(collision_penalty)
         self.collision_margin = float(collision_margin)
         #: Whether the collision kernel runs (its flags feed the reward and ``info()``).
-        self.track_collisions = self.collision_penalty > 0.0 or self.scenery_collide
+        self.track_collisions = self.collision_penalty > 0.0 or self.has_scenery
         #: Layout probabilities (none, perimeter, room, clutter), and the share of envs that
         #: draw from them at all (a trainer can ramp it between resets).
         self.scenery_probs = tuple(float(x) for x in (scenery_probs or (1.0, 0.0, 0.0, 0.0)))
         self.scenery_on = float(scenery_on)
         self.scenery_gap = _range(scenery_gap, "scenery_gap")
-        if scenery_clearance is None and self.scenery_collide:
-            scenery_clearance = 0.0
-        self.scenery_clearance = scenery_clearance
+        self.scenery_clearance = float(scenery_clearance)
         self.wall_missing = float(wall_missing)
         self.wall_radius = _range(wall_radius, "wall_radius")
         self.n_clutter = int(n_clutter)
@@ -685,13 +663,11 @@ class PushTLidarScenario(PushTScenario):
         self.scenery: Scenery | None = None
         if self.has_scenery:
             # The surroundings' slots and the layout each env drew, rewritten in place by
-            # every reset, and the free region's clearance (see the class docstring).
+            # every reset.
             self.scenery = Scenery.empty(n_envs, N_WALLS + self.n_clutter, device,
                                          world.wp_dtype)
             self.scenery_mode = torch.zeros(n_envs, dtype=torch.int32, device=device)
             self._scenery_mode_wp = wp.from_torch(self.scenery_mode, dtype=wp.int32)
-            if self.scenery_clearance is None:
-                self.scenery_clearance = max(self.robot_reach(), self.tee_reach())
             self._scenery_launch = CachedLaunch()
         # The T's sizes (n_tee_sizes; the first until a reset draws them) and each one's
         # body root in the stepper's obstacles.
@@ -701,15 +677,15 @@ class PushTLidarScenario(PushTScenario):
         self._tee_root_wp = wp.from_torch(self._tee_root, dtype=wp.int32)
         self._tee_size_launch = CachedLaunch()
         self._lidar_half = self._obs_half
-        if self.scenery_collide or self.tee_sized:
+        if self.has_scenery or self.tee_sized:
             self._build_obstacles(world)
         if self.has_scenery and self.lidar_label_from_pose:
             #: Per robot, the share of its rays whose scenery hit the deployment's labels
             #: call the T; ``info()["scenery_leak"]``, at a fixed address.
             self._leak = torch.zeros(n_envs, na, **tt)
             self._leak_wp = wp.from_torch(self._leak)
-        # Solid surroundings are stepper obstacles, which the lidar scans anyway.
-        self.lidar.bind(world, None if self.scenery_collide else self.scenery)
+        # The surroundings are stepper obstacles, which the lidar scans anyway.
+        self.lidar.bind(world)
         self._collision_launch = CachedLaunch()
         if self.track_collisions and self.scenery is None:
             # One empty slot per env, for the collision kernel's surroundings arguments.
@@ -720,11 +696,9 @@ class PushTLidarScenario(PushTScenario):
             # One RNG stream per robot for the range noise, advanced in place by the sensor
             # kernel (so it draws fresh noise on every replay of a captured step).
             self._lidar_rng = self._rng_streams(world)
-            # Per-robot half field of view and noise deviation, at the ranges' low ends
-            # until a sensor_dr reset redraws them in place.
-            self._half_fov = torch.full((n_envs, na), 0.5 * self.lidar_fov[0], **tt)
+            # Per-robot noise deviation, at the range's low end until a sensor_dr reset
+            # redraws it in place.
             self._noise_std = torch.full((n_envs, na), self.lidar_noise[0], **tt)
-            self._half_fov_wp = wp.from_torch(self._half_fov)
             self._noise_std_wp = wp.from_torch(self._noise_std)
         if self.sensor_dr:
             vec2 = VEC2[world.wp_dtype]
@@ -737,9 +711,8 @@ class PushTLidarScenario(PushTScenario):
                 wp.from_torch(self._bias_theta),
             ]
             if not self.sensor_model:
-                self._half_fov_wp = wp.zeros((n_envs, na), dtype=world.wp_dtype,
-                                             device=world.device)
-                self._noise_std_wp = wp.zeros_like(self._half_fov_wp)
+                self._noise_std_wp = wp.zeros((n_envs, na), dtype=world.wp_dtype,
+                                              device=world.device)
             self._dr_launch = CachedLaunch()
         if self.pose_noise_on:
             # The pose the observation reports, written by the noise kernel before the
@@ -759,7 +732,7 @@ class PushTLidarScenario(PushTScenario):
         self._drift_state = torch.zeros(*shape, **tt)
         self._drift_wp = wp.from_torch(self._drift_state)
         # The out-of-bounds latch (a fused carry when the check is on).
-        self._oob = torch.zeros(n_envs if self.oob_limit > 0.0 else 1, dtype=torch.uint8,
+        self._oob = torch.zeros(n_envs if self.oob_on else 1, dtype=torch.uint8,
                                 device=device)
         self._oob_wp = wp.from_torch(self._oob)
         if self.artefact_dr:
@@ -782,7 +755,7 @@ class PushTLidarScenario(PushTScenario):
     def _build_obstacles(self, world: World) -> None:
         """Rebuild the stepper's obstacle spec as the T's boxes, once per size of the bank
         (``tee_scale``; one block without it), followed by one immovable obstacle per
-        surroundings slot when they are solid (:func:`~swarp.scenarios.pusht_lidar_scenery.
+        surroundings slot (:func:`~swarp.scenarios.pusht_lidar_scenery.
         slot_bank`). Each size is its own movable body; an env's other sizes wait parked
         far apart, out of everything's reach. Without the bank Push-T's ``_box_*`` buffers
         become views of the spec's first rows, so its install path is unchanged; the slot
@@ -790,7 +763,7 @@ class PushTLidarScenario(PushTScenario):
         ne, nb = world.n_envs, self.n_boxes
         kv = self.n_tee_sizes
         nt = kv * nb
-        ns = self.scenery.n_slots if self.scenery_collide else 0
+        ns = self.scenery.n_slots if self.has_scenery else 0
         n = nt + ns
         dev = world.device
         tt = {"device": dev, "dtype": world.dtype}
@@ -927,22 +900,6 @@ class PushTLidarScenario(PushTScenario):
             record_tape=False,
         )
 
-    def robot_reach(self) -> float:
-        """How far past the arena a robot's footprint can get: the arena stop's margin,
-        what a robot at full speed covers in the step the stop is judged on and through its
-        command latency, its stopping distance at the drive's lowest acceleration, and its
-        circumscribed radius."""
-        v = self.max_speed * max(1.0, self._actuation_ranges[2][1])
-        accel = self._actuation_ranges[0][0]
-        stop = 0.0 if math.isinf(accel) else v * v / (2.0 * accel)
-        latency = min(self.cmd_latency[1], self.dt)
-        return self.arena_stop_margin + v * (self.dt + latency) + stop + self.agent_radius
-
-    def tee_reach(self) -> float:
-        """How far past the arena the T's body can get before its episode fails: the
-        out-of-bounds margin plus its radius."""
-        return (self.oob_margin or 0.0) + self.tee_radius
-
     def _rng_streams(self, world: World) -> wp.array:
         """``[n_envs, n_agents]`` uint32 RNG states, one stream per robot, seeded from the
         world's kernel seed."""
@@ -998,47 +955,14 @@ class PushTLidarScenario(PushTScenario):
         launch.set_param_by_name("seed", seed)
         launch.launch()
 
-    def _launch_scenery(self, mask, use_mask) -> None:
-        """Redraw the respawned envs' surroundings around their new arenas
-        (:func:`~swarp.scenarios.pusht_lidar_scenery.scenery_reset_kernel`)."""
-        if self.scenery_collide:
-            self._launch_scenery_slots(mask, use_mask)
-            return
-        w = self.world
-        scalar = w.wp_dtype
-        seed = wp.int32(w.next_kernel_seed())
-        _, p_per, p_room, p_clut = self.scenery_probs
-        values = (
-            self.scenery_clearance, self.scenery_on, p_per, p_room, p_clut, *self.scenery_gap,
-            self.wall_missing, *self.wall_radius,
-        )
-        sizes = (*self.clutter_radius, *self.clutter_half, self._clutter_reach())
-        sc = self.scenery
-        outs = [self._scenery_mode_wp, *sc.arrays()]
-        launch = self._scenery_launch.get(
-            concrete(scenery_reset_kernel, scalar),
-            dim=w.n_envs,
-            inputs=[
-                mask, use_mask, seed, self._arena_half_wp, *(scalar(x) for x in values),
-                wp.int32(self.clutter_count[0]), wp.int32(self.clutter_count[1]),
-                *(scalar(x) for x in sizes),
-            ],
-            outputs=outs,
-            device=w.device,
-            key=(w.n_envs, ptr_key(mask), ptr_key(self._arena_half_wp), *values,
-                 *self.clutter_count, *sizes, *(ptr_key(o) for o in outs)),
-        )
-        launch.set_param_by_name("use_mask", use_mask)
-        launch.set_param_by_name("seed", seed)
-        launch.launch()
-
     def _clutter_reach(self) -> float:
         return self.lidar_max_range if self.clutter_reach is None else self.clutter_reach
 
-    def _launch_scenery_slots(self, mask, use_mask) -> None:
-        """Solid surroundings: the slot bank's layouts, into the lidar's per-env arrays and
-        the stepper's obstacle spec (:func:`~swarp.scenarios.pusht_lidar_scenery.
-        scenery_slots_reset_kernel`), which the reset's install then copies in."""
+    def _launch_scenery(self, mask, use_mask) -> None:
+        """Redraw the respawned envs' surroundings around their new arenas: the slot bank's
+        layouts, into the per-env slot arrays and the stepper's obstacle spec
+        (:func:`~swarp.scenarios.pusht_lidar_scenery.scenery_slots_reset_kernel`), which the
+        reset's install then copies in."""
         w = self.world
         scalar = w.wp_dtype
         seed = wp.int32(w.next_kernel_seed())
@@ -1066,16 +990,13 @@ class PushTLidarScenario(PushTScenario):
         launch.launch()
 
     def _launch_sensor_dr(self, mask, use_mask) -> None:
-        """Redraw the respawned robots' field of view, range noise, pose-noise scale and
-        localisation bias (``sensor_dr``)."""
+        """Redraw the respawned robots' range noise, pose-noise scale and localisation bias
+        (``sensor_dr``)."""
         w = self.world
         scalar = w.wp_dtype
         seed = wp.int32(w.next_kernel_seed())
-        bounds = (
-            0.5 * self.lidar_fov[0], 0.5 * self.lidar_fov[1], *self.lidar_noise,
-            *self.pose_noise, *self.pose_bias_std,
-        )
-        outs = [self._half_fov_wp, self._noise_std_wp, *self._pose_dr_wp]
+        bounds = (*self.lidar_noise, *self.pose_noise, *self.pose_bias_std)
+        outs = [self._noise_std_wp, *self._pose_dr_wp]
         launch = self._dr_launch.get(
             concrete(pusht_lidar_dr_reset_kernel, scalar),
             dim=(w.n_envs, self.n_agents),
@@ -1242,13 +1163,9 @@ class PushTLidarScenario(PushTScenario):
         ang = self._ray_angles()
         hx = ranges * torch.cos(ang) - self.lidar_mount_offset * torch.cos(th)
         hy = ranges * torch.sin(ang) - self.lidar_mount_offset * torch.sin(th)
-        off = ang - th
-        if self.lidar_fov_at_mount:
-            off = torch.atan2(hy, hx) - th
-        elif self.lidar.body_frame:
-            off = self.lidar.ray_offsets(device=ang.device, dtype=ang.dtype).expand_as(ang)
+        off = torch.atan2(hy, hx) - th
         rel = torch.atan2(torch.sin(off), torch.cos(off))
-        half = self._half_fov.unsqueeze(-1) + FOV_EPS
+        half = 0.5 * self.lidar_fov + FOV_EPS
         blind = (hit_class != 0) & (
             (hx * hx + hy * hy < self.lidar_min_range**2) | (rel.abs() > half)
         )
@@ -1317,7 +1234,7 @@ class PushTLidarScenario(PushTScenario):
         hit = opos.unsqueeze(2) + ranges.unsqueeze(-1) * torch.stack(
             [torch.cos(ang), torch.sin(ang)], dim=-1
         )  # [E, A, R, 2]
-        if self.per_env_arena and self.oob_margin is not None:
+        if self.oob_on:
             bound = (self.arena_half + self.oob_margin).view(-1, 1, 1, 2)
             out = (hit.abs() > bound).any(-1)
         else:
@@ -1641,11 +1558,8 @@ class PushTLidarScenario(PushTScenario):
         c = self._cache  # Push-T's refresh, just run by super()
         on_goal = c["on_goal"]
         failed = torch.zeros_like(on_goal)
-        if self.oob_limit > 0.0:
-            if self.per_env_arena:
-                out = (q.detach().abs() > self.arena_half + self.oob_margin).any(-1)
-            else:
-                out = (q.detach().abs() > self.oob_limit).any(-1)
+        if self.oob_on:
+            out = (q.detach().abs() > self.arena_half + self.oob_margin).any(-1)
             if reset:
                 fresh = torch.ones_like(out) if env_mask is None else env_mask
                 failed = torch.where(fresh, torch.zeros_like(out), self._oob.bool())
@@ -1682,7 +1596,7 @@ class PushTLidarScenario(PushTScenario):
         con_t = torch.where(is_obs & near, torch.full_like(zero, -self.contact_penalty), zero)
         col_t = torch.where(hit_robot | hit_scenery,
                             torch.full_like(zero, -self.collision_penalty), zero)
-        if self.oob_limit > 0.0:
+        if self.oob_on:
             f = failed.unsqueeze(1)
             approach, standoff, vis_t, cov_t, occ_t, con_t, col_t = (
                 torch.where(f, zero, t)
@@ -1855,7 +1769,7 @@ class PushTLidarScenario(PushTScenario):
             *(
                 (Buf("oob", (ne,), "uint8", attr="_oob", alloc="never", carry=True,
                      watch=True),)
-                if self.oob_limit > 0.0
+                if self.oob_on
                 else ()
             ),
             *(
@@ -1930,8 +1844,8 @@ class PushTLidarScenario(PushTScenario):
         scalar = w.wp_dtype
         lid = self.lidar
         seen = self._obs_pose_wp if self.pose_noise_on else [st.pos, st.vel, st.theta]
-        # The bound is the env's arena plus the out-of-bounds margin with a per-env arena.
-        per_env = self.per_env_arena and self.oob_margin is not None
+        # The bound is the env's arena plus the out-of-bounds margin when there is one.
+        per_env = self.oob_on
         leak = self.has_scenery
         wp.launch(
             concrete(lidar_relabel_kernel, scalar),
@@ -2007,8 +1921,7 @@ class PushTLidarScenario(PushTScenario):
                 wp.int32(int(lid.body_frame)),
                 scalar(self.lidar_mount_offset),
                 scalar(self.lidar_min_range),
-                self._half_fov_wp,
-                wp.int32(int(self.lidar_fov_at_mount)),
+                scalar(0.5 * self.lidar_fov),
                 self._noise_std_wp,
                 self._lidar_rng,
                 lid.wp_ranges,
@@ -2205,11 +2118,10 @@ class PushTLidarScenario(PushTScenario):
             self.occlusion_weight,
             self.contact_penalty,
             self.collision_penalty,
-            self.oob_limit,
             self.oob_penalty,
         )
-        oob = self._wp["oob"] if self.oob_limit > 0.0 else self._oob_wp
-        per_env = self.per_env_arena and self.oob_limit > 0.0
+        oob = self._wp["oob"] if self.oob_on else self._oob_wp
+        per_env = self.oob_on
         arena = self._arena_half_wp if per_env else self._dummy_vec2()
         margin = self.oob_margin if per_env else 0.0
         launch = self._lidar_reward_launch.get(
@@ -2335,7 +2247,7 @@ class PushTLidarScenario(PushTScenario):
             )
             # Views of the fused buffers, so a trainer that reads info by address (the
             # rollout's captured store graph) sees the same tensors on every step.
-            if self.oob_limit > 0.0:
+            if self.oob_on:
                 out["out_of_bounds"] = self._oob.view(torch.bool)
             if self.has_scenery and self.lidar_label_from_pose:
                 out["scenery_leak"] = self._leak
@@ -2351,7 +2263,7 @@ class PushTLidarScenario(PushTScenario):
             occlusion=c["occlusion"],
             tee_seen=c["tee_seen"],
         )
-        if self.oob_limit > 0.0:
+        if self.oob_on:
             out["out_of_bounds"] = c["out_of_bounds"]
         if "scenery_leak" in c:
             out["scenery_leak"] = c["scenery_leak"]

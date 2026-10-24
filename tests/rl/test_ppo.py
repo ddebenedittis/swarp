@@ -850,10 +850,11 @@ def test_rollback_restores_weights_and_adam_in_place_and_the_graphs_replay():
     assert all(torch.isfinite(p).all() for p in algo.params)
 
 
-def _l8b_s1_trace(dip: bool = True) -> list[float]:
-    """A windowed solve rate shaped like L8b-s1's (logged every 25 iterations): learned by
-    3000, a 0.95-0.97 plateau, the 5650-5700 dip and its recovery, then the collapse from
-    0.83 at 5900 to 0.22 at 5960. A small deterministic wobble stands in for the noise."""
+def _staged_collapse_trace(dip: bool = True) -> list[float]:
+    """A windowed solve rate shaped like a staged slim-T Limo run's (logged every 25
+    iterations): learned by 3000, a 0.95-0.97 plateau, the 5650-5700 dip and its recovery,
+    then the collapse from 0.83 at 5900 to 0.22 at 5960. A small deterministic wobble stands
+    in for the noise."""
     knots = [(0, 0.0), (3000, 0.9), (3200, 0.95), (5550, 0.97)]
     if dip:
         knots += [(5575, 0.92), (5600, 0.89), (5625, 0.88), (5650, 0.625), (5675, 0.537),
@@ -882,7 +883,7 @@ def test_rollback_guard_fires_on_the_l8b_s1_dip_and_restores_from_before_it():
     from swarp.rl.ppo import RollbackGuard
 
     guard = RollbackGuard()
-    it = _first_rollback(_l8b_s1_trace(), guard)
+    it = _first_rollback(_staged_collapse_trace(), guard)
     assert it is not None and 5650 <= it <= 5725
     # Before the fall from 0.88 at 5625, while still within keep * best of the plateau.
     assert guard.restore_it < 5625 and guard.snaps[-1] == guard.restore_it
@@ -893,7 +894,7 @@ def test_rollback_guard_fires_on_the_final_collapse_and_ignores_wobble():
     from swarp.rl.ppo import RollbackGuard
 
     guard = RollbackGuard()
-    it = _first_rollback(_l8b_s1_trace(dip=False), guard)
+    it = _first_rollback(_staged_collapse_trace(dip=False), guard)
     assert it is not None and 5900 < it <= 5960  # never on the plateau's wobble
     assert guard.restore_it < 5900
     # A short excursion (under the patience) is not a collapse.
@@ -902,7 +903,7 @@ def test_rollback_guard_fires_on_the_final_collapse_and_ignores_wobble():
 
 
 def test_rollback_guard_ignores_a_policy_still_learning_around_the_floor():
-    """L9b's trace: rising through 0.2-0.51 with windowed noise of +-0.05 is not a
+    """A Limo run's trace: rising through 0.2-0.51 with windowed noise of +-0.05 is not a
     collapse, so nothing is judged until the rate has passed floor + drop."""
     from swarp.rl.ppo import RollbackGuard
 

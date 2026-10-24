@@ -1224,8 +1224,9 @@ class RollbackGuard:
       ramp's progress), so a harder condition is never held to an easier one's best.
     - Armed once the rate has passed ``arm``; until then nothing is snapshotted or judged.
       ``arm`` is ``floor + drop`` by default: a collapse is a fall from a mastered level,
-      and a policy still learning around the floor is not judged (L9b, armed at 0.5, rolled
-      back four times in 100 iterations while rising through 0.38-0.51 and stopped).
+      and a policy still learning around the floor is not judged (a Limo run armed at 0.5
+      rolled back four times in 100 iterations while rising through 0.38-0.51 and
+      stopped).
     - Snapshot every ``every`` iterations while the rate is at least ``keep`` times the
       position's best, keeping the newest ``ring``.
     - Roll back once the rate has stayed below ``max(floor, best - drop)`` for ``patience``
@@ -1235,10 +1236,10 @@ class RollbackGuard:
       Snapshots newer than the one restored are dropped.
     - After ``max_rollbacks`` rollbacks the next trigger is ``"stop"``.
 
-    On L8b-s1's trace the 5650-5700 dip to 0.53 (a 44-point drop for about 75 iterations,
-    then a partial recovery to 0.90) triggers too: it was the onset of the instability
-    that collapsed the run to 0.04 by 6000, and rolling back there is the cheap reading of
-    it.
+    On the trace of a staged slim-T Limo run the 5650-5700 dip to 0.53 (a 44-point drop for
+    about 75 iterations, then a partial recovery to 0.90) triggers too: it was the onset of
+    the instability that collapsed the run to 0.04 by 6000, and rolling back there is the
+    cheap reading of it.
     """
 
     def __init__(
@@ -1671,8 +1672,9 @@ def train(cfg: TrainConfig) -> Path:
             clock = it
         progress = set_ramps(clock)
         # The guard's ramp position: every ramp's progress, not the least of them, which
-        # stays 0 until the last ramp starts (L11's turn-away cost at 8000 held every
-        # condition before it to the clean world's best, and rolled the run back three times).
+        # stays 0 until the last ramp starts (with a turn-away cost ramping in at 8000, that
+        # held every condition before it to the clean world's best, and rolled a Limo run
+        # back three times).
         position = tuple(round(r.progress(clock) * 1000) for r in spec.ramps)
         tick = clock  # the clock this iteration ran at
         lr = spec.lr

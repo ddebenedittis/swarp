@@ -36,8 +36,9 @@ robot moves, and all are reported against the one pose of the scan's stamp. ``sw
 models that (and a mount yaw error) by casting each ray from the pose at its own time,
 extrapolated at constant velocity; see :func:`sweep_offsets`.
 
-``scenery`` (a :class:`Scenery`) adds geometry only the lidar sees: per-env circles, boxes
-and segments that no contact ever touches, scanned after the obstacles and reported as
+``scenery`` (a :class:`Scenery`'s tensors or arrays) adds per-env circles, boxes and
+segments to :func:`lidar_scan` and :func:`~swarp.sensors.lidar_kernels.lidar_scan_warp`,
+each with its own size per env, scanned after the obstacles and reported as
 ``HIT_IMMOVABLE`` with hit index ``-1``.
 """
 
@@ -121,16 +122,18 @@ def _ray_capsule(rel, d, ca, sa, half_len, rad, miss: float):
 
 @dataclass
 class Scenery:
-    """Per-env geometry that only the lidar sees: ``n_slots`` shapes per env, each with its
-    own pose *and* size per env (the stepper's obstacles share their sizes across envs).
+    """Per-env geometry: ``n_slots`` shapes per env, each with its own pose *and* size per
+    env (the stepper's obstacles share their sizes across envs).
 
     The torch tensors ``pos [E, S, 2]``, ``angle [E, S]``, ``half [E, S, 2]`` (a box's
     half-extents; a segment's core half-length in ``half[..., 0]``), ``radius [E, S]`` (a
     circle's or a segment's radius) and ``shape [E, S]`` (int32
     :class:`~swarp.core.config.ObstacleShape`, negative for an empty slot) are zero-copy
-    views of the Warp arrays ``wp_*``, which a capture-safe scan reads by pointer: write
-    either side in place, never rebind them. No contact, collision or body pass reads
-    them, so whatever is placed here must lie where nothing can reach it."""
+    views of the Warp arrays ``wp_*``, which a capture-safe kernel reads by pointer: write
+    either side in place, never rebind them. :func:`lidar_scan` and
+    :func:`~swarp.sensors.lidar_kernels.lidar_scan_warp` scan them (``scenery=``); a
+    world-bound :class:`Lidar` and the stepper's contacts do not, so geometry the robots
+    must collide with and a :class:`Lidar` must see belongs in the stepper's obstacles."""
 
     pos: torch.Tensor
     angle: torch.Tensor
@@ -162,7 +165,8 @@ class Scenery:
         return self.shape.shape[1]
 
     def tensors(self) -> tuple:
-        """``(pos, angle, half, radius, shape)``, the ``scenery`` argument of the scans."""
+        """``(pos, angle, half, radius, shape)``, the ``scenery`` argument of
+        :func:`lidar_scan`."""
         return self.pos, self.angle, self.half, self.radius, self.shape
 
     def arrays(self) -> tuple:
@@ -451,8 +455,6 @@ class Lidar:
         self.wp_hit_class = None
         self.wp_hit_index = None
         self._box_agents = False
-        #: Lidar-only geometry (:class:`Scenery`), set by :meth:`bind`.
-        self.scenery: Scenery | None = None
 
     def ray_offsets(self, device=None, dtype: torch.dtype = torch.float32) -> torch.Tensor:
         """``[n_rays]`` ray angles relative to the frame (heading or world x axis)."""
@@ -503,8 +505,6 @@ class Lidar:
             yaw = zero if self.yaw_bias is None else self.yaw_bias
             phase = zero if self.stamp_phase is None else self.stamp_phase
             kw["sweep"] = (st.vel, st.ang_vel, yaw, phase, self.scan_period, self.sweep_dir)
-        if self.scenery is not None:
-            kw["scenery"] = self.scenery.tensors()
         return lidar_scan(
             world.state.pos,
             world.state.theta,
@@ -521,7 +521,7 @@ class Lidar:
 
     # --------------------------------------------------------- capture-safe
 
-    def bind(self, world, scenery: Scenery | None = None) -> None:
+    def bind(self, world) -> None:
         """Allocate the output buffers for ``world`` and load the scan kernels.
 
         Call it **outside** any capture (in ``make_world``, or before the first step): it
@@ -532,19 +532,10 @@ class Lidar:
         capture cannot be loaded there. Idempotent: re-binding the same world with the same
         batch size keeps the buffers (and their pointers); anything else reallocates and
         bumps :attr:`version`.
-
-        ``scenery`` (a :class:`Scenery` of the world's batch size) is scanned by every
-        later scan on both backends, read by pointer.
         """
-        if scenery is not None and scenery.shape.shape[0] != world.n_envs:
-            raise ValueError(
-                f"scenery holds {scenery.shape.shape[0]} envs, the world {world.n_envs}"
-            )
-        key = (id(world), world.n_envs, world.n_agents, world.dtype, world.device,
-               None if scenery is None else id(scenery))
+        key = (id(world), world.n_envs, world.n_agents, world.dtype, world.device)
         if self._bound_key == key:
             return
-        self.scenery = scenery
         shape = (world.n_envs, world.n_agents, self.n_rays)
         hit_shape = shape if self.return_hits else (1, 1, 1)
         dev = world.device
@@ -569,7 +560,6 @@ class Lidar:
             self.return_hits,
             self.return_hits,
             self.sweep,
-            scenery is not None,
             device=dev,
         )
         self._bound_key = key
@@ -626,7 +616,6 @@ class Lidar:
                 if self.sweep
                 else None
             ),
-            scenery=None if self.scenery is None else self.scenery.arrays(),
         )
 
     __call__ = scan
