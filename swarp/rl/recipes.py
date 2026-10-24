@@ -425,7 +425,10 @@ SPECS: dict[str, TrainSpec] = {
     # of hold_reward 1.0 that a broken hold gives back. Without it the policy crossed the goal
     # at 0.09 m/s with the robots at 0.32 m/s, and 10 s later 9% of the solved T were still on
     # it. The robots' thresholds sit 2.5 sigma above the jitter the actor's std floor (0.1)
-    # puts on a stopped robot's command, so a sampled stop still completes the hold.
+    # puts on a stopped robot's command, so a sampled stop still completes the hold. The hold
+    # comes in last, on its own ramps (below): fine-tuned from a policy that solves 0.96 on
+    # the goal alone, the full hold scored no solve in 320 iterations, since a policy that
+    # never stops on the goal never collects a hold step to learn from.
     #
     # Drive and contacts, from a Gazebo sysid (swarp_gz_test out/sysid). ControlMode.SERVO
     # with accelerations and command gains drawn per env and robot around Gazebo's Limo
@@ -465,21 +468,21 @@ SPECS: dict[str, TrainSpec] = {
     # or a surroundings shape. The T's size is drawn per env from three copies scaled 0.9,
     # 1.0 and 1.1.
     #
-    # Training. From scratch in one run of 2048 envs and 16 minibatches, the world made
-    # hard in ramps on a gated clock (a tick needs a windowed solve of 0.75, so no condition
-    # comes in before the last is mastered): the arena widens from 4 x 4 m over ticks
-    # 1000-3000; the pose noise, the command delay, the surroundings and the collision cost
-    # come in over 3000-5000; the turn-away cost over 8000-10000, since from scratch it made
-    # a clumsy push of the slim T net-negative and the policies stopped pushing. The run
-    # ends 4000 ticks after the last ramp (24000 iterations is a cap). Guards against the
-    # late collapses unguarded runs met: the learning rate decays 5e-4 -> 1e-4 over the
-    # clock and follows the KL (adaptive_kl), a KL brake skips the rest of a destructive
-    # iteration, the actor's std is floored at 0.1 (the greedy action is the mean, so the
-    # floor does not reach the deployment), and rollback restores a pre-collapse snapshot at
+    # Training. From scratch in one run of 2048 envs and 16 minibatches, the world made hard in
+    # ramps on a gated clock (a tick needs a windowed solve of 0.75, so no condition comes in before
+    # the last is mastered): the arena widens from 4 x 4 m over ticks 1000-3000; the pose noise, the
+    # command delay, the surroundings and the collision cost come in over 3000-5000; the turn-away
+    # cost over 8000-10000, since from scratch it made a clumsy push of the slim T net-negative and
+    # the policies stopped pushing; the settled hold over 10000-12000, from one step at speeds no
+    # push reaches to 1 s at the settle speeds. The run ends 4000 ticks after the last ramp (24000
+    # iterations is a cap). Guards against the late collapses unguarded runs met: the learning rate
+    # decays 5e-4 -> 1e-4 over the clock and follows the KL (adaptive_kl), a KL brake skips the rest
+    # of a destructive iteration, the actor's std is floored at 0.1 (the greedy action is the mean,
+    # so the floor does not reach the deployment), and rollback restores a pre-collapse snapshot at
     # half the learning rate. An action-rate penalty of 0.03 ramps in over the first 2000
-    # iterations. Two pushers on their own lidar, frame_stack 4 and aux loss 0.1, which
-    # solved 0.99 at the default scale; standoff_dist 1.0 only clears the scenario's check,
-    # since pushers never read it.
+    # iterations. Two pushers on their own lidar, frame_stack 4 and aux loss 0.1, which solved 0.99
+    # at the default scale; standoff_dist 1.0 only clears the scenario's check, since pushers never
+    # read it.
     "pusht_lidar_limo": TrainSpec(
         scenario="pusht_lidar",
         dt=0.2, substeps=32, max_steps=450, n_agents=2,
@@ -537,6 +540,11 @@ SPECS: dict[str, TrainSpec] = {
             Ramp("scenery_on", 0.0, 1.0, 3000, 5000),
             Ramp("rot_away_penalty", 0.0, 1.0, 8000, 10000),
             Ramp("collision_penalty", 0.0, 0.03, 3000, 5000),
+            Ramp("hold_steps", 1, 5, 10000, 12000),
+            Ramp("settle_tee_speed", 0.5, 0.03, 10000, 12000),
+            Ramp("settle_tee_ang_vel", 2.0, 0.1, 10000, 12000),
+            Ramp("settle_robot_speed", 0.5, 0.1, 10000, 12000),
+            Ramp("settle_robot_ang_vel", 2.0, 0.4, 10000, 12000),
         ),
         ramp_gate=0.75, hold_iters=4000, target_kl=0.3, adaptive_kl=0.02, rollback=True,
         actor_scale_min=0.1, action_rate_coef=0.03, action_rate_ramp_iters=2000,

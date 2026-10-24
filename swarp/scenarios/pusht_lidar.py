@@ -558,13 +558,24 @@ class PushTLidarScenario(PushTScenario):
         if min(settle) <= 0.0:
             raise ValueError(f"the settle thresholds must be > 0, got {settle}")
         #: The settled hold (see the class docstring): steps the T must stay on goal and
-        #: settled for the episode to succeed (0: on goal is enough), the weight of the
-        #: hold's potential, and the speed thresholds below which the T and every robot
-        #: count as settled (the T's speed and turn rate, each robot's speed and turn rate).
+        #: settled for the episode to succeed (0: on goal is enough; a trainer can ramp it
+        #: between resets as long as it stays above 0), the weight of the hold's potential,
+        #: and the speed thresholds below which the T and every robot count as settled.
         self.hold_steps = int(hold_steps)
         self.hold_on = self.hold_steps > 0
         self.hold_reward = float(hold_reward)
-        self.settle = tuple(min(float(x), 1e30) for x in settle)
+        self.settle_tee_speed, self.settle_tee_ang_vel = settle[0], settle[1]
+        self.settle_robot_speed, self.settle_robot_ang_vel = settle[2], settle[3]
+
+    @property
+    def settle(self) -> tuple[float, float, float, float]:
+        """The settle thresholds (the T's speed and turn rate, each robot's speed and turn
+        rate), an infinite one as a large finite value for the kernel."""
+        return tuple(
+            min(float(x), 1e30)
+            for x in (self.settle_tee_speed, self.settle_tee_ang_vel, self.settle_robot_speed,
+                      self.settle_robot_ang_vel)
+        )
 
     # ------------------------------------------------------------- dimensions
 
