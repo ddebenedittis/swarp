@@ -101,7 +101,7 @@ def test_checkpoint_round_trips_through_eval_mappo(tmp_path):
     assert ckpt["format"] == "rsl_rl/1"
     lo, hi = -0.1 * torch.ones(4, ckpt["act_dim"]), 0.1 * torch.ones(4, ckpt["act_dim"])
     obs = torch.randn(3, 4, ckpt["obs_dim"])
-    act = arm(3, "cpu", lo, hi)(obs)
+    act = arm["policy"](3, "cpu", lo, hi)(obs)
     mean = actor.distribution.deterministic_output(actor.mlp(obs))
     assert torch.equal(act, mean.clamp(lo, hi).detach())
     sys.modules.pop("eval_mappo", None)

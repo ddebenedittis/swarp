@@ -24,6 +24,22 @@ capsule). **Box-box obstacle contacts are not modelled**: that needs a polygon c
 manifold (SAT), not an SDF evaluated against a disc, so two boxes pass through one
 another. Agent-vs-box is exact for every shape; this gap is only obstacle-vs-obstacle.
 
+**Box agents.** A world holding a box agent launches the ``boxes`` variant of the body
+pass (:func:`_make_obstacle_dynamics`), which takes a box agent's reaction from the same
+oriented-box contact the agent side applies (:func:`_reaction_box`) and turns it into a
+torque about the body origin through the lever to the contact point. A disc-only world
+launches the disc variant, the historical kernel with the box branch compiled out.
+
+**Floor friction.** Besides the viscous drag, a body can slide on a Coulomb floor
+(:func:`body_friction_kernel`, launched right after the body pass and only when the
+world has floor friction): the body's weight ``m g`` pressed uniformly over its
+footprint, sampled on a grid of points per shape, each point resisting its own sliding
+velocity with ``mu`` times its share of the weight. Summed over the grid that is the
+body's limit surface, so an off-centre push turns the body about the right pivot instead
+of the centroid. The direction is regularised below ``friction_speed``, and an impulse
+that would reverse the body's velocity (or spin) sticks it instead, so the stiff law
+stays stable at any substep.
+
 Not taped: like the neighbor lists, body state is advanced with ``record_tape=False``.
 The discrete question of which contacts exist is not differentiated, and a scenario that
 needs gradients through a movable body keeps its own torch-side reference (see
@@ -38,15 +54,20 @@ import warp as wp
 
 from swarp._overloads import concrete, register
 from swarp.core.collisions import (
+    BOX_MODULE_OPTIONS,
     SHAPE_BOX,
+    SHAPE_CIRCLE,
     SHAPE_SEGMENT,
+    _box_obstacle_force,
+    bounds_apart,
     box_force,
     closest_on_segment,
     pair_force,
+    shape_bound,
 )
 from swarp.core.config import ObstacleKind
 from swarp.core.state import VEC2
-from swarp.dynamics.base import P_MASS, P_RADIUS
+from swarp.dynamics.base import P_HALF_X, P_HALF_Y, P_MASS, P_RADIUS, P_SHAPE
 
 # Lean launches (no grid-stride loop); see docs/performance.md.
 wp.set_module_options({"default_grid_stride": False})
@@ -104,6 +125,43 @@ def _reaction(
         )
         r = type(p)(zero, zero)
     return -f_agent, r
+
+
+@wp.func
+def _reaction_box(
+    p: Any,
+    th: Any,
+    v: Any,
+    w: Any,
+    ha: Any,
+    am: Any,
+    center: Any,
+    angle: Any,
+    st: wp.int32,
+    obs_r: Any,
+    half: Any,
+    v_obs: Any,
+    om_obs: Any,
+    k: Any,
+    c: Any,
+    margin: Any,
+    sub_dt: Any,
+    max_overlap: Any,
+):
+    """:func:`_reaction` for a *box* agent (half-extents ``ha``, heading ``th``, spin ``w``).
+
+    Calls :func:`swarp.core.collisions._box_obstacle_force`, the very function the agent
+    side sums, with the same arguments, and negates it, so action and reaction are the
+    same number. The lever runs from the shape centre to the contact point that function
+    reports: on a box or capsule that is where the two surfaces meet, so an off-centre
+    push spins the body; on a circle it is the centre, through which a frictionless normal
+    passes, so no torque."""
+    damp_denom = type(k)(1.0) + c * sub_dt / am
+    f_agent, x = _box_obstacle_force(
+        p, th, v, w, ha, center, st, angle, obs_r, half, v_obs, om_obs, k, c, margin,
+        damp_denom, max_overlap,
+    )
+    return -f_agent, x - center
 
 
 @wp.func
@@ -195,11 +253,329 @@ def _body_body(
     return f, r
 
 
-@wp.kernel
-def obstacle_dynamics_kernel(
-    pos: wp.array2d(dtype=Any),
-    vel: wp.array2d(dtype=Any),
-    params: wp.array2d(dtype=Any),  # [n_agents, NUM_PARAMS]
+@wp.func
+def _reaction_shaped(
+    p: Any,
+    v: Any,
+    th: Any,
+    w: Any,
+    shape: Any,
+    ra: Any,
+    hx: Any,
+    hy: Any,
+    am: Any,
+    center: Any,
+    angle: Any,
+    st: wp.int32,
+    obs_r: Any,
+    half: Any,
+    v_obs: Any,
+    om_obs: Any,
+    k: Any,
+    c: Any,
+    margin: Any,
+    sub_dt: Any,
+    max_overlap: Any,
+):
+    """The reaction of one agent of either shape: :func:`_reaction` for a disc,
+    :func:`_reaction_box` for a box."""
+    zero = type(k)(0.0)
+    f = type(p)(zero, zero)
+    r = type(p)(zero, zero)
+    if shape < type(k)(0.5):
+        f, r = _reaction(
+            p, v, ra, am, center, angle, st, obs_r, half, v_obs, om_obs, k, c, margin, sub_dt,
+            max_overlap,
+        )
+    else:
+        f, r = _reaction_box(
+            p, th, v, w, type(p)(hx, hy), am, center, angle, st, obs_r, half, v_obs, om_obs,
+            k, c, margin, sub_dt, max_overlap,
+        )
+    return f, r
+
+
+@wp.func
+def _shape_area(st: wp.int32, obs_r: Any, half: Any):
+    """Footprint area of one obstacle shape (a segment is a capsule)."""
+    pi = type(obs_r)(3.141592653589793)
+    four = type(obs_r)(4.0)
+    if st == SHAPE_BOX:
+        return four * half[0] * half[1]
+    if st == SHAPE_CIRCLE:
+        return pi * obs_r * obs_r
+    return four * half[0] * obs_r + pi * obs_r * obs_r
+
+
+@wp.func
+def _floor_friction(
+    v: Any,
+    om: Any,
+    ca: Any,
+    sa: Any,
+    st: wp.int32,
+    off: Any,
+    half: Any,
+    obs_r: Any,
+    weight: Any,
+    friction_speed: Any,
+    grid: wp.int32,
+):
+    """Coulomb friction of one shape on the floor: ``(force, torque about the body
+    origin)`` at body velocity ``v``/``om``, the shape carrying ``weight`` (its share of
+    ``mu m g``) spread uniformly over a ``grid x grid`` lattice on its footprint (a circle
+    keeps the lattice points inside it)."""
+    zero = type(om)(0.0)
+    hx = half[0]
+    hy = half[1]
+    if st == SHAPE_CIRCLE:
+        hx = obs_r
+        hy = obs_r
+    elif st != SHAPE_BOX:  # a segment is a capsule: its box core
+        hy = obs_r
+    n_in = wp.int32(0)
+    for i in range(grid):
+        for j in range(grid):
+            lx = (type(om)(2 * i + 1) / type(om)(grid) - type(om)(1.0)) * hx
+            ly = (type(om)(2 * j + 1) / type(om)(grid) - type(om)(1.0)) * hy
+            if st != SHAPE_CIRCLE or lx * lx + ly * ly <= obs_r * obs_r:
+                n_in += wp.int32(1)
+    w = weight / type(om)(wp.max(n_in, wp.int32(1)))
+    fx = zero
+    fy = zero
+    tau = zero
+    for i in range(grid):
+        for j in range(grid):
+            lx = (type(om)(2 * i + 1) / type(om)(grid) - type(om)(1.0)) * hx
+            ly = (type(om)(2 * j + 1) / type(om)(grid) - type(om)(1.0)) * hy
+            if st != SHAPE_CIRCLE or lx * lx + ly * ly <= obs_r * obs_r:
+                bx = off[0] + lx
+                by = off[1] + ly
+                rx = ca * bx - sa * by  # lever from the body origin, world axes
+                ry = sa * bx + ca * by
+                ux = v[0] - om * ry
+                uy = v[1] + om * rx
+                inv = w / wp.sqrt(ux * ux + uy * uy + friction_speed * friction_speed)
+                px = -ux * inv
+                py = -uy * inv
+                fx += px
+                fy += py
+                tau += rx * py - ry * px
+    return type(v)(fx, fy), tau
+
+
+def _make_obstacle_dynamics(boxes: bool) -> wp.Kernel:
+    """The body pass, with the box-agent reaction compiled in (``boxes``) or out.
+
+    The disc variant is the historical kernel verbatim (``theta``/``ang_vel`` are in its
+    signature only so both variants launch the same way, and it never reads them), so a
+    disc-only world integrates its bodies exactly as before. The box variant dispatches
+    each agent on its :data:`~swarp.dynamics.base.P_SHAPE` and, like every box-world
+    kernel, compiles without FP contraction, so its reaction is bit for bit the negated
+    force the agent side applied.
+    """
+
+    @wp.kernel(
+        module="unique",
+        enable_backward=False,
+        grid_stride=False,
+        module_options=BOX_MODULE_OPTIONS if boxes else None,
+    )
+    def obstacle_dynamics_kernel(
+        pos: wp.array2d(dtype=Any),
+        vel: wp.array2d(dtype=Any),
+        theta: wp.array2d(dtype=Any),  # read only by the box variant
+        ang_vel: wp.array2d(dtype=Any),  # read only by the box variant
+        params: wp.array2d(dtype=Any),  # [n_agents, NUM_PARAMS]
+        obs_kind: wp.array(dtype=wp.int32),
+        obs_type: wp.array(dtype=wp.int32),
+        obs_radius: wp.array(dtype=Any),
+        obs_half: wp.array(dtype=Any),
+        obs_mass: wp.array(dtype=Any),
+        obs_inertia: wp.array(dtype=Any),
+        obs_body: wp.array(dtype=wp.int32),
+        obs_body_off: wp.array(dtype=Any),
+        n_obstacles: wp.int32,
+        n_agents: wp.int32,
+        k: Any,
+        c: Any,
+        margin: Any,
+        sub_dt: Any,
+        max_overlap: Any,
+        lin_damping: Any,
+        ang_damping: Any,
+        bounds_min: Any,
+        bounds_max: Any,
+        clamp_bounds: wp.int32,
+        body_pos: wp.array2d(dtype=Any),
+        body_angle: wp.array2d(dtype=Any),
+        body_vel: wp.array2d(dtype=Any),
+        body_ang_vel: wp.array2d(dtype=Any),
+        obs_pos: wp.array2d(dtype=Any),
+        obs_angle: wp.array2d(dtype=Any),
+        obs_vel: wp.array2d(dtype=Any),
+        obs_ang_vel: wp.array2d(dtype=Any),
+    ):
+        """Thread per (env, body root): sum reactions over the body's shapes, integrate once.
+
+        A *compound* body is several obstacle shapes rigidly sharing one pose: ``obs_body[s]``
+        names the body a shape belongs to (its lowest-index shape, the "root") and
+        ``obs_body_off[s]`` places the shape in the body frame. Only the root thread does
+        work; it accumulates force and torque about the body origin over every shape it owns,
+        integrates the single body state, then writes each shape's world pose and velocity
+        back for the agent-side force pass. A one-shape body is the ordinary case with a zero
+        offset, so nothing special-cases it.
+        """
+        e, o = wp.tid()
+        if obs_body[o] != o:
+            return  # not a body root: its pose is written by the root below
+        if obs_kind[o] != KIND_MOVABLE:
+            return  # immovable scenery: infinite mass, never integrated
+
+        q = body_pos[e, o]
+        tv = body_vel[e, o]
+        th = body_angle[e, o]
+        om = body_ang_vel[e, o]
+        zero = type(th)(0.0)
+        one = type(th)(1.0)
+        ca = wp.cos(th)
+        sa = wp.sin(th)
+
+        fx = zero
+        fy = zero
+        tau = zero
+        denom_self = one + c * sub_dt / obs_mass[o]
+        ext = zero  # bounding radius of the whole body about its origin, for the bounds clamp
+        for s in range(n_obstacles):
+            if obs_body[s] != o:
+                continue
+            off = obs_body_off[s]
+            # this shape's world pose and the velocity of its own centre (v + om x r)
+            owx = ca * off[0] - sa * off[1]
+            owy = sa * off[0] + ca * off[1]
+            cs = type(q)(q[0] + owx, q[1] + owy)
+            vs = type(tv)(tv[0] - om * owy, tv[1] + om * owx)
+            st = obs_type[s]
+            obs_r = obs_radius[s]
+            half = obs_half[s]
+            # Farthest point of the shape from the body origin (shapes are axis-aligned in
+            # the body frame), so a T's ext equals the spawn's farthest-corner radius.
+            ax = wp.abs(off[0])
+            ay = wp.abs(off[1])
+            reach = wp.sqrt(ax * ax + ay * ay) + obs_r  # circle
+            if st == SHAPE_BOX:
+                reach = wp.sqrt((ax + half[0]) * (ax + half[0]) + (ay + half[1]) * (ay + half[1]))
+            elif st == SHAPE_SEGMENT:
+                reach = wp.sqrt((ax + half[0]) * (ax + half[0]) + ay * ay) + obs_r
+            ext = wp.max(ext, reach)
+            bound = shape_bound(st, obs_r, half)
+
+            for a in range(n_agents):
+                # The agent's bounding disc: a box's half-diagonal, a disc's radius.
+                ra = params[a, P_RADIUS]
+                if wp.static(boxes):  # noqa: SIM102
+                    if params[a, P_SHAPE] > type(ra)(0.5):
+                        hx = params[a, P_HALF_X]
+                        hy = params[a, P_HALF_Y]
+                        ra = wp.max(ra, wp.sqrt(hx * hx + hy * hy))
+                if bounds_apart(pos[e, a] - cs, ra + bound + margin):
+                    continue
+                if wp.static(boxes):
+                    f, r = _reaction_shaped(
+                        pos[e, a], vel[e, a], theta[e, a], ang_vel[e, a], params[a, P_SHAPE],
+                        params[a, P_RADIUS], params[a, P_HALF_X], params[a, P_HALF_Y],
+                        params[a, P_MASS], cs, th, st, obs_r, half, vs, om, k, c, margin,
+                        sub_dt, max_overlap,
+                    )
+                else:
+                    f, r = _reaction(
+                        pos[e, a], vel[e, a], params[a, P_RADIUS], params[a, P_MASS],
+                        cs, th, st, obs_r, half, vs, om, k, c, margin, sub_dt, max_overlap,
+                    )
+                # Lever about the *body* origin: out to the shape, then within the shape.
+                lx = owx + r[0]
+                ly = owy + r[1]
+                fx += f[0]
+                fy += f[1]
+                tau += lx * f[1] - ly * f[0]
+
+            # Contacts with shapes of *other* bodies, so a pushed body stops at scenery
+            # instead of sliding through it. Shapes of the same body never self-collide.
+            for o2 in range(n_obstacles):
+                if obs_body[o2] != o and not bounds_apart(
+                    obs_pos[e, o2] - cs,
+                    bound + shape_bound(obs_type[o2], obs_radius[o2], obs_half[o2]) + margin,
+                ):
+                    f2, r2v = _body_body(
+                        cs, vs, th, om, st, obs_r, half,
+                        obs_pos[e, o2], obs_vel[e, o2], obs_angle[e, o2], obs_ang_vel[e, o2],
+                        obs_type[o2], obs_radius[o2], obs_half[o2],
+                        k, c, margin, denom_self, max_overlap,
+                    )
+                    lx = owx + r2v[0]
+                    ly = owy + r2v[1]
+                    fx += f2[0]
+                    fy += f2[1]
+                    tau += lx * f2[1] - ly * f2[0]
+
+        lin_decay = one - lin_damping * sub_dt
+        ang_decay = one - ang_damping * sub_dt
+        new_vx = (tv[0] + fx / obs_mass[o] * sub_dt) * lin_decay
+        new_vy = (tv[1] + fy / obs_mass[o] * sub_dt) * lin_decay
+        new_om = (om + tau / obs_inertia[o] * sub_dt) * ang_decay
+        new_x = q[0] + new_vx * sub_dt
+        new_y = q[1] + new_vy * sub_dt
+        if clamp_bounds == 1:
+            # The whole body stays inside, not just its origin: with only the origin clamped
+            # half a body can leave the arena, and agents pinned between the soft wall and
+            # the part still inside get crushed. Shrunk by the bounding radius, clamped to the
+            # middle if the body is wider than the arena. A clamped axis also loses its
+            # velocity, or a body held at the bound keeps integrating contact force into a
+            # velocity it can never move at, which the contact damping then reads and uses to
+            # fling the pushing agents off at many times their max speed.
+            lo_x = wp.min(bounds_min[0] + ext, (bounds_min[0] + bounds_max[0]) * type(th)(0.5))
+            hi_x = wp.max(bounds_max[0] - ext, lo_x)
+            lo_y = wp.min(bounds_min[1] + ext, (bounds_min[1] + bounds_max[1]) * type(th)(0.5))
+            hi_y = wp.max(bounds_max[1] - ext, lo_y)
+            cx = wp.clamp(new_x, lo_x, hi_x)
+            cy = wp.clamp(new_y, lo_y, hi_y)
+            if cx != new_x:
+                new_vx = zero
+            if cy != new_y:
+                new_vy = zero
+            new_x = cx
+            new_y = cy
+        new_th = th + new_om * sub_dt
+        body_vel[e, o] = type(tv)(new_vx, new_vy)
+        body_ang_vel[e, o] = new_om
+        body_pos[e, o] = type(q)(new_x, new_y)
+        body_angle[e, o] = new_th
+
+        # Re-install every shape of this body at the new pose, for the next substep's agent
+        # force pass (and for rendering, which reads these arrays).
+        nca = wp.cos(new_th)
+        nsa = wp.sin(new_th)
+        for s in range(n_obstacles):
+            if obs_body[s] == o:
+                off = obs_body_off[s]
+                owx = nca * off[0] - nsa * off[1]
+                owy = nsa * off[0] + nca * off[1]
+                obs_pos[e, s] = type(q)(new_x + owx, new_y + owy)
+                obs_angle[e, s] = new_th
+                obs_vel[e, s] = type(tv)(new_vx - new_om * owy, new_vy + new_om * owx)
+                obs_ang_vel[e, s] = new_om
+
+    return obstacle_dynamics_kernel
+
+
+#: ``boxes`` -> the generic body-pass kernel (see :func:`_make_obstacle_dynamics`).
+OBSTACLE_DYNAMICS = {False: _make_obstacle_dynamics(False), True: _make_obstacle_dynamics(True)}
+#: The disc variant, under its historical name.
+obstacle_dynamics_kernel = OBSTACLE_DYNAMICS[False]
+
+
+@wp.kernel(enable_backward=False)
+def body_friction_kernel(
     obs_kind: wp.array(dtype=wp.int32),
     obs_type: wp.array(dtype=wp.int32),
     obs_radius: wp.array(dtype=Any),
@@ -209,17 +585,12 @@ def obstacle_dynamics_kernel(
     obs_body: wp.array(dtype=wp.int32),
     obs_body_off: wp.array(dtype=Any),
     n_obstacles: wp.int32,
-    n_agents: wp.int32,
-    k: Any,
-    c: Any,
-    margin: Any,
     sub_dt: Any,
-    max_overlap: Any,
-    lin_damping: Any,
-    ang_damping: Any,
-    bounds_min: Any,
-    bounds_max: Any,
-    clamp_bounds: wp.int32,
+    friction_acc: Any,
+    friction_env: wp.array(dtype=Any),
+    friction_per_env: wp.int32,
+    friction_speed: Any,
+    friction_grid: wp.int32,
     body_pos: wp.array2d(dtype=Any),
     body_angle: wp.array2d(dtype=Any),
     body_vel: wp.array2d(dtype=Any),
@@ -229,133 +600,108 @@ def obstacle_dynamics_kernel(
     obs_vel: wp.array2d(dtype=Any),
     obs_ang_vel: wp.array2d(dtype=Any),
 ):
-    """Thread per (env, body root): sum reactions over the body's shapes, integrate once.
+    """Thread per (env, body root): the Coulomb floor's impulse on the velocity the body
+    pass just integrated, then the pose moved by the change.
 
-    A *compound* body is several obstacle shapes rigidly sharing one pose: ``obs_body[s]``
-    names the body a shape belongs to (its lowest-index shape, the "root") and
-    ``obs_body_off[s]`` places the shape in the body frame. Only the root thread does
-    work; it accumulates force and torque about the body origin over every shape it owns,
-    integrates the single body state, then writes each shape's world pose and velocity
-    back for the agent-side force pass. A one-shape body is the ordinary case with a zero
-    offset, so nothing special-cases it.
-    """
+    The body pass advanced the pose with the contacts' velocity ``v``; friction turns it
+    into ``v'``, so the pose moves on by ``(v' - v) * sub_dt``, which is the semi-implicit
+    step at ``v'``. An impulse that would reverse the motion (or the spin) sticks the body
+    instead: static friction, and what keeps this stiff law stable at any substep."""
     e, o = wp.tid()
-    if obs_body[o] != o:
-        return  # not a body root: its pose is written by the root below
-    if obs_kind[o] != KIND_MOVABLE:
-        return  # immovable scenery: infinite mass, never integrated
-
-    q = body_pos[e, o]
-    tv = body_vel[e, o]
+    if obs_body[o] != o or obs_kind[o] != KIND_MOVABLE:
+        return
+    mu_g = friction_acc  # mu * g: the floor's deceleration of a sliding body
+    if friction_per_env == 1:
+        mu_g = friction_env[e]
     th = body_angle[e, o]
-    om = body_ang_vel[e, o]
     zero = type(th)(0.0)
-    one = type(th)(1.0)
+    if mu_g <= zero:
+        return
+    q = body_pos[e, o]
+    v = body_vel[e, o]
+    om = body_ang_vel[e, o]
+    if v[0] == zero and v[1] == zero and om == zero:
+        # At rest every lattice point's friction is zero, the velocity stays zero and the
+        # pose moves by (0 - 0) * sub_dt: the pass would rewrite the state it found.
+        return
     ca = wp.cos(th)
     sa = wp.sin(th)
-
+    m = obs_mass[o]
+    area = zero
+    for s in range(n_obstacles):
+        if obs_body[s] == o:
+            area += _shape_area(obs_type[s], obs_radius[s], obs_half[s])
     fx = zero
     fy = zero
     tau = zero
-    denom_self = one + c * sub_dt / obs_mass[o]
-    ext = zero  # bounding radius of the whole body about its origin, for the bounds clamp
     for s in range(n_obstacles):
-        if obs_body[s] != o:
-            continue
-        off = obs_body_off[s]
-        # this shape's world pose and the velocity of its own centre (v + om x r)
-        owx = ca * off[0] - sa * off[1]
-        owy = sa * off[0] + ca * off[1]
-        cs = type(q)(q[0] + owx, q[1] + owy)
-        vs = type(tv)(tv[0] - om * owy, tv[1] + om * owx)
-        st = obs_type[s]
-        obs_r = obs_radius[s]
-        half = obs_half[s]
-        # Farthest point of the shape from the body origin (shapes are axis-aligned in
-        # the body frame), so a T's ext equals the spawn's farthest-corner radius.
-        ax = wp.abs(off[0])
-        ay = wp.abs(off[1])
-        reach = wp.sqrt(ax * ax + ay * ay) + obs_r  # circle
-        if st == SHAPE_BOX:
-            reach = wp.sqrt((ax + half[0]) * (ax + half[0]) + (ay + half[1]) * (ay + half[1]))
-        elif st == SHAPE_SEGMENT:
-            reach = wp.sqrt((ax + half[0]) * (ax + half[0]) + ay * ay) + obs_r
-        ext = wp.max(ext, reach)
-
-        for a in range(n_agents):
-            f, r = _reaction(
-                pos[e, a], vel[e, a], params[a, P_RADIUS], params[a, P_MASS],
-                cs, th, st, obs_r, half, vs, om, k, c, margin, sub_dt, max_overlap,
+        if obs_body[s] == o:
+            share = _shape_area(obs_type[s], obs_radius[s], obs_half[s]) / area
+            f, t = _floor_friction(
+                v, om, ca, sa, obs_type[s], obs_body_off[s], obs_half[s], obs_radius[s],
+                share * mu_g * m, friction_speed, friction_grid,
             )
-            # Lever about the *body* origin: out to the shape, then within the shape.
-            lx = owx + r[0]
-            ly = owy + r[1]
             fx += f[0]
             fy += f[1]
-            tau += lx * f[1] - ly * f[0]
-
-        # Contacts with shapes of *other* bodies, so a pushed body stops at scenery
-        # instead of sliding through it. Shapes of the same body never self-collide.
-        for o2 in range(n_obstacles):
-            if obs_body[o2] != o:
-                f2, r2v = _body_body(
-                    cs, vs, th, om, st, obs_r, half,
-                    obs_pos[e, o2], obs_vel[e, o2], obs_angle[e, o2], obs_ang_vel[e, o2],
-                    obs_type[o2], obs_radius[o2], obs_half[o2],
-                    k, c, margin, denom_self, max_overlap,
-                )
-                lx = owx + r2v[0]
-                ly = owy + r2v[1]
-                fx += f2[0]
-                fy += f2[1]
-                tau += lx * f2[1] - ly * f2[0]
-
-    lin_decay = one - lin_damping * sub_dt
-    ang_decay = one - ang_damping * sub_dt
-    new_vx = (tv[0] + fx / obs_mass[o] * sub_dt) * lin_decay
-    new_vy = (tv[1] + fy / obs_mass[o] * sub_dt) * lin_decay
-    new_om = (om + tau / obs_inertia[o] * sub_dt) * ang_decay
-    new_x = q[0] + new_vx * sub_dt
-    new_y = q[1] + new_vy * sub_dt
-    if clamp_bounds == 1:
-        # The whole body stays inside, not just its origin: with only the origin clamped
-        # half a body can leave the arena, and agents pinned between the soft wall and
-        # the part still inside get crushed. Shrunk by the bounding radius, clamped to the
-        # middle if the body is wider than the arena. A clamped axis also loses its
-        # velocity, or a body held at the bound keeps integrating contact force into a
-        # velocity it can never move at, which the contact damping then reads and uses to
-        # fling the pushing agents off at many times their max speed.
-        lo_x = wp.min(bounds_min[0] + ext, (bounds_min[0] + bounds_max[0]) * type(th)(0.5))
-        hi_x = wp.max(bounds_max[0] - ext, lo_x)
-        lo_y = wp.min(bounds_min[1] + ext, (bounds_min[1] + bounds_max[1]) * type(th)(0.5))
-        hi_y = wp.max(bounds_max[1] - ext, lo_y)
-        cx = wp.clamp(new_x, lo_x, hi_x)
-        cy = wp.clamp(new_y, lo_y, hi_y)
-        if cx != new_x:
-            new_vx = zero
-        if cy != new_y:
-            new_vy = zero
-        new_x = cx
-        new_y = cy
-    new_th = th + new_om * sub_dt
-    body_vel[e, o] = type(tv)(new_vx, new_vy)
-    body_ang_vel[e, o] = new_om
-    body_pos[e, o] = type(q)(new_x, new_y)
-    body_angle[e, o] = new_th
-
-    # Re-install every shape of this body at the new pose, for the next substep's agent
-    # force pass (and for rendering, which reads these arrays).
-    nca = wp.cos(new_th)
-    nsa = wp.sin(new_th)
+            tau += t
+    dvx = fx / m * sub_dt
+    dvy = fy / m * sub_dt
+    dom = tau / obs_inertia[o] * sub_dt
+    nvx = v[0] + dvx
+    nvy = v[1] + dvy
+    if dvx * dvx + dvy * dvy >= v[0] * v[0] + v[1] * v[1]:
+        nvx = zero
+        nvy = zero
+    nom = om + dom
+    if wp.abs(dom) >= wp.abs(om):
+        nom = zero
+    nx = q[0] + (nvx - v[0]) * sub_dt
+    ny = q[1] + (nvy - v[1]) * sub_dt
+    nth = th + (nom - om) * sub_dt
+    body_pos[e, o] = type(q)(nx, ny)
+    body_angle[e, o] = nth
+    body_vel[e, o] = type(v)(nvx, nvy)
+    body_ang_vel[e, o] = nom
+    nca = wp.cos(nth)
+    nsa = wp.sin(nth)
     for s in range(n_obstacles):
         if obs_body[s] == o:
             off = obs_body_off[s]
             owx = nca * off[0] - nsa * off[1]
             owy = nsa * off[0] + nca * off[1]
-            obs_pos[e, s] = type(q)(new_x + owx, new_y + owy)
-            obs_angle[e, s] = new_th
-            obs_vel[e, s] = type(tv)(new_vx - new_om * owy, new_vy + new_om * owx)
-            obs_ang_vel[e, s] = new_om
+            obs_pos[e, s] = type(q)(nx + owx, ny + owy)
+            obs_angle[e, s] = nth
+            obs_vel[e, s] = type(v)(nvx - nom * owy, nvy + nom * owx)
+            obs_ang_vel[e, s] = nom
+
+
+def _friction_signature(dtype) -> list:
+    vec2 = VEC2[dtype]
+    return [
+        wp.array(dtype=wp.int32),  # obs_kind
+        wp.array(dtype=wp.int32),  # obs_type
+        wp.array(dtype=dtype),  # obs_radius
+        wp.array(dtype=vec2),  # obs_half
+        wp.array(dtype=dtype),  # obs_mass
+        wp.array(dtype=dtype),  # obs_inertia
+        wp.array(dtype=wp.int32),  # obs_body
+        wp.array(dtype=vec2),  # obs_body_off
+        wp.int32,  # n_obstacles
+        dtype,  # sub_dt
+        dtype,  # friction_acc
+        wp.array(dtype=dtype),  # friction_env
+        wp.int32,  # friction_per_env
+        dtype,  # friction_speed
+        wp.int32,  # friction_grid
+        wp.array2d(dtype=vec2),  # body_pos
+        wp.array2d(dtype=dtype),  # body_angle
+        wp.array2d(dtype=vec2),  # body_vel
+        wp.array2d(dtype=dtype),  # body_ang_vel
+        wp.array2d(dtype=vec2),  # obs_pos
+        wp.array2d(dtype=dtype),  # obs_angle
+        wp.array2d(dtype=vec2),  # obs_vel
+        wp.array2d(dtype=dtype),  # obs_ang_vel
+    ]
 
 
 @wp.kernel
@@ -404,6 +750,8 @@ def _signature(dtype) -> list:
     return [
         wp.array2d(dtype=vec2),  # pos
         wp.array2d(dtype=vec2),  # vel
+        wp.array2d(dtype=dtype),  # theta
+        wp.array2d(dtype=dtype),  # ang_vel
         wp.array2d(dtype=dtype),  # params
         wp.array(dtype=wp.int32),  # obs_kind
         wp.array(dtype=wp.int32),  # obs_type
@@ -437,8 +785,10 @@ def _signature(dtype) -> list:
 
 
 for _T in (wp.float32, wp.float64):
-    register(obstacle_dynamics_kernel, _T, _signature(_T))
+    for _kernel in OBSTACLE_DYNAMICS.values():
+        register(_kernel, _T, _signature(_T))
     register(body_state_gather_kernel, _T, _gather_signature(_T))
+    register(body_friction_kernel, _T, _friction_signature(_T))
 
 
 def launch_obstacle_dynamics(
@@ -459,19 +809,29 @@ def launch_obstacle_dynamics(
     bounds_max,
     clamp_bounds: bool,
     dtype,
+    theta=None,
+    ang_vel=None,
+    boxes: bool = False,
 ) -> None:
     """Advance every movable obstacle by one substep (no-op when there are none).
 
     Everything past ``stepper`` is keyword-only: the tail is seven interchangeable floats
     and a bool, where a swapped argument would be invisible at the call site.
+
+    ``boxes=True`` selects the box-agent variant, which takes a box agent's reaction as the
+    box it is and reads the agents' ``theta`` and ``ang_vel``; the stepper passes it
+    exactly when the world holds a box agent. The disc variant never reads the two arrays,
+    so ``None`` is fine there.
     """
     n_envs = pos.shape[0]
     wp.launch(
-        concrete(obstacle_dynamics_kernel, dtype),
+        concrete(OBSTACLE_DYNAMICS[boxes], dtype),
         dim=(n_envs, stepper.n_obstacles),
         inputs=[
             pos,
             vel,
+            theta,
+            ang_vel,
             params,
             stepper.obs_kind,
             stepper.obs_type,
@@ -505,5 +865,57 @@ def launch_obstacle_dynamics(
             stepper.obs_ang_vel,
         ],
         device=pos.device,
+        record_tape=False,
+    )
+
+
+def launch_body_friction(
+    stepper,
+    n_envs: int,
+    *,
+    sub_dt: float,
+    friction_acc: float,
+    friction_speed: float,
+    friction_grid: int,
+    dtype,
+) -> None:
+    """The Coulomb floor on every movable body, after :func:`launch_obstacle_dynamics`.
+
+    ``friction_acc`` is the floor's ``mu * g``; the stepper's ``body_friction`` array, when
+    installed, overrides it per env. The caller launches this only when one of the two
+    can be nonzero, so a world without floor friction never sees it.
+    """
+    per_env = stepper.body_friction is not None
+    wp.launch(
+        concrete(body_friction_kernel, dtype),
+        dim=(n_envs, stepper.n_obstacles),
+        inputs=[
+            stepper.obs_kind,
+            stepper.obs_type,
+            stepper.obs_radius,
+            stepper.obs_half,
+            stepper.obs_mass,
+            stepper.obs_inertia,
+            stepper.obs_body,
+            stepper.obs_body_off,
+            wp.int32(stepper.n_obstacles),
+            dtype(sub_dt),
+            dtype(friction_acc),
+            stepper.body_friction if per_env else stepper.body_friction_dummy,
+            wp.int32(1 if per_env else 0),
+            dtype(friction_speed),
+            wp.int32(friction_grid),
+        ],
+        outputs=[
+            stepper.body_pos,
+            stepper.body_angle,
+            stepper.body_vel,
+            stepper.body_ang_vel,
+            stepper.obs_pos,
+            stepper.obs_angle,
+            stepper.obs_vel,
+            stepper.obs_ang_vel,
+        ],
+        device=stepper.body_pos.device,
         record_tape=False,
     )

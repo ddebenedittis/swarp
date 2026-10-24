@@ -8,7 +8,6 @@ space to pause). With ``--save PATH`` it renders a rollout to a video (.mp4/.web
 from __future__ import annotations
 
 import argparse
-import math
 
 import numpy as np
 import torch
@@ -49,9 +48,7 @@ class VisualizationScenario(NavigationScenario):
             ranges = self.lidar.scan(world)[env_idx]
             pos = world.state.pos[env_idx]
             theta = world.state.theta[env_idx]
-            offsets = self.lidar.angle_start + torch.arange(
-                self.lidar.n_rays, device=pos.device, dtype=pos.dtype
-            ) * (2.0 * math.pi / self.lidar.n_rays)
+            offsets = self.lidar.ray_offsets(device=pos.device, dtype=pos.dtype)
             angles = theta.unsqueeze(-1) + offsets
             dirs = torch.stack((torch.cos(angles), torch.sin(angles)), dim=-1)
             radius = world.agent_radius

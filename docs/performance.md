@@ -59,6 +59,26 @@ The trade is launches against occupancy: a kernel that holds the whole chain nee
 It also needs the CUDA device, the slim 2D Euler path, shared agent parameters, no movable obstacles and the `brute` neighbor backend.
 `True` forces it wherever it is eligible, `False` turns it off.
 
+The chain is compiled per world from `wp.static` flags, and `boxes` is one of them: a world holding a [box agent](world.md#box-agents) runs a variant that dispatches every pair on the two agents' shapes and adds the oriented-box obstacle, wall and clamp terms, summed in the layered box kernel's order.
+With `boxes=False` the box branches compile out and the generated code is the disc chain's, line for line.
+It takes 213–255 registers per thread against the disc chain's 119–150 (float32, RTX 3070 Laptop), yet its crossover sits where the disc chain's does, so `"auto"` applies the same thresholds to box worlds.
+A graph-mode sweep of box-agent navigation (RTX 4070 Ti SUPER, median of 3 interleaved runs) timed it against the layered pipeline:
+
+| envs | agents | substeps | fused vs layered |
+|---|---|---|---|
+| 1,000 / 4,000 / 16,000 | 4 | 1 | +6.0% / +5.6% / −3.3% |
+| 1,000 / 4,000 / 16,000 | 8 | 1 | +3.9% / −2.2% / −7.5% |
+| 1,000 / 4,000 / 16,000 | 16 | 1 | +1.0% / −10.0% / −12.2% |
+| 1,000 / 4,000 / 16,000 | 4 | 4 | +47.7% / +38.6% / +14.5% |
+| 1,000 / 4,000 / 16,000 | 8 | 4 | +38.7% / +18.4% / +4.6% |
+| 1,000 / 4,000 / 16,000 | 16 | 4 | +25.9% / +2.6% / +1.0% |
+
+The rule picks the faster path in every cell but 1,000 envs × 8 agents × 1 substep, where it leaves 4% on the table.
+
+Every kernel of a box world (the layered box force pass, the box-world copy of the slim integrator, the box variants of the chain and of the body pass) compiles without floating-point contraction (`fuse_fp=False`).
+With contraction on, nvcc fused the box contact into FMAs differently inside the large chain than inside the layered kernel, a 1-ulp drift; without it each operation rounds alone, so the two paths are bit-identical again (`tests/interop/test_fused_substeps.py`).
+Disc worlds keep contraction on and launch exactly the kernels they did before.
+
 At 1024 envs × 4 agents × 8 substeps with `auto_reset=True` the step drops from 84 to 43 µs; the full table is in [Benchmarks](benchmarks.md#fused-substep-chain).
 
 ### Lean launches
@@ -150,7 +170,7 @@ Two things follow for anyone writing a scenario:
 ```bash
 python -m swarp.benchmark.throughput      # the full (n_envs, n_agents) grid
 python -m swarp.benchmark.ablation        # cumulative optimization ablation, parity-gated
-python -m swarp.benchmark.scenarios       # all 11 scenarios x model x lidar rays
+python -m swarp.benchmark.scenarios       # all 12 scenarios x model x lidar rays
 python -m swarp.benchmark.compare_vmas    # vs VMAS: --metric {throughput,memory,both}
 python -m swarp.benchmark.compare_sims    # vs VMAS, JaxMARL and CAMAR
 ```

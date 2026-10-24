@@ -65,6 +65,8 @@ Three are its own:
 `--compile`
 : `torch.compile` the minibatch loss (needs triton). Adds tens of seconds of startup; the compiled code is still captured by the minibatch graph.
 
+The network options (`--actor`, `--role-params`, `--critic-input`, `--per-agent-value`, `--aux-coef`, `--resume-critic-only`) are described in [Roles, privileged critics and auxiliary losses](#roles-privileged-critics-and-auxiliary-losses), and the actor's memory and communication (`--recurrent`, `--hidden-dim`, `--seq-len`, `--comm`, `--comm-dim`) in [Memory and communication](#memory-and-communication).
+
 ## Using it from Python
 
 `swarp.rl.train(swarp.rl.parse_args([...]))` is the CLI as a function.
@@ -84,12 +86,117 @@ algo = MAPPO(env, actor, critic, spec)
 algo.reset()
 for it in range(spec.iters):
     algo.rollout()
-    mean_reward, n_terminated, n_done, *_ = algo.update(spec.entropy_coeff)
+    stats = algo.update(spec.entropy_coeff)   # {name: float}, keys in algo.stat_names
+    print(it, stats["mean_reward"], stats["n_done"])
 ```
 
 The environment must be built with `auto_reset=True` and `clone_outputs=False` (the default): the graphs read its output buffers by address.
 `Actor` samples in a `[-1, 1]` tanh box and maps it affinely onto the env's per-slot action box, which `swarp.rl.check_action_box(env, name)` returns (it raises if agents' boxes disagree, since the weights are shared); `train` runs it for you and stores the box in the checkpoint.
 The map's Jacobian is constant, so it cancels in the PPO ratio and the loss is the unit-box loss.
+
+## Roles, privileged critics and auxiliary losses
+
+Five `TrainSpec` fields, each with a CLI flag, change the networks.
+Their defaults are the plain trainer: with all five at their default the same kernels run in the same order with the same random draws, and no buffer is added.
+
+| field | flag | values (default first) | needs from the scenario |
+|---|---|---|---|
+| `actor` | `--actor` | `"mlp"`, `"policynet"` | nothing |
+| `role_params` | `--role-params` | `"heads"`, `"shared"`, `"separate"` | `agent_roles()` |
+| `critic_input` | `--critic-input` | `"obs"`, `"state"`, `"state+obs"` | `critic_state()` for `state` |
+| `per_agent_value` | `--per-agent-value` | `False`, `True` | nothing |
+| `aux_coef` | `--aux-coef` | `0.0`, any positive weight | `aux_targets()` |
+
+The scenario side is three optional hooks, `critic_state()`, `agent_roles()` and `aux_targets()`, described in [Writing a scenario](writing-a-scenario.md#training-hooks-optional).
+`train` refuses an option whose hook the scenario does not provide, rather than training without it.
+
+**Actor.**
+`"mlp"` is `Actor`, the obs-only shared-weight network.
+`"policynet"` is `PolicyNet`, the same tanh-Gaussian (same squash, same greedy action), which also reads each agent's role when the scenario has roles.
+`role_params` sets where the role enters:
+
+- `"shared"`: one trunk and one head over the observation concatenated with a one-hot of the role.
+- `"heads"`: the same trunk, and a final layer with one head per role, gathered by role, so a role's head only learns from that role's agents.
+- `"separate"`: one network per role. Agents are put in role-sorted order with `role_permutation` (a one-hot cumulative sum, no sort), and each role's network runs on its fixed-size slice, so the cost is one plain GEMM per role rather than a per-sample weight gather.
+
+Roles may move between agents every episode; the role counts are fixed for the run, which is what keeps the slices fixed-size.
+
+**Critic.**
+`"obs"` with one value per team is the default `Critic` on a scenario without roles.
+Anything else, and the obs critic of a scenario with roles, is a `StateCritic`, which reads the scenario's privileged `critic_state()` (`"state"`), every agent's observation (`"obs"`), or both (`"state+obs"`).
+With roles, the observations enter in role-sorted order, so the critic sees the team in a fixed layout however the roles were drawn.
+`per_agent_value` gives each role-sorted slot its own value instead of one team value, which matters once the roles are rewarded differently.
+The privileged state is not reordered: a scenario with roles writes it in role-sorted agent order (see [Writing a scenario](writing-a-scenario.md#training-hooks-optional)).
+The critic only shapes the advantages, so a privileged state helps training and never reaches the deployed policy.
+
+**Auxiliary loss.**
+With `aux_coef > 0` the `PolicyNet` carries a linear `aux_head` on its last hidden layer, and the minibatch loss gains `aux_coef * mse(aux_head(features), aux_targets)`.
+Its use is to make the policy's features encode something the observation only implies, such as a hidden object pose behind a lidar scan.
+The mean auxiliary MSE is logged as a `loss_aux` column, which `metrics.csv` has only when the loss is on.
+
+The rollout records the critic state, the roles and the auxiliary targets next to the observation, inside the same captured act graph, and reads them back by address, as it reads the observation.
+That is why the scenario has to write them in the observation pass.
+
+**Advantages.**
+With roles and `normalize_advantage`, the advantages are standardized per role-sorted slot rather than per agent index, so each column of statistics holds one role however the roles were drawn.
+
+`--resume-critic-only` with `--resume` loads only the critic from a checkpoint and starts a fresh actor.
+`--resume` refuses a checkpoint whose networks differ from the ones the flags build, and names the flags that rebuild them.
+A checkpoint of a role-aware policy evaluates through `examples/eval_mappo.py` as any other: the evaluator reads the roles from the env at every step.
+
+```bash
+python -m swarp.rl --scenario <name> --actor policynet --role-params heads \
+    --critic-input state+obs --per-agent-value --aux-coef 0.1
+```
+
+## Memory and communication
+
+A `"policynet"` actor can also remember and talk.
+Both are off by default, and with both off the networks, buffers and graphs are the ones above.
+
+| field | flag | values (default first) | needs from the scenario |
+|---|---|---|---|
+| `recurrent` | `--recurrent` | `False`, `True` | nothing |
+| `hidden_dim` | `--hidden-dim` | `128`, any width | nothing |
+| `seq_len` | `--seq-len` | `0` (= `steps_per_batch`), a divisor of `steps_per_batch` | nothing |
+| `comm` | `--comm` | `"none"`, `"attn"` | `comm_mask()`, optionally |
+| `comm_dim` | `--comm-dim` | `64`, any width | nothing |
+
+**Memory.**
+`recurrent` puts a `GRUCell` after the trunk (one per role with `"separate"`), and the action heads and the auxiliary head read its output.
+Its hidden state is the policy's memory of the episode: what a lidar-only agent saw a few steps ago, or where an object went when it left the field of view.
+The rollout carries the hidden state `[n_envs, n_agents, hidden_dim]` from step to step and from one rollout to the next, and zeroes it in each env whose episode just ended, since with `auto_reset=True` the next observation already belongs to the next episode.
+The act graph also stores the hidden state *entering* each step, so the update never has to recompute it.
+
+The update trains it by backpropagation through time.
+Each env's `steps_per_batch` steps are cut into chunks of `seq_len` consecutive steps, minibatches are drawn over whole chunks, and each chunk is unrolled from its stored starting hidden state, with the hidden state zeroed after every episode end inside it.
+The recomputed log-probs are then the ones the rollout sampled with, which is what makes the PPO ratio start at one.
+A minibatch holds as many env steps as without memory; only the GRU steps one at a time, while the trunk, the heads and the critic run over the whole minibatch at once.
+A shorter `seq_len` gives more, shorter chunks per minibatch: cheaper gradients that cannot reach as far back.
+`python -m swarp.benchmark.train_throughput --configs policynet recurrent comm recurrent-comm` measures what each option costs per iteration.
+
+**Communication.**
+`comm="attn"` adds one round of learned communication before the trunk.
+Each agent's input (its observation and role one-hot) is encoded to a `comm_dim`-wide vector and projected to a query, a key and a value.
+Each agent then attends over its teammates' keys with single-head scaled dot-product attention, and the trunk reads its encoding concatenated with the weighted sum of their values, the message.
+An agent never attends to itself.
+A scenario that limits who hears whom (a radio range, line of sight) provides `comm_mask()`, a `[n_envs, n_agents, n_agents]` bool tensor where entry `[e, i, j]` lets agent `i` hear agent `j`; without one every agent hears every teammate.
+An agent that hears nobody gets a zero message.
+The message is computed from the current step's inputs, so communication works with and without memory, and with memory the GRU is what lets a message's content persist.
+Communication needs one shared trunk, so it combines with `role_params` `"heads"` or `"shared"`; with roles and `"separate"`, `train` refuses it.
+
+The mask is a training hook with the same fixed-address contract as the others ([Writing a scenario](writing-a-scenario.md#training-hooks-optional)); the rollout records it next to the observation and the update reads it back with each sample.
+Whether a scenario has one is decided once, when `MAPPO` is built, from whether `comm_mask()` returns `None`.
+
+**Evaluation.**
+`swarp.rl.greedy_env_arm(actor)` (and `examples/eval_mappo.py`, which goes through it) gives a recurrent policy a stateful action function: it starts from a zero hidden state and carries it from call to call, which is right for the evaluator's single un-reset episode per env.
+A loop whose envs reset mid-run builds a fresh action function per episode.
+`PolicyNet.greedy(obs, roles, h)` acts from a given hidden state and drops the new one; `PolicyNet.step` returns it.
+
+```bash
+python -m swarp.rl --scenario <name> --actor policynet --recurrent --hidden-dim 128 \
+    --seq-len 16 --comm attn --comm-dim 64
+```
 
 ## What differs from the TorchRL trainer
 
@@ -101,7 +208,8 @@ Three things differ on purpose:
 - **The greedy action is `tanh(loc)`**, the mode of the squashed Gaussian. The TorchRL trainer's evaluator clamps the pre-tanh mean to the action box instead.
 
 A minibatch with a non-finite gradient is skipped on the device, through Adam's `found_inf` (the `GradScaler` mechanism): weights, Adam moments and step count stay exactly as they were, which is the skip the TorchRL trainer does on the host.
-The checkpoint format differs (`"format": "swarp.rl/1"`), so the two trainers' checkpoints cannot resume each other.
+The checkpoint format differs (`"format": "swarp.rl/2"`), so the two trainers' checkpoints cannot resume each other.
+A `swarp.rl/2` checkpoint keeps every `swarp.rl/1` key and adds the network classes and their constructor arguments (`actor_cls`, `actor_kwargs`, `critic_cls`, `critic_kwargs`, resolved through `swarp.rl.ARCHS`), so it still loads with `torch.load(weights_only=True)`; `swarp.rl/1` checkpoints load as before.
 
 ## Not done yet
 

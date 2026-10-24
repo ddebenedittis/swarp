@@ -24,6 +24,7 @@ from swarp.scenarios.fused import Buf, FusedPass, FusedScenario
 from swarp.scenarios.giveway import GiveWayScenario
 from swarp.scenarios.navigation import NavigationScenario
 from swarp.scenarios.pusht import PushTScenario
+from swarp.scenarios.pusht_lidar import PushTLidarScenario
 from swarp.scenarios.ringroad import RingRoadScenario
 from swarp.scenarios.sampling import SamplingScenario
 from swarp.scenarios.shepherding import ShepherdingScenario
@@ -41,6 +42,7 @@ __all__ = [
     "FusedScenario",
     "GiveWayScenario",
     "NavigationScenario",
+    "PushTLidarScenario",
     "PushTScenario",
     "RingRoadScenario",
     "SamplingScenario",
@@ -68,6 +70,7 @@ SCENARIOS: dict[str, type[Scenario]] = {
     "shepherding": ShepherdingScenario,
     "caging": CagingScenario,
     "ringroad": RingRoadScenario,
+    "pusht_lidar": PushTLidarScenario,
 }
 
 
@@ -129,8 +132,23 @@ def scenario_class(name: str) -> type[Scenario]:
 
 
 def supports_model(cls: type[Scenario]) -> bool:
-    """Whether ``cls.__init__`` accepts a ``model`` kwarg (i.e. is not holonomic-only)."""
-    return "model" in inspect.signature(cls.__init__).parameters
+    """Whether ``cls.__init__`` accepts a ``model`` kwarg (i.e. is not holonomic-only).
+
+    An ``__init__`` that forwards ``**kwargs`` to its base (``pusht_lidar`` to ``pusht``)
+    accepts whatever that base does, so the search walks the MRO until an ``__init__``
+    names ``model`` or stops forwarding. Which models a scenario takes, when it does not
+    take them all, is its ``supported_models`` class attribute.
+    """
+    for klass in cls.__mro__:
+        init = klass.__dict__.get("__init__")
+        if init is None:
+            continue
+        params = inspect.signature(init).parameters
+        if "model" in params:
+            return True
+        if not any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+            return False
+    return False
 
 
 def fused_scenarios() -> list[str]:

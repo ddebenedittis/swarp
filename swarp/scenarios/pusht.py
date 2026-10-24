@@ -2,7 +2,8 @@
 
 The T is a **movable compound obstacle** (:class:`~swarp.core.config.ObstacleKind`):
 two oriented ``BOX`` shapes tagged with the same body id and placed by their offsets in
-the body frame, so :mod:`swarp.core.bodies` integrates one rigid pose for the pair from
+the body frame (any other box compound from :mod:`swarp.scenarios.shapes` via ``shape=``),
+so :mod:`swarp.core.bodies` integrates one rigid pose for the set from
 the reaction of the very same agent contacts the collision kernel applies. That happens
 *inside* the substep loop, so the pose an agent collides against is at most one substep
 old — a body advanced once per env step instead sweeps its surface across agents that
@@ -45,17 +46,60 @@ from swarp.core.cached_launch import CachedLaunch, ptr_key
 from swarp.core.config import ObstacleKind, Obstacles, ObstacleShape, WorldConfig
 from swarp.core.state import VEC2
 from swarp.core.world import World
-from swarp.dynamics.base import AgentConfig, ControlMode, DynamicsModel
+from swarp.dynamics.base import AgentConfig, AgentShape, ControlMode, DynamicsModel, _coerce
 from swarp.interop.autograd import torch_stream_scope
 from swarp.scenarios.fused import Buf, FusedPass, FusedScenario
 from swarp.scenarios.pusht_kernels import (
+    pusht_actuation_reset_kernel,
+    pusht_arena_reset_kernel,
+    pusht_friction_reset_kernel,
+    pusht_heading_reset_kernel,
+    pusht_latency_reset_kernel,
     pusht_obs_kernel,
     pusht_reset_kernel,
     pusht_reward_kernel,
 )
+from swarp.scenarios.shapes import SHAPES, CompoundShape, tee
+
+
+def _as_range(
+    v: float | tuple[float, float] | None, default: float, name: str
+) -> tuple[float, float]:
+    """``(low, high)`` of an actuation knob: a value is its own range, ``None`` the
+    default's."""
+    if v is None:
+        return (default, default)
+    lo, hi = (float(v), float(v)) if isinstance(v, int | float) else (float(v[0]), float(v[1]))
+    if not 0.0 < lo <= hi:
+        raise ValueError(f"{name} must be positive with low <= high, got {v!r}")
+    return (lo, hi)
+
+
+def arena_ranges(v: float | tuple[float, ...]) -> tuple[float, float, float, float]:
+    """``(w_lo, w_hi, h_lo, h_hi)`` of an ``arena_size``: one extent for both axes, a
+    ``(lo, hi)`` range drawn for each axis independently, or a range per axis."""
+    if isinstance(v, int | float):
+        r = (float(v),) * 4
+    elif len(v) == 2:
+        r = (float(v[0]), float(v[1])) * 2
+    elif len(v) == 4:
+        r = tuple(float(x) for x in v)
+    else:
+        raise ValueError(
+            f"arena_size takes a value, (lo, hi) or (w_lo, w_hi, h_lo, h_hi), got {v!r}"
+        )
+    if not (0.0 < r[0] <= r[1] and 0.0 < r[2] <= r[3]):
+        raise ValueError(f"arena_size must be positive with low <= high, got {v!r}")
+    return r
 
 
 class PushTScenario(FusedScenario):
+    #: The robot models the constructor's ``model`` accepts (see ``supports_model``).
+    supported_models: tuple[DynamicsModel, ...] = (
+        DynamicsModel.HOLONOMIC,
+        DynamicsModel.DIFF_DRIVE,
+    )
+
     def __init__(
         self,
         n_agents: int = 4,
@@ -81,10 +125,149 @@ class PushTScenario(FusedScenario):
         goal_reward: float = 5.0,
         goal_tolerance: float = 0.1,
         angle_tolerance: float = 0.25,
+        shape: str | CompoundShape | None = None,
+        model: DynamicsModel | str = DynamicsModel.HOLONOMIC,
+        agent_shape: AgentShape | str = AgentShape.DISC,
+        agent_half_extents: tuple[float, float] | None = None,
+        max_ang_vel: float = 2.0 * math.pi,
+        servo_accel: float | tuple[float, float] | None = None,
+        servo_ang_accel: float | tuple[float, float] | None = None,
+        cmd_gain_v: float | tuple[float, float] | None = None,
+        cmd_gain_w: float | tuple[float, float] | None = None,
+        agent_mass: float = 1.0,
+        floor_friction: float | tuple[float, float] | None = None,
+        wheel_contacts: bool = False,
+        wheel_lateral_friction: float = 0.2,
+        wheel_turn_torque: float = 0.0,
+        cmd_latency: float | tuple[float, float] = 0.0,
+        open_arena: bool = False,
+        arena_stop_margin: float = 0.25,
+        arena_size: float | tuple[float, ...] | None = None,
     ) -> None:
+        """``model="diff_drive"`` makes the robots unicycles commanded by ``(v, omega)``,
+        with turn rates up to ``max_ang_vel``; ``agent_shape="box"`` makes them rectangles
+        of ``agent_half_extents`` (default ``(agent_radius, agent_radius / 2)``, along and
+        across the heading). Either one makes the heading matter, so it is drawn at random
+        on reset and observed as its cos and sin (:attr:`heading_obs`). A box's radius is
+        its circumscribed one and replaces ``agent_radius`` wherever the scenario reads it
+        as a bound (spawn clearance, the lidar's ``contact_dist``); the contact margin
+        keeps the nominal ``agent_radius``.
+
+        ``servo_accel``, ``servo_ang_accel``, ``cmd_gain_v`` and ``cmd_gain_w`` give
+        ``diff_drive`` robots a drive (:attr:`ControlMode.SERVO
+        <swarp.dynamics.base.ControlMode.SERVO>`): the commanded speed and turn rate are
+        scaled by the gains and reached at most at the accelerations, instead of at once.
+        Each is a value, or a ``(low, high)`` range drawn uniformly per env and robot on
+        every reset. Setting any one of them turns the drive on; the others then default
+        to no limit and unit gain. All ``None`` keeps the instantaneous velocity command.
+
+        ``agent_mass`` is the robots' mass. A velocity-commanded robot has no inertia of
+        its own, so the mass only sets how far a contact deflects it: in a push it gives
+        up ``tee_mass * linear_damping * sub_dt / agent_mass`` of its speed to the T.
+
+        ``floor_friction`` puts the T on a Coulomb floor with that ``mu`` (see
+        ``WorldConfig.obstacle_friction``), or a ``(low, high)`` range drawn per env on
+        every reset; it adds to the viscous ``linear_damping``/``angular_damping``, which a
+        Coulomb T usually sets near 0.
+
+        ``wheel_contacts`` gives ``diff_drive`` robots wheel-faithful contacts
+        (``WorldConfig.wheel_contacts``): a contact turns a box robot through its torque
+        past the drive's ``wheel_turn_torque``, pushes it sideways only past the wheels'
+        grip ``wheel_lateral_friction``.
+
+        ``cmd_latency`` (seconds, a value or a ``(low, high)`` range drawn per env and
+        robot on every reset) delays every command: for that long into each step, rounded
+        to whole substeps, a robot still applies the previous step's command
+        (:meth:`Stepper.enable_command_delay
+        <swarp.core.stepper.Stepper.enable_command_delay>`); a respawned robot's previous
+        command is zero. A latency past ``dt`` is held at ``dt``.
+
+        ``open_arena`` removes the arena's walls, as on a real floor: the T is no longer
+        clamped inside ``world_size`` and the robots meet no wall. A ``diff_drive`` robot
+        instead gets a safety bridge's arena stop (:meth:`Stepper.enable_arena_stop
+        <swarp.core.stepper.Stepper.enable_arena_stop>`) ``arena_stop_margin`` past the
+        arena's edge. It needs ``arena_size``.
+
+        ``arena_size`` (metres, full extents; needs ``open_arena``) gives every env its own
+        rectangular arena, drawn on every reset: one value for a fixed square, ``(lo, hi)``
+        for a width and a height each drawn uniformly from it, or ``(w_lo, w_hi, h_lo,
+        h_hi)`` for a range per axis. The spawns, the arena stop (at the env's half-extents
+        plus ``arena_stop_margin``) and, in subclasses, everything else that reads the arena
+        follow the env's :attr:`arena_half`; ``world_size`` must cover the largest. It is
+        read on every reset, so a trainer can move it between resets. ``None`` keeps the
+        one walled square arena of ``world_size``."""
         self.n_agents = n_agents
-        self.agent_radius = agent_radius
-        self.tee_mass = tee_mass
+        self.model = _coerce(DynamicsModel, model, "model")
+        if self.model not in self.supported_models:
+            raise ValueError(f"Push-T supports holonomic and diff_drive robots, not {model!r}")
+        shape_tag = _coerce(AgentShape, agent_shape, "agent_shape")
+        if shape_tag == AgentShape.BOX:
+            if agent_half_extents is None:
+                agent_half_extents = (agent_radius, 0.5 * agent_radius)
+            footprint = AgentConfig(shape=shape_tag, half_extents=agent_half_extents)
+        else:
+            footprint = AgentConfig(radius=agent_radius)
+        self.agent_shape = footprint.shape
+        self.agent_half_extents = footprint.half_extents
+        self.max_ang_vel = max_ang_vel
+        if agent_mass <= 0.0:
+            raise ValueError(f"agent_mass must be positive, got {agent_mass}")
+        self.agent_mass = agent_mass
+        if wheel_contacts and self.model != DynamicsModel.DIFF_DRIVE:
+            raise ValueError("wheel_contacts needs model='diff_drive'")
+        self.wheel_contacts = bool(wheel_contacts)
+        self.wheel_lateral_friction = wheel_lateral_friction
+        self.wheel_turn_torque = wheel_turn_torque
+        lat = (cmd_latency, cmd_latency) if isinstance(cmd_latency, int | float) else cmd_latency
+        if not 0.0 <= lat[0] <= lat[1]:
+            raise ValueError(f"cmd_latency must be >= 0 with low <= high, got {cmd_latency!r}")
+        #: ``(low, high)`` command latency in seconds; turned into substeps in make_world.
+        self.cmd_latency = (float(lat[0]), float(lat[1]))
+        if open_arena and self.model != DynamicsModel.DIFF_DRIVE:
+            raise ValueError("open_arena needs model='diff_drive' (its arena stop)")
+        self.open_arena = bool(open_arena)
+        self.arena_stop_margin = float(arena_stop_margin)
+        #: Whether every env draws its own arena (``arena_size`` set at construction).
+        self.per_env_arena = arena_size is not None
+        #: The per-env arena's extents (see :func:`arena_ranges`), read on every reset.
+        self.arena_size = arena_size
+        if self.per_env_arena != self.open_arena:
+            raise ValueError(
+                "open_arena and arena_size go together: walls and the T's clamp are global, "
+                "and an open floor's arena is per env (a value fixes one square)"
+            )
+        self.floor_friction = (
+            None if floor_friction is None else _as_range(floor_friction, 0.0, "floor_friction")
+        )
+        #: Whether ``mu`` is drawn per env on reset.
+        self.friction_dr = self.floor_friction is not None and (
+            self.floor_friction[0] != self.floor_friction[1]
+        )
+        self._actuation = (servo_accel, servo_ang_accel, cmd_gain_v, cmd_gain_w)
+        #: Whether the robots drive through ``ControlMode.SERVO``.
+        self.servo = any(v is not None for v in self._actuation)
+        if self.servo and self.model != DynamicsModel.DIFF_DRIVE:
+            raise ValueError("servo_accel/servo_ang_accel/cmd_gain_* need model='diff_drive'")
+        defaults = (math.inf, math.inf, 1.0, 1.0)
+        #: ``(low, high)`` per actuation column: accel, ang accel, speed gain, rate gain.
+        self._actuation_ranges = tuple(
+            _as_range(v, d, name)
+            for v, d, name in zip(
+                self._actuation, defaults,
+                ("servo_accel", "servo_ang_accel", "cmd_gain_v", "cmd_gain_w"), strict=True,
+            )
+        )
+        #: Whether any actuation value is drawn per env on reset.
+        self.actuation_dr = any(lo != hi for lo, hi in self._actuation_ranges)
+        # The contact margin stays a fraction of the nominal size, not of a box's
+        # circumscribed radius, which would widen the box contact's reach.
+        self._margin_radius = agent_radius
+        self.agent_radius = footprint.radius
+        #: Whether a robot's heading matters (a unicycle steers by it, a box collides by
+        #: it): then it is randomised on reset and observed.
+        self.heading_obs = (
+            self.model != DynamicsModel.HOLONOMIC or self.agent_shape == AgentShape.BOX
+        )
         self.world_size = world_size
         self.max_speed = max_speed
         # contact_k/contact_c ARE the engine's WorldConfig.collision_k/collision_c —
@@ -129,30 +312,41 @@ class PushTScenario(FusedScenario):
         self.goal_tolerance = goal_tolerance
         self.angle_tolerance = angle_tolerance
 
-        # --- T geometry, in the body frame, origin at the area centroid ---------
-        # Crossbar sits on top at local y=0; the stem hangs below it. Shifting both
-        # by the centroid puts the rotation origin and the inertia origin together.
-        a_bar = bar_len * bar_width
-        a_stem = stem_width * stem_len
-        y_stem = -(bar_width + stem_len) / 2.0
-        cy = a_stem * y_stem / (a_bar + a_stem)
-        self.box_half = ((bar_len / 2.0, bar_width / 2.0), (stem_width / 2.0, stem_len / 2.0))
-        self.box_off = ((0.0, -cy), (0.0, y_stem - cy))
-        self.n_boxes = len(self.box_half)
-
-        # Mass splits by area; inertia about the centroid by the parallel-axis theorem.
-        inertia = 0.0
-        for (hx, hy), (_, oy) in zip(self.box_half, self.box_off, strict=True):
-            m_i = tee_mass * (4.0 * hx * hy) / (a_bar + a_stem)
-            inertia += m_i * ((2.0 * hx) ** 2 + (2.0 * hy) ** 2) / 12.0 + m_i * oy * oy
-        self.tee_inertia = inertia
-        # Farthest corner from the centroid: the clamp radius that keeps the whole
-        # T inside the world bounds.
-        self.tee_radius = max(
-            math.hypot(hx, oy + sy * hy)
-            for (hx, hy), (_, oy) in zip(self.box_half, self.box_off, strict=True)
-            for sy in (-1.0, 1.0)
-        )
+        # --- body geometry, in the body frame, origin at the area centroid -----
+        # See swarp.scenarios.shapes: mass splits by area, inertia about the centroid by
+        # the parallel-axis theorem, radius to the farthest corner (the clamp radius that
+        # keeps the whole body inside the world bounds). The default is the T, crossbar
+        # first, sized by ``bar_*``/``stem_*`` whether ``shape`` is ``None`` or ``"tee"``
+        # (pusht_lidar's default, so its T can be resized too). ``shape`` swaps in any
+        # other compound body: another ``SHAPES`` name (built at its defaults with
+        # ``tee_mass``) or a ``CompoundShape``, which carries its own mass; either way the
+        # ``bar_*``/``stem_*`` sizes are ignored.
+        if shape is None or shape == "tee":
+            shape = tee(bar_len, bar_width, stem_len, stem_width, mass=tee_mass)
+        elif isinstance(shape, str):
+            if shape not in SHAPES:
+                raise ValueError(f"unknown shape {shape!r}; choose from {sorted(SHAPES)}")
+            shape = SHAPES[shape](mass=tee_mass)
+        self.shape = shape
+        self.tee_mass = shape.mass
+        self.box_half = shape.half
+        self.box_off = shape.off
+        self.n_boxes = shape.n_boxes
+        self.tee_inertia = shape.inertia
+        self.tee_radius = shape.radius
+        if self.per_env_arena:
+            w_lo, w_hi, h_lo, h_hi = arena_ranges(arena_size)
+            if 0.5 * max(w_hi, h_hi) > world_size + 1e-9:
+                raise ValueError(
+                    f"world_size {world_size} must cover the largest arena half-extent "
+                    f"{0.5 * max(w_hi, h_hi)}"
+                )
+            inset = max(self.tee_radius, 2.0 * self.agent_radius)
+            if 0.5 * min(w_lo, h_lo) <= inset:
+                raise ValueError(
+                    f"the smallest arena half-extent {0.5 * min(w_lo, h_lo)} leaves no room "
+                    f"for the T (radius {self.tee_radius}) and the robots"
+                )
         # Staging point for the approach shaping, push_point_offset past the T centre
         # directly away from the goal. 0 = the T centre itself: plain approach shaping.
         # (>0 turned out noisier in practice — the point moves with the T.)
@@ -162,18 +356,41 @@ class PushTScenario(FusedScenario):
         self.goal_spawn_radius: float | None = None
         self.goal_spawn_angle: float | None = None
 
-    def make_world(self, n_envs, device, dt, substeps, dtype, world_config=None) -> World:
-        cfgs = [
+    def _agent_configs(self) -> list[AgentConfig]:
+        """One :class:`AgentConfig` per agent: velocity-controlled pushers of ``model``
+        (holonomic, or a unicycle commanded by ``(v, omega)``) and ``agent_shape``.
+
+        Split out, as in :meth:`NavigationScenario._agent_configs
+        <swarp.scenarios.navigation.NavigationScenario._agent_configs>`, so a subclass can
+        vary the fleet without reimplementing ``make_world``. The contact derivation in
+        ``make_world`` assumes velocity control at ``self.max_speed``.
+        """
+        if self.servo:
+            # The ranges' low ends; an actuation_dr world redraws them on every reset.
+            (acc, _), (ang_acc, _), (gv, _), (gw, _) = self._actuation_ranges
+            drive = {
+                "ctrl_mode": ControlMode.SERVO, "max_accel": acc, "max_ang_accel": ang_acc,
+                "cmd_gain_v": gv, "cmd_gain_w": gw,
+            }
+        else:
+            drive = {"ctrl_mode": ControlMode.VELOCITY, "max_accel": 2.0 * self.max_speed}
+        return [
             AgentConfig(
-                model=DynamicsModel.HOLONOMIC,
-                ctrl_mode=ControlMode.VELOCITY,
-                radius=self.agent_radius,
+                model=self.model,
+                radius=None if self.agent_shape == AgentShape.BOX else self.agent_radius,
+                mass=self.agent_mass,
                 max_speed=self.max_speed,
-                max_accel=2.0 * self.max_speed,
+                max_ang_vel=self.max_ang_vel,
+                shape=self.agent_shape,
+                half_extents=self.agent_half_extents,
+                **drive,
             )
             for _ in range(self.n_agents)
         ]
-        margin = 0.5 * self.agent_radius
+
+    def make_world(self, n_envs, device, dt, substeps, dtype, world_config=None) -> World:
+        cfgs = self._agent_configs()
+        margin = 0.5 * self._margin_radius
         # A velocity-mode agent has no contact memory: each substep its velocity is
         # overwritten by the command plus f*sub_dt/m, so holding it out of the body needs
         # f >= m*max_speed/sub_dt, i.e. an equilibrium depth of
@@ -181,7 +398,7 @@ class PushTScenario(FusedScenario):
         # through the T; twice it bounds a deep sweep's impulse while leaving the holding
         # force intact (2x headroom, and legitimate pushing sits ~20x shallower).
         sub_dt = dt / max(1, substeps)
-        equilibrium_depth = self.max_speed / (self.contact_k * sub_dt)
+        equilibrium_depth = self.max_speed * self.agent_mass / (self.contact_k * sub_dt)
         self.max_overlap = 2.0 * equilibrium_depth
         # No neighbor_radius override: obstacles are scanned linearly by
         # _static_forces, not looked up in the neighbor grid, so the T's size does
@@ -191,12 +408,18 @@ class PushTScenario(FusedScenario):
             collision_k=self.contact_k,
             collision_c=self.contact_c,
             collision_margin=margin,
-            bounds=(-self.world_size, self.world_size, -self.world_size, self.world_size),
+            bounds=None
+            if self.open_arena
+            else (-self.world_size, self.world_size, -self.world_size, self.world_size),
             bounds_mode="soft",
             max_neighbors=min(32, max(4, self.n_agents)),
             # The T is a movable obstacle now, so its drag is engine config.
             obstacle_linear_damping=self.linear_damping,
             obstacle_angular_damping=self.angular_damping,
+            obstacle_friction=0.0 if self.floor_friction is None else self.floor_friction[0],
+            wheel_contacts=self.wheel_contacts,
+            wheel_lateral_friction=self.wheel_lateral_friction,
+            wheel_turn_torque=self.wheel_turn_torque,
             contact_max_overlap=self.max_overlap,
         ).override_with(world_config)
         self.dt = dt
@@ -217,14 +440,14 @@ class PushTScenario(FusedScenario):
         idx = torch.arange(na, device=device)
         others = idx.unsqueeze(0).expand(na, -1)[idx.unsqueeze(1) != idx.unsqueeze(0)]
         self._others = others.view(na, na - 1)  # [A, A-1]
-        # Env-independent obstacle attributes (both boxes, every env).
+        # Env-independent obstacle attributes (every box, every env).
         self._obs_shape = torch.full((self.n_boxes,), int(ObstacleShape.BOX), device=device,
                                      dtype=torch.int32)
         self._obs_radius = torch.zeros(self.n_boxes, **tt)  # a box ignores radius
         self._obs_half = torch.tensor(self.box_half, **tt)
         self._box_off_t = torch.tensor(self.box_off, **tt)  # [n_boxes, 2]
-        # The T is ONE movable compound body: both boxes share body 0 (the root) and sit
-        # at their local offsets, so the engine integrates a single pose for the pair.
+        # The T is ONE movable compound body: all boxes share body 0 (the root) and sit
+        # at their local offsets, so the engine integrates a single pose for the set.
         # Mass/inertia are read from the root and are about the body origin (the centroid).
         self._obs_kind = torch.full(
             (self.n_boxes,), int(ObstacleKind.MOVABLE), device=device, dtype=torch.int32
@@ -276,6 +499,38 @@ class PushTScenario(FusedScenario):
         # swarp/core/cached_launch.py. ``_launch_body_sync`` is excluded: it only ever
         # runs on the STEP pass, i.e. inside capture, where it is paid exactly once.
         self._reset_launch = CachedLaunch()
+        self._heading_launch = CachedLaunch()
+        self._actuation_launch = CachedLaunch()
+        self._friction_launch = CachedLaunch()
+        self._latency_launch = CachedLaunch()
+        #: The command delay's ``(low, high)`` in substeps; ``None`` without a latency.
+        self.cmd_delay_substeps: tuple[int, int] | None = None
+        if self.cmd_latency[1] > 0.0:
+            lo, hi = (min(round(x / sub_dt), substeps) for x in self.cmd_latency)
+            if hi > 0:
+                self.cmd_delay_substeps = (lo, hi)
+                self.world.stepper.enable_command_delay(n_envs, self.world.act_dim, hi)
+        if self.per_env_arena:
+            # Pointer-stable [n_envs, 2] buffers the arena reset kernel rewrites in place:
+            # the half-extents every arena-aware kernel reads, and the arena stop's edges.
+            self.arena_half = torch.full((n_envs, 2), float(self.world_size), **tt)
+            self._arena_edges = self.arena_half + self.arena_stop_margin
+            vec2 = VEC2[self.world.wp_dtype]
+            self._arena_half_wp = wp.from_torch(self.arena_half, dtype=vec2)
+            self._arena_edges_wp = wp.from_torch(self._arena_edges, dtype=vec2)
+            self.world.stepper.enable_arena_stop(n_envs, self.world.act_dim, self._arena_edges_wp)
+        if self.friction_dr:
+            # A per-env mu * g, allocated here (outside any capture) and redrawn in place.
+            g = self.world.config.gravity
+            self.world.stepper.set_body_friction(
+                torch.full((n_envs,), self.floor_friction[0] * g, **tt)
+            )
+        if self.actuation_dr:
+            # Per-env parameter rows, installed once here (outside any capture) and then
+            # redrawn in place by the reset kernel, so the step's kernels keep one pointer.
+            stepper = self.world.stepper
+            rows = wp.to_torch(stepper.params.floats)
+            stepper.set_agent_params_per_env(rows.unsqueeze(0).expand(n_envs, -1, -1).clone())
         self._obs_launch = CachedLaunch()
         self._reward_launch = CachedLaunch()
         return self.world
@@ -294,8 +549,9 @@ class PushTScenario(FusedScenario):
 
     @property
     def obs_dim(self) -> int:
-        # 12 own/task features + the other agents' relative positions (coordination).
-        return 12 + 2 * (self.n_agents - 1)
+        # 12 own/task features + the other agents' relative positions (coordination),
+        # then the robot's own cos/sin heading when it matters.
+        return 12 + 2 * (self.n_agents - 1) + (2 if self.heading_obs else 0)
 
     # ------------------------------------------------------------------ reset
 
@@ -309,13 +565,28 @@ class PushTScenario(FusedScenario):
         path's ``_refresh`` still reassigns them (fresh tensors for the tape), which the
         framework's handle resync catches on the next no-grad step.
         """
+        mask, use_mask = self.reset_mask_wp(env_mask)
+        self._launch_spawn(mask, use_mask)
+        self.world.mark_pos_dirty()
+
+        self._install_obstacles()
+        self.finish_reset(env_mask, obs_only=obs_only)
+
+    def _launch_spawn(self, mask, use_mask) -> None:
+        """Respawn agents, body and goal in the masked envs: one ``pusht_reset_kernel``.
+
+        ``mask``/``use_mask`` are what :meth:`reset_mask_wp` returned. A subclass that
+        samples extra per-env state on reset (roles, say) overrides this, calls
+        ``super()._launch_spawn(mask, use_mask)`` and launches its own kernel with the
+        same mask; ``reset_world`` still marks positions dirty, re-installs the body and
+        finishes the reset afterwards.
+        """
         w = self.world
         lim = self.world_size - 2.0 * self.agent_radius
         tlim = self.world_size - self.tee_radius
         # Any agent inside the T's bounding disk is pushed out to its rim by the kernel:
         # with a stiff contact_k a spawn overlap is a violent ejection.
         clear = self.tee_radius + 2.0 * self.agent_radius
-        mask, use_mask = self.reset_mask_wp(env_mask)
         st = w.state_wp()
         scalar = w.wp_dtype
         vec2 = VEC2[scalar]
@@ -346,62 +617,209 @@ class PushTScenario(FusedScenario):
         use_goal_radius = 0 if self.goal_spawn_radius is None else 1
         use_goal_angle = 0 if self.goal_spawn_angle is None else 1
         with torch_stream_scope(w.device):
-            launch = self._reset_launch.get(
-                concrete(pusht_reset_kernel, scalar),
-                dim=w.n_envs,
-                inputs=[
-                    mask,
-                    use_mask,
-                    seed,
-                    scalar(lim),
-                    scalar(tlim),
-                    scalar(clear),
-                    scalar(goal_radius),
-                    scalar(goal_angle),
-                    wp.int32(use_goal_radius),
-                    wp.int32(use_goal_angle),
-                    wp.int32(self.n_agents),
-                    st.pos,
-                    st.vel,
-                    tee_pos,
-                    tee_vel,
-                    tee_theta,
-                    tee_ang_vel,
-                    goal_pos,
-                    goal_theta,
-                ],
-                device=w.device,
-                key=(
-                    w.n_envs,
-                    ptr_key(mask),
-                    lim,
-                    tlim,
-                    clear,
-                    goal_radius,
-                    goal_angle,
-                    use_goal_radius,
-                    use_goal_angle,
-                    self.n_agents,
-                    ptr_key(st.pos),
-                    ptr_key(st.vel),
-                    ptr_key(tee_pos),
-                    ptr_key(tee_vel),
-                    ptr_key(tee_theta),
-                    ptr_key(tee_ang_vel),
-                    ptr_key(goal_pos),
-                    ptr_key(goal_theta),
-                ),
-            )
-            launch.set_param_by_name("use_mask", use_mask)
-            launch.set_param_by_name("seed", seed)
-            launch.launch()
-        w.mark_pos_dirty()
+            if self.per_env_arena:
+                self._launch_arena_spawn(
+                    st, mask, use_mask, seed, clear, goal_radius, goal_angle,
+                    use_goal_radius, use_goal_angle,
+                    (tee_pos, tee_vel, tee_theta, tee_ang_vel, goal_pos, goal_theta),
+                )
+            else:
+                self._launch_square_spawn(
+                    st, mask, use_mask, seed, lim, tlim, clear, goal_radius, goal_angle,
+                    use_goal_radius, use_goal_angle,
+                    (tee_pos, tee_vel, tee_theta, tee_ang_vel, goal_pos, goal_theta),
+                )
+            if self.heading_obs:
+                self._launch_heading_reset(st, mask, use_mask)
+            if self.actuation_dr:
+                self._launch_actuation_reset(mask, use_mask)
+            if self.friction_dr:
+                self._launch_friction_reset(mask, use_mask)
+            if self.cmd_delay_substeps is not None:
+                self._launch_latency_reset(mask, use_mask)
 
-        self._install_obstacles()
-        self.finish_reset(env_mask, obs_only=obs_only)
+    def _launch_square_spawn(
+        self, st, mask, use_mask, seed, lim, tlim, clear, goal_radius, goal_angle,
+        use_goal_radius, use_goal_angle, body,
+    ) -> None:
+        """The one square arena's spawn: ``pusht_reset_kernel``."""
+        w = self.world
+        scalar = w.wp_dtype
+        tee_pos, tee_vel, tee_theta, tee_ang_vel, goal_pos, goal_theta = body
+        launch = self._reset_launch.get(
+            concrete(pusht_reset_kernel, scalar),
+            dim=w.n_envs,
+            inputs=[
+                mask,
+                use_mask,
+                seed,
+                scalar(lim),
+                scalar(tlim),
+                scalar(clear),
+                scalar(goal_radius),
+                scalar(goal_angle),
+                wp.int32(use_goal_radius),
+                wp.int32(use_goal_angle),
+                wp.int32(self.n_agents),
+                st.pos,
+                st.vel,
+                tee_pos,
+                tee_vel,
+                tee_theta,
+                tee_ang_vel,
+                goal_pos,
+                goal_theta,
+            ],
+            device=w.device,
+            key=(
+                w.n_envs,
+                ptr_key(mask),
+                lim,
+                tlim,
+                clear,
+                goal_radius,
+                goal_angle,
+                use_goal_radius,
+                use_goal_angle,
+                self.n_agents,
+                ptr_key(st.pos),
+                ptr_key(st.vel),
+                ptr_key(tee_pos),
+                ptr_key(tee_vel),
+                ptr_key(tee_theta),
+                ptr_key(tee_ang_vel),
+                ptr_key(goal_pos),
+                ptr_key(goal_theta),
+            ),
+        )
+        launch.set_param_by_name("use_mask", use_mask)
+        launch.set_param_by_name("seed", seed)
+        launch.launch()
+
+    def _launch_arena_spawn(
+        self, st, mask, use_mask, seed, clear, goal_radius, goal_angle, use_goal_radius,
+        use_goal_angle, body,
+    ) -> None:
+        """A per-env arena's draw and spawn: ``pusht_arena_reset_kernel``, which also
+        rewrites :attr:`arena_half` and the arena stop's edges in place."""
+        w = self.world
+        scalar = w.wp_dtype
+        tee_pos, tee_vel, tee_theta, tee_ang_vel, goal_pos, goal_theta = body
+        w_lo, w_hi, h_lo, h_hi = arena_ranges(self.arena_size)
+        agent_inset = 2.0 * self.agent_radius
+        agent_clear = 2.0 * self.agent_radius
+        # The bare clearance a crowded arena falls back to: the T's bounding disc and a
+        # robot's, 2 cm apart.
+        clear_min = self.tee_radius + self.agent_radius + 0.02
+        launch = self._reset_launch.get(
+            concrete(pusht_arena_reset_kernel, scalar),
+            dim=w.n_envs,
+            inputs=[
+                mask, use_mask, seed,
+                scalar(w_lo), scalar(w_hi), scalar(h_lo), scalar(h_hi),
+                scalar(agent_inset), scalar(self.tee_radius), scalar(clear), scalar(clear_min),
+                scalar(agent_clear), scalar(self.arena_stop_margin),
+                scalar(goal_radius), scalar(goal_angle),
+                wp.int32(use_goal_radius), wp.int32(use_goal_angle), wp.int32(self.n_agents),
+                self._arena_half_wp, self._arena_edges_wp,
+                st.pos, st.vel, tee_pos, tee_vel, tee_theta, tee_ang_vel, goal_pos, goal_theta,
+            ],
+            device=w.device,
+            key=(
+                w.n_envs, ptr_key(mask), w_lo, w_hi, h_lo, h_hi, agent_inset,
+                self.tee_radius, clear, clear_min, agent_clear, self.arena_stop_margin,
+                goal_radius,
+                goal_angle, use_goal_radius, use_goal_angle, self.n_agents,
+                ptr_key(self._arena_half_wp), ptr_key(self._arena_edges_wp),
+                ptr_key(st.pos), ptr_key(st.vel), ptr_key(tee_pos), ptr_key(tee_vel),
+                ptr_key(tee_theta), ptr_key(tee_ang_vel), ptr_key(goal_pos),
+                ptr_key(goal_theta),
+            ),
+        )
+        launch.set_param_by_name("use_mask", use_mask)
+        launch.set_param_by_name("seed", seed)
+        launch.launch()
+
+    def _launch_heading_reset(self, st, mask, use_mask) -> None:
+        """Random headings, zero speed and spin for the respawned robots (only launched
+        when the heading matters, so the default fleet's reset is unchanged)."""
+        w = self.world
+        seed = wp.int32(w.next_kernel_seed())
+        launch = self._heading_launch.get(
+            concrete(pusht_heading_reset_kernel, w.wp_dtype),
+            dim=(w.n_envs, self.n_agents),
+            inputs=[mask, use_mask, seed, st.theta, st.speed, st.ang_vel],
+            device=w.device,
+            key=(
+                w.n_envs,
+                ptr_key(mask),
+                ptr_key(st.theta),
+                ptr_key(st.speed),
+                ptr_key(st.ang_vel),
+            ),
+        )
+        launch.set_param_by_name("use_mask", use_mask)
+        launch.set_param_by_name("seed", seed)
+        launch.launch()
+
+    def _launch_friction_reset(self, mask, use_mask) -> None:
+        """Redraw the respawned envs' floor friction (``friction_dr``)."""
+        w = self.world
+        scalar = w.wp_dtype
+        seed = wp.int32(w.next_kernel_seed())
+        out = w.stepper.body_friction
+        lo, hi = self.floor_friction
+        launch = self._friction_launch.get(
+            concrete(pusht_friction_reset_kernel, scalar),
+            dim=w.n_envs,
+            inputs=[mask, use_mask, seed, scalar(lo), scalar(hi),
+                    scalar(w.config.gravity), out],
+            device=w.device,
+            key=(w.n_envs, ptr_key(mask), ptr_key(out)),
+        )
+        launch.set_param_by_name("use_mask", use_mask)
+        launch.set_param_by_name("seed", seed)
+        launch.launch()
+
+    def _launch_latency_reset(self, mask, use_mask) -> None:
+        """Redraw the respawned robots' command delays and zero their last command."""
+        w = self.world
+        st = w.stepper
+        seed = wp.int32(w.next_kernel_seed())
+        lo, hi = self.cmd_delay_substeps
+        launch = self._latency_launch.get(
+            concrete(pusht_latency_reset_kernel, w.wp_dtype),
+            dim=(w.n_envs, self.n_agents),
+            inputs=[mask, use_mask, seed, wp.int32(lo), wp.int32(hi), w.wp_dtype(0.0),
+                    st.cmd_delay, st.prev_actions],
+            device=w.device,
+            key=(w.n_envs, ptr_key(mask), lo, hi, ptr_key(st.cmd_delay),
+                 ptr_key(st.prev_actions)),
+        )
+        launch.set_param_by_name("use_mask", use_mask)
+        launch.set_param_by_name("seed", seed)
+        launch.launch()
+
+    def _launch_actuation_reset(self, mask, use_mask) -> None:
+        """Redraw the respawned envs' drive accelerations and gains (``actuation_dr``)."""
+        w = self.world
+        scalar = w.wp_dtype
+        seed = wp.int32(w.next_kernel_seed())
+        params = w.stepper.params.floats_per_env
+        bounds = [scalar(x) for lo_hi in self._actuation_ranges for x in lo_hi]
+        launch = self._actuation_launch.get(
+            concrete(pusht_actuation_reset_kernel, scalar),
+            dim=(w.n_envs, self.n_agents),
+            inputs=[mask, use_mask, seed, *bounds, params],
+            device=w.device,
+            key=(w.n_envs, ptr_key(mask), ptr_key(params)),
+        )
+        launch.set_param_by_name("use_mask", use_mask)
+        launch.set_param_by_name("seed", seed)
+        launch.launch()
 
     def _box_poses(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """The two box centres ``[n_envs, n_boxes, 2]`` and angles ``[n_envs, n_boxes]``
+        """The box centres ``[n_envs, n_boxes, 2]`` and angles ``[n_envs, n_boxes]``
         for the current T pose, written **into** the persistent pose buffers.
 
         Torch (the fused path does this inside the body kernel). Returns the buffers so the
@@ -482,6 +900,11 @@ class PushTScenario(FusedScenario):
         to be bit-comparable. :attr:`parity_rtol` / :attr:`parity_atol` say so numerically.
         """
         if self._grad_step():
+            if self.agent_shape == AgentShape.BOX:
+                raise NotImplementedError(
+                    "a taped Push-T step integrates the T in torch against disc robots; "
+                    "box robots push it only on the no-grad path"
+                )
             self._refresh(integrate=True)
         else:
             self._sync_from_engine()
@@ -546,7 +969,11 @@ class PushTScenario(FusedScenario):
         kernels — would otherwise leave the body one step ahead of the eager path.
         """
         w = self.world
-        return [*w.obstacle_state_views(), *w.obstacle_state_views(body=True)]
+        out = [*w.obstacle_state_views(), *w.obstacle_state_views(body=True)]
+        if w.stepper.prev_actions is not None:
+            # The step copies its command into the latency's last-command buffer.
+            out.append(wp.to_torch(w.stepper.prev_actions))
+        return out
 
     def launch_fused(self, pass_: FusedPass) -> None:
         """Lift the engine's body state into ``tee_*``, then obs and reward.
@@ -594,7 +1021,16 @@ class PushTScenario(FusedScenario):
         launch = self._obs_launch.get(
             concrete(pusht_obs_kernel, self.world.wp_dtype),
             dim=(w.n_envs, self.n_agents),
-            inputs=[st.pos, st.vel, tee_pos, tee_theta, goal_pos, goal_theta],
+            inputs=[
+                st.pos,
+                st.vel,
+                st.theta,
+                tee_pos,
+                tee_theta,
+                goal_pos,
+                goal_theta,
+                wp.int32(self.heading_obs),
+            ],
             outputs=[obs],
             device=w.device,
             key=(
@@ -602,6 +1038,7 @@ class PushTScenario(FusedScenario):
                 self.n_agents,
                 ptr_key(st.pos),
                 ptr_key(st.vel),
+                ptr_key(st.theta),
                 ptr_key(tee_pos),
                 ptr_key(tee_theta),
                 ptr_key(goal_pos),
@@ -763,7 +1200,7 @@ class PushTScenario(FusedScenario):
             # force is recomputed from the frozen agent state each sub-step, which is what
             # keeps a stiff contact_k stable. Gradients flow through every sub-step.
             sub_dt = self.dt / self.body_substeps
-            b = self.world_size - self.tee_radius
+            b = math.inf if self.open_arena else self.world_size - self.tee_radius
             for _ in range(self.body_substeps):
                 force, torque = self._box_contact(pos, vel)  # [E,A,B,2], [E,A,B]
                 f_total = force.sum(dim=(1, 2))  # [E, 2] net force on the T
@@ -847,9 +1284,10 @@ class PushTScenario(FusedScenario):
         angles = torch.stack([th.cos(), th.sin(), raw.cos(), raw.sin()], dim=-1)
         # Teammates' positions relative to each agent, ascending index, self skipped.
         rel = (s.pos[:, self._others] - s.pos.unsqueeze(2)).flatten(2)  # [E, A, 2(A-1)]
-        return torch.cat(
-            [s.pos, s.vel, self._cache["tee_rel"], tee_to_goal, angles, rel], dim=-1
-        )
+        parts = [s.pos, s.vel, self._cache["tee_rel"], tee_to_goal, angles, rel]
+        if self.heading_obs:
+            parts.append(torch.stack([s.theta.cos(), s.theta.sin()], dim=-1))
+        return torch.cat(parts, dim=-1)
 
     def global_reward(self) -> torch.Tensor:
         c = self._cache
@@ -868,7 +1306,7 @@ class PushTScenario(FusedScenario):
     def render_extras(self, env_idx: int) -> dict[str, Any]:
         """The target pose of the T, as oriented boxes for the ``goal_pose`` overlay.
 
-        Same two boxes the body is built from, placed at ``(goal_pos, goal_theta)``:
+        Same boxes the body is built from, placed at ``(goal_pos, goal_theta)``:
         the outline shows exactly where the T has to end up.
         """
         th = float(self.goal_theta[env_idx])

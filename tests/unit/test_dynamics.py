@@ -51,6 +51,14 @@ def ref_diff_drive(pos, theta, speed, ang_vel, actions, cfg: AgentConfig, dt: fl
         if cfg.ctrl_mode == ControlMode.VELOCITY:
             s_new = np.clip(a[0], -cfg.max_speed, cfg.max_speed)
             w_new = np.clip(a[1], -cfg.max_ang_vel, cfg.max_ang_vel)
+        elif cfg.ctrl_mode == ControlMode.SERVO:
+            tv = np.clip(a[0], -cfg.max_speed, cfg.max_speed) * cfg.cmd_gain_v
+            tw = np.clip(a[1], -cfg.max_ang_vel, cfg.max_ang_vel) * cfg.cmd_gain_w
+            dv, dw = cfg.max_accel * dt, cfg.max_ang_accel * dt
+            s_new = np.clip(speed + np.clip(tv - speed, -dv, dv), -cfg.max_speed, cfg.max_speed)
+            w_new = np.clip(
+                ang_vel + np.clip(tw - ang_vel, -dw, dw), -cfg.max_ang_vel, cfg.max_ang_vel
+            )
         else:
             acc = np.clip(a[0], -cfg.max_accel, cfg.max_accel)
             alp = np.clip(a[1], -cfg.max_ang_accel, cfg.max_ang_accel)
@@ -151,8 +159,9 @@ def test_holonomic(device, ctrl_mode):
 
 
 @pytest.mark.parametrize("device", DEVICES)
-@pytest.mark.parametrize("ctrl_mode", [ControlMode.VELOCITY, ControlMode.ACCELERATION])
+@pytest.mark.parametrize("ctrl_mode", list(ControlMode))
 def test_diff_drive(device, ctrl_mode):
+    # The gains are SERVO's alone; the other modes must ignore them.
     cfg = AgentConfig(
         model=DynamicsModel.DIFF_DRIVE,
         ctrl_mode=ctrl_mode,
@@ -160,6 +169,8 @@ def test_diff_drive(device, ctrl_mode):
         max_accel=1.5,
         max_ang_vel=2.0,
         max_ang_accel=4.0,
+        cmd_gain_v=1.1,
+        cmd_gain_w=0.8,
     )
     rng = np.random.default_rng(1)
     T, dt = 100, 0.05
@@ -280,6 +291,11 @@ def test_bicycle_min_speed_brakes_to_a_stop(device, integrator):
     reversing = replace(cfg, min_speed=None)
     rev = rollout_warp([reversing], init, actions, dt, device, integrator=integrator)
     assert rev[-1]["speed"][0] < 0.0
+
+
+def test_servo_is_a_diff_drive_mode():
+    with pytest.raises(ValueError, match="diff-drive mode"):
+        AgentConfig(model=DynamicsModel.HOLONOMIC, ctrl_mode=ControlMode.SERVO)
 
 
 def test_min_speed_must_lie_within_max_speed():
@@ -414,7 +430,14 @@ COLUMN_FIELDS = {
     "P_KAPPA": "torque_coeff",
     "P_GRAVITY": "gravity",
     "P_MIN_SPEED": "min_speed",
+    "P_SHAPE": "shape",
+    "P_HALF_X": "half_x",
+    "P_HALF_Y": "half_y",
+    "P_CMD_GAIN_V": "cmd_gain_v",
+    "P_CMD_GAIN_W": "cmd_gain_w",
 }
+#: The footprint columns, which take derived values rather than free sentinels.
+_FOOTPRINT = ("radius", "shape", "half_x", "half_y")
 
 
 def test_every_column_constant_points_at_the_field_to_row_packs_there():
@@ -426,12 +449,24 @@ def test_every_column_constant_points_at_the_field_to_row_packs_there():
     here. Getting this wrong is otherwise silent: right shape, wrong physics.
     """
     assert len(COLUMN_FIELDS) == NUM_PARAMS
-    sentinels = {name: float(i + 1) for i, name in enumerate(COLUMN_FIELDS.values())}
+    free = [name for name in COLUMN_FIELDS.values() if name not in _FOOTPRINT]
+    # Offset past the footprint values below (1, 3, 4, 5), so all twenty stay distinct.
+    sentinels = {name: float(i + 10) for i, name in enumerate(free)}
     # min_speed is validated against max_speed, so its sentinel is the one negative value.
     sentinels["min_speed"] = -0.5 * sentinels["max_speed"]
-    cfg = AgentConfig(model=DynamicsModel.DRONE, **sentinels)
+    # A box footprint gives the four footprint columns four distinct values too (a box's
+    # radius is derived, hypot(3, 4) = 5; shape BOX packs as 1.0). Box and drone are
+    # mutually exclusive, so the drone columns are checked as plain sentinels on a bicycle.
+    cfg = AgentConfig(
+        model=DynamicsModel.KINEMATIC_BICYCLE,
+        shape=base.AgentShape.BOX,
+        half_extents=(3.0, 4.0),
+        **sentinels,
+    )
     row = cfg.to_row()
     assert len(row) == NUM_PARAMS
+    assert (row[base.P_RADIUS], row[base.P_SHAPE]) == (5.0, 1.0)
+    assert (row[base.P_HALF_X], row[base.P_HALF_Y]) == (3.0, 4.0)
     for const, field in COLUMN_FIELDS.items():
         col = getattr(base, const)
         assert row[col] == getattr(cfg, field), f"{const} does not name {field}"

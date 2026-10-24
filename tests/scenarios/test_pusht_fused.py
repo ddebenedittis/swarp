@@ -35,9 +35,11 @@ SPEC = FusedSpec(
 )
 
 
-def _env(device, fused, *, n_agents=4, world_size=0.5):
+def _env(device, fused, *, n_agents=4, world_size=0.5, **fleet):
     # rot_away_penalty on, so parity covers the turn-away cost (it defaults to 0).
-    scen = PushTScenario(n_agents=n_agents, world_size=world_size, rot_away_penalty=1.0)
+    scen = PushTScenario(
+        n_agents=n_agents, world_size=world_size, rot_away_penalty=1.0, **fleet
+    )
     return fused_env(scen, device, fused, spec=SPEC)
 
 
@@ -70,6 +72,46 @@ def test_fused_matches_torch(device, n_agents):
         assert torch.equal(df, dt_), f"done@{t}"
         torch.testing.assert_close(gf, gt, rtol=1e-3, atol=1e-3, msg=f"tee_dist@{t}")
         torch.testing.assert_close(af, at, rtol=1e-3, atol=1e-3, msg=f"tee_angle@{t}")
+
+
+FLEETS = pytest.mark.parametrize(
+    "fleet",
+    [
+        {"model": "diff_drive"},
+        {"agent_shape": "box"},
+        {"model": "diff_drive", "agent_shape": "box"},
+    ],
+    ids=["unicycle", "box", "unicycle-box"],
+)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@FLEETS
+def test_fleet_fused_matches_torch(device, fleet):
+    """Unicycle and box robots: random spawn headings, the heading appended to the obs, and
+    box contacts pushing the T, the same on both paths."""
+    fused = _run(_env(device, fused=True, **fleet), 20, device, 4)
+    torchp = _run(_env(device, fused=False, **fleet), 20, device, 4)
+    assert fused[0][0].shape[-1] == 12 + 2 * 3 + 2
+    heading = fused[0][0][..., -2:]
+    assert heading[..., 0].std() > 0.3, "spawn headings are not randomised"
+    moved = any((fused[t][3] - fused[0][3]).abs().sum().item() > 0 for t in range(1, 20))
+    assert moved, "T never moved; contact physics not exercised"
+    for t, (f, r) in enumerate(zip(fused, torchp, strict=True)):
+        torch.testing.assert_close(f[0], r[0], rtol=1e-3, atol=1e-3, msg=f"obs@{t}")
+        torch.testing.assert_close(f[1], r[1], rtol=SPEC.rtol, atol=SPEC.atol, msg=f"rew@{t}")
+        assert torch.equal(f[2], r[2]), f"done@{t}"
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_taped_step_refuses_box_robots(device):
+    """The grad path integrates the T in torch against disc robots, so it refuses boxes
+    rather than push them as discs."""
+    env = _env(device, fused=True, agent_shape="box")
+    env.reset(seed=0)
+    act = torch.zeros(env.n_envs, 4, 2, device=device, requires_grad=True)
+    with torch.enable_grad(), pytest.raises(NotImplementedError, match="box robots"):
+        env.step(act)
 
 
 @pytest.mark.parametrize("device", DEVICES)

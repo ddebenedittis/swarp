@@ -462,6 +462,49 @@ class Environment:
         """Env-level action width (max arity over the agent models)."""
         return self.world.act_dim
 
+    # Training hooks, forwarded from the scenario (see :class:`~swarp.scenarios.base.
+    # Scenario`): each is "not provided" (0 / 1 / () / None) unless the scenario sets it.
+
+    @property
+    def state_dim(self) -> int:
+        """Width of :meth:`critic_state`; 0 when the scenario provides none."""
+        return self.scenario.state_dim
+
+    @property
+    def n_roles(self) -> int:
+        """Number of agent roles; 1 when the scenario has none."""
+        return self.scenario.n_roles
+
+    @property
+    def role_counts(self) -> tuple[int, ...]:
+        """Agents per role (fixed for the run); empty when the scenario has no roles."""
+        return tuple(self.scenario.role_counts)
+
+    @property
+    def aux_dim(self) -> int:
+        """Width of :meth:`aux_targets`; 0 when the scenario provides none."""
+        return self.scenario.aux_dim
+
+    def critic_state(self) -> torch.Tensor | None:
+        """Privileged per-env state ``[n_envs, state_dim]`` for a critic, or ``None``.
+        A live buffer, overwritten by the next step: clone it to keep a value."""
+        return self.scenario.critic_state()
+
+    def agent_roles(self) -> torch.Tensor | None:
+        """Each agent's role ``[n_envs, n_agents]`` (integer), or ``None``. A live
+        buffer that belongs to the current observation."""
+        return self.scenario.agent_roles()
+
+    def aux_targets(self) -> torch.Tensor | None:
+        """Per-agent auxiliary targets ``[n_envs, n_agents, aux_dim]``, or ``None``. A
+        live buffer that belongs to the current observation."""
+        return self.scenario.aux_targets()
+
+    def comm_mask(self) -> torch.Tensor | None:
+        """Who may hear whom ``[n_envs, n_agents, n_agents]`` (bool), or ``None`` for
+        everyone. A live buffer that belongs to the current observation."""
+        return self.scenario.comm_mask()
+
     @property
     def action_bounds(self) -> tuple[torch.Tensor, torch.Tensor]:
         """The action box the dynamics kernels clamp against: ``(low, high)``, each

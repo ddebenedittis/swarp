@@ -38,7 +38,7 @@ env = swarp.make(
 Only the fields you set **away from the `WorldConfig()` defaults** are applied, so the scenario keeps everything it computed (`WorldConfig.override_with` is the merge).
 The one case this cannot express is forcing a field *back* to its default against a scenario that changed it — build the scenario's `World` yourself for that.
 
-`Scenario.make_world` takes the same argument, and all eleven built-ins honour it (a test pins that).
+`Scenario.make_world` takes the same argument, and all twelve built-ins honour it (a test pins that).
 
 ## Soft contacts
 
@@ -62,6 +62,41 @@ Contacts are **frictionless** everywhere in the engine: normal spring plus norma
 
 Forces are **gather-based** — each thread sums the forces on its own agent from its own neighbor list, obstacles and walls. Symmetric pairs are computed twice, which buys a deterministic, race-free result with no atomics.
 
+### Box agents
+
+A box agent (`AgentShape.BOX`, see [Agent shape](dynamics.md#agent-shape)) collides as the oriented rectangle it is, with the same normal law and the same constants as a disc.
+Every contact it takes part in is a signed distance `s`, a unit normal `n` and a contact point `x`, from `obb_contact` in `swarp/core/collisions.py`:
+
+- A separating-axis test over the four face normals runs first. The largest projection gap is a lower bound on the distance, so when it exceeds the contact reach the pair is skipped.
+- Disjoint but within reach, `s` is the exact Euclidean gap. The closest pair of two disjoint rectangles always involves a vertex, so `s` is the minimum of the eight vertex-versus-other-box distances, and `n` and `x` come from the winning vertex (`x` midway across the gap).
+- Overlapping, `s` is minus the smallest overlap over the four axes, `n` is that axis, and `x` sits on its reference face at the centre of the interval where the two projections onto the face overlap. A centred face-on push therefore has its contact point on the line through both centres.
+
+Both branches reach zero at touching, so `s` is continuous through contact, and a `+` crossing of two thin boxes, where no corner lies inside the other box, is still caught by the axis test.
+The force is `f = max(0, (k*overlap - c*v_n) / (1 + c*sub_dt/m)) * n` with `overlap = reach - s`, where `v_n` is the closing velocity of the two *material points* at `x`, `v + ω × r` on both sides.
+
+| pair | geometry | reach |
+|---|---|---|
+| box agent – box agent | `obb_contact` | `collision_margin` |
+| disc agent – box agent | `box_force` with the disc as the point | disc radius + margin |
+| box agent – `BOX` obstacle | `obb_contact` | margin |
+| box agent – `SEGMENT` obstacle | `obb_contact` against the degenerate box `(half_len, 0)` | capsule radius + margin, so the end caps are exactly round |
+| box agent – `CIRCLE` obstacle | `box_force` with the circle centre as the point | circle radius + margin |
+
+A box-box pair is evaluated with the lower agent index as box A on both threads, so the two threads compute one contact and the pair's forces cancel exactly for equal masses.
+By default contacts push a box agent's centre only: a box agent feels **no contact torque**.
+Its heading is its own, driven by its dynamics model, so a diff-drive or bicycle box turns as it steers and a holonomic box keeps the heading it was reset with.
+
+`WorldConfig.wheel_contacts` makes the contacts of diff-drive agents wheel-faithful (no-grad Euler path only; the world then never runs the fused substep chain).
+The force pass also sums each box agent's contact torque `r × F` about its centre.
+For a box-box contact the lever runs to the vertices that reach into the other box, averaged with their depths as weights, because the midpoint of the overlap carries no torque when a face lies nearly flush on another.
+The torque turns the agent only by what exceeds `wheel_turn_torque`, the torque its drive holds the turn rate against: `ω = ω_cmd + sign(τ) max(|τ| - wheel_turn_torque, 0) dt / I`, with `I = m (hx² + hy²) / 3`.
+A box driving flush into a face that does not give way therefore stalls its turn, because its corner would have to swing through the face, while an off-centre push weaker than the drive leaves its heading alone.
+Along the heading the contact force moves the agent as before, but sideways it only slides by what exceeds the wheels' grip `wheel_lateral_friction · m · gravity`.
+Against a Gazebo Limo (`swarp_gz_test` sysid) this reproduces a pair of robots squeezing the T head-on locking each other's yaw (+0° of a commanded +258°), and a single robot turning against a free T (about +200°).
+
+Every kernel a box world runs compiles without floating-point contraction (`fuse_fp=False`), which keeps the layered and fused paths bit-identical (see [Performance](performance.md#fused-substep-chain)).
+A world without a box agent never launches them, so its step is the disc step unchanged.
+
 ## Bounds
 
 `bounds=(x_min, x_max, y_min, y_max)`, or `None` for an unbounded world.
@@ -71,6 +106,9 @@ Forces are **gather-based** — each thread sums the forces on its own agent fro
 
 `bounds_mode="clamp"`
 : positions are hard-clamped inside. Differentiable as a subgradient.
+
+A box agent at heading `θ` reaches `ex = hx|cos θ| + hy|sin θ|` along x and `ey = hx|sin θ| + hy|cos θ|` along y from its centre, and both modes use those support extents in place of a disc's radius.
+A soft wall damps the velocity of the support vertex touching it (on a face flush with the wall, the face centre), and the clamp insets each box by its extents at its *new* heading, so a box turned 45 degrees is held off the wall by its corner rather than by its circumscribed radius.
 
 ## Obstacles
 
@@ -110,10 +148,16 @@ Like the agent side, this is gather-based — one thread per `(env, obstacle)`, 
 Several shapes that share a `body` id form one **compound** rigid body with a single pose, placed by their `body_offset` in the body frame. That is what makes Push-T's T work: a crossbar and a stem, one rigid pose, mass split by area and inertia from the parallel-axis theorem about the area centroid — which is what gives a contact above the centroid the torque that makes the orientation half of the task solvable.
 
 `obstacle_linear_damping` and `obstacle_angular_damping` stand in for table friction: a pushed body settles at `Σf / (m·damping)` instead of accelerating without limit. Set them to 0 for a frictionless puck that coasts.
+`obstacle_friction` (a Coulomb coefficient μ, 0 by default) instead puts movable bodies on a Coulomb floor: the weight `m·gravity` is spread uniformly over each shape's footprint on an `obstacle_friction_grid` × `obstacle_friction_grid` lattice, and every lattice point resists its own sliding velocity with its share of μ·m·g, regularised below `obstacle_friction_speed` (5 mm/s).
+Summed, that is the footprint's limit surface, so a body pushed off-centre turns about the pivot a real one would, and a sliding body stops within `v² / (2μg)`.
+An impulse that would reverse a body's motion or spin sticks it instead (static friction), which keeps the stiff law stable at any substep.
+`Stepper.set_body_friction` overrides μ·g per env.
+
+A **box agent** pushes a body through the same oriented-box contact it feels itself: the body pass calls the very function the agent side summed and negates it, so action equals reaction to the bit, and the reaction acts at the contact point, so a box agent pushing a box body off-centre spins it.
 
 Two limits worth knowing:
 
-- **Box-box obstacle-obstacle contacts are not modelled.** Obstacles collide with each other for every pair in which at least one body is round; two boxes pass through one another, since that needs a polygon contact manifold rather than an SDF evaluated against a disc. Agent-vs-box is exact for every shape.
+- **Box-box obstacle-obstacle contacts are not modelled.** Obstacles collide with each other for every pair in which at least one body is round; two boxes pass through one another, since the body-body pass evaluates an SDF against a round body. Agent-vs-box is exact for every shape, box agents included.
 - **Body integration is not taped** (`record_tape=False`), so no gradient flows through a body's motion. A scenario that needs one keeps its own torch-side copy — see [Differentiability](differentiability.md).
 
 ## Neighbor search
@@ -153,14 +197,56 @@ ranges = lidar.scan(world)                 # [n_envs, n_agents, n_rays]
 obs = torch.cat([base_obs, ranges], dim=-1)
 ```
 
-Geometry is analytic ray-circle intersection against other agents and circular obstacles; a ray that hits nothing returns `max_range`. Rays are spaced uniformly over 2π and rotate with each agent's heading when `body_frame=True`.
-Box and segment obstacles are **excluded** from the scan — `Lidar.scan` filters on `ObstacleShape` before casting, because ray-circle is the only test implemented — so they are invisible to the sensor while still acting in the collision step.
-`Lidar.scan` reads the obstacle pose from `world.obstacle_state_views()`, so a *movable* obstacle is scanned where it currently is, not where it spawned.
+Every shape in the world is scanned, with the geometry the collision step uses:
 
-Two interchangeable backends:
+| target | geometry |
+|---|---|
+| disc agent, `CIRCLE` obstacle | closed-form ray-circle |
+| box agent (`AgentShape.BOX`) | slab test against its `half_extents`, oriented by the agent's `theta` |
+| `BOX` obstacle | slab test against its `half_extents` at its live angle |
+| `SEGMENT` obstacle | the exact capsule: the rectangle `(half_len, radius)` around the core plus a circle of `radius` at each end |
+
+A ray that hits nothing returns `max_range`, an agent never sees itself, and a ray whose origin lies inside a shape misses that shape.
+A segment of radius zero is a line, hit wherever a ray crosses it.
+Ray direction components below `1e-12` are replaced by `±1e-12` in the slab test, so the ranges and their gradients stay finite for a ray parallel to a face.
+`Lidar.scan` reads obstacle poses from the engine's live arrays (`world.obstacle_state_views()` on the torch path, `stepper.obs_*` on the Warp path), so a *movable* obstacle is scanned where it currently is, not where it spawned.
+Nothing in a scan reads the device back to the host.
+
+### What each ray hit
+
+`Lidar(..., return_hits=True)` makes a scan return `(ranges, hit_class, hit_index)`, all `[n_envs, n_agents, n_rays]`:
+
+| `hit_class` (`uint8`) | meaning | `hit_index` (`int32`) |
+|---|---|---|
+| 0 | nothing within `max_range` | -1 |
+| 1 | an agent | the agent index |
+| 2 | an `IMMOVABLE` obstacle | the obstacle *shape* index |
+| 3 | a `MOVABLE` obstacle | the obstacle *shape* index |
+
+A compound body is several shapes, so a scenario that wants the body maps the shape index through its `Obstacles.body` tags.
+Ties go to agents before obstacles, and to the lower index within each.
+
+### Field of view
+
+Rays start at `angle_start` and rotate with each agent's heading when `body_frame=True`.
+Without `angle_end` they cover the full circle, `2π / n_rays` apart.
+With `angle_end` spanning less than 2π the first ray points at `angle_start` and the last at `angle_end`, `(angle_end - angle_start) / (n_rays - 1)` apart; a span of 2π or more is the full circle again.
+`Lidar.ray_offsets()` returns the ray angles, so a renderer draws exactly the rays that were cast.
+
+### Backends
 
 `"torch"` (default)
-: the pure-torch broadcast implementation. Differentiable, but materializes a dense `[E, A, R, T]` family, so memory grows with the target count.
+: the pure-torch broadcast implementation. Differentiable with respect to agent poses (including box agents' headings) and obstacle poses, but materializes a dense `[E, A, R, T]` family per shape, so memory grows with the target count.
 
 `"warp"`
-: the Warp kernel — numerically equivalent with no dense intermediate, which keeps high ray counts affordable. Inference-only: when gradients are required the scan transparently falls back to the torch path.
+: the Warp kernel, one thread per `(env, agent, ray)` keeping a running minimum, so there is no dense intermediate and high ray counts stay affordable. It returns the same ranges and the same hits (tested on randomized mixed scenes in float32 and float64). Inference-only: when gradients are required the scan transparently falls back to the torch path. Its outputs are views of buffers the `Lidar` owns, overwritten by the next scan.
+
+### Inside a captured step
+
+`Lidar.scan` is the eager convenience wrapper.
+A fused scenario that wants the scan inside the whole-step CUDA graph splits it in two:
+
+- `Lidar.bind(world)`, called once **outside** any capture (in `make_world`, or before the first step): allocates the output buffers (`lidar.ranges`, `lidar.hit_class`, `lidar.hit_index` as torch views; `lidar.wp_ranges`, `lidar.wp_hit_class`, `lidar.wp_hit_index` as Warp handles) and loads the kernel modules, because a kernel first launched inside a capture cannot be loaded there. Re-binding the same world keeps the buffers; anything else reallocates them and bumps `lidar.version`, which a scenario can fold into its recapture token.
+- `Lidar.launch(world)`, called in `launch_fused` ahead of the observation kernel that reads `lidar.wp_ranges`: a single `wp.launch` against `world.state_wp()` and the stepper's live `obs_*` arrays, with no allocation, wrap, host read or stream scope, so it follows the capture-safety rule of [Writing a scenario](writing-a-scenario.md).
+
+The Warp path reads the agent footprint from the shared parameter matrix, so a per-env parameter override of the radius or half-extents is not seen by the lidar.

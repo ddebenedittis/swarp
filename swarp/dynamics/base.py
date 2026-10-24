@@ -62,13 +62,36 @@ class ControlMode(IntEnum):
     """Interpretation of the 2D action vector.
 
     HOLONOMIC: VELOCITY -> (vx, vy), ACCELERATION -> (ax, ay).
-    DIFF_DRIVE: VELOCITY -> (v, omega), ACCELERATION -> (a, alpha).
+    DIFF_DRIVE: VELOCITY -> (v, omega), ACCELERATION -> (a, alpha), SERVO -> (v, omega).
     KINEMATIC_BICYCLE: always (acceleration, steering angle); the flag is ignored.
     DRONE: always four per-rotor thrusts; the flag is ignored.
+
+    ``SERVO`` (diff-drive only) is a velocity command tracked by a rate-limited servo,
+    the way a wheeled robot's motor controller tracks ``cmd_vel``: each substep the
+    speed and turn rate move toward ``cmd_gain_v * v`` and ``cmd_gain_w * omega`` by at
+    most ``max_accel * dt`` and ``max_ang_accel * dt``, and are then clamped to
+    ``max_speed`` / ``max_ang_vel`` as in ``VELOCITY``. The gains model a drive that
+    under- or over-delivers (a skid-steer base turns slower than commanded).
     """
 
     VELOCITY = 0
     ACCELERATION = 1
+    SERVO = 2
+
+
+class AgentShape(IntEnum):
+    """Agent footprint tags, packed into the :data:`P_SHAPE` parameter column.
+
+    ``DISC`` is a circle of ``AgentConfig.radius``. ``BOX`` is a rectangle of
+    ``AgentConfig.half_extents`` centred on the agent and rotated by its heading
+    ``theta``; its ``radius`` is the circumscribed one, so every radius-based bound in the
+    engine (neighbor reach, spawn spacing, ``World.agent_radius``) stays conservative.
+    The lidar sees the box, and the contact step collides it as the oriented rectangle it
+    is (:func:`swarp.core.collisions.obb_contact`) against agents, obstacles and walls.
+    """
+
+    DISC = 0
+    BOX = 1
 
 
 class Integrator(Enum):
@@ -108,6 +131,13 @@ PARAM_FIELDS: tuple[str, ...] = (
     "gravity",
     # Appended last so every existing column keeps its index.
     "min_speed",
+    # Agent footprint: the AgentShape tag (as a float) and the box half-extents.
+    "shape",
+    "half_x",
+    "half_y",
+    # ControlMode.SERVO's command gains (read by no other mode).
+    "cmd_gain_v",
+    "cmd_gain_w",
 )
 NUM_PARAMS = len(PARAM_FIELDS)
 _COL = {name: i for i, name in enumerate(PARAM_FIELDS)}
@@ -132,6 +162,11 @@ P_IZZ = _COL["inertia_zz"]
 P_KAPPA = _COL["torque_coeff"]  # yaw reaction torque per unit rotor thrust
 P_GRAVITY = _COL["gravity"]  # gravitational acceleration (m/s^2)
 P_MIN_SPEED = _COL["min_speed"]  # bicycle's lower speed clamp (-max_speed if unset)
+P_SHAPE = _COL["shape"]  # AgentShape tag, stored as a float (0.0 disc, 1.0 box)
+P_HALF_X = _COL["half_x"]  # box half-extent along the heading (0 for a disc)
+P_HALF_Y = _COL["half_y"]  # box half-extent across the heading (0 for a disc)
+P_CMD_GAIN_V = _COL["cmd_gain_v"]  # SERVO: delivered / commanded speed
+P_CMD_GAIN_W = _COL["cmd_gain_w"]  # SERVO: delivered / commanded turn rate
 
 
 @dataclass
@@ -144,7 +179,11 @@ class AgentConfig:
     #: coercing here is what makes ``swarp.make("navigation", model="drone")`` work.
     model: DynamicsModel | str | int = DynamicsModel.HOLONOMIC
     ctrl_mode: ControlMode | str | int = ControlMode.VELOCITY
-    radius: float = 0.05
+    #: Disc radius; ``None`` means 0.05 for a disc. For a box it is *derived*: ``None``
+    #: resolves to the circumscribed radius ``hypot(*half_extents)``, and any other value
+    #: raises. Resolved in ``__post_init__``, so a ``dataclasses.replace`` that changes a
+    #: box's ``half_extents`` has to pass ``radius=None`` along with it.
+    radius: float | None = None
     mass: float = 1.0
     max_speed: float = 1.0
     max_accel: float = 1.0
@@ -166,21 +205,74 @@ class AgentConfig:
     inertia_zz: float = 0.02
     torque_coeff: float = 0.02  # yaw reaction torque per unit rotor thrust
     gravity: float = 9.81
+    #: Footprint, :class:`AgentShape` (member, name or value). Appended last, after the
+    #: drone block, so positional construction keeps working.
+    shape: AgentShape | str | int = AgentShape.DISC
+    #: Box half-extents ``(along, across)`` the heading; must be ``(0, 0)`` for a disc.
+    half_extents: tuple[float, float] = (0.0, 0.0)
+    #: ``ControlMode.SERVO`` only: the speed and turn rate the drive delivers per unit
+    #: commanded, before the ``max_speed`` / ``max_ang_vel`` clamp.
+    cmd_gain_v: float = 1.0
+    cmd_gain_w: float = 1.0
 
     def __post_init__(self) -> None:
         self.model = _coerce(DynamicsModel, self.model, "model")
         self.ctrl_mode = _coerce(ControlMode, self.ctrl_mode, "ctrl_mode")
+        self.shape = _coerce(AgentShape, self.shape, "shape")
+        self.half_extents = tuple(float(h) for h in self.half_extents)
+        if len(self.half_extents) != 2:
+            raise ValueError("AgentConfig.half_extents must be a pair (hx, hy).")
+        if self.shape == AgentShape.BOX:
+            hx, hy = self.half_extents
+            if hx <= 0.0 or hy <= 0.0:
+                raise ValueError("A box agent needs positive half_extents (hx, hy).")
+            if self.model == DynamicsModel.DRONE:
+                raise ValueError("A drone cannot be a box agent; its footprint is a disc.")
+            circumscribed = math.hypot(hx, hy)
+            if self.radius is not None and not math.isclose(
+                self.radius, circumscribed, rel_tol=1e-9, abs_tol=1e-12
+            ):
+                raise ValueError(
+                    f"A box agent's radius is derived from its half_extents (the "
+                    f"circumscribed radius {circumscribed}); got radius={self.radius}. "
+                    "Leave radius unset (None)."
+                )
+            self.radius = circumscribed
+        else:
+            if self.half_extents != (0.0, 0.0):
+                raise ValueError(
+                    "AgentConfig.half_extents is only meaningful for shape=AgentShape.BOX; "
+                    "a disc's footprint is its radius."
+                )
+            if self.radius is None:
+                self.radius = 0.05
         if self.l_f + self.l_r <= 0.0:
             raise ValueError("Bicycle wheelbase l_f + l_r must be positive.")
-        for name in ("radius", "mass", "max_speed", "max_accel", "max_ang_vel", "max_ang_accel"):
+        for name in (
+            "radius", "mass", "max_speed", "max_accel", "max_ang_vel", "max_ang_accel",
+            "cmd_gain_v", "cmd_gain_w",
+        ):
             if getattr(self, name) <= 0.0:
                 raise ValueError(f"AgentConfig.{name} must be positive.")
+        if self.ctrl_mode == ControlMode.SERVO and self.model != DynamicsModel.DIFF_DRIVE:
+            raise ValueError("ControlMode.SERVO is a diff-drive mode; got model "
+                             f"{self.model.name}.")
         if self.min_speed is not None and not -self.max_speed <= self.min_speed <= self.max_speed:
             raise ValueError("AgentConfig.min_speed must lie in [-max_speed, max_speed].")
         if self.model == DynamicsModel.DRONE:
             for name in ("thrust_max", "arm_length", "inertia_xx", "inertia_yy", "inertia_zz"):
                 if getattr(self, name) <= 0.0:
                     raise ValueError(f"AgentConfig.{name} must be positive for a drone.")
+
+    @property
+    def half_x(self) -> float:
+        """``half_extents[0]``, the value packed into :data:`P_HALF_X`."""
+        return self.half_extents[0]
+
+    @property
+    def half_y(self) -> float:
+        """``half_extents[1]``, the value packed into :data:`P_HALF_Y`."""
+        return self.half_extents[1]
 
     def to_row(self) -> list[float]:
         """This config as one ``[NUM_PARAMS]`` kernel row, in :data:`PARAM_FIELDS` order.
@@ -205,6 +297,7 @@ _ACTION_LIMITS: dict[tuple[str, str], tuple[tuple[float | None, str], ...]] = {
     ("HOLONOMIC", "ACCELERATION"): ((None, "max_accel"), (None, "max_accel")),
     ("DIFF_DRIVE", "VELOCITY"): ((None, "max_speed"), (None, "max_ang_vel")),
     ("DIFF_DRIVE", "ACCELERATION"): ((None, "max_accel"), (None, "max_ang_accel")),
+    ("DIFF_DRIVE", "SERVO"): ((None, "max_speed"), (None, "max_ang_vel")),
     # the bicycle and drone ignore ctrl_mode, so both modes map to one row
     ("KINEMATIC_BICYCLE", "VELOCITY"): ((None, "max_accel"), (None, "max_steer")),
     ("KINEMATIC_BICYCLE", "ACCELERATION"): ((None, "max_accel"), (None, "max_steer")),

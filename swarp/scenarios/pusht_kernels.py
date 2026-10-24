@@ -30,6 +30,7 @@ import warp as wp
 
 from swarp._overloads import register
 from swarp.core.state import VEC2
+from swarp.dynamics.base import P_CMD_GAIN_V, P_CMD_GAIN_W, P_MAX_ACCEL, P_MAX_ANG_ACCEL
 from swarp.scenarios.reset_kernels import _as
 
 # Lean launches (no grid-stride loop); see docs/performance.md.
@@ -40,13 +41,16 @@ wp.set_module_options({"default_grid_stride": False})
 def pusht_obs_kernel(
     pos: wp.array2d(dtype=Any),
     vel: wp.array2d(dtype=Any),
+    theta: wp.array2d(dtype=Any),
     tee_pos: wp.array(dtype=Any),
     tee_theta: wp.array(dtype=Any),
     goal_pos: wp.array(dtype=Any),
     goal_theta: wp.array(dtype=Any),
+    heading: wp.int32,
     obs: wp.array3d(dtype=Any),
 ):
-    """Thread per (env, agent): obs row (agent pose, T-relative, T->goal, angles)."""
+    """Thread per (env, agent): obs row (agent pose, T-relative, T->goal, angles,
+    teammates, then the robot's own cos/sin heading when ``heading`` is 1)."""
     e, a = wp.tid()
     p = pos[e, a]
     v = vel[e, a]
@@ -75,6 +79,9 @@ def pusht_obs_kernel(
             obs[e, a, k] = q2[0] - p[0]
             obs[e, a, k + 1] = q2[1] - p[1]
             k += wp.int32(2)
+    if heading == 1:
+        obs[e, a, k] = wp.cos(theta[e, a])
+        obs[e, a, k + 1] = wp.sin(theta[e, a])
 
 
 @wp.kernel
@@ -185,10 +192,12 @@ def _obs_signature(dtype) -> list:
     return [
         wp.array2d(dtype=vec2),  # pos
         wp.array2d(dtype=vec2),  # vel
+        wp.array2d(dtype=dtype),  # theta
         wp.array(dtype=vec2),  # tee_pos
         wp.array(dtype=dtype),  # tee_theta
         wp.array(dtype=vec2),  # goal_pos
         wp.array(dtype=dtype),  # goal_theta
+        wp.int32,  # heading
         wp.array3d(dtype=dtype),  # obs
     ]
 
@@ -313,6 +322,309 @@ def pusht_reset_kernel(
         goal_theta[e] = (_as(wp.randf(rng), lim) * two - one) * pi
 
 
+#: Tries per robot of the per-env arena spawn: uniform in the arena first, then on a ring
+#: around the T, where a small arena still has room when the uniform draws keep landing
+#: on the T's disc, then on a ring down to the T's bare clearance.
+ARENA_SPAWN_TRIES_UNIFORM = wp.constant(8)
+ARENA_SPAWN_TRIES_RING = wp.constant(24)
+ARENA_SPAWN_TRIES_TIGHT = wp.constant(32)
+ARENA_GOAL_TRIES = wp.constant(16)
+
+
+@wp.kernel
+def pusht_arena_reset_kernel(
+    reset_mask: wp.array(dtype=wp.uint8),
+    use_mask: wp.int32,
+    seed: wp.int32,
+    w_lo: Any,
+    w_hi: Any,
+    h_lo: Any,
+    h_hi: Any,
+    agent_inset: Any,
+    tee_inset: Any,
+    clear: Any,
+    clear_min: Any,
+    agent_clear: Any,
+    stop_margin: Any,
+    goal_radius: Any,
+    goal_angle: Any,
+    use_goal_radius: wp.int32,
+    use_goal_angle: wp.int32,
+    n_agents: wp.int32,
+    arena_half: wp.array(dtype=Any),
+    arena_edges: wp.array(dtype=Any),
+    pos: Any,
+    vel: Any,
+    tee_pos: Any,
+    tee_vel: Any,
+    tee_theta: Any,
+    tee_ang_vel: Any,
+    goal_pos: Any,
+    goal_theta: Any,
+):
+    """Masked episode reset on a per-env arena: its width and height, then the T, robot
+    and goal spawns inside it.
+
+    The arena is ``W x H`` (each uniform in its range), centred on the origin;
+    ``arena_half[e]`` gets ``(W / 2, H / 2)`` and ``arena_edges[e]`` the arena stop's
+    ``(W / 2, H / 2) + stop_margin``. The T is uniform in the arena inset by ``tee_inset``,
+    each robot uniform in it inset by ``agent_inset``, clear of the T's disc (``clear``)
+    and of the robots already placed (``agent_clear``): rejection over
+    ``ARENA_SPAWN_TRIES_UNIFORM`` uniform draws, then ``ARENA_SPAWN_TRIES_RING`` draws on a
+    ring just outside ``clear``, then ``ARENA_SPAWN_TRIES_TIGHT`` on a ring between
+    ``clear_min`` (the T's radius plus a robot's) and ``clear``, and if all miss
+    :func:`pusht_reset_kernel`'s push-out and clamp. The goal is drawn like
+    :func:`pusht_reset_kernel`'s, but a disc draw outside the inset arena is redrawn
+    (``ARENA_GOAL_TRIES``) rather than clamped, so a small arena's goals do not pile up on
+    its edge."""
+    e = wp.tid()
+    if use_mask == 1 and reset_mask[e] == wp.uint8(0):
+        return
+    rng = wp.rand_init(seed, e)
+    zero = _as(0.0, w_lo)
+    two = _as(2.0, w_lo)
+    one = _as(1.0, w_lo)
+    half = _as(0.5, w_lo)
+    pi = _as(3.14159265358979, w_lo)
+
+    hx = half * (w_lo + _as(wp.randf(rng), w_lo) * (w_hi - w_lo))
+    hy = half * (h_lo + _as(wp.randf(rng), w_lo) * (h_hi - h_lo))
+    arena_half[e] = wp.vector(hx, hy)
+    arena_edges[e] = wp.vector(hx + stop_margin, hy + stop_margin)
+    lx = hx - agent_inset
+    ly = hy - agent_inset
+    tlx = hx - tee_inset
+    tly = hy - tee_inset
+
+    tx = (_as(wp.randf(rng), w_lo) * two - one) * tlx
+    ty = (_as(wp.randf(rng), w_lo) * two - one) * tly
+    theta = (_as(wp.randf(rng), w_lo) * two - one) * pi
+    tee_pos[e] = wp.vector(tx, ty)
+    tee_vel[e] = wp.vector(zero, zero)
+    tee_theta[e] = theta
+    tee_ang_vel[e] = zero
+
+    for a in range(n_agents):
+        px = zero
+        py = zero
+        placed = bool(False)  # noqa: UP018 - Warp: a loop-mutated flag must not be a constant
+        n_try = ARENA_SPAWN_TRIES_UNIFORM + ARENA_SPAWN_TRIES_RING + ARENA_SPAWN_TRIES_TIGHT
+        for k in range(n_try):
+            if not placed:
+                qx = zero
+                qy = zero
+                need = clear
+                if k < ARENA_SPAWN_TRIES_UNIFORM:
+                    qx = (_as(wp.randf(rng), w_lo) * two - one) * lx
+                    qy = (_as(wp.randf(rng), w_lo) * two - one) * ly
+                else:
+                    ang = (_as(wp.randf(rng), w_lo) * two - one) * pi
+                    u = _as(wp.randf(rng), w_lo)
+                    rad = clear * (one + half * u)
+                    if k >= ARENA_SPAWN_TRIES_UNIFORM + ARENA_SPAWN_TRIES_RING:
+                        need = clear_min
+                        rad = clear_min + u * (clear - clear_min)
+                    qx = tx + rad * wp.cos(ang)
+                    qy = ty + rad * wp.sin(ang)
+                ok = wp.abs(qx) <= lx and wp.abs(qy) <= ly
+                dx = qx - tx
+                dy = qy - ty
+                if dx * dx + dy * dy < need * need:
+                    ok = False
+                for b in range(a):
+                    ob = pos[e, b]
+                    bx = qx - ob[0]
+                    by = qy - ob[1]
+                    if bx * bx + by * by < agent_clear * agent_clear:
+                        ok = False
+                if ok:
+                    px = qx
+                    py = qy
+                    placed = True
+        if not placed:
+            px = (_as(wp.randf(rng), w_lo) * two - one) * lx
+            py = (_as(wp.randf(rng), w_lo) * two - one) * ly
+            dx = px - tx
+            dy = py - ty
+            dn = wp.sqrt(dx * dx + dy * dy)
+            if dn < clear:
+                if dn > _as(1.0e-9, w_lo):
+                    px = tx + dx / dn * clear
+                    py = ty + dy / dn * clear
+                else:
+                    px = tx
+                    py = ty + clear
+            px = wp.clamp(px, -lx, lx)
+            py = wp.clamp(py, -ly, ly)
+        pos[e, a] = wp.vector(px, py)
+        vel[e, a] = wp.vector(zero, zero)
+
+    gx = zero
+    gy = zero
+    if use_goal_radius == 1:
+        found = bool(False)  # noqa: UP018 - Warp: a loop-mutated flag must not be a constant
+        for _k in range(ARENA_GOAL_TRIES):
+            if not found:
+                gdir = (_as(wp.randf(rng), w_lo) * two - one) * pi
+                grad = goal_radius * wp.sqrt(_as(wp.randf(rng), w_lo))
+                gx = tx + grad * wp.cos(gdir)
+                gy = ty + grad * wp.sin(gdir)
+                if wp.abs(gx) <= tlx and wp.abs(gy) <= tly:
+                    found = True
+        gx = wp.clamp(gx, -tlx, tlx)
+        gy = wp.clamp(gy, -tly, tly)
+    else:
+        gx = (_as(wp.randf(rng), w_lo) * two - one) * tlx
+        gy = (_as(wp.randf(rng), w_lo) * two - one) * tly
+    goal_pos[e] = wp.vector(gx, gy)
+
+    if use_goal_angle == 1:
+        goal_theta[e] = theta + (_as(wp.randf(rng), w_lo) * two - one) * goal_angle
+    else:
+        goal_theta[e] = (_as(wp.randf(rng), w_lo) * two - one) * pi
+
+
+@wp.kernel
+def pusht_heading_reset_kernel(
+    reset_mask: wp.array(dtype=wp.uint8),
+    use_mask: wp.int32,
+    seed: wp.int32,
+    theta: wp.array2d(dtype=Any),
+    speed: wp.array2d(dtype=Any),
+    ang_vel: wp.array2d(dtype=Any),
+):
+    """Thread per (env, agent): a uniform heading and zero speed and spin, for robots whose
+    heading matters (unicycles, boxes), after :func:`pusht_reset_kernel` placed them. Its
+    own seed, so the spawn kernel's draws are the same with or without it."""
+    e, a = wp.tid()
+    if use_mask == 1 and reset_mask[e] == wp.uint8(0):
+        return
+    rng = wp.rand_init(seed, e * theta.shape[1] + a)
+    th = theta[e, a]
+    one = _as(1.0, th)
+    theta[e, a] = (_as(wp.randf(rng), th) * _as(2.0, th) - one) * _as(3.14159265358979, th)
+    speed[e, a] = _as(0.0, th)
+    ang_vel[e, a] = _as(0.0, th)
+
+
+@wp.func
+def _draw(u: float, lo: Any, hi: Any, old: Any):
+    """``u`` in ``[0, 1)`` mapped onto ``[lo, hi]``, or ``old`` for a fixed (``lo == hi``)
+    knob, whose value may be infinite."""
+    out = old
+    if hi > lo:
+        out = lo + (hi - lo) * _as(u, lo)
+    return out
+
+
+@wp.kernel
+def pusht_actuation_reset_kernel(
+    reset_mask: wp.array(dtype=wp.uint8),
+    use_mask: wp.int32,
+    seed: wp.int32,
+    acc_lo: Any,
+    acc_hi: Any,
+    ang_lo: Any,
+    ang_hi: Any,
+    gv_lo: Any,
+    gv_hi: Any,
+    gw_lo: Any,
+    gw_hi: Any,
+    params: wp.array3d(dtype=Any),
+):
+    """Thread per (env, robot): fresh ``SERVO`` accelerations and command gains in the
+    per-env parameter rows of the respawned envs, each uniform in its range. Its own
+    seed, so the spawn and heading draws are the same with or without it."""
+    e, a = wp.tid()
+    if use_mask == 1 and reset_mask[e] == wp.uint8(0):
+        return
+    rng = wp.rand_init(seed, e * params.shape[1] + a)
+    u0 = wp.randf(rng)
+    u1 = wp.randf(rng)
+    u2 = wp.randf(rng)
+    u3 = wp.randf(rng)
+    params[e, a, P_MAX_ACCEL] = _draw(u0, acc_lo, acc_hi, params[e, a, P_MAX_ACCEL])
+    params[e, a, P_MAX_ANG_ACCEL] = _draw(u1, ang_lo, ang_hi, params[e, a, P_MAX_ANG_ACCEL])
+    params[e, a, P_CMD_GAIN_V] = _draw(u2, gv_lo, gv_hi, params[e, a, P_CMD_GAIN_V])
+    params[e, a, P_CMD_GAIN_W] = _draw(u3, gw_lo, gw_hi, params[e, a, P_CMD_GAIN_W])
+
+
+@wp.kernel
+def pusht_friction_reset_kernel(
+    reset_mask: wp.array(dtype=wp.uint8),
+    use_mask: wp.int32,
+    seed: wp.int32,
+    lo: Any,
+    hi: Any,
+    gravity: Any,
+    mu_g: wp.array(dtype=Any),
+):
+    """Thread per env: a fresh floor friction ``mu * g``, ``mu`` uniform in ``[lo, hi]``,
+    for the respawned envs. Its own seed."""
+    e = wp.tid()
+    if use_mask == 1 and reset_mask[e] == wp.uint8(0):
+        return
+    rng = wp.rand_init(seed, e)
+    mu_g[e] = (lo + (hi - lo) * _as(wp.randf(rng), lo)) * gravity
+
+
+def _friction_reset_signature(dtype) -> list:
+    return [wp.array(dtype=wp.uint8), wp.int32, wp.int32, dtype, dtype, dtype,
+            wp.array(dtype=dtype)]
+
+
+@wp.kernel
+def pusht_latency_reset_kernel(
+    reset_mask: wp.array(dtype=wp.uint8),
+    use_mask: wp.int32,
+    seed: wp.int32,
+    lo: wp.int32,
+    hi: wp.int32,
+    zero: Any,
+    delay: wp.array2d(dtype=wp.int32),
+    prev_actions: wp.array3d(dtype=Any),
+):
+    """Thread per (env, robot): a fresh command delay, uniform over the integer substeps
+    ``[lo, hi]``, and a zero previous command (the robot respawns at rest) for the
+    respawned envs. Its own seed, like the actuation draw."""
+    e, a = wp.tid()
+    if use_mask == 1 and reset_mask[e] == wp.uint8(0):
+        return
+    rng = wp.rand_init(seed, e * delay.shape[1] + a)
+    d = lo + wp.int32(wp.randf(rng) * float(hi - lo + 1))
+    delay[e, a] = wp.min(d, hi)
+    for i in range(prev_actions.shape[2]):
+        prev_actions[e, a, i] = zero
+
+
+def _latency_reset_signature(dtype) -> list:
+    return [
+        wp.array(dtype=wp.uint8),
+        wp.int32,
+        wp.int32,
+        wp.int32,
+        wp.int32,
+        dtype,  # zero
+        wp.array2d(dtype=wp.int32),
+        wp.array3d(dtype=dtype),
+    ]
+
+
+def _actuation_reset_signature(dtype) -> list:
+    return [
+        wp.array(dtype=wp.uint8),
+        wp.int32,
+        wp.int32,
+        *([dtype] * 8),
+        wp.array3d(dtype=dtype),
+    ]
+
+
+def _heading_reset_signature(dtype) -> list:
+    a2s = wp.array2d(dtype=dtype)
+    return [wp.array(dtype=wp.uint8), wp.int32, wp.int32, a2s, a2s, a2s]
+
+
 def _reset_signature(dtype) -> list:
     a1v = wp.array(dtype=VEC2[dtype])
     a1s = wp.array(dtype=dtype)
@@ -339,7 +651,48 @@ def _reset_signature(dtype) -> list:
         a1s,  # goal_theta
     ]
 
+def _arena_reset_signature(dtype) -> list:
+    a1v = wp.array(dtype=VEC2[dtype])
+    a1s = wp.array(dtype=dtype)
+    a2v = wp.array2d(dtype=VEC2[dtype])
+    return [
+        wp.array(dtype=wp.uint8),  # reset_mask
+        wp.int32,  # use_mask
+        wp.int32,  # seed
+        dtype,  # w_lo
+        dtype,  # w_hi
+        dtype,  # h_lo
+        dtype,  # h_hi
+        dtype,  # agent_inset
+        dtype,  # tee_inset
+        dtype,  # clear
+        dtype,  # clear_min
+        dtype,  # agent_clear
+        dtype,  # stop_margin
+        dtype,  # goal_radius
+        dtype,  # goal_angle
+        wp.int32,  # use_goal_radius
+        wp.int32,  # use_goal_angle
+        wp.int32,  # n_agents
+        a1v,  # arena_half
+        a1v,  # arena_edges
+        a2v,  # pos
+        a2v,  # vel
+        a1v,  # tee_pos
+        a1v,  # tee_vel
+        a1s,  # tee_theta
+        a1s,  # tee_ang_vel
+        a1v,  # goal_pos
+        a1s,  # goal_theta
+    ]
+
+
 for _T in (wp.float32, wp.float64):
     register(pusht_obs_kernel, _T, _obs_signature(_T))
     register(pusht_reward_kernel, _T, _reward_signature(_T))
     register(pusht_reset_kernel, _T, _reset_signature(_T))
+    register(pusht_arena_reset_kernel, _T, _arena_reset_signature(_T))
+    register(pusht_heading_reset_kernel, _T, _heading_reset_signature(_T))
+    register(pusht_actuation_reset_kernel, _T, _actuation_reset_signature(_T))
+    register(pusht_friction_reset_kernel, _T, _friction_reset_signature(_T))
+    register(pusht_latency_reset_kernel, _T, _latency_reset_signature(_T))

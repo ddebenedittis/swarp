@@ -25,7 +25,8 @@ import numpy as np
 import torch
 import warp as wp
 
-from swarp.core.bodies import launch_obstacle_dynamics
+from swarp._overloads import concrete
+from swarp.core.bodies import launch_body_friction, launch_obstacle_dynamics
 from swarp.core.collisions import launch_collision_forces
 from swarp.core.config import Obstacles, WorldConfig
 from swarp.core.fused_substeps import MAX_AGENTS as FUSED_MAX_AGENTS
@@ -35,13 +36,15 @@ from swarp.core.state import VEC2, WorldState
 from swarp.dynamics.base import (
     NUM_PARAMS,
     P_RADIUS,
+    P_SHAPE,
     AgentConfig,
     AgentParams,
+    AgentShape,
     DynamicsModel,
     Integrator,
     build_agent_params,
 )
-from swarp.dynamics.kernels import launch_integrate
+from swarp.dynamics.kernels import launch_integrate, step_commands_kernel
 
 #: ``"auto"`` fuses the substep chain only up to this many agents per env per substep...
 FUSE_AGENTS_PER_SUBSTEP = 4
@@ -168,8 +171,13 @@ class Stepper:
         self.body_vel = wp.zeros((1, 1), dtype=vec2, device=device)
         self.body_ang_vel = wp.zeros((1, 1), dtype=dtype, device=device)
         self.any_movable = False
+        # Per-env floor friction (mu * g) of the movable bodies; None reads the world's
+        # scalar. The dummy fills the kernel's array slot when there is no override.
+        self.body_friction: wp.array | None = None
+        self.body_friction_dummy = wp.zeros(1, dtype=dtype, device=device)
 
         self._zero_forces: dict[int, wp.array] = {}
+        self._torques: dict[int, wp.array] = {}
         self._zero_nbr: dict[int, tuple[wp.array, wp.array]] = {}
         self._grids: dict[int, NeighborGrid] = {}
         self._cached_buffers: dict[int, StepBuffers] = {}
@@ -199,6 +207,12 @@ class Stepper:
         # kernel, whose drone passthrough carries the identity adjoints the slim
         # kernel would drop). ``enable_slim2d`` lets the ablation disable it.
         self.has_drone: bool = any(c.model == DynamicsModel.DRONE for c in configs)
+        # Host-side, static for the life of the stepper (the shape column is structural;
+        # set_agent_params_per_env refuses to change it). Read by the lidar to compile its
+        # box-agent branch in or out, and by launch_substeps to route the force pass, the
+        # movable-body reactions and the bounds clamp to their box-aware kernels. A
+        # disc-only world never launches those, so its step is the disc step unchanged.
+        self.has_box_agents: bool = any(c.shape == AgentShape.BOX for c in configs)
         self.enable_slim2d: bool = True
         # The single-launch substep chain (swarp/core/fused_substeps.py): ``"auto"`` takes
         # it where it measured faster (see _can_fuse_substeps), ``True`` wherever it is
@@ -211,8 +225,72 @@ class Stepper:
         # field name -> (identity key, Warp view, the tensor it views). Zero-copy wraps of
         # the obstacle install's *source* tensors, kept across installs; see _src_handle.
         self._src_handles: dict[str, tuple[tuple, wp.array, torch.Tensor]] = {}
+        # Command latency, off until enable_command_delay: then cmd_delay [n_envs,
+        # n_agents] substeps of each step still apply prev_actions.
+        self.cmd_delay: wp.array | None = None
+        self.prev_actions: wp.array | None = None
+        self._delayed: list[wp.array] = []
+        # Arena stop, off until enable_arena_stop: the edge, and the filtered command.
+        self.arena_edge: float = 0.0
+        self._after: wp.array | None = None
+        # Per-env (x, y) edges [n_envs] vec2 when the stop was enabled with an array, and
+        # the stand-in the kernel reads otherwise (never read: per_env_edge is 0 then).
+        self._arena_edges: wp.array | None = None
+        self._zero_edges = wp.zeros(1, dtype=VEC2[dtype], device=device)
 
     # ------------------------------------------------------------------ setup
+
+    def enable_command_delay(self, n_envs: int, act_dim: int, max_delay: int) -> None:
+        """Apply each agent's previous command for the first ``cmd_delay[e, a]`` substeps of
+        every step and the new one after, as a command latency of that many substeps would.
+
+        Allocates ``cmd_delay`` (int32 ``[n_envs, n_agents]``, zero: no latency) and
+        ``prev_actions`` (``[n_envs, n_agents, act_dim]``, the command the last step
+        applied; zero: at rest), which the caller writes in place (a scenario's reset
+        kernel draws the delays and zeroes the respawned agents' commands). ``max_delay``
+        bounds the delays and sizes the per-substep command scratch. The step then runs
+        the layered pipeline, with one extra launch per step; untaped steps only.
+        """
+        if not 0 < max_delay <= self.substeps:
+            raise ValueError(f"max_delay must lie in [1, substeps], got {max_delay}")
+        z = {"device": self.device, "dtype": self.dtype}
+        self.cmd_delay = wp.zeros((n_envs, self.n_agents), dtype=wp.int32, device=self.device)
+        self.prev_actions = wp.zeros((n_envs, self.n_agents, act_dim), **z)
+        scratch = wp.zeros((max_delay, n_envs, self.n_agents, act_dim), **z)
+        self._delayed_scratch = scratch
+        self._delayed = [scratch[k] for k in range(max_delay)]
+        self.mutation_version += 1
+
+    def enable_arena_stop(self, n_envs: int, act_dim: int, edge: float | wp.array) -> None:
+        """Zero a diff-drive's speed command (slot 0) while its centre is beyond ``edge``
+        on an axis (``|x| > edge`` or ``|y| > edge``) and the command would drive it further
+        out along that axis; turning, and driving back in, pass. A real robot's safety
+        bridge does this on every command from the robot's latest pose; here it is judged
+        on the pose at the start of each step and holds for the step (also for the
+        delayed command, with :meth:`enable_command_delay`). Untaped steps only.
+
+        ``edge`` is one positive float for both axes of every env, or an ``[n_envs]`` vec2
+        Warp array of per-env ``(x, y)`` edges, read on every step by pointer: rewrite it
+        in place (a captured step keeps the array it was captured with)."""
+        z = {"device": self.device, "dtype": self.dtype}
+        if isinstance(edge, wp.array):
+            if edge.shape != (n_envs,) or edge.dtype is not VEC2[self.dtype]:
+                raise ValueError(
+                    f"per-env edges must be a [{n_envs}] vec2 array of the world dtype, "
+                    f"got shape {edge.shape} of {edge.dtype}"
+                )
+            self._arena_edges = edge
+            self.arena_edge = 1.0  # positive: the stop is on, the edges come from the array
+        else:
+            if edge <= 0.0:
+                raise ValueError(f"edge must be positive, got {edge}")
+            self._arena_edges = None
+            self.arena_edge = float(edge)
+        self._after = wp.zeros((n_envs, self.n_agents, act_dim), **z)
+        # Stand-ins for the delay's buffers when only the arena stop is on (never written).
+        self._zero_delay = wp.zeros((n_envs, self.n_agents), dtype=wp.int32, device=self.device)
+        self._zero_scratch = wp.zeros((1, 1, 1, 1), **z)
+        self.mutation_version += 1
 
     def set_obstacles(self, obstacles: Obstacles) -> None:
         """Install (or refresh) the obstacle set described by ``obstacles``.
@@ -397,6 +475,21 @@ class Stepper:
         )
         return ids, off, b_pos, r_ang, b_vel, b_ang_vel
 
+    def set_body_friction(self, mu_g: torch.Tensor) -> None:
+        """Install a per-env floor friction ``mu * g`` (``[n_envs]``) for the movable
+        bodies, overriding ``WorldConfig.obstacle_friction``.
+
+        Allocated on the first call; later calls copy in place, so the array a captured
+        step reads keeps its pointer. A scenario that draws it per episode can also write
+        :attr:`body_friction` directly from a reset kernel.
+        """
+        src = wp.from_torch(mu_g.detach().to(self.torch_dtype).contiguous(), dtype=self.dtype)
+        if self.body_friction is None or self.body_friction.shape != src.shape:
+            self.body_friction = wp.clone(src)
+            self.mutation_version += 1
+        else:
+            wp.copy(self.body_friction, src)
+
     def set_agent_params_per_env(self, floats: torch.Tensor | np.ndarray) -> None:
         """Install a per-env parameter override for domain randomization.
 
@@ -412,7 +505,9 @@ class Stepper:
         graph-mode loop — is trusted against the bound validated then: a stall per reset
         is exactly what that path exists to avoid. Widening the radius range past what the
         first install validated therefore needs a reinstall (a differently shaped or typed
-        array, or a fresh Stepper) for it to be re-checked.
+        array, or a fresh Stepper) for it to be re-checked. The same goes for the second
+        host-side check, that the ``P_SHAPE`` column equals the shared one: an agent's
+        :class:`~swarp.dynamics.base.AgentShape` is structural and never randomized.
 
         Args:
             floats: ``[n_envs, n_agents, NUM_PARAMS]`` array (torch.Tensor or
@@ -440,6 +535,21 @@ class Stepper:
             and floats.dtype == torch_dt
             and str(floats.device) == str(self.device)
         )
+        if not in_place:
+            # The shape column is structural, like the model tag: the lidar and the box-agent
+            # kernel routing (has_box_agents) are decided from the configs. This is
+            # the first-install / reallocation path, never the per-reset in-place refresh, so
+            # its host read stays off the hot loop (and out of any capture).
+            shared = np.array([float(c.shape) for c in self.configs])
+            if is_torch:
+                given = floats[..., P_SHAPE].detach().cpu().double().numpy()
+            else:
+                given = np.asarray(floats, dtype=np.float64)[..., P_SHAPE]
+            if not np.array_equal(given, np.broadcast_to(shared, given.shape)):
+                raise ValueError(
+                    "per-env params must not change the P_SHAPE column: an agent's "
+                    "AgentShape is structural and fixed by its AgentConfig."
+                )
         if self.collisions and not in_place:
             if is_torch:
                 max_r = float(floats[..., P_RADIUS].max())
@@ -480,6 +590,15 @@ class Stepper:
     @property
     def _needs_forces(self) -> bool:
         return self.collisions or self._soft_walls or self.n_obstacles > 0
+
+    def _wheel_torques(self, n_envs: int) -> wp.array:
+        """The per-agent contact torques of the wheel contacts, one buffer per batch size
+        (zeroed, so a world whose force pass never runs reads no torque)."""
+        buf = self._torques.get(n_envs)
+        if buf is None:
+            buf = wp.zeros((n_envs, self.n_agents), dtype=self.dtype, device=self.device)
+            self._torques[n_envs] = buf
+        return buf
 
     def zero_forces(self, n_envs: int) -> wp.array:
         """Shared all-zero force buffer (read-only, safe to reuse under a tape)."""
@@ -629,7 +748,14 @@ class Stepper:
         above it up to 29% slower (a single substep with 16+ agents per env). A single
         substep saves only two launches, so there the batch decides too: 4 agents were 15%
         faster at 1k envs and 5% slower at 16k, so it fuses up to
-        :data:`FUSE_MAX_AGENTS_ONE_SUBSTEP` agents in total."""
+        :data:`FUSE_MAX_AGENTS_ONE_SUBSTEP` agents in total.
+
+        A world holding box agents runs the chain's ``boxes`` variant under the same rule.
+        That variant needs 213-255 registers, but the same graph-mode sweep with box agents
+        (RTX 4070 Ti SUPER, 1k-16k envs, 4-16 agents, 1 and 4 substeps) crossed over in the
+        same place: at 4 substeps the chain was 1-48% faster, a single substep above the
+        limits 2-12% slower, and only 1k envs x 8 agents x 1 substep (4% faster fused) fell
+        on the wrong side."""
         mode = self.enable_fused_substeps
         if mode == "auto" and (
             self.n_agents > FUSE_AGENTS_PER_SUBSTEP * self.substeps
@@ -647,6 +773,9 @@ class Stepper:
             and self.world.integrator == Integrator.EULER
             and not self.any_movable
             and self.params.floats_per_env is None
+            and not self.world.wheel_contacts
+            and self.cmd_delay is None
+            and self._after is None
             and state_in.pos.device.is_cuda
             and self.n_agents <= FUSED_MAX_AGENTS
             and (not self.collisions or self.grid(state_in.pos.shape[0]).method == "brute")
@@ -719,6 +848,14 @@ class Stepper:
             and not buffers.taped
             and world.integrator == Integrator.EULER
         )
+        torques = None
+        if world.wheel_contacts:
+            if not slim:
+                raise ValueError(
+                    "WorldConfig.wheel_contacts runs on the slim Euler 2D path only (no "
+                    "drone agents, untaped, Integrator.EULER)"
+                )
+            torques = self._wheel_torques(n_envs)
         if write_in_place:
             if not slim:
                 raise ValueError(
@@ -731,6 +868,36 @@ class Stepper:
             chain = [state_in] * (self.substeps + 1)
         else:
             chain = [state_in, *buffers.inter_states, state_out]
+        delayed = self._delayed if self.cmd_delay is not None else []
+        after = self._after
+        if delayed or after is not None:
+            if buffers.taped:
+                raise ValueError("a command delay or arena stop runs on untaped steps only")
+            n_set = (self.cmd_delay if delayed else after).shape[0]
+            if n_set != n_envs:
+                raise ValueError(
+                    f"the command filters were enabled for {n_set} envs, stepping {n_envs}"
+                )
+            wp.launch(
+                concrete(step_commands_kernel, self.dtype),
+                dim=(n_envs, self.n_agents),
+                inputs=[
+                    actions,
+                    self.prev_actions if delayed else actions,
+                    self.cmd_delay if delayed else self._zero_delay,
+                    state_in.pos,
+                    state_in.theta,
+                    wp.int32(len(delayed)),
+                    self.dtype(self.arena_edge),
+                    self._arena_edges if self._arena_edges is not None else self._zero_edges,
+                    wp.int32(self._arena_edges is not None),
+                    self._delayed_scratch if delayed else self._zero_scratch,
+                    after if after is not None else actions,
+                ],
+                device=self.device,
+                record_tape=False,
+            )
+        applied = after if after is not None else actions
         grid = self.grid(n_envs) if self.collisions else None
         can_reuse = (
             reuse_neighbors
@@ -776,6 +943,11 @@ class Stepper:
                     bounds_min=self._bounds_min,
                     bounds_max=self._bounds_max,
                     dtype=self.dtype,
+                    # Box contacts read the headings and spins; a disc world passes None
+                    # and keeps the disc kernel.
+                    theta=st.theta if self.has_box_agents or torques is not None else None,
+                    ang_vel=st.ang_vel if self.has_box_agents or torques is not None else None,
+                    torques=torques,
                 )
                 if self.any_movable and not buffers.taped:
                     # Same state the force pass just used, so action and reaction match;
@@ -803,11 +975,24 @@ class Stepper:
                         bounds_max=self._bounds_max,
                         clamp_bounds=world.bounds is not None,
                         dtype=self.dtype,
+                        theta=st.theta,
+                        ang_vel=st.ang_vel,
+                        boxes=self.has_box_agents,
                     )
+                    if self.body_friction is not None or world.obstacle_friction > 0.0:
+                        launch_body_friction(
+                            self,
+                            st.pos.shape[0],
+                            sub_dt=self.sub_dt,
+                            friction_acc=world.obstacle_friction * world.gravity,
+                            friction_speed=world.obstacle_friction_speed,
+                            friction_grid=world.obstacle_friction_grid,
+                            dtype=self.dtype,
+                        )
             launch_integrate(
                 st,
                 chain[k + 1],
-                actions,
+                delayed[k] if k < len(delayed) else applied,
                 forces,
                 self.params,
                 self.sub_dt,
@@ -815,6 +1000,12 @@ class Stepper:
                 integrator=world.integrator,
                 slim=slim,
                 skip_drone=skip_drone and slim,
+                footprint=self.has_box_agents,
+                torques=torques,
+                lat_grip=world.wheel_lateral_friction * world.gravity,
+                turn_cap=world.wheel_turn_torque,
             )
+        if delayed:
+            wp.copy(self.prev_actions, actions)
         # State has advanced; the grid's lists no longer match this generation.
         self.state_version += 1

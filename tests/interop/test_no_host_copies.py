@@ -64,8 +64,16 @@ def _pusht():
     return PushTScenario(n_agents=2)
 
 
+def _pusht_lidar():
+    from swarp import PushTLidarScenario
+
+    return PushTLidarScenario(n_agents=3, obs_level=2)
+
+
 @pytest.mark.parametrize("device", DEVICES)
-@pytest.mark.parametrize("factory", [_transport, _pusht], ids=["transport", "pusht"])
+@pytest.mark.parametrize(
+    "factory", [_transport, _pusht, _pusht_lidar], ids=["transport", "pusht", "pusht_lidar"]
+)
 def test_obstacle_reinstall_no_host_transfer(device, factory):
     """Both body scenarios re-install their obstacle spec on every reset. That must not sync.
 

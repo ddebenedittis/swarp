@@ -41,6 +41,11 @@ All four are differentiable and integrate with either semi-implicit Euler or cla
 
 Every slot is clamped inside the kernel against that agent's limits (`max_speed`, `max_accel`, `max_ang_vel`, `max_ang_accel`, `max_steer`, `thrust_max`).
 
+`DIFF_DRIVE` has a third mode, `SERVO`: the action is still `(v, ω)`, but a drive tracks it the way a wheeled robot's motor controller tracks `cmd_vel`.
+Each substep the speed and turn rate move toward `cmd_gain_v · v` and `cmd_gain_w · ω` by at most `max_accel · dt` and `max_ang_accel · dt`, then are clamped to `max_speed` and `max_ang_vel` as in `VELOCITY`.
+The gains model a drive that under- or over-delivers, such as a skid-steer base that turns slower than commanded.
+The integrate kernels turn a `SERVO` command into the `VELOCITY` command it amounts to that substep, so no other mode reads the gain or limit columns.
+
 ### Per-slot action bounds
 
 Those limits *are* the action space — actions are physical and nothing rescales them:
@@ -51,6 +56,7 @@ Those limits *are* the action space — actions are physical and nothing rescale
 | `HOLONOMIC`, `ACCELERATION` | `±max_accel` | `±max_accel` | — |
 | `DIFF_DRIVE`, `VELOCITY` | `±max_speed` | `±max_ang_vel` | — |
 | `DIFF_DRIVE`, `ACCELERATION` | `±max_accel` | `±max_ang_accel` | — |
+| `DIFF_DRIVE`, `SERVO` | `±max_speed` | `±max_ang_vel` | — |
 | `KINEMATIC_BICYCLE` | `±max_accel` | `±max_steer` (an angle) | — |
 | `DRONE` | `[0, thrust_max]` | `[0, thrust_max]` | `[0, thrust_max]` |
 
@@ -85,11 +91,25 @@ With inertia ~1e-2 kg·m² a 10 Hz control step diverges — substep the physics
 | field | default | used by |
 |---|---|---|
 | `model`, `ctrl_mode` | `HOLONOMIC`, `VELOCITY` | all |
-| `radius`, `mass` | 0.05, 1.0 | all (contacts, and the drone's rigid body) |
+| `radius`, `mass` | `None` (= 0.05 for a disc, derived for a box), 1.0 | all (contacts, and the drone's rigid body) |
 | `max_speed`, `max_accel` | 1.0, 1.0 | all 2D models |
 | `max_ang_vel`, `max_ang_accel` | π, 2π | diff-drive |
 | `l_f`, `l_r`, `max_steer`, `min_speed` | 0.1, 0.1, π/4, `None` (= `-max_speed`) | kinematic bicycle |
 | `thrust_max`, `arm_length`, `inertia_xx/yy/zz`, `torque_coeff`, `gravity` | see `drone_config` | drone |
+| `shape`, `half_extents` | `AgentShape.DISC`, `(0, 0)` | the footprint; see below |
+| `cmd_gain_v`, `cmd_gain_w` | 1.0, 1.0 | diff-drive `SERVO` |
+
+### Agent shape
+
+An agent is a disc of `radius` by default.
+`shape=AgentShape.BOX` (or `"box"`) makes it a rectangle of `half_extents=(hx, hy)` centred on the agent, `hx` along its heading `theta` and `hy` across it.
+A box's `radius` is derived: it is the circumscribed radius `hypot(hx, hy)`, so the neighbor reach, spawn spacing and `World.agent_radius` stay conservative for it, and passing any other radius raises.
+A box needs positive half-extents, a disc must leave them at `(0, 0)`, and a drone cannot be a box.
+The footprint is packed into the parameter matrix as `P_SHAPE` (the tag as a float), `P_HALF_X` and `P_HALF_Y`, and mirrored on the world as `World.agent_shape` (`[n_agents]` int32) and `World.agent_half_extents` (`[n_agents, 2]`).
+
+A box agent collides as the oriented rectangle it is, against agents, obstacles and walls, and the [lidar](world.md#lidar) sees it the same way; the contact law is in [Box agents](world.md#box-agents).
+Contacts push its centre and apply no torque, so its heading is the one its dynamics model drives: a diff-drive or bicycle box turns as it steers, a holonomic box keeps the heading it was reset with.
+`NavigationScenario(agent_shape="box", agent_half_extents=(hx, hy))` builds a fleet of them.
 
 ## Heterogeneous fleets
 
@@ -113,10 +133,10 @@ floats[..., P_MAX_SPEED] *= rng.uniform(0.9, 1.1, size=floats.shape[:2])
 world.stepper.set_agent_params_per_env(floats)
 ```
 
-Columns follow `AgentConfig.to_row()` order and are addressed by the exported `P_*` index constants (`P_RADIUS`, `P_MASS`, `P_MAX_SPEED`, `P_MAX_ACCEL`, `P_MAX_ANG_VEL`, `P_MAX_ANG_ACCEL`, `P_LF`, `P_LR`, `P_MAX_STEER`, `P_THRUST_MAX`, `P_ARM`, `P_IXX`, `P_IYY`, `P_IZZ`, `P_KAPPA`, `P_GRAVITY`).
+Columns follow `AgentConfig.to_row()` order and are addressed by the exported `P_*` index constants (`P_RADIUS`, `P_MASS`, `P_MAX_SPEED`, `P_MAX_ACCEL`, `P_MAX_ANG_VEL`, `P_MAX_ANG_ACCEL`, `P_LF`, `P_LR`, `P_MAX_STEER`, `P_THRUST_MAX`, `P_ARM`, `P_IXX`, `P_IYY`, `P_IZZ`, `P_KAPPA`, `P_GRAVITY`, `P_MIN_SPEED`, `P_SHAPE`, `P_HALF_X`, `P_HALF_Y`).
 
 Parameters are static per episode, so call `set_agent_params_per_env` again at reset to re-randomize.
 Randomizing `P_RADIUS` upward is checked against `neighbor_radius`: if the widened contact reach would exceed it, the call raises rather than silently missing contacts.
-Model tags and control modes stay per-agent — they are structural and are never randomized.
+Model tags, control modes and the `P_SHAPE` column stay per-agent — they are structural and are never randomized (a first install that changes `P_SHAPE` raises).
 
 The recurrence itself is shared between the shared and per-env kernels, so the two cannot drift; the measured hot-path overhead is about 2% in the mid band and within noise elsewhere.

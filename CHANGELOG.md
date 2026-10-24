@@ -7,6 +7,67 @@ All notable changes to `swarp`. Newest first. Nothing has been released yet — 
 
 ### Added
 
+- **`pusht`/`pusht_lidar` per-env arena (`arena_size`), solid surroundings (`scenery_probs`) and T sizes (`tee_scale`).**
+  `arena_size` draws each env's W and H on every reset (a value, a range, or a range per axis); the spawns, the arena stop (`Stepper.enable_arena_stop` now takes a per-env edge array), the out-of-bounds limit and the label bound become per env and per axis, and `pusht_lidar` observes the half-extents after the heading.
+  `scenery_probs` draws per env nothing, perimeter walls, a rotated room or walls plus circles and capsules outside the arena (plus `scenery_clearance`), held by the stepper as immovable obstacles of a fixed slot bank, so the robots and the T collide with them and the lidar scans them; their per-env poses are mirrored in the new `swarp.sensors.Scenery`, which `lidar_scan(..., scenery=...)` and `lidar_scan_warp` also take.
+  `info()["scenery_leak"]` counts the rays they reach the policy through as T, `collision_penalty` charges a robot touching the other robot or a surroundings shape, and `tee_scale` draws the T per env from a bank of `n_tee_sizes` scaled copies.
+  Every obstacle loop skips a shape whose bounding disc cannot reach, bit-identically.
+  Default worlds launch nothing new.
+
+- **`swarp.rl` single-run guards**, off by default: an adaptive learning rate that follows the KL (`TrainSpec.adaptive_kl`, logged as `kl_lr_mult`), a floor under the actor's std (`TrainSpec.actor_scale_min`, `PolicyNet(scale_min=...)`), a KL brake (`TrainSpec.target_kl`) that skips an iteration's remaining minibatch steps on device, automatic rollback (`rollback`) to a pre-collapse snapshot with a halved learning rate, and a gated ramp clock (`ramp_gate`, `hold_iters`); `metrics.csv` logs `ramp_clock`, `approx_kl`, `kl_stop_frac`, `rollbacks` and `lr_mult`.
+  The rollout's store graph now fails loudly, naming the outputs, when a scenario's outputs move between steps.
+
+- **`SPECS["pusht_lidar_limo"]`**: lidar Push-T for two real AgileX Limos, from scratch in one guarded run: the slim T on 2–5 m open arenas with solid surroundings, a 220 deg field of view cut at the mount, AMCL-sized localisation error, command latency, the scan artefacts and the outside-the-arena mask; 0.97 greedy on its own distribution. See the Lidar Push-T page.
+
+- **A rotating lidar: `Lidar(scan_period=..., sweep_dir=...)` and `lidar_scan(..., sweep=...)`.**
+  A spinning sensor takes its rays one after the other and reports them against one pose; with the sweep on, ray `r` is cast from the pose `tau_r = (stamp_phase - phi_r) scan_period` before the reported one, at constant velocity, plus a per-agent mount yaw error (`sweep_offsets`).
+  A `wp.static` flag of the scan kernel, off by default, so a plain scan compiles to the code it always did; torch and Warp agree on randomized mixed scenes.
+
+- **`pusht_lidar` scan artefacts, deployment labels and a critic that sees the randomisation**, all opt-in (`swarp/scenarios/pusht_lidar_artefacts.py`).
+  `lidar_span` spans the rays over less than the full circle; `lidar_grazing_cos`, `lidar_dropout`, `lidar_spurious`, `lidar_range_scale` and `lidar_range_bias` lose, add and distort returns per robot; `lidar_scan_period`, `lidar_stamp_phase` and `lidar_yaw_bias` turn on the rotating scan.
+  `lidar_label_from_pose` classes every hit by the deployment's rule on the reported poses, so a teammate hit off its reported footprint reads as the T, and `lidar_arena_flag` adds a mask of the T-labelled hits past the arena.
+  `critic_dr` appends every randomised parameter, scaled to about [-1, 1] and role-sorted, to `critic_state()`.
+  Default worlds launch nothing new, and their step times are unchanged.
+
+- **`pusht`/`pusht_lidar` `open_arena`** (with `arena_size`): no walls, the T is not clamped, and a diff-drive robot meets a safety bridge's arena stop (`Stepper.enable_arena_stop`) instead; `pusht_lidar`'s `oob_margin` fails an episode whose T leaves the arena by that much.
+
+- **`swarp.rl` action-rate penalty** (`TrainSpec.action_rate_coef`, `action_rate_ramp_iters`; `--action-rate-coef`, `--action-rate-ramp-iters`): each agent's reward loses the weight times the mean squared change of its normalised action, logged as `action_rate`.
+  Off by default, and then training is byte-identical.
+
+- **`pusht_lidar`, a twelfth scenario: multi-robot Push-T observed through lidar, with pusher and observer roles.**
+  Five identical robots, two pushers and three observers by default, with the roles redrawn per env per episode at fixed counts; every robot can push, and the roles differ only in their rewards.
+  From `obs_level=1` on a robot does not observe the T pose: it sees its own pose, the goal, its teammates and its own 32-ray lidar (range, object mask, robot mask per ray), optionally a ring of past scans and, at level 2, every teammate's object-hit points pooled in the world frame.
+  Observers earn only penalty and potential terms (standoff, visibility, sector coverage, occlusion, contact), kept per term in `info()["multiobj_reward"]`.
+  It is the first scenario with the trainer hooks: a role-sorted `critic_state()`, `agent_roles()` and `aux_targets()` (the T in each robot's frame), all written by the observation pass; `SPECS["pusht_lidar"]` is the oracle stage that trains with role heads and a state critic.
+  The fused path launches the capture-safe Warp lidar inside the whole-step graph; the torch path scans with the `lidar_scan` oracle.
+
+- **Box agents collide as oriented boxes.**
+  `obb_contact` (`swarp/core/collisions.py`) gives every box pair a signed distance, a normal and a contact point: a separating-axis test over the four face normals with an early out past the reach, the exact vertex-versus-box distance when the boxes are disjoint, and the axis of least overlap with its contact point centred on the reference face when they intersect, so the distance is continuous through contact and a `+` crossing of two thin boxes is caught.
+  One frictionless spring-damper per pair uses the disc law, damped by the closing velocity of the two material points at the contact point.
+  Box agents collide with disc agents (`box_force` with the disc as the point), box agents (one contact per pair, lower index first, so equal-mass forces cancel exactly), box, segment (an exact capsule, round end caps) and circle obstacles, soft walls through their support extents, and the clamp, which insets a box by its extents at its new heading.
+  Movable bodies take a box agent's reaction from the same contact, so action equals reaction, and spin from an off-centre push.
+  The step stays differentiable through the contact geometry, headings included (gradchecked in float64).
+  A box agent feels no contact torque yet: its heading is driven by its dynamics model alone.
+  `NavigationScenario(agent_shape="box", agent_half_extents=...)` builds a box fleet, `python -m swarp.benchmark.throughput --agent-shape box` benchmarks one, and the viewer draws a box agent as its rotated rectangle.
+  Box worlds launch their own kernels (`collision_forces_box_kernel`, the `boxes` variants of the body pass and of the fused substep chain), all compiled without FP contraction so the layered and fused paths are bit-identical; `"auto"` keeps them on the layered pipeline until the fused crossover is measured.
+  Disc-only worlds launch the kernels they did before, and their trajectories are bit-identical.
+
+- **The lidar sees every shape: boxes, segments as capsules, and box agents, and reports what each ray hit.**
+  `lidar_scan`, `lidar_scan_warp` and `Lidar` ray-cast against oriented boxes (a slab test in the box frame), segment obstacles as the exact capsule the collision step uses, and box agents oriented by their heading, alongside the circles they already handled.
+  The circle-only filter that made boxes and segments invisible is gone, and with it the two host syncs it cost per install.
+  `return_hits=True` adds a per-ray `hit_class` (`uint8`: none, agent, immovable obstacle, movable obstacle) and `hit_index` (`int32`: the agent or obstacle shape index); `angle_end` narrows the field of view, with its first and last rays on the endpoints.
+  The torch and Warp backends agree on ranges and hits on randomized mixed scenes in float32 and float64, and the torch path is gradchecked through boxes, capsules and box agents.
+
+- **`Lidar.bind` / `Lidar.launch` make the Warp lidar capture-safe.**
+  `bind(world)` allocates the output buffers and loads the kernels once, outside any capture; `launch(world)` is then a single `wp.launch` against the live engine arrays, so a fused scenario can scan inside its captured whole-step graph.
+  `Lidar.scan` stays the eager wrapper over the pair.
+
+- **`AgentConfig(shape=AgentShape.BOX, half_extents=(hx, hy))`, the plumbing for box agents.**
+  The footprint is appended to the parameter matrix as `P_SHAPE`, `P_HALF_X` and `P_HALF_Y` (every existing column keeps its index) and mirrored as `World.agent_shape` and `World.agent_half_extents`.
+  A box's radius is its circumscribed one, so every radius-based bound stays conservative.
+  The contact physics is the entry above.
+  Disc-only worlds run the same arithmetic as before; only the parameter row grew from 17 to 20 columns.
+
 - **`ringroad`, an eleventh scenario: mixed-autonomy stop-and-go waves on the Flow / Sugiyama ring.**
   `n_agents` kinematic-bicycle RL cars (actions `(accel, steer)`) share a single-lane ring with IDM human drivers that the scenario integrates itself as 1-D state, the way `shepherding` owns its sheep.
   It is the one task here whose phenomenon needs many vehicles: at the Sugiyama density the IDM ring is stable up to 8 cars and string-unstable from 11, so a 6-car ring at the same density never grows the wave a 22-car ring does (linear growth rate −0.103/s against +0.024/s; the Scenarios page has the whole sweep).
@@ -241,6 +302,10 @@ All notable changes to `swarp`. Newest first. Nothing has been released yet — 
   host-side stream, reset alongside the generator, with no device->host round-trip.
 
 ### Breaking changes
+
+- **`NUM_PARAMS` is 20 (was 17)**: a per-env parameter array built by hand with 17 columns is rejected; `per_env_float_template` builds the right width.
+  `AgentConfig.radius` now defaults to `None`, which resolves to 0.05 for a disc as before and to the derived radius for a box.
+- **`lidar_scan_warp` returns freshly allocated tensors**; the reused-buffer convention moved to the `Lidar` object, whose Warp outputs are views of buffers it owns.
 
 - **`SamplingScenario(collision_penalty=...)` is gone.** The parameter was stored and never
   read — the reward never had a collision term. Agents still collide physically

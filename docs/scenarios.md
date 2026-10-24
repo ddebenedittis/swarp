@@ -3,7 +3,7 @@
 A scenario defines the task: what the world is made of, how it resets, and what the agents observe and are rewarded for.
 The engine knows nothing about tasks — every built-in scenario is written against the same public `Scenario` ABC you would use for your own.
 
-## The eleven built-ins
+## The twelve built-ins
 
 | name | task | agents | `obs_dim` | notable |
 |---|---|---|---|---|
@@ -13,11 +13,12 @@ The engine knows nothing about tasks — every built-in scenario is written agai
 | `discovery` | cover scattered targets, each needing several agents nearby | 5 | 19 | one-off shared reward the step a target is first covered, plus optional per-agent closing speed on the nearest uncovered target (off by default) |
 | `sampling` | collect an unknown scalar field, consuming cells | 4 | 13 | batched sum-of-Gaussians density on a grid; obs is the 3×3 cell neighborhood |
 | `transport` | push a movable circular package to a goal | 4 | 8 | package integrated in torch, staggered by one step, so BPTT flows package→agent→action |
-| `pusht` | push a T-shaped rigid body to a target **pose** | 4 | 18 | movable compound body with rotation; needs `substeps >= 8`; optional cost on heading-error growth, so extra turns are not free (off by default) |
+| `pusht` | push a T-shaped rigid body to a target **pose** | 4 | 18 | movable compound body with rotation; needs `substeps >= 8`; optional cost on heading-error growth, so extra turns are not free (off by default); `shape=` swaps the T for another compound from `swarp.scenarios.shapes` (`ell`, `plus`, `bar`) |
 | `giveway` | cross a one-lane intersection without deadlocking | 4 | 25 | the only task whose solution requires moving *away* from your goal; a per-episode `politeness` scalar breaks the mirror symmetry that would otherwise force deadlock |
 | `shepherding` | drive non-cooperative sheep into a pen | 3 dogs + 5 sheep | 34 | the environment pushes back: sheep flee the dogs and cohere, so a dog must herd rather than chase |
 | `caging` | surround an evasive disc so it cannot escape | 5 | 23 | a *topological* objective — the maximum angular gap between agents, not any distance |
 | `ringroad` | damp stop-and-go waves on a single-lane ring of IDM drivers | 1 car + 21 IDM humans | 9 | kinematic-bicycle RL cars among scenario-owned IDM traffic; the wave only exists on a ring of about 11 or more cars at this density |
+| `pusht_lidar` | push the T to a target pose, observed only through each robot's lidar | 2 pushers + 3 observers | 117 | per-episode random roles with fixed counts; `obs_level` 0 adds the oracle T pose, 2 adds teammates' pooled object hits; the only scenario with the trainer's `critic_state`/`agent_roles`/`aux_targets` hooks ([Lidar Push-T](pusht-lidar.md)) |
 
 Defaults shown; every scenario takes constructor keywords (`n_agents`, `world_size`, shaping factors, penalties, tolerances).
 `navigation`, `flocking` and `giveway` size their observation from `neighbor_obs`, so their `obs_dim` moves with it;
@@ -28,6 +29,7 @@ The last three are newer and break assumptions the first seven share.
 Every one of the original seven rewards monotone progress toward a goal, so a greedy "reduce the distance" controller does well on all of them;
 `giveway` cannot be solved that way (the greedy policy deadlocks nose-to-nose in the corridor), `caging` scores an angular property rather than a distance, and `shepherding` is the only one whose environment reacts to what the agents do.
 `ringroad` has no goal at all, and its difficulty comes from the number of vehicles, as the next section explains.
+`pusht_lidar` is Push-T without the object pose: the team must infer the T from its lidars, and the observers are rewarded for keeping it in view rather than for moving it.
 
 ## Ring road: a task that needs many vehicles
 
@@ -116,6 +118,7 @@ cls = swarp.scenario_class("pusht")                   # the class itself
 
 `SCENARIOS` is the one registry; `make` raises a `ValueError` listing the valid names for anything else.
 `make_scenario` drops a `model=` keyword for holonomic-only scenarios, so a sweep over dynamics models can pass it uniformly.
+`navigation` takes every planar model; `pusht` and `pusht_lidar` take holonomic and diff-drive robots (their `supported_models`), plus `agent_shape="box"`.
 
 ## Two execution paths
 

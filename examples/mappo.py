@@ -45,6 +45,7 @@ from swarp.rl.recipes import (  # noqa: F401  (re-exported for train_mappo / eva
     plot_curve,
     random_actions,
     requires_success_spec,
+    scenario_name,
     wilson_ci,
     zero_actions,
 )

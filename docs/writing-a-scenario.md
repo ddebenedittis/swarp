@@ -10,7 +10,7 @@ want it.
    the no-grad hot path, foldable into the whole-step CUDA graph. Worth 4–11× (see
    [benchmarks](benchmarks.md)); costs you a kernel module and a buffer spec.
 
-All eleven built-in scenarios are `FusedScenario`s, and they implement the *same* member
+All twelve built-in scenarios are `FusedScenario`s, and they implement the *same* member
 set — there are no opt-outs to copy from.
 
 ---
@@ -57,7 +57,7 @@ constructor does not expose (`integrator`, `bounds_mode`, `neighbor_reuse`, `gri
 `uniform_bins`, the obstacle damping) via `swarp.make(..., world_config=...)` without
 subclassing, while your computed `bounds` and `neighbor_radius` survive — only the fields
 set away from the `WorldConfig()` defaults are taken. `tests/scenarios/test_scenarios.py`
-pins that all eleven built-ins do this.
+pins that all twelve built-ins do this.
 
 ### `reset_world` must be host-sync-free
 
@@ -86,6 +86,38 @@ those to raise and steps the env.
 have **already been returned to the caller**, so this pass must recompute observations
 without clobbering their buffers. `False` (a standalone `reset`/`reset_at`) recomputes
 everything, so `info()` is populated.
+
+### Training hooks (optional)
+
+Four optional hooks hand a trainer what the observation does not carry.
+Each defaults to "not provided", and `Environment` forwards each one under the same name, as it does `obs_dim`:
+
+| member | default | shape | read by `swarp.rl` for |
+|---|---|---|---|
+| `state_dim: int`, `critic_state()` | `0`, `None` | `[n_envs, state_dim]` float | a privileged centralised critic (`critic_input="state"`) |
+| `n_roles: int`, `role_counts: tuple[int, ...]`, `agent_roles()` | `1`, `()`, `None` | `[n_envs, n_agents]` integer | role-specific policy heads and a role-ordered critic |
+| `aux_dim: int`, `aux_targets()` | `0`, `None` | `[n_envs, n_agents, aux_dim]` float | an auxiliary regression loss on the actor's features |
+| `comm_mask()` | `None` (everyone hears everyone) | `[n_envs, n_agents, n_agents]` bool, `[e, i, j]`: `i` hears `j` | who a communicating actor (`comm="attn"`) may attend to |
+
+`role_counts` is fixed for the run and sums to `n_agents`: which agent holds which role may change every episode, but each env always has exactly `role_counts[r]` agents in role `r`.
+`swarp.rl` checks this once, on every env, when it resets, and raises on a row that breaks it, since a per-role network would otherwise silently run on the wrong agents.
+
+With roles, `critic_state()` is written in **role-sorted agent order**: any per-agent block lists role 0's agents by ascending agent index, then role 1's, and so on, not agents by index.
+The critic reads the state as it comes and adds no role one-hot, so the order is the only role information it gets; with `per_agent_value` its output slot `k` is the agent at role-sorted rank `k`, so per-agent block `k` of the state must describe that same agent.
+`swarp.rl.networks.role_permutation(roles, role_counts)` gives that order without a sort (`x.gather(-1, perm)` lists `x` role-sorted), and is capturable.
+
+The contract is the one the trainer's CUDA graphs rely on:
+
+- **Fixed address.**
+  Each method returns the same tensor every call (a buffer allocated in `make_world`, or a `Buf` of a fused scenario), updated in place.
+  The rollout graph reads it by address, as it reads the observation.
+- **Written by the observation pass.**
+  The values describe the state the current observation describes, so they are written by the same pass that writes `observations()`, including the obs-only pass after an auto-reset.
+  With `auto_reset=True` the observation returned at an episode's last step already belongs to the next episode, and so must the state, the roles, the auxiliary targets and the comm mask.
+  A role drawn in `reset_world` before the obs pass meets this; a critic state recomputed lazily in `info()` does not.
+- **Host-sync-free**, like `reset_world`, since the obs pass runs inside the step.
+
+The hooks live on the plain `Scenario` base, not in the `FusedScenario` framework, so a fused scenario overrides them like `obs_dim` and the zero-opt-outs rule is unaffected.
 
 ---
 
@@ -256,11 +288,13 @@ why, because it is the shape of every such exception:
 pins it, including a `wp.ScopedCapture` case. Anything that cannot meet a bar like that
 belongs in the spec instead, where the framework allocates it once, up front.
 
+The lidar is the other ready-made capture-safe call: `Lidar.bind(world)` once outside the capture, then `Lidar.launch(world)` inside `launch_fused` ahead of the kernel that reads `lidar.wp_ranges` (see [the lidar section](world.md#inside-a-captured-step)).
+
 ### The torch reference path is the parity oracle
 
 `post_step_torch` / `reset_torch` and whatever they call (`_refresh`, `_box_contact`, …) are
 what the fused kernels are *tested against*. Keep them independent — sharing code with the
-fused path would weaken the exact property the eleven `tests/scenarios/test_*_fused.py`
+fused path would weaken the exact property the twelve `tests/scenarios/test_*_fused.py`
 suites exist to test. For the same reason the `_launch_*` wrappers are deliberately not
 unified: their `wp.launch` signatures are bespoke, and a launch DSL would be a worse
 `wp.launch` with none of Warp's type checking.

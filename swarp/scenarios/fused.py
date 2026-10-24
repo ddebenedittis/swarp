@@ -279,6 +279,16 @@ class FusedScenario(Scenario):
                 f"{type(self).__name__}.fused_spec declares {len(masks)} reset_mask "
                 f"buffers ({[b.name for b in masks]}); there can be at most one"
             )
+        # ``fb``/``_wp`` are keyed by name (plus ``name + "_bool"`` for a bool view), so a
+        # repeated name would silently replace the earlier buffer. That is the easy mistake
+        # for a subclass that extends its parent's spec with ``super().fused_spec(...)``.
+        names = [b.name for b in spec] + [b.name + "_bool" for b in spec if b.bool_view]
+        dupes = sorted({n for n in names if names.count(n) > 1})
+        if dupes:
+            raise ValueError(
+                f"{type(self).__name__}.fused_spec declares the buffer name(s) {dupes} "
+                "more than once (a bool_view also claims name + '_bool')"
+            )
         self.fb = {}
         self._wp = {}
         self._fused_ptrs: dict[str, int] = {}

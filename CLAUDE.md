@@ -105,10 +105,16 @@ TorchRL `EnvBase` wrapper).
   sharing a body id form one compound rigid pose (Push-T's T). **Not taped**
   (`record_tape=False`), so a scenario needing gradients through a body integrates it in
   torch itself. Box-box obstacle-obstacle contacts are not modelled.
+  A box agent's reaction comes from the same oriented-box contact the agent side applies, in a `wp.static(boxes)` variant of the body kernel (torque through the lever to the contact point); disc worlds launch the disc variant.
+- `swarp/core/collisions.py` — the contact law (`pair_force`, `box_force`, `obb_contact`/`obb_force`) and the gather-based force kernels.
+  Box agents (`AgentShape.BOX`) run `collision_forces_box_kernel`, routed by `Stepper.has_box_agents`: SAT over the four face normals, exact vertex distance when disjoint, least-overlap axis when overlapping, the disc law damped at the contact point (`v + ω×r`), support-extent walls and a footprint clamp (`clamp_bounds == 2`). No contact torque on agents.
+  Every box-world kernel compiles with `fuse_fp=False` so layered and fused stay bit-identical; disc-only worlds never launch any of it, and their step is the disc step unchanged.
+  Every obstacle loop (agent side, body pass, lidar) skips a shape whose bounding disc cannot reach the agent, the other body or the lidar range (`shape_bound`/`bounds_apart`, `_out_of_range`): every contact law adds force only at positive overlap, so the skip is exact (bit-identical), and parked or far shapes cost one distance test. The floor friction skips a body at rest, for the same reason.
 - `swarp/core/fused_substeps.py` — the whole no-grad substep chain (forces, integration, every substep, optionally the post-step neighbor list) as one kernel: a CUDA block per group of whole envs, a `__syncthreads` barrier (`wp.func_native`) between the force and the in-place integrate phase.
   It is bit-identical to the layered pipeline by construction (same neighbor membership and order, same `pair_force`/`_step_2d`), which `tests/interop/test_fused_substeps.py` checks for every scenario.
   `Stepper.enable_fused_substeps="auto"` routes to it only where it measured faster (≤ 4 agents per env per substep; with one substep, ≤ 16,384 agents in all): it trades ~3 launches per substep for ~100 registers per thread, and loses on large single-substep batches.
   Kernel variants are compiled per world (`wp.static` flags) and their `(emit, reuse)` siblings are loaded together, because a variant first launched inside a capture cannot be loaded there.
+  The `boxes` flag adds the box-agent contacts (per-pair dispatch on `P_SHAPE`); with it off the generated code is the disc chain's. `"auto"` routes box worlds by the disc thresholds (measured: same crossover, `docs/performance.md`).
 - `swarp/dynamics/base.py` — `DynamicsModel`/`ControlMode`/`Integrator` enums, `AgentConfig`
   (per-agent, mixable in one world), and `build_agent_params`. Four models: holonomic point,
   diff-drive, kinematic bicycle (all 2D), and a 6-DOF `+`-config quadrotor whose `AgentConfig`
@@ -118,8 +124,8 @@ TorchRL `EnvBase` wrapper).
 - `swarp/core/neighbors.py` — `NeighborGrid` with three backends (per-env brute force, a batched
   radix-sort `uniform_grid`, and one `wp.HashGrid` over all envs), selected via
   `WorldConfig.neighbor_method`; tested to agree exactly.
-- `swarp/scenarios/` — 11 scenarios: navigation, flocking, formation, discovery, sampling,
-  transport, pusht, giveway, shepherding, caging, ringroad. Each pairs a torch implementation of
+- `swarp/scenarios/` — 12 scenarios: navigation, flocking, formation, discovery, sampling,
+  transport, pusht, giveway, shepherding, caging, ringroad, pusht_lidar. Each pairs a torch implementation of
   obs/reward/done with fused Warp `*_kernels.py` for the no-grad hot path. The torch path is
   the **parity oracle** the fused kernels are tested against — keep them independent rather
   than sharing code. The first seven all reward monotone progress toward a goal; the last
@@ -127,15 +133,21 @@ TorchRL `EnvBase` wrapper).
   angular property rather than a distance, shepherding's environment reacts, and ringroad's
   stop-and-go wave only exists on a ring of about 11+ cars at its density, so it is the one
   task whose phenomenon needs many vehicles; its IDM humans are scenario-owned 1-D state).
-  `giveway`/`shepherding`/`caging`/`ringroad` each emit `info()["multiobj_reward"]`
+  `pusht_lidar` subclasses `pusht`: robots see the T only through the capture-safe Warp lidar
+  (launched inside the whole-step graph), hold per-episode pusher/observer roles, and it is
+  the one scenario that implements the training hooks (`critic_state`, `agent_roles`,
+  `aux_targets`).
+  `SPECS["pusht_lidar_limo"]` is the one real-robot (AgileX Limo) recipe; the variants that led to it (L1–L12) live only in `notes/pusht-lidar-limo.md` (a removable working note outside the docs site) and under the tag `archive/pusht-lidar-limo`. Evolve that recipe in place rather than adding `_vN` variants.
+  `pusht`/`pusht_lidar` take `model` (holonomic or diff_drive, their `supported_models`) and `agent_shape="box"`; either makes the heading matter: randomised by a separate reset kernel, observed as cos/sin, body-frame lidar. Default fleets stay bit-identical.
+  `giveway`/`shepherding`/`caging`/`ringroad`/`pusht_lidar` each emit `info()["multiobj_reward"]`
   `[n_envs, n_agents, n_obj]` summing to the scalar reward, so a shaping imbalance is visible
   on the first training iteration rather than after an hour — that check has already caught
   one 22x imbalance.
-- `swarp/scenarios/fused.py` — `FusedScenario`, which all 11 subclass. A scenario declares its
+- `swarp/scenarios/fused.py` — `FusedScenario`, which all 12 subclass. A scenario declares its
   persistent buffers as a tuple of `Buf` from `fused_spec(n_envs)` and its launch sequence
   as `launch_fused(FusedPass)`; the framework owns lazy allocation, uint8→bool reinterpret
   views, Warp handle caching, pointer-move resync, the recapture token, the warm-up carry
-  list and the reset-mask stamp. **Zero opt-outs** — a test asserts all 11 implement the same
+  list and the reset-mask stamp. **Zero opt-outs** — a test asserts all 12 implement the same
   four members and override none of the framework's. `swarp/core/hooks.py` holds
   `WholeStepHook`, the declared form of what the scenario hands `StepRuntime`. Contract and
   capture-safety rules: `docs/writing-a-scenario.md`.

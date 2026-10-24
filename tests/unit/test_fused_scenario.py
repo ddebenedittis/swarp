@@ -314,6 +314,16 @@ def test_two_reset_masks_are_rejected():
         scen.ensure_fused()
 
 
+def test_duplicate_buffer_names_are_rejected():
+    """A subclass appending to ``super().fused_spec()`` must not shadow a parent buffer."""
+    scen = _build(Buf("obs", (4, 3)), Buf("obs", (4, 5)))
+    with pytest.raises(ValueError, match="more than once"):
+        scen.ensure_fused()
+    scen = _build(Buf("done", (4,), "uint8", bool_view=True), Buf("done_bool", (4,)))
+    with pytest.raises(ValueError, match="more than once"):
+        scen.ensure_fused()
+
+
 def test_if_none_allocates_and_assigns_the_attribute():
     scen = _build(Buf("x", (4, 3), attr="x", alloc="if_none"), x=None)
     scen.ensure_fused()

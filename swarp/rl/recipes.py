@@ -26,6 +26,7 @@ import torch
 
 import swarp
 from swarp import Environment
+from swarp.rl.networks import COMMS, ROLE_PARAMS
 from swarp.scenarios import scenario_class
 from swarp.scenarios.base import Scenario
 
@@ -61,6 +62,51 @@ class CurriculumKnob:
 
 
 @dataclass(frozen=True)
+class Ramp:
+    """One scenario attribute the trainer ramps from ``lo`` to ``hi`` over iterations
+    ``[start, end)``: what a staged recipe does by resuming under new keywords, in one run.
+
+    Unlike a :class:`CurriculumKnob` it follows the iteration count, not the solve-gated
+    difficulty, so a cost or a noise can come in only once the policy has learned without
+    it. A value is a float or a tuple of floats; an ``int`` in ``hi`` rounds its entry. The
+    ramp moves in ``steps`` increments, and the trainer recaptures the env's graph on each:
+    a captured step bakes in every scalar it reads by value, so a changed reward weight
+    would otherwise never reach it.
+    """
+
+    attr: str
+    lo: float | tuple[float, ...]
+    hi: float | tuple[float, ...]
+    start: int
+    end: int
+    steps: int = 20
+
+    def progress(self, it: int) -> float:
+        """The quantized fraction of the ramp done at iteration ``it``, in ``[0, 1]``."""
+        if it >= self.end:
+            return 1.0
+        f = max(0.0, (it - self.start) / max(self.end - self.start, 1))
+        return math.floor(f * self.steps) / self.steps
+
+    def value(self, it: int) -> float | tuple[float, ...]:
+        f = self.progress(it)
+
+        def lerp(lo: float, hi: float) -> float:
+            v = lo + (hi - lo) * f
+            return round(v) if isinstance(hi, int) else v
+
+        if isinstance(self.hi, tuple):
+            return tuple(lerp(lo, hi) for lo, hi in zip(self.lo, self.hi, strict=True))
+        return lerp(self.lo, self.hi)
+
+
+#: ``TrainSpec.actor`` values: the obs-only Actor or the role-aware PolicyNet.
+ACTORS = ("mlp", "policynet")
+#: ``TrainSpec.critic_input`` values.
+CRITIC_INPUTS = ("obs", "state", "state+obs")
+
+
+@dataclass(frozen=True)
 class TrainSpec:
     """The recipe that produced a checkpoint, for one scenario.
 
@@ -80,6 +126,10 @@ class TrainSpec:
     """
 
     # --- simulation ---------------------------------------------------------------
+    scenario: str | None = None
+    """The registered scenario this recipe builds, for a recipe keyed by another name (a
+    variant of a scenario, such as its physical-scale configuration). ``None`` means the
+    ``SPECS`` key itself; :func:`scenario_name` resolves either."""
     dt: float = 0.1
     substeps: int = 1
     max_steps: int = 200
@@ -92,6 +142,8 @@ class TrainSpec:
     epochs: int = 8
     minibatches: int = 4
     lr: float = 1e-3
+    lr_final: float | None = None
+    """When set, ``lr`` decays linearly to this over the run."""
     gamma: float = 0.99
     lmbda: float = 0.95
     entropy_coeff: float = 3e-3
@@ -103,6 +155,28 @@ class TrainSpec:
     """torchrl's ``ClipPPOLoss`` defaults this to ``False``. With a large sparse terminal
     bonus on top of small dense shaping -- which is every scenario here -- unnormalized
     advantages swing the effective step size by orders of magnitude between iterations."""
+    target_kl: float | None = None
+    """When set, an iteration's remaining minibatch steps are skipped on device once one
+    minibatch's approximate KL to the rollout policy, ``mean((r - 1) - log r)``, exceeds
+    ``1.5 * target_kl`` (that minibatch's own step included). A brake on destructive
+    updates: a staged slim-T Limo run fell 0.83 -> 0.22 in 60 iterations of 128 steps
+    each, no step non-finite."""
+    actor_scale_min: float | None = None
+    """When set, the floor under the actor's Gaussian std (``PolicyNet``'s ``scale_min``,
+    0.01 by default). A higher floor keeps a policy from sharpening faster than it learns;
+    the greedy action is the mean, so the deployed policy is unaffected."""
+    adaptive_kl: float | None = None
+    """When set, the learning rate follows the KL (rsl_rl's adaptive schedule, per
+    iteration): its multiplier is divided by 1.5 after an iteration whose mean approximate
+    KL exceeds ``2 * adaptive_kl`` and multiplied by 1.5 after one below ``adaptive_kl / 2``,
+    within ``[1/64, 1]`` of the scheduled rate. A policy that sharpens (its entropy falling)
+    moves further per step; this slows it there instead of freezing the iteration as
+    ``target_kl`` does."""
+    rollback: bool = False
+    """Roll the actor, critic and Adam back to an earlier snapshot when the windowed solve
+    rate collapses, halving the learning rate, instead of training on a dead policy (see
+    :class:`~swarp.rl.ppo.RollbackGuard`). The run stops, its best checkpoint saved, after
+    ``RollbackGuard.max_rollbacks`` of them."""
     # --- curriculum ---------------------------------------------------------------
     curriculum: tuple[CurriculumKnob, ...] = ()
     curriculum_iters: int = 0
@@ -112,6 +186,20 @@ class TrainSpec:
     curriculum_gate: float = 0.35
     curriculum_fn: Callable[[Scenario, float], None] | None = None
     """Escape hatch for anything the affine knobs cannot express. Applied after them."""
+    ramps: tuple[Ramp, ...] = ()
+    """Scenario attributes on an iteration schedule (:class:`Ramp`). With any, the best
+    checkpoint is ranked on how far they have run before the solve rate, so a policy that
+    solved before the noise came in does not stay "best"."""
+    ramp_gate: float | None = None
+    """When set, the ramps follow a gated clock instead of the iteration: it runs freely up
+    to the first ramp's start, and from there advances only on iterations whose windowed
+    solve rate is at least this, so no condition comes in before the policy has mastered
+    the last. The learning rate then decays over that clock (to ``lr_final`` at the last
+    ramp's end plus ``hold_iters``), and the run ends there, ``iters`` being a cap. The
+    entropy schedule stays on the iteration count."""
+    hold_iters: int = 0
+    """With ``ramp_gate``: clock ticks to train at the final conditions after the last ramp
+    ends."""
     # --- reporting ----------------------------------------------------------------
     metrics: tuple[str, ...] = ()
     """``scenario.info()`` keys to log, mean-reduced. A ``multiobj_reward`` key is
@@ -123,6 +211,96 @@ class TrainSpec:
     """Desynchronise episode starts before the first rollout (see ``MAPPO.reset``). For a
     scenario whose episodes mostly run to ``max_steps``: without it every env truncates on
     the same step and each batch is one slice of the episode, in phase across all envs."""
+    # --- networks -----------------------------------------------------------------
+    # The defaults are the plain shared-weight Actor and obs-only Critic. The rest needs
+    # the scenario's training hooks (``Scenario.critic_state`` / ``agent_roles`` /
+    # ``aux_targets``); see docs/training.md.
+    actor: str = "mlp"
+    """``"mlp"``: :class:`~swarp.rl.networks.Actor`, obs only. ``"policynet"``:
+    :class:`~swarp.rl.networks.PolicyNet`, which reads the scenario's roles (if it has
+    any) through ``role_params`` and carries the aux head when ``aux_coef > 0``."""
+    role_params: str = "heads"
+    """How a ``"policynet"`` actor's parameters depend on the role: ``"shared"`` (role as an
+    input only), ``"heads"`` (one output head per role) or ``"separate"`` (one network per
+    role). Ignored for ``"mlp"`` and for a scenario without roles."""
+    critic_input: str = "obs"
+    """``"obs"`` (every agent's observation), ``"state"`` (the scenario's privileged
+    ``critic_state()``) or ``"state+obs"``."""
+    per_agent_value: bool = False
+    """One value per agent (per role-sorted slot when the scenario has roles) instead of
+    one team value broadcast to every agent."""
+    aux_coef: float = 0.0
+    """Weight of the auxiliary loss ``mse(aux_head(features), scenario.aux_targets())``;
+    0 disables it. Above 0 it needs ``actor="policynet"`` and a scenario with
+    ``aux_dim > 0``."""
+    action_rate_coef: float = 0.0
+    """Weight of the action-rate penalty: every agent's reward loses
+    ``action_rate_coef * mean_i(((a_t - a_{t-1}) / half_i)^2)``, ``half_i`` the action
+    box's half-width, with ``a_{t-1} = 0`` on an episode's first step (a robot starts at
+    rest). 0 disables it; above 0 the trainer logs the mean squared change as
+    ``action_rate``."""
+    action_rate_ramp_iters: int = 0
+    """Iterations over which the action-rate weight ramps linearly from 0 to
+    ``action_rate_coef``; 0 starts at the full weight. Counted from the run's first
+    iteration, a resumed run included."""
+    # --- memory and communication (a ``"policynet"`` actor only) ----------------------
+    recurrent: bool = False
+    """A GRU after the policy's trunk, its hidden state carried across steps and reset at
+    episode ends; the update backpropagates through time over ``seq_len`` chunks."""
+    hidden_dim: int = 128
+    """Width of the GRU's hidden state. Ignored unless ``recurrent``."""
+    seq_len: int = 0
+    """Length of the update's BPTT chunks; 0 means ``steps_per_batch`` (one chunk per env
+    and rollout). Must divide ``steps_per_batch``. Ignored unless ``recurrent``."""
+    comm: str = "none"
+    """``"none"``, or ``"attn"``: one round of attention over teammates' encoded inputs
+    before the trunk, restricted by the scenario's ``comm_mask()`` when it has one."""
+    comm_dim: int = 64
+    """Width of the encoded input, the keys, the values and the message. Ignored unless
+    ``comm="attn"``."""
+
+    def __post_init__(self) -> None:
+        for name, allowed in (
+            ("actor", ACTORS), ("role_params", ROLE_PARAMS), ("critic_input", CRITIC_INPUTS),
+            ("comm", COMMS),
+        ):
+            if getattr(self, name) not in allowed:
+                raise ValueError(f"{name} must be one of {allowed}, got {getattr(self, name)!r}")
+        if self.aux_coef < 0:
+            raise ValueError(f"aux_coef must be >= 0, got {self.aux_coef}")
+        if self.action_rate_coef < 0 or self.action_rate_ramp_iters < 0:
+            raise ValueError("action_rate_coef and action_rate_ramp_iters must be >= 0")
+        if self.aux_coef > 0 and self.actor != "policynet":
+            raise ValueError("aux_coef > 0 needs actor='policynet' (the aux head lives there)")
+        if self.recurrent and self.actor != "policynet":
+            raise ValueError("recurrent=True needs actor='policynet' (the GRU lives there)")
+        if self.comm != "none" and self.actor != "policynet":
+            raise ValueError(f"comm={self.comm!r} needs actor='policynet' (the attention "
+                             "lives there)")
+        for name in ("hidden_dim", "comm_dim"):
+            if getattr(self, name) < 1:
+                raise ValueError(f"{name} must be >= 1, got {getattr(self, name)}")
+        if self.seq_len < 0:
+            raise ValueError(f"seq_len must be >= 0 (0 means steps_per_batch), got {self.seq_len}")
+        if self.seq_len and not self.recurrent:
+            raise ValueError("seq_len is the BPTT chunk length: it needs recurrent=True")
+        if self.seq_len and self.steps_per_batch % self.seq_len:
+            raise ValueError(
+                f"seq_len {self.seq_len} must divide steps_per_batch {self.steps_per_batch}"
+            )
+        if self.target_kl is not None and self.target_kl <= 0:
+            raise ValueError(f"target_kl must be > 0, got {self.target_kl}")
+        if self.actor_scale_min is not None and self.actor == "mlp":
+            raise ValueError("actor_scale_min is a PolicyNet option: it needs actor != 'mlp'")
+        if self.adaptive_kl is not None and self.adaptive_kl <= 0:
+            raise ValueError(f"adaptive_kl must be > 0, got {self.adaptive_kl}")
+        if self.ramp_gate is not None and not self.ramps:
+            raise ValueError("ramp_gate gates the ramps' clock: it needs ramps")
+        if self.hold_iters < 0:
+            raise ValueError(f"hold_iters must be >= 0, got {self.hold_iters}")
+        if self.hold_iters and self.ramp_gate is None:
+            raise ValueError("hold_iters counts ticks of the gated ramp clock: it needs "
+                             "ramp_gate")
 
 
 # Scenarios with no success criterion: both inherit the all-False ``Scenario.done``, so an
@@ -205,6 +383,160 @@ SPECS: dict[str, TrainSpec] = {
         ),
         curriculum_iters=250, curriculum_gate=0.0,
         metrics=("tee_dist_to_goal", "tee_angle_error"),
+    ),
+    # Lidar Push-T, stage T0: Push-T's physics and shaping with five robots (two pushers,
+    # three observers) and the oracle T block still in the observation (obs_level 0), so
+    # this stage isolates the roles, the observer rewards and the privileged critic from
+    # the perception problem. The critic reads the role-sorted critic_state() with one
+    # value per role-sorted slot; the actor is one trunk with a head per role. The aux
+    # loss is off until the stages that drop the T pose (docs/pusht-lidar.md).
+    "pusht_lidar": TrainSpec(
+        dt=0.05, substeps=8, max_steps=400, n_agents=5,
+        scen_kwargs={
+            "pos_shaping_factor": 5.0, "rot_shaping_factor": 0.5, "rot_away_penalty": 1.0,
+            "obs_level": 0,
+        },
+        iters=4000, n_envs=512, steps_per_batch=32, epochs=8, minibatches=4,
+        lr=5e-4, entropy_coeff=3e-3, num_cells=256, normalize_advantage=False,
+        curriculum=(
+            CurriculumKnob("goal_spawn_radius", 0.25, 0.25 + 1.9),
+            CurriculumKnob("goal_spawn_angle", 0.4, math.pi),
+        ),
+        curriculum_iters=250, curriculum_gate=0.0,
+        metrics=("tee_dist_to_goal", "tee_angle_error", "team_coverage",
+                 "observer_visibility", "occlusion", "tee_seen", "multiobj_reward"),
+        actor="policynet", role_params="heads", critic_input="state",
+        per_agent_value=True, aux_coef=0.0,
+    ),
+    # Lidar Push-T on two real AgileX Limos (EAI T-mini Pro lidar, localised by mocap or nav2
+    # AMCL), in metres and seconds; notes/pusht-lidar-limo.md records how each value below
+    # was arrived at, and docs/pusht-lidar.md what the recipe trains to.
+    #
+    # Scale and timing. 0.322 x 0.220 m unicycle boxes at up to 0.4 m/s and 1.5 rad/s, the
+    # real slim T (two 0.50 x 0.04 m bars), a 5 Hz policy on the latest 10 Hz scan: at
+    # dt 0.1 one action moves a robot 4% of the T and PPO kept a near-random policy for
+    # thousands of iterations. 32 substeps keep Push-T's validated 6.25 ms contact sub-step;
+    # 450 steps (90 s) are Push-T's episode scaled by the task's ~4.5x duration; gamma 0.99
+    # and lmbda 0.95 are 20 s / 4 s credit horizons. The length-based shaping is halved
+    # (pos 2.5, approach 0.5) so an episode's shaping keeps Push-T's ratio to the goal bonus.
+    #
+    # Drive and contacts, from a Gazebo sysid (swarp_gz_test out/sysid). ControlMode.SERVO
+    # with accelerations and command gains drawn per env and robot around Gazebo's Limo
+    # (1 m/s^2, 3 rad/s^2, gains 1.0 / 0.79). The T on a Coulomb floor (mu 0.2-0.5, no
+    # viscous drag), which turns an off-centre push as the quasi-static reference does
+    # (60 / 142 deg/m at 0.2 / 0.4 m, reference 64 / 145); robots of mass 2, so a pusher
+    # keeps 0.95-0.98 of its command in contact. Wheel-faithful contacts: a contact torque
+    # turns a robot only past the drive's 3.5 N m, and its wheels grip sideways with mu 0.2,
+    # so two robots squeezing the T from opposite faces cannot spin in place as a Limo
+    # cannot. A command delay of 0-125 ms per robot stands in for WiFi and processing.
+    #
+    # Sensor. The lidar sits 0.103 m ahead of the centre, returns from 0.02 m with 5-20 mm
+    # of range noise, and sees 220 deg cut at the mount (the lab's drivers deliver
+    # -116..+108 deg on both robots), 40 rays at a 5.6 deg spacing, out to 5 m: at 1.5 m a
+    # robot without the T in range in a 4-5 m arena had nothing to go on and training
+    # stalled. What the real scan and the deployment add (pusht_lidar_artefacts.py): labels
+    # from the reported poses (a teammate hit off its reported footprint reads as the T),
+    # grazing-incidence losses on the T, 0-3% dropouts, 0-0.5% spurious short returns, a
+    # 1% scale and 1 cm bias error, the 10 Hz rotating sweep with its stamp anywhere in it
+    # and a 2 deg mount yaw error. lidar_arena_flag adds a fourth mask per frame, the
+    # T-labelled hits past the arena's edge, which the deployment builds from the reported
+    # pose as it builds the labels.
+    #
+    # Localisation. pose_noise on the observation only, sized from nav2 AMCL in Gazebo:
+    # per-episode bias, jitter and a slip-driven, decaying drift (position decorrelates in
+    # 3.6 s, heading in 1.6 s; the slip gain is 2 because AMCL amplifies a shove), at a
+    # scale drawn per env from 0 (mocap) to 1.25 (worse than tuned AMCL). Reward, success,
+    # the critic and the auxiliary targets read the true state; critic_dr appends every
+    # randomised parameter to the critic state.
+    #
+    # Arena and surroundings. An open floor: each env's arena is W x H with W, H in 2-5 m,
+    # observed as its half-extents; the robots meet the safety bridge's stop 0.25 m past
+    # it, and a T centroid 0.5 m past it fails the episode (-0.05 per robot and step, no
+    # solve). Outside it, per env, nothing, perimeter walls, a rotated room or walls plus
+    # 2-6 circle and capsule clutter shapes within 1.5 m, all solid: the robots and the T
+    # collide with them, and every robot pays 0.03 per step within 1 cm of the other robot
+    # or a surroundings shape. The T's size is drawn per env from three copies scaled 0.9,
+    # 1.0 and 1.1.
+    #
+    # Training. From scratch in one run of 2048 envs and 16 minibatches, the world made
+    # hard in ramps on a gated clock (a tick needs a windowed solve of 0.75, so no condition
+    # comes in before the last is mastered): the arena widens from 4 x 4 m over ticks
+    # 1000-3000; the pose noise, the command delay, the surroundings and the collision cost
+    # come in over 3000-5000; the turn-away cost over 8000-10000, since from scratch it made
+    # a clumsy push of the slim T net-negative and the policies stopped pushing. The run
+    # ends 4000 ticks after the last ramp (24000 iterations is a cap). Guards against the
+    # late collapses unguarded runs met: the learning rate decays 5e-4 -> 1e-4 over the
+    # clock and follows the KL (adaptive_kl), a KL brake skips the rest of a destructive
+    # iteration, the actor's std is floored at 0.1 (the greedy action is the mean, so the
+    # floor does not reach the deployment), and rollback restores a pre-collapse snapshot at
+    # half the learning rate. An action-rate penalty of 0.03 ramps in over the first 2000
+    # iterations. Two pushers on their own lidar, frame_stack 4 and aux loss 0.1, which
+    # solved 0.99 at the default scale; standoff_dist 1.0 only clears the scenario's check,
+    # since pushers never read it.
+    "pusht_lidar_limo": TrainSpec(
+        scenario="pusht_lidar",
+        dt=0.2, substeps=32, max_steps=450, n_agents=2,
+        scen_kwargs={
+            # Robots and task.
+            "n_pushers": 2, "model": "diff_drive", "agent_shape": "box",
+            "agent_half_extents": (0.161, 0.110), "max_speed": 0.4, "max_ang_vel": 1.5,
+            "bar_len": 0.5, "bar_width": 0.04, "stem_len": 0.5, "stem_width": 0.04,
+            "tee_scale": (0.9, 1.1), "n_tee_sizes": 3,
+            "goal_tolerance": 0.15, "angle_tolerance": 0.25, "obs_level": 1,
+            "frame_stack": 4, "standoff_dist": 1.0,
+            "pos_shaping_factor": 2.5, "rot_shaping_factor": 0.5, "rot_away_penalty": 1.0,
+            "agent_dist_shaping": 0.5,
+            # Drive and contacts.
+            "agent_mass": 2.0, "servo_accel": (0.6, 2.0), "servo_ang_accel": (2.0, 6.0),
+            "cmd_gain_v": (0.9, 1.05), "cmd_gain_w": (0.7, 1.0),
+            "floor_friction": (0.2, 0.5), "linear_damping": 0.0, "angular_damping": 0.0,
+            "wheel_contacts": True, "wheel_lateral_friction": 0.2, "wheel_turn_torque": 3.5,
+            "cmd_latency": (0.0, 0.125),
+            # Sensor.
+            "n_rays": 40, "lidar_span": math.radians(220.0), "lidar_fov": math.radians(220.0),
+            "lidar_max_range": 5.0, "lidar_mount_offset": 0.103, "lidar_min_range": 0.02,
+            "lidar_noise": (0.005, 0.02),
+            "lidar_label_from_pose": True, "lidar_grazing_cos": math.cos(math.radians(80.0)),
+            "lidar_dropout": (0.0, 0.03), "lidar_spurious": (0.0, 0.005),
+            "lidar_range_scale": 0.01, "lidar_range_bias": 0.01, "lidar_scan_period": 0.1,
+            "lidar_stamp_phase": (0.0, 1.0), "lidar_yaw_bias": math.radians(2.0),
+            "lidar_arena_flag": True,
+            # Localisation.
+            "pose_noise": (0.0, 1.25), "pose_bias_std": (0.04, 0.015),
+            "pose_jitter_std": (0.01, 0.005), "vel_noise_std": 0.02,
+            "pose_drift_tau": (3.6, 1.6), "pose_drift_std": (0.05, 0.015),
+            "pose_slip_gain": (2.0, 0.1), "critic_dr": True,
+            # Arena and surroundings.
+            "world_size": 2.5, "open_arena": True, "arena_size": (2.0, 5.0),
+            "arena_stop_margin": 0.25, "oob_margin": 0.5, "oob_penalty": 0.05,
+            "scenery_probs": (0.25, 0.25, 0.25, 0.25), "n_clutter": 12,
+            "clutter_count": (2, 6), "clutter_reach": 1.5,
+            "collision_penalty": 0.03, "collision_margin": 0.01,
+        },
+        iters=24000, n_envs=2048, steps_per_batch=32, epochs=8, minibatches=16,
+        lr=5e-4, lr_final=1e-4, gamma=0.99, lmbda=0.95, entropy_coeff=3e-3, num_cells=256,
+        normalize_advantage=False,
+        curriculum=(
+            CurriculumKnob("goal_spawn_radius", 0.4, 3.8),
+            CurriculumKnob("goal_spawn_angle", 0.4, math.pi),
+        ),
+        curriculum_iters=500, curriculum_gate=0.0,
+        ramps=(
+            Ramp("arena_size", (4.0, 4.0), (2.0, 5.0), 1000, 3000),
+            Ramp("pose_noise", (0.0, 0.0), (0.0, 1.25), 3000, 5000),
+            Ramp("cmd_delay_substeps", (0, 0), (0, 20), 3000, 5000),
+            Ramp("scenery_on", 0.0, 1.0, 3000, 5000),
+            Ramp("rot_away_penalty", 0.0, 1.0, 8000, 10000),
+            Ramp("collision_penalty", 0.0, 0.03, 3000, 5000),
+        ),
+        ramp_gate=0.75, hold_iters=4000, target_kl=0.3, adaptive_kl=0.02, rollback=True,
+        actor_scale_min=0.1, action_rate_coef=0.03, action_rate_ramp_iters=2000,
+        metrics=("tee_dist_to_goal", "tee_angle_error", "team_coverage",
+                 "observer_visibility", "occlusion", "tee_seen", "multiobj_reward",
+                 "out_of_bounds", "scenery_leak", "robot_collision", "scenery_collision"),
+        stagger_starts=True,
+        actor="policynet", role_params="heads", critic_input="state",
+        per_agent_value=True, aux_coef=0.1,
     ),
     # Give-way. Four agents, one per arm, crossing to the opposite arm through a junction
     # that fits one of them. shared_reward defaults True in the scenario: under per-agent
@@ -319,7 +651,7 @@ SPECS: dict[str, TrainSpec] = {
         metrics=("gap_max", "band_error", "caged", "multiobj_reward"),
     ),
     # Flow's ring: 1 AV among 21 IDM humans on the Sugiyama 230 m ring. The multi-AV variant
-    # is `--n-agents 4` (n_vehicles stays 22, so 18 humans): SPECS is keyed by registry
+    # is `--n-agents 4` (n_vehicles stays 22, so 18 humans): SPECS keys it by its registry
     # name, and the obs width does not depend on either count. dt=0.1 is Flow's (SUMO's)
     # step. max_steps=1500 (150 s), because a FollowerStopper AV needs 64 s to stabilise
     # this ring at 58% of v_eq. 60 s, the first guess, left no margin for a learner.
@@ -356,6 +688,13 @@ SPECS: dict[str, TrainSpec] = {
         stagger_starts=True,
     ),
 }
+
+
+def scenario_name(name: str) -> str:
+    """The registered scenario behind ``name``: a ``SPECS`` key's ``scenario`` when it
+    sets one, else ``name`` itself (a registry name, or a key that is one)."""
+    spec = SPECS.get(name)
+    return name if spec is None or spec.scenario is None else spec.scenario
 
 
 # ------------------------------------------------------------- episode solve accounting
@@ -500,7 +839,7 @@ def _coerce_one(raw: str, annotation: Any) -> Any:
         raise ValueError(f"{raw!r} is not a boolean")
     if annotation is int or text == "int":
         return int(raw)
-    if annotation is float or "float" in text:
+    if annotation is float or ("float" in text and "tuple" not in text):
         return float(raw)
     if annotation is str or text == "str":
         return raw
@@ -527,7 +866,7 @@ def coerce_scen_kwargs(name: str, pairs: Sequence[str]) -> dict[str, Any]:
     ``tests/scenarios/test_scenarios.py`` pins that the two parameter-name sets are
     disjoint for every registered scenario, so this can never false-positive.
     """
-    params = inspect.signature(scenario_class(name).__init__).parameters
+    params = inspect.signature(scenario_class(scenario_name(name)).__init__).parameters
     out: dict[str, Any] = {}
     for pair in pairs:
         if "=" not in pair:
@@ -714,10 +1053,11 @@ def build_env(
     Goes through :func:`swarp.make`, which already routes keywords by name and raises a
     legible ``TypeError`` (with a ``difflib`` suggestion) for a misspelling -- there is no
     reason for this file to reimplement any of that. ``auto_reset`` defaults to ``False``,
-    which is what ``SwarpEnv`` requires; the lean trainer passes ``True``.
+    which is what ``SwarpEnv`` requires; the lean trainer passes ``True``. ``scenario`` is
+    a registry name or a ``SPECS`` key (see :func:`scenario_name`).
     """
     return swarp.make(
-        scenario, n_envs=n_envs, device=device, dt=dt, substeps=substeps,
+        scenario_name(scenario), n_envs=n_envs, device=device, dt=dt, substeps=substeps,
         seed=seed, max_steps=max_steps, n_agents=n_agents, **dict(env_kwargs),
         **dict(scen_kwargs),
     )
@@ -727,6 +1067,7 @@ def score(
     scenario: str,
     *,
     policy: PolicyArm | None = None,
+    policy_from_env: Callable[[Environment], ActionFn] | None = None,
     n_agents: int,
     n_envs: int = 2048,
     steps: int = 400,
@@ -748,14 +1089,19 @@ def score(
     counts. (Looks like a bug otherwise, hence this note.)
 
     ``max_steps=None`` and ``auto_reset=False``, so the episode is genuinely single and
-    ``truncated`` never fires. ``policy`` builds the policy arm (see :data:`PolicyArm`).
+    ``truncated`` never fires. ``policy`` builds the policy arm (see :data:`PolicyArm`);
+    ``policy_from_env`` builds it from the arm's env instead, for a policy that reads more
+    than the observation each call (the roles in ``env.agent_roles()``, a hidden state).
+    Pass one of the two.
     Each arm gets a **fresh env on the same seed**, and the policy arm consumes no RNG, so
     the arms are paired: differences are attributable to the controller, not to the
     initial conditions. ``tests/examples`` pins that.
     """
+    if policy is not None and policy_from_env is not None:
+        raise ValueError("pass policy or policy_from_env, not both")
     out: dict[str, ArmResult] = {}
     for name in arms:
-        if name == "policy" and policy is None:
+        if name == "policy" and policy is None and policy_from_env is None:
             continue
         if name == "scripted" and baseline is None:
             continue
@@ -776,7 +1122,7 @@ def score(
         lo, hi = env.action_bounds
         act_dim = env.world.act_dim
         if name == "policy":
-            act = policy(n_envs, device, lo, hi)
+            act = policy_from_env(env) if policy is None else policy(n_envs, device, lo, hi)
         elif name == "random":
             act = random_actions(n_envs, n_agents, act_dim, device, seed, lo, hi)
         elif name == "zero":

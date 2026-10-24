@@ -65,6 +65,50 @@ class Scenario(ABC):
     parity_rtol: float = 1e-5
     parity_atol: float = 1e-6
 
+    # Training hooks: optional, and "not provided" by default. A trainer reads them to
+    # build a privileged critic, role-specific policy heads or an auxiliary loss. Each
+    # tensor they return must be a fixed-address buffer written by the same pass as
+    # ``observations()``, including the obs-only pass after an auto-reset, so that at
+    # every step it describes the same state the observation does (see
+    # ``docs/writing-a-scenario.md``).
+
+    #: Width of :meth:`critic_state`; 0 means the scenario provides none.
+    state_dim: int = 0
+    #: Number of agent roles. 1 means a single role, and :meth:`agent_roles` is ``None``.
+    n_roles: int = 1
+    #: Agents per role, summing to ``n_agents`` and fixed for the run; empty when the
+    #: scenario has no roles. Which agent holds which role may change per episode.
+    role_counts: tuple[int, ...] = ()
+    #: Width of :meth:`aux_targets`; 0 means the scenario provides none.
+    aux_dim: int = 0
+
+    def critic_state(self) -> torch.Tensor | None:
+        """Privileged per-env state for a centralised critic, ``[n_envs, state_dim]``, or
+        ``None``. Never shown to the actor.
+
+        With roles, any per-agent part of the state is laid out in role-sorted agent order
+        (role 0's agents by ascending index, then role 1's, ...), not by agent index: the
+        critic reads it as-is and its per-agent value slot ``k`` is the agent at
+        role-sorted rank ``k``."""
+        return None
+
+    def agent_roles(self) -> torch.Tensor | None:
+        """Each agent's role index, ``[n_envs, n_agents]`` integer in ``[0, n_roles)``,
+        with exactly ``role_counts[r]`` agents in role ``r`` per env; or ``None``."""
+        return None
+
+    def aux_targets(self) -> torch.Tensor | None:
+        """Per-agent auxiliary regression targets, ``[n_envs, n_agents, aux_dim]`` (e.g. a
+        hidden pose in the agent's frame), or ``None``."""
+        return None
+
+    def comm_mask(self) -> torch.Tensor | None:
+        """Who may hear whom, ``[n_envs, n_agents, n_agents]`` bool (``[e, i, j]``: agent
+        ``i`` receives agent ``j``'s message, e.g. within a radio range), or ``None``,
+        meaning every agent hears every teammate. Read by a communicating policy; the
+        diagonal is ignored (an agent never messages itself)."""
+        return None
+
     @property
     @abstractmethod
     def obs_dim(self) -> int:
@@ -104,7 +148,7 @@ class Scenario(ABC):
         ``bounds_mode``, ``neighbor_reuse``, ``grid_dim``, ``uniform_bins``, the
         obstacle damping) reachable without subclassing. See
         :meth:`~swarp.core.config.WorldConfig.override_with` for the merge rule; a test
-        pins that all eleven built-ins honour it.
+        pins that all twelve built-ins honour it.
         """
 
     @abstractmethod

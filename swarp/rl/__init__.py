@@ -4,13 +4,16 @@
 :data:`swarp.rl.recipes.SPECS`; :func:`train` is the same loop as a function.
 """
 
-from swarp.rl.networks import Actor, Critic
+from swarp.rl.networks import Actor, Critic, PolicyNet, StateCritic, role_permutation
 from swarp.rl.ppo import (
+    ARCHS,
     MAPPO,
     NonFiniteGradients,
     TrainConfig,
     check_action_box,
     greedy_arm,
+    greedy_env_arm,
+    greedy_score_kwargs,
     load_checkpoint,
     load_policy,
     parse_args,
@@ -19,17 +22,23 @@ from swarp.rl.ppo import (
 from swarp.rl.recipes import SPECS, TrainSpec
 
 __all__ = [
+    "ARCHS",
     "MAPPO",
     "SPECS",
     "Actor",
     "Critic",
     "NonFiniteGradients",
+    "PolicyNet",
+    "StateCritic",
     "TrainConfig",
     "TrainSpec",
     "check_action_box",
     "greedy_arm",
+    "greedy_env_arm",
+    "greedy_score_kwargs",
     "load_checkpoint",
     "load_policy",
     "parse_args",
+    "role_permutation",
     "train",
 ]
