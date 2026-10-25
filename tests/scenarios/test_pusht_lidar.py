@@ -516,9 +516,39 @@ def test_settled_hold_succeeds_only_after_hold_steps(device, fused):
     assert team[1, 1].item() == pytest.approx(-0.2, abs=1e-4)
 
 
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("fused", [False, True], ids=["torch", "fused"])
+def test_on_goal_reward_pays_on_arrival_and_takes_it_back_on_leaving(device, fused):
+    """The on-goal potential adds ``on_goal_reward`` on the step the T reaches the goal and
+    takes it back on the step it leaves, and nothing while it stays or stays away."""
+
+    def team(on_goal_reward):
+        env = _env(device, n_envs=2, fused=fused, n_agents=2, n_pushers=2, hold_steps=3,
+                   on_goal_reward=on_goal_reward)
+        env.reset(seed=0)
+        scen = env.scenario
+        out = []
+        for t in range(4):
+            with torch.no_grad():
+                if t in (1, 3):  # the T jumps onto its goal, then off it again
+                    scen.tee_pos.copy_(scen.goal_pos + (0.0 if t == 1 else 1.0))
+                    scen.tee_theta.copy_(scen.goal_theta)
+                    scen.tee_vel.zero_()
+                    scen.tee_ang_vel.zero_()
+                    scen._install_obstacles()
+            _, _, _, _, info = env.step(torch.zeros(2, 2, 2, device=device))
+            out.append(info["multiobj_reward"][:, 0, 0].clone())
+        return torch.stack(out).cpu()
+
+    diff = team(0.7) - team(0.0)
+    assert diff[:, 0].tolist() == pytest.approx([0.0, 0.7, 0.0, -0.7], abs=1e-4)
+
+
 def test_hold_validation():
     with pytest.raises(ValueError, match="hold_steps"):
         PushTLidarScenario(hold_steps=256)
+    with pytest.raises(ValueError, match="on_goal_reward"):
+        PushTLidarScenario(on_goal_reward=1.0)
     with pytest.raises(ValueError, match="settle"):
         PushTLidarScenario(hold_steps=3, settle_tee_speed=0.0)
 

@@ -607,12 +607,13 @@ def pusht_lidar_reward_kernel(
     tee_ang_vel: wp.array(dtype=Any),
     hold_steps: wp.int32,
     hold_reward: Any,
+    on_goal_reward: Any,
     settle_tee_speed: Any,
     settle_tee_ang_vel: Any,
     settle_robot_speed: Any,
     settle_robot_ang_vel: Any,
     hold_col: wp.int32,
-    hold: wp.array(dtype=wp.uint8),
+    hold: wp.array2d(dtype=wp.uint8),
     critic: wp.array2d(dtype=Any),
     aux_goal: wp.int32,
     aux: wp.array3d(dtype=Any),
@@ -647,12 +648,14 @@ def pusht_lidar_reward_kernel(
 
     With ``hold_steps > 0`` the episode succeeds only once the T has been on goal and
     settled (the T and every robot below the settle speeds) for ``hold_steps`` steps in a
-    row: ``hold`` counts them, advancing on a step, cleared by a reset or by any step that
-    is not settled, and the goal bonus is paid while it is at least ``hold_steps``. The
-    team column adds the hold's potential difference, ``hold_reward`` times the change of
-    ``min(hold, hold_steps) / hold_steps``, so breaking a hold gives back what it earned;
-    ``critic[e, hold_col]`` is that fraction, written on every pass. ``hold`` and
-    ``critic`` are one-element stand-ins, never touched, without the hold.
+    row: ``hold[e, 0]`` counts them, advancing on a step, cleared by a reset or by any step
+    that is not settled, and the goal bonus is paid while it is at least ``hold_steps``.
+    The team column adds the hold's potential difference, ``hold_reward`` times the change
+    of ``min(hold, hold_steps) / hold_steps``, so breaking a hold gives back what it
+    earned, and ``on_goal_reward`` times the change of the on-goal flag (the pose within
+    both tolerances), which ``hold[e, 1]`` keeps from the last step: reaching the goal pays,
+    leaving it gives that back. ``critic[e, hold_col]`` is the hold's fraction, written on
+    every pass. ``hold`` and ``critic`` are stand-ins, never touched, without the hold.
 
     With ``aux_goal`` the last auxiliary target of every robot, ``aux[e, a, 4]``, is 1
     while the T is on goal (within both tolerances, not failed) and 0 otherwise, written on
@@ -723,18 +726,24 @@ def pusht_lidar_reward_kernel(
                 settled = False
             if wp.abs(ang_vel[e, a]) >= settle_robot_ang_vel:
                 settled = False
-        old = wp.int32(hold[e])
+        old = wp.int32(hold[e, 0])
         h = old
+        g = hold[e, 1]
         if reset_hit == 1:
             h = wp.int32(0)
+            g = wp.uint8(0)
         elif advance_prev == 1:
             if settled:
                 h = wp.min(old + wp.int32(1), wp.int32(255))
             else:
                 h = wp.int32(0)
             dh = wp.min(h, hold_steps) - wp.min(old, hold_steps)
+            dg = wp.int32(on_goal) - wp.int32(g)
             hold_t = hold_reward * type(zero)(dh) / type(zero)(hold_steps)
-        hold[e] = wp.uint8(h)
+            hold_t = hold_t + on_goal_reward * type(zero)(dg)
+            g = on_goal
+        hold[e, 0] = wp.uint8(h)
+        hold[e, 1] = g
         critic[e, hold_col] = type(zero)(wp.min(h, hold_steps)) / type(zero)(hold_steps)
         on_goal = wp.uint8(0)
         if h >= hold_steps:
@@ -1073,9 +1082,9 @@ def _reward_signature(dtype) -> list:
         wp.array(dtype=vec2),  # tee_vel
         a1s,  # tee_ang_vel
         wp.int32,  # hold_steps
-        *([dtype] * 5),  # hold_reward and the four settle thresholds
+        *([dtype] * 6),  # hold_reward, on_goal_reward and the four settle thresholds
         wp.int32,  # hold_col
-        wp.array(dtype=wp.uint8),  # hold
+        wp.array2d(dtype=wp.uint8),  # hold
         a2s,  # critic
         wp.int32,  # aux_goal
         wp.array3d(dtype=dtype),  # aux
