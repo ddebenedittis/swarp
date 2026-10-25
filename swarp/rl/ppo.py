@@ -1547,6 +1547,8 @@ def parse_args(argv: list[str] | None = None) -> TrainConfig:
                    help="with --resume: load only the critic, start a fresh actor")
     p.add_argument("--resume-widen", action="store_true",
                    help="with --resume: zero-initialise input columns the networks gained")
+    p.add_argument("--ramp-gate", type=float,
+                   help="the training solve rate the gated ramp clock needs to advance")
     p.add_argument("--start-clock", type=int, default=0,
                    help="with ramp_gate: the ramps' clock at the first iteration")
     p.add_argument("--checkpoint-every", type=int, default=250, help="0 disables")
@@ -1573,7 +1575,7 @@ def parse_args(argv: list[str] | None = None) -> TrainConfig:
             "curriculum_iters", "curriculum_gate", "actor", "role_params", "critic_input",
             "per_agent_value", "aux_coef", "action_rate_coef", "action_rate_ramp_iters",
             "recurrent", "hidden_dim", "seq_len", "comm", "comm_dim", "msg_coef",
-            "msg_beta", "msg_drop",
+            "msg_beta", "msg_drop", "ramp_gate",
         )
         if getattr(a, f) is not None
     }
