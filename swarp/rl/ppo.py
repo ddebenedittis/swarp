@@ -561,7 +561,8 @@ class MAPPO:
         kl = ["approx_kl", "kl_stops"] if self.kl_brake else []
         self.stat_names = [*losses, "grad_skips", *kl, *self.metric_names]
 
-        params = [*actor.parameters(), *critic.parameters()]
+        # A frozen parameter (TrainConfig.train_only) is left out of Adam and the clip.
+        params = [p for p in (*actor.parameters(), *critic.parameters()) if p.requires_grad]
         self.params = params
         # Inductor fuses the loss's elementwise work (bias/tanh/log-prob chains) around the
         # cuBLAS GEMMs; the result is still captured by the minibatch graph below.
@@ -1180,6 +1181,19 @@ def check_resume(
         )
 
 
+def freeze_actor(actor: torch.nn.Module, prefixes: Sequence[str]) -> list[str]:
+    """Freeze every actor parameter whose name starts with none of ``prefixes``, before
+    :class:`MAPPO` is built (it optimises only what still needs a gradient); returns the
+    names left to train."""
+    names = [n for n, _ in actor.named_parameters()]
+    keep = [n for n in names if n.startswith(tuple(prefixes))]
+    if not keep:
+        raise ValueError(f"train_only {list(prefixes)} matches none of {names}")
+    for n, p in actor.named_parameters():
+        p.requires_grad_(n in keep)
+    return keep
+
+
 def load_widened(module: torch.nn.Module, state: Mapping[str, torch.Tensor]) -> list[str]:
     """Load ``state`` into ``module``, widening where the module grew.
 
@@ -1454,6 +1468,9 @@ class TrainConfig:
     resume_widen: bool = False
     """With ``resume``: accept networks whose input grew (:data:`WIDENABLE`), the new
     columns' weights starting at zero."""
+    train_only: tuple[str, ...] = ()
+    """Prefixes of the actor's parameter names to train (e.g. ``head.``, the action heads); the
+    rest of the actor stays frozen, the critic trains. Empty: all of it."""
     start_clock: int = 0
     """With ``ramp_gate``: the ramps' clock at the first iteration, e.g. a fine-tune that
     resumes at the final conditions."""
@@ -1547,6 +1564,8 @@ def parse_args(argv: list[str] | None = None) -> TrainConfig:
                    help="with --resume: load only the critic, start a fresh actor")
     p.add_argument("--resume-widen", action="store_true",
                    help="with --resume: zero-initialise input columns the networks gained")
+    p.add_argument("--train-only", nargs="+", default=(), metavar="PREFIX",
+                   help="train only the actor parameters with these name prefixes")
     p.add_argument("--ramp-gate", type=float,
                    help="the training solve rate the gated ramp clock needs to advance")
     p.add_argument("--start-clock", type=int, default=0,
@@ -1599,6 +1618,7 @@ def parse_args(argv: list[str] | None = None) -> TrainConfig:
         scenario=a.scenario, spec=spec, scen_kwargs=scen_kwargs, device=a.device,
         checkpoint_dir=Path(a.checkpoint_dir or f"runs/{a.scenario}"), resume=a.resume,
         resume_critic_only=a.resume_critic_only, resume_widen=a.resume_widen,
+        train_only=tuple(a.train_only),
         start_clock=a.start_clock, start_difficulty=a.start_difficulty,
         checkpoint_every=a.checkpoint_every,
         eval_every=a.eval_every, eval_envs=a.eval_envs, seed=a.seed,
@@ -1694,6 +1714,9 @@ def train(cfg: TrainConfig) -> Path:
         what = "critic" if cfg.resume_critic_only else "actor + critic"
         print(f"resumed {what} from {cfg.resume}"
               + (f"; freshly initialised: {', '.join(fresh)}" if fresh else ""))
+    if cfg.train_only:
+        keep = freeze_actor(actor, cfg.train_only)
+        print(f"training only the actor's {', '.join(keep)} (and the critic)")
     actor.train()
     critic.train()
 

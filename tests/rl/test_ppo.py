@@ -14,6 +14,7 @@ from swarp.rl import MAPPO, Actor, Critic, load_checkpoint, parse_args, train
 from swarp.rl.networks import PolicyNet, StateCritic, role_permutation, tanh_normal_log_prob
 from swarp.rl.ppo import (
     LEGACY_STAT_NAMES,
+    freeze_actor,
     gae,
     greedy_env_arm,
     greedy_score_kwargs,
@@ -357,6 +358,7 @@ def _algo(
     features: bool = False,
     patch=_patch_training_hooks,
     scen_kwargs=(),
+    train_only=(),
     **spec_kw,
 ) -> MAPPO:
     """Navigation at test size; ``features`` turns on the state critic (state + obs, per
@@ -400,6 +402,8 @@ def _algo(
     else:
         actor = Actor(Ob, env.act_dim, spec.num_cells)
         critic = Critic(Ob, A, spec.num_cells)
+    if train_only:
+        freeze_actor(actor, train_only)
     algo = MAPPO(env, actor.to(device), critic.to(device), spec, graphs=graphs)
     algo.reset()
     return algo
@@ -1139,3 +1143,21 @@ def test_a_heard_message_changes_the_listener_and_a_policy_widens_into_messages(
     a = talk.step(obs, msg_obs=prev, msg_mask=mask)[0]
     b = talk.step(obs, msg_obs=prev + 1.0, msg_mask=mask)[0]
     assert not torch.allclose(a[:, 0], b[:, 0]) and torch.equal(a[:, 1:], b[:, 1:])
+
+
+@pytest.mark.parametrize("graphs", [False, True], ids=["eager", "graphed"])
+def test_train_only_moves_the_named_actor_parameters_and_the_critic(graphs):
+    """With the trunk frozen, an update moves the action head and the critic, nothing else."""
+    if graphs and not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    algo = _algo(graphs=graphs, device="cuda:0" if graphs else "cpu", features=True,
+                 train_only=("head.",))
+    before = {n: p.detach().clone() for n, p in algo.actor.named_parameters()}
+    critic = [p.detach().clone() for p in algo.critic.parameters()]
+    algo.rollout()
+    algo.update(algo.spec.entropy_coeff)
+    for n, p in algo.actor.named_parameters():
+        assert torch.equal(p, before[n]) is not n.startswith("head."), n
+    assert any(not torch.equal(p, q) for p, q in zip(algo.critic.parameters(), critic, strict=True))
+    with pytest.raises(ValueError, match="matches none"):
+        freeze_actor(algo.actor, ("nope",))
