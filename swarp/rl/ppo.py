@@ -38,7 +38,7 @@ import argparse
 import csv
 import math
 import time
-from collections.abc import Callable, Hashable, Mapping, Sequence
+from collections.abc import Callable, Hashable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
@@ -1506,6 +1506,18 @@ def misplaced_growth(cls: str, saved: Mapping[str, Any], built: Mapping[str, Any
     return out
 
 
+def roles_reassigned(saved: Sequence[int], built: Sequence[int] | None) -> bool:
+    """Whether ``built`` splits the agents of ``saved`` role counts among the same roles,
+    as ``(2, 0)`` to ``(1, 1)`` does: same number of roles, same number of agents. Neither
+    network changes shape (the role inputs and head rows are per role, the critic per
+    agent), so ``--resume-widen`` loads it; :func:`train` ties each role the checkpoint
+    left empty to role 0 (:func:`tie_roles`), and the critic re-learns its role slots."""
+    return (
+        bool(saved) and built is not None
+        and len(built) == len(saved) and sum(built) == sum(saved)
+    )
+
+
 def check_resume(
     path: str | Path,
     ckpt: Mapping[str, Any],
@@ -1517,7 +1529,8 @@ def check_resume(
     :func:`network_archs` gives for the current flags) describes, naming the mismatch and
     the flags that rebuild the checkpoint's networks. With ``critic_only`` only the critic
     must match; with ``widen`` an input width (:data:`WIDENABLE`) may have grown, unless
-    :func:`load_widened` would misplace its columns (:func:`misplaced_growth`)."""
+    :func:`load_widened` would misplace its columns (:func:`misplaced_growth`), and the
+    agents may be split among the same roles differently (:func:`roles_reassigned`)."""
     saved = checkpoint_archs(ckpt)
     nets = [("critic", 2)] if critic_only else [("actor", 0), ("critic", 2)]
     problems: list[str] = []
@@ -1528,6 +1541,7 @@ def check_resume(
             keys = [
                 k for k in keys
                 if k in kw_s and not (k in WIDENABLE and kw_b.get(k, 0) > kw_s.get(k, 0))
+                and not (k == "role_counts" and roles_reassigned(kw_s[k], kw_b.get(k)))
             ]
         misplaced = misplaced_growth(cls_s, kw_s, kw_b) if widen and cls_s == cls_b else []
         if cls_s == cls_b and not keys and not misplaced:
@@ -1589,6 +1603,40 @@ def load_widened(module: torch.nn.Module, state: Mapping[str, torch.Tensor]) -> 
     return fresh
 
 
+def tie_roles(
+    actor: PolicyNet, state: Mapping[str, torch.Tensor], roles: Iterable[int]
+) -> dict[str, torch.Tensor]:
+    """``state``, the weights of a role-aware :class:`PolicyNet` with ``actor``'s role
+    layout, with each of ``roles`` tied to role 0: its head rows and role-input column
+    (trunk or attention encoder, message encoder) copied from role 0's, or with
+    ``"separate"`` roles its trunk, memory and head. ``actor`` then acts in those roles as
+    the weights did in role 0, which is what a role the checkpoint never filled (its rows
+    never saw a gradient) should start from."""
+    state, roles = dict(state), sorted(set(roles) - {0})
+    if not roles:
+        return state
+    if actor.separate:
+        for prefix in ("trunks.0.", "grus.0.", "heads.0."):
+            for name in [n for n in state if n.startswith(prefix)]:
+                for r in roles:
+                    state[f"{prefix[:-2]}{r}.{name[len(prefix):]}"] = state[name].clone()
+        return state
+    Ob, R, two_d = actor.obs_dim, actor.n_roles, 2 * actor.act_dim
+    first = "comm_enc.weight" if actor.comm == "attn" else "trunk.0.weight"
+    if actor.role_input:
+        for name in (first, "msg_enc.0.weight"):
+            if name in state:
+                w = state[name].clone()
+                w[:, [Ob + r for r in roles]] = w[:, Ob : Ob + 1].clone()
+                state[name] = w
+    if actor.role_heads:
+        for name in ("head.weight", "head.bias"):
+            h = state[name].clone().view(R, two_d, *state[name].shape[1:])
+            h[roles] = h[:1].clone()
+            state[name] = h.view(state[name].shape)
+    return state
+
+
 def tie_learned_roles(
     actor: PolicyNet, state: Mapping[str, torch.Tensor]
 ) -> dict[str, torch.Tensor]:
@@ -1597,27 +1645,16 @@ def tie_learned_roles(
 
     The teammates' role columns enter the trunk after the role one-hot, ahead of any
     message or privileged columns, so those are moved right and the new ones zeroed (a
-    leading-corner widening would misplace them). Every role's head rows and role-input
-    column (trunk or attention encoder, message encoder) are tied to role 0's, so the
-    widened actor acts under any role as the checkpoint did in role 0, the only one a
-    ``(A, 0)`` scenario fills."""
-    state = dict(state)
-    Ob, R, two_d = actor.obs_dim, actor.n_roles, 2 * actor.act_dim
-    first = "comm_enc.weight" if actor.comm == "attn" else "trunk.0.weight"
-    for name in (first, "msg_enc.0.weight"):
-        if name in state:
-            w = state[name].clone()
-            w[:, Ob + 1 : Ob + R] = w[:, Ob : Ob + 1]
-            state[name] = w
+    leading-corner widening would misplace them). Every role is tied to role 0
+    (:func:`tie_roles`), so the widened actor acts under any role as the checkpoint did in
+    role 0, the only one a ``(A, 0)`` scenario fills."""
+    Ob, R = actor.obs_dim, actor.n_roles
+    state = tie_roles(actor, state, range(1, R))
     w = state["trunk.0.weight"]
     if actor.comm != "attn" and w.shape[1] > Ob + R:
         state["trunk.0.weight"] = torch.cat(
             [w[:, : Ob + R], w.new_zeros(w.shape[0], R), w[:, Ob + R :]], 1
         )
-    for name in ("head.weight", "head.bias"):
-        h = state[name].clone().view(R, two_d, *state[name].shape[1:])
-        h[1:] = h[:1]
-        state[name] = h.view(state[name].shape)
     return state
 
 
@@ -2195,18 +2232,28 @@ def train(cfg: TrainConfig) -> Path:
         built = (actor_cls, actor_kwargs, critic_cls, critic_kwargs)
         check_resume(cfg.resume, ckpt, built, critic_only=cfg.resume_critic_only,
                      widen=cfg.resume_widen)
-        state = a.state_dict()
-        # A checkpoint without learned roles: every role starts as its role 0.
-        tie = (spec.learned_roles and not cfg.resume_critic_only
-               and not checkpoint_archs(ckpt)[1].get("learned_roles"))
-        if tie:
-            state = tie_learned_roles(actor, state)
+        state, saved = a.state_dict(), checkpoint_archs(ckpt)[1]
+        tied: list[int] = []
+        if isinstance(actor, PolicyNet) and not cfg.resume_critic_only:
+            if spec.learned_roles and not saved.get("learned_roles"):
+                # A checkpoint without learned roles: every role starts as its role 0.
+                tied = list(range(1, actor.n_roles))
+                state = tie_learned_roles(actor, state)
+            else:
+                # A role the checkpoint left empty (rows never trained) starts as its role 0.
+                old = saved.get("role_counts") or ()
+                tied = [
+                    r for r, (o, n) in enumerate(zip(old, actor.role_counts, strict=False))
+                    if o == 0 < n
+                ]
+                state = tie_roles(actor, state, tied)
         fresh = [] if cfg.resume_critic_only else load_widened(actor, state)
+        # The critic as is: a value slot trained on another role's agent re-learns.
         fresh += load_widened(critic, c.state_dict())
         what = "critic" if cfg.resume_critic_only else "actor + critic"
         print(f"resumed {what} from {cfg.resume}"
               + (f"; freshly initialised: {', '.join(fresh)}" if fresh else "")
-              + ("; every role tied to role 0 (heads, role inputs)" if tie else ""))
+              + (f"; roles {tied} tied to role 0 (heads, role inputs)" if tied else ""))
     if cfg.train_only:
         keep = freeze_actor(actor, cfg.train_only)
         print(f"training only the actor's {', '.join(keep)} (and the critic)")

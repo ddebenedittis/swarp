@@ -27,6 +27,7 @@ from swarp.rl.ppo import (
     ppo_loss,
     standardize_advantage,
     tie_learned_roles,
+    tie_roles,
 )
 from swarp.rl.recipes import SPECS, Ramp, SolveRateWindow, build_env, scenario_name, score
 
@@ -1549,6 +1550,74 @@ def test_teammate_role_columns_and_a_tied_warm_start_that_acts_as_before():
             torch.testing.assert_close(out[0], ref[0])
             torch.testing.assert_close(out[1], ref[1])
             assert torch.equal(out[4], torch.zeros(5, 3, 2))
+
+
+@pytest.mark.parametrize(
+    "kw",
+    [{}, {"comm": "attn", "comm_dim": 4}, {"comm": "pose", "comm_dim": 4},
+     {"role_params": "shared"}, {"role_params": "separate", "recurrent": True}],
+    ids=["heads", "attn", "pose", "shared", "separate-gru"],
+)
+def test_a_role_the_checkpoint_left_empty_resumes_as_role_0(kw):
+    """``(2, 0)`` to ``(1, 1)``: same networks, so ``--resume-widen`` loads it, and with the
+    observer tied to role 0 the actor acts as the checkpoint did with two pushers; without
+    the tie the observer reads untrained rows. A changed sum or length is refused."""
+    torch.manual_seed(0)
+
+    def nets(counts):
+        actor = PolicyNet(6, 2, 16, role_counts=counts, aux_dim=3, **kw)
+        critic = StateCritic(3, 6, sum(counts), 16, use_obs=True, role_counts=counts,
+                             per_agent=True)
+        return actor, critic
+
+    def resume(saved, built, widen=True):
+        ckpt = {"format": "swarp.rl/2", "actor_cls": "PolicyNet", "actor_kwargs": saved[0].config,
+                "critic_cls": "StateCritic", "critic_kwargs": saved[1].config}
+        built = ("PolicyNet", built[0].config, "StateCritic", built[1].config)
+        check_resume("pushers.pt", ckpt, built, widen=widen)
+
+    saved, built = nets((2, 0)), nets((1, 1))
+    resume(saved, built)
+    with pytest.raises(ValueError, match=r"role_counts \[2, 0\] vs \[1, 1\]"):
+        resume(saved, built, widen=False)
+    for other, want in (((2, 1), r"\[2, 1\]"), ((2, 0, 0), r"\[2, 0, 0\]")):
+        with pytest.raises(ValueError, match=rf"role_counts \[2, 0\] vs {want}"):
+            resume(saved, nets(other))
+    assert load_widened(built[0], tie_roles(built[0], saved[0].state_dict(), [1])) == []
+    assert load_widened(built[1], saved[1].state_dict()) == []
+    obs = torch.randn(5, 2, 6)
+    msg = {"msg_obs": torch.randn(5, 2, 6), "msg_mask": torch.rand(5, 2, 2) < 0.7}
+    msg = msg if kw.get("comm") == "pose" else {}
+    ref = saved[0].step(obs, torch.zeros(5, 2, dtype=torch.long), **msg)
+    out = built[0].step(obs, torch.tensor([0, 1]).expand(5, 2), **msg)
+    torch.testing.assert_close(out[0], ref[0])
+    torch.testing.assert_close(out[1], ref[1])
+    load_widened(built[0], saved[0].state_dict())
+    untied = built[0].step(obs, torch.tensor([0, 1]).expand(5, 2), **msg)
+    assert not torch.allclose(untied[0][:, 1], ref[0][:, 1])
+
+
+def test_train_resumes_two_pushers_as_a_pusher_and_an_observer(tmp_path, capsys):
+    """Through :func:`train`: a ``(2, 0)`` checkpoint fine-tuned with ``n_pushers=1`` is
+    refused without ``--resume-widen``; with it the observer acts as the pusher did at
+    iteration 0, and the run says which roles it tied."""
+    flags = ["--scenario", "pusht_lidar", *SMOKE, "--n-agents", "2"]
+    path = train(parse_args([*flags, "--checkpoint-dir", str(tmp_path / "a"),
+                             "--scen-kwarg", "n_pushers=2"]))
+    pushers, _, meta = load_checkpoint(path)
+    assert meta["role_counts"] == [2, 0]
+    one = [*flags, "--checkpoint-dir", str(tmp_path / "b"), "--scen-kwarg", "n_pushers=1",
+           "--resume", str(path), "--iters", "0"]
+    with pytest.raises(ValueError, match=r"role_counts \[2, 0\] vs \[1, 1\]"):
+        train(parse_args(one))
+    tuned, _, meta = load_checkpoint(train(parse_args([*one, "--resume-widen"])))
+    assert meta["role_counts"] == [1, 1]
+    assert "roles [1] tied to role 0" in capsys.readouterr().out
+    obs = torch.randn(5, 2, pushers.obs_dim)
+    ref = pushers.step(obs, torch.zeros(5, 2, dtype=torch.long))
+    out = tuned.step(obs, torch.tensor([0, 1]).expand(5, 2))
+    torch.testing.assert_close(out[0], ref[0])
+    torch.testing.assert_close(out[1], ref[1])
 
 
 def test_greedy_arm_holds_a_learned_role_for_the_dwell():
