@@ -333,14 +333,21 @@ def _patch_training_hooks(env) -> None:
     scen.aux_targets = lambda: scen.observations()[..., :AUX_DIM]
 
 
+#: Where :func:`_patch_single_role` lays navigation's (four agents, 19 columns) role signs.
+SIGN_LAYOUT = {"role": slice(4, 5), "teammates": slice(8, 17)}
+SIGN_COLS = [4, 10, 13, 16]  # own, then the teammates in ascending index, self skipped
+
+
 def _patch_single_role(env) -> None:
     """:func:`_patch_training_hooks` with one role filled, what learned roles need:
-    ``role_counts`` ``(A, 0)`` and every agent in role 0."""
+    ``role_counts`` ``(A, 0)``, every agent in role 0, and an ``obs_layout()`` naming the
+    role-sign columns the learned roles rewrite (:data:`SIGN_LAYOUT`)."""
     _patch_training_hooks(env)
     scen = env.scenario
     roles = torch.zeros(env.n_envs, env.n_agents, dtype=torch.int32, device=env.device)
     scen.role_counts = (env.n_agents, 0)
     scen.agent_roles = lambda: roles
+    scen.obs_layout = lambda: dict(SIGN_LAYOUT)
 
 
 POSE_SCALE = 0.5
@@ -1620,6 +1627,130 @@ def test_train_resumes_two_pushers_as_a_pusher_and_an_observer(tmp_path, capsys)
     torch.testing.assert_close(out[1], ref[1])
 
 
+def _learned_signs(roles: torch.Tensor) -> torch.Tensor:
+    """``[*, A, A]``: per agent its own sign, then its teammates' in ascending index with
+    itself skipped, +1 for role 1 and -1 for role 0."""
+    sign, A = 2.0 * roles.float() - 1.0, roles.shape[-1]
+    mates = [sign[..., [[j for j in range(A) if j != i][m] for i in range(A)]]
+             for m in range(A - 1)]
+    return torch.stack([sign, *mates], -1)
+
+
+@pytest.mark.parametrize("comm", ["none", "pose"])
+def test_learned_roles_write_their_signs_into_the_observation(comm):
+    """Under learned roles the actor reads its own and its teammates' previous learned
+    roles in the role-sign columns (the teammates in the scenario's order); ``obs_buf``,
+    which the critic and the update read, and the messages carry the same, every other
+    column is the env's, and the last row too. A scenario without a role column is
+    refused."""
+    kw = {"comm": comm, "comm_dim": 4} if comm != "none" else {}
+    algo = _algo(graphs=False, device="cpu", features=True, **_LEARNED, **kw)
+    E, A, T = algo.E, algo.A, algo.T
+    prev = torch.tensor([0, 1, 1, 0]).expand(E, A)
+    algo.role_prev.copy_(prev)
+    algo.role_age.fill_(1)  # held, not decided
+    raw = algo._out[0].clone()
+    algo._act_body()
+    seen = algo.obs_buf[0]
+    assert torch.equal(seen[..., SIGN_COLS], _learned_signs(prev))
+    assert _learned_signs(prev)[0, 3].tolist() == [-1.0, -1.0, 1.0, 1.0]
+    other = [c for c in range(algo.env.obs_dim) if c not in SIGN_COLS]
+    assert torch.equal(seen[..., other], raw[..., other])
+    msg = {}
+    if comm != "none":
+        assert torch.equal(algo.prev_obs, seen)
+        msg = {"msg_obs": algo.msg_obs_buf[0], "msg_mask": algo.msg_mask_buf[0]}
+
+    def logp(obs: torch.Tensor) -> torch.Tensor:
+        with torch.no_grad():
+            loc, scale = policy_outputs(algo.actor, obs, prev, msg=msg, head_roles=prev)[:2]
+        return tanh_normal_log_prob(algo.u_buf[0], loc, scale)
+
+    assert algo.decide_buf[0].sum() == 0
+    torch.testing.assert_close(algo.logp_buf[0], logp(seen))
+    assert not torch.allclose(algo.logp_buf[0], logp(raw))
+    algo.rollout()  # the roles now decided by the role head, row T included
+    role_in = algo.lrole_in_buf
+    assert (role_in == 1).any() and (role_in == 0).any()
+    assert torch.equal(algo.obs_buf[..., SIGN_COLS], _learned_signs(role_in))
+    assert torch.equal(algo.obs_buf[T][..., other], algo._out[0][..., other])
+
+    def no_layout(env) -> None:
+        _patch_single_role(env)
+        del env.scenario.obs_layout
+
+    with pytest.raises(ValueError, match="one-column 'role' slice"):
+        _algo(graphs=False, device="cpu", features=True, **{**_LEARNED, "patch": no_layout})
+
+
+def test_a_learned_roles_run_resumed_from_a_pusher_and_an_observer_acts_as_they_did(
+    tmp_path, capsys
+):
+    """Phase A fine-tunes two pushers ``(2, 0)`` into a pusher and an observer ``(1, 1)``
+    sending pose messages; phase B resumes it with learned roles on the ``(2, 0)`` scenario,
+    keeping both trained heads. With every robot's learned role held at the one phase A's
+    env assigned it, phase B's rollout reads phase A's observations (the env writes -1
+    for both robots; the learned signs restore the observer's +1) and samples from phase A's
+    action distribution, messages included."""
+    flags = ["--scenario", "pusht_lidar", *SMOKE, "--n-agents", "2", "--comm", "pose",
+             "--comm-dim", "4", "--aux-coef", "0.1"]
+    two = train(parse_args([*flags, "--checkpoint-dir", str(tmp_path / "two"),
+                            "--scen-kwarg", "n_pushers=2"]))
+    one = [*flags, "--scen-kwarg", "n_pushers=1", "--resume-widen"]
+    phase_a = train(parse_args([*one, "--checkpoint-dir", str(tmp_path / "a"),
+                                "--resume", str(two)]))
+    learned = [*flags, "--scen-kwarg", "n_pushers=2", "--learned-roles", "--role-dwell", "50",
+               "--resume", str(phase_a), "--resume-widen", "--iters", "0"]
+    capsys.readouterr()
+    cfg = parse_args([*learned, "--checkpoint-dir", str(tmp_path / "b")])
+    phase_b = train(cfg)
+    out = capsys.readouterr().out
+    assert "learned roles from role_counts [1, 1]" in out and "no role tied" in out
+    actor_a = load_checkpoint(phase_a)[0]
+    actor_b, critic_b, meta = load_checkpoint(phase_b)
+    assert meta["role_counts"] == [2, 0] and actor_b.learned_roles
+
+    spec = replace(cfg.spec, stagger_starts=False)
+    E, T = spec.n_envs, spec.steps_per_batch
+
+    def env(pushers: int):
+        return build_env(
+            "pusht_lidar", n_envs=E, n_agents=2, device="cpu", dt=spec.dt,
+            substeps=spec.substeps, max_steps=spec.max_steps, seed=0,
+            scen_kwargs={**cfg.scen_kwargs, "n_pushers": pushers},
+            env_kwargs={"auto_reset": True},
+        )
+
+    env_a = env(1)
+    obs = env_a.reset().clone()
+    roles = env_a.agent_roles().long()
+    assert (roles.sum(-1) == 1).all() and (roles[:, 0] == 1).any() and (roles[:, 1] == 1).any()
+    algo = MAPPO(env(2), actor_b, critic_b, spec, graphs=False)
+    algo.reset()
+    algo.role_prev.copy_(roles)
+    algo.role_age.fill_(1)  # held for the whole rollout (dwell 50)
+    algo.rollout()
+    assert torch.equal(algo.lrole_buf, roles.expand(T, -1, -1))
+    assert algo.decide_buf.sum() == 0
+    assert torch.maximum(algo.term_buf, algo.trunc_buf).sum() == 0
+    sent = None
+    for t in range(T):
+        assert torch.equal(algo.obs_buf[t], obs)  # phase A's observation, signs included
+        mask = algo.msg_mask_buf[t]
+        assert t == 0 or (torch.equal(algo.msg_obs_buf[t], sent) and mask.any())
+        msg = {"msg_obs": algo.msg_obs_buf[t], "msg_mask": mask}
+        with torch.no_grad():
+            loc, scale = policy_outputs(actor_a, obs, roles, msg=msg)[:2]
+        want = tanh_normal_log_prob(algo.u_buf[t], loc, scale)
+        torch.testing.assert_close(algo.logp_buf[t], want)
+        sent = obs
+        obs = env_a.step(actor_b.squash(algo.u_buf[t]))[0].clone()
+    # Both heads trained in phase A: the observer does not act as a pusher would.
+    with torch.no_grad():
+        as_pushers = policy_outputs(actor_a, sent, torch.zeros_like(roles), msg=msg)[0]
+    assert not torch.allclose(as_pushers, loc)
+
+
 def test_greedy_arm_holds_a_learned_role_for_the_dwell():
     env = build_env("navigation", n_envs=3, n_agents=4, device="cpu", dt=0.1, substeps=1,
                     max_steps=None, seed=0)
@@ -1633,7 +1764,9 @@ def test_greedy_arm_holds_a_learned_role_for_the_dwell():
 
     def acting(prev: int, role: int) -> torch.Tensor:
         full = torch.full((3, 4), prev, dtype=torch.long)
-        return actor.greedy(obs, full, head_roles=torch.full_like(full, role))
+        signed = obs.clone()
+        signed[..., SIGN_COLS] = 2.0 * prev - 1.0  # every agent in the previous role
+        return actor.greedy(signed, full, head_roles=torch.full_like(full, role))
 
     act = greedy_score_kwargs(actor)["policy_from_env"](env)
     bias = actor.role_head.bias

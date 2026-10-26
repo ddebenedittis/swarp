@@ -411,6 +411,50 @@ def next_role(
     return torch.where(age >= dwell, score.argmax(-1), prev)
 
 
+def role_sign_columns(
+    scenario: Any, n_agents: int, device: torch.device | str = "cpu"
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(cols [K], src [A, K])``: the observation columns that carry a role sign, from
+    ``scenario.obs_layout()``, and per agent ``i`` the agent whose role each one shows.
+
+    ``"role"`` is the agent's own sign (``src`` ``i``). A ``"teammates"`` slice holds
+    ``A - 1`` equal blocks, one per other agent in ascending index with the agent itself
+    skipped, each ending with that agent's sign (``pusht_lidar``'s layout). Learned roles
+    rewrite these columns (:func:`learned_role_signs`); a scenario without a one-column
+    ``"role"`` slice is refused."""
+    layout = scenario.obs_layout() if hasattr(scenario, "obs_layout") else {}
+    own = layout.get("role")
+    if own is None or own.stop - own.start != 1:
+        raise ValueError(
+            "learned roles write each agent's role sign into the observation: the scenario "
+            f"needs a one-column 'role' slice in obs_layout(); {type(scenario).__name__} "
+            f"has {own!r}"
+        )
+    A, cols = n_agents, [own.start]
+    src = [[i] for i in range(A)]
+    mates = layout.get("teammates")
+    if mates is not None and A > 1:
+        width, rem = divmod(mates.stop - mates.start, A - 1)
+        if rem or width < 1:
+            raise ValueError(f"obs_layout()['teammates'] {mates} is not {A - 1} equal blocks")
+        cols += [mates.start + (m + 1) * width - 1 for m in range(A - 1)]
+        for i in range(A):
+            src[i] += [j for j in range(A) if j != i]
+    as_long = partial(torch.tensor, dtype=torch.long, device=device)
+    return as_long(cols), as_long(src)
+
+
+def learned_role_signs(
+    obs: torch.Tensor, roles: torch.Tensor, cols: torch.Tensor, src: torch.Tensor
+) -> torch.Tensor:
+    """``obs`` ``[*, A, Ob]`` with the role-sign columns ``cols`` rewritten from ``roles``
+    ``[*, A]`` (:func:`role_sign_columns`): ``+1`` where the agent ``src`` names holds role
+    1, ``-1`` otherwise, what the scenario writes for its own roles. Out of place, a fixed
+    number of ops on fixed shapes, so it records into a captured graph."""
+    sign = (roles[..., src] == 1).to(obs.dtype) * 2.0 - 1.0
+    return obs.index_copy(obs.dim() - 1, cols, sign)
+
+
 #: Side of the square, in metres and centred on the truth, an outlier position is drawn in.
 PRIV_OUTLIER_BOX = 1.0
 
@@ -512,7 +556,11 @@ class MAPPO:
     log-probability to the action's; ``lrole_in_buf`` ``[T + 1, E, A]``, ``lrole_buf`` and
     ``decide_buf`` ``[T, E, A]`` record ``r_{t-1}``, ``r_t`` and the decision rows for the
     update. The critic keeps the env's roles and reads, appended to its state, every
-    agent's ``onehot(r_{t-1})`` and ``min(age, dwell) / dwell`` in agent order.
+    agent's ``onehot(r_{t-1})`` and ``min(age, dwell) / dwell`` in agent order. The
+    observation's role signs, its own and its teammates' (:func:`role_sign_columns`), are
+    rewritten from ``r_{t-1}`` (:func:`learned_role_signs`) before ``obs_buf`` records it,
+    so the actor, the critic, the messages and the update read the learned roles there too,
+    not the env's.
 
     A ``teacher`` (a privileged :class:`PolicyNet` without memory, communication or learned
     roles, frozen here) is distilled into the actor on the actor's own rollouts: the act
@@ -702,6 +750,7 @@ class MAPPO:
             self.lrole_in_buf = z(T + 1, E, A, dtype=torch.long)
             self.lrole_buf = z(T, E, A, dtype=torch.long)
             self.decide_buf = z(T, E, A)
+            self._sign_cols, self._sign_src = role_sign_columns(env.scenario, A, dev)
         # The logged switch rate: switches and decisions summed over the rollout, divided
         # once in the update (a per-step ratio would average in the steps nobody decides).
         self.switch_acc = z(2) if self.learned else None
@@ -890,6 +939,8 @@ class MAPPO:
     def _greedy(self, obs: torch.Tensor) -> torch.Tensor:
         """The greedy action; a recurrent policy advances ``self.h``, a delayed-message one
         sends this observation's messages for the next step."""
+        if self.learned:
+            obs = self._signed(obs)
         if self.priv:
             obs = torch.cat([obs, self.env.aux_targets()], -1)
         if not (self.recurrent or self.use_mask or self.delayed or self.learned):
@@ -944,6 +995,10 @@ class MAPPO:
         age = self.role_age.clamp_max(self.dwell).float() / self.dwell
         return torch.cat([onehot, age.unsqueeze(-1)], -1).flatten(-2)
 
+    def _signed(self, obs: torch.Tensor) -> torch.Tensor:
+        """``obs`` ``[E, A, Ob]`` with the role signs of the previous learned roles."""
+        return learned_role_signs(obs, self.role_prev, self._sign_cols, self._sign_src)
+
     def _fetch_sources(self) -> None:
         """Point at the env's state/role/aux/mask buffers for the current observation
         (host only)."""
@@ -980,7 +1035,10 @@ class MAPPO:
         return (self._out[0], *(x for x in self._src if x is not None))
 
     def _act_body(self) -> None:
-        obs = self._out[0]
+        obs = env_obs = self._out[0]
+        if self.learned:
+            # The learned roles' signs, for everything but a teacher (the env's roles).
+            obs = self._signed(obs)
         self.obs_buf.index_copy_(0, self.t, obs.unsqueeze(0))
         state, roles, aux, mask = self._src
         if self.learned:
@@ -1054,7 +1112,7 @@ class MAPPO:
             self._advance_roles(role)
         self.logp_buf.index_copy_(0, self.t, logp.unsqueeze(0))
         if self.distil:
-            t_loc = self.teacher.step(torch.cat([obs, aux], -1), env_roles)[0]
+            t_loc = self.teacher.step(torch.cat([env_obs, aux], -1), env_roles)[0]
             self.teacher_loc_buf.index_copy_(0, self.t, t_loc.unsqueeze(0))
 
     def _store_body(self) -> None:
@@ -1132,7 +1190,7 @@ class MAPPO:
             self._out = out
             self._fetch_sources()
             self._store()
-        self.obs_buf[self.T].copy_(self._out[0])
+        self.obs_buf[self.T].copy_(self._signed(self._out[0]) if self.learned else self._out[0])
         state, roles = self._src[:2]
         if self.learned:
             state = torch.cat([state, self._role_state()], -1)
@@ -1638,18 +1696,19 @@ def tie_roles(
 
 
 def tie_learned_roles(
-    actor: PolicyNet, state: Mapping[str, torch.Tensor]
+    actor: PolicyNet, state: Mapping[str, torch.Tensor], roles: Iterable[int] | None = None
 ) -> dict[str, torch.Tensor]:
     """``state``, the weights of a ``"heads"`` :class:`PolicyNet` without learned roles,
     laid out for the learned-roles ``actor`` before :func:`load_widened`.
 
     The teammates' role columns enter the trunk after the role one-hot, ahead of any
     message or privileged columns, so those are moved right and the new ones zeroed (a
-    leading-corner widening would misplace them). Every role is tied to role 0
-    (:func:`tie_roles`), so the widened actor acts under any role as the checkpoint did in
-    role 0, the only one a ``(A, 0)`` scenario fills."""
+    leading-corner widening would misplace them). ``roles`` (every role past 0 by default)
+    are tied to role 0 (:func:`tie_roles`): :func:`train` ties the ones the checkpoint left
+    empty, so a ``(A, 0)`` checkpoint acts under any role as it did in role 0, and a
+    ``(1, 1)`` one keeps both trained heads."""
     Ob, R = actor.obs_dim, actor.n_roles
-    state = tie_roles(actor, state, range(1, R))
+    state = tie_roles(actor, state, range(1, R) if roles is None else roles)
     w = state["trunk.0.weight"]
     if actor.comm != "attn" and w.shape[1] > Ob + R:
         state["trunk.0.weight"] = torch.cat(
@@ -1682,7 +1741,9 @@ def greedy_env_arm(
     which is right for :func:`score`'s one un-reset episode per env; a loop whose env
     resets mid-run must build a fresh action function per episode. A learned-roles one
     carries each agent's role the same way, from role 0 with a decision on the first call:
-    the argmax of the role logits every ``role_dwell`` calls, held in between.
+    the argmax of the role logits every ``role_dwell`` calls, held in between; it reads the
+    observation with the role signs of its previous roles, as the trainer does
+    (:func:`learned_role_signs`).
 
     ``priv_noise`` (``TrainSpec.priv_noise``'s tuple) feeds a privileged actor
     :func:`noisy_priv` of the aux targets instead, with each robot's bias drawn on the
@@ -1720,10 +1781,13 @@ def greedy_env_arm(
         if learned:
             role = torch.zeros(env.n_envs, env.n_agents, dtype=torch.long, device=env.device)
             age = torch.full_like(role, actor.role_dwell)
+            sign_cols, sign_src = role_sign_columns(env.scenario, env.n_agents, env.device)
 
         @torch.no_grad()
         def act(obs: torch.Tensor) -> torch.Tensor:
             nonlocal h, prev, role, age
+            if learned:
+                obs = learned_role_signs(obs, role, sign_cols, sign_src)
             roles = env.agent_roles() if uses_roles else None
             mask = env.comm_mask() if actor.communicates else None
             msg = {}
@@ -2234,14 +2298,19 @@ def train(cfg: TrainConfig) -> Path:
                      widen=cfg.resume_widen)
         state, saved = a.state_dict(), checkpoint_archs(ckpt)[1]
         tied: list[int] = []
+        warm = ""  # the learned-roles warm start, for the print
         if isinstance(actor, PolicyNet) and not cfg.resume_critic_only:
+            old = saved.get("role_counts") or ()
             if spec.learned_roles and not saved.get("learned_roles"):
-                # A checkpoint without learned roles: every role starts as its role 0.
-                tied = list(range(1, actor.n_roles))
-                state = tie_learned_roles(actor, state)
+                # A checkpoint without learned roles: a role it left empty (or lacks)
+                # starts as its role 0, and the teammates' role columns are added.
+                tied = [r for r in range(1, actor.n_roles) if r >= len(old) or old[r] == 0]
+                state = tie_learned_roles(actor, state, tied)
+                warm = ("; learned roles from role_counts "
+                        f"{list(old)}: teammates' role columns added, "
+                        + (f"roles {tied} tied to role 0" if tied else "no role tied"))
             else:
                 # A role the checkpoint left empty (rows never trained) starts as its role 0.
-                old = saved.get("role_counts") or ()
                 tied = [
                     r for r, (o, n) in enumerate(zip(old, actor.role_counts, strict=False))
                     if o == 0 < n
@@ -2253,7 +2322,7 @@ def train(cfg: TrainConfig) -> Path:
         what = "critic" if cfg.resume_critic_only else "actor + critic"
         print(f"resumed {what} from {cfg.resume}"
               + (f"; freshly initialised: {', '.join(fresh)}" if fresh else "")
-              + (f"; roles {tied} tied to role 0 (heads, role inputs)" if tied else ""))
+              + (warm or (f"; roles {tied} tied to role 0 (heads, role inputs)" if tied else "")))
     if cfg.train_only:
         keep = freeze_actor(actor, cfg.train_only)
         print(f"training only the actor's {', '.join(keep)} (and the critic)")

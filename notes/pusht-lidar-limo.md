@@ -334,6 +334,7 @@ The consolidation changed only which per-robot values L12's resets draw (one few
 
 - `obs.py` reads `lidar_fov_at_mount` from a checkpoint's keywords and defaults it to False (per centre ray). Checkpoints trained after the consolidation no longer store it and are always cropped at the mount, so the deployment's default must become True for them (or key on the checkpoint's commit). The original L12 checkpoint still stores `lidar_fov_at_mount=True`, so it deploys as before.
 - `swarp_reference.py` and `sysid_swarp.py` look recipes up by name in `SPECS`: use `pusht_lidar_limo`, or check out the tag for an old name.
+- A `--learned-roles` checkpoint reads each robot's and its teammates' previous learned role in the observation's role-sign columns (`swarp.rl.ppo.learned_role_signs`), not the scenario's; a deployment must rewrite them from the roles it carries, or every robot reads itself and its teammate as pushers. `policy_node` runs fixed roles only.
 - `scripts/real/config.bash` and `localize.py` still point at L9c; L12 needs `lidar_fov:=3.8397243543875255` (220°) and the arena's half side, as L9c did.
 
 ## Open leads

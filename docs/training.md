@@ -125,7 +125,7 @@ Their defaults are the plain trainer: with all seven at their default the same k
 | `aux_coef` | `--aux-coef` | `0.0`, any positive weight | `aux_targets()` |
 | `privileged_actor` | `--privileged-actor` | `False`, `True` | `aux_targets()` |
 | `priv_noise` | `--priv-noise` | `()`, five values `>= 0` | `aux_targets()` with `aux_scale`, no on-goal flag |
-| `learned_roles` | `--learned-roles` | `False`, `True` | `agent_roles()` with `role_counts` `(A, 0)` |
+| `learned_roles` | `--learned-roles` | `False`, `True` | `agent_roles()` with `role_counts` `(A, 0)`, a `role` column in `obs_layout()` |
 
 The scenario side is three optional hooks, `critic_state()`, `agent_roles()` and `aux_targets()`, described in [Writing a scenario](writing-a-scenario.md#training-hooks-optional).
 `train` refuses an option whose hook the scenario does not provide, rather than training without it.
@@ -173,9 +173,10 @@ The periodic greedy evaluation applies the same noise, so the logged `eval_solve
 A zero-initialised role head on the last hidden layer gives role logits, so every role starts equally likely.
 Every `role_dwell` steps (`--role-dwell`, 5), and on an episode's first step, the rollout samples the role by Gumbel-argmax and its log-probability joins the action's in the PPO ratio; in between the role is held and adds nothing to the ratio.
 The actor reads its previous role as the role one-hot and the teammates' mean previous-role one-hot right after it, and acts with the head of the role it holds now; its messages are encoded with the previous role.
+The observation's role signs (the `role` column of the scenario's `obs_layout()`, and the last column of each `teammates` block, one per other agent in ascending index) are rewritten from the previous roles, +1 for role 1 and -1 for role 0, so the actor, its messages, the critic and the greedy evaluation read the learned roles there too rather than the scenario's all-role-0 signs.
 The critic keeps the scenario's roles and reads every agent's previous role and dwell age appended to its state.
 The loss gains `role_entropy_coeff` (`--role-entropy-coeff`, 0.01) times the exact categorical entropy averaged over the decision steps, logged as `role_entropy`; `role1_frac` and `switch_rate` (the decisions that changed the role) are logged with the metrics.
-`--resume --resume-widen --learned-roles` starts from a checkpoint without learned roles with every role's head and role input tied to role 0's, so the policy acts as it did whichever role it holds.
+`--resume --resume-widen --learned-roles` starts from a checkpoint without learned roles with zero weights on the teammates' role columns and each role the checkpoint left empty tied to role 0's head and role input: a `(2, 0)` checkpoint acts as it did whichever role it holds, and a `(1, 1)` one keeps both trained heads and acts as it did in whichever role it was assigned.
 
 **Distillation from a privileged teacher.**
 `teacher` (`--teacher PATH`, with `"policynet"` and `aux_coef > 0`) distils a privileged checkpoint into the actor, DAgger-style: the actor keeps acting with its own samples, and at every rollout step the act graph also records the frozen teacher's pre-tanh mean on the observation and the aux targets under the scenario's roles.
