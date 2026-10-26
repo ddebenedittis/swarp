@@ -140,13 +140,31 @@ The weights were set from a random-policy rollout (512 envs, 400 steps, the reci
 An observer's terms total about −0.028 per step against −0.0016 for a pusher's, and each is within a factor of seven of the pushers' approach term.
 Occlusion is rare under a random policy (11% of observer steps, covering a third of the cone when it happens), so its weight is five times the others': a blocked view then costs about 0.033 per step, the size of the approach term's 0.023.
 
+### Settled hold
+
+By default an episode succeeds on the first step the T is within `goal_tolerance` and `angle_tolerance`, so a policy can cross the goal at speed and still count as solved.
+`hold_steps > 0` asks for a settled hold instead: the T must stay on goal for that many steps in a row while it moves slower than `settle_tee_speed` and turns slower than `settle_tee_ang_vel`, and every robot moves slower than `settle_robot_speed` and turns slower than `settle_robot_ang_vel`.
+Stopping the T while still pushing it does not count, and neither does passing through.
+A per-env counter tracks the hold, cleared by a reset or by any step that is not settled.
+The goal bonus is paid on the step the hold completes, and the team term adds `hold_reward` times the change of the hold's progress (its count over `hold_steps`, capped at 1).
+That is a potential difference, so a hold that breaks gives back what it earned and cannot be farmed by stepping in and out of the goal.
+`on_goal_reward` adds a second potential on the pose being within both tolerances: reaching the goal pays it and leaving gives it back, so a reach still pays while passing through no longer counts as success.
+The critic state ends with the hold's progress; the robots do not observe it.
+Every threshold is an attribute a trainer can ramp, and `hold_steps` can ramp too as long as it stays above 0.
+
+### Sensor failure
+
+`lidar_blackout` kills each robot's lidar for a whole episode with that probability, drawn per robot on every reset.
+Every ray of a dead lidar reads as a miss, so a blind robot knows the T only from what its teammates tell it (see [Memory and communication](training.md#memory-and-communication)).
+The critic state ends with the role-sorted flags.
+
 ### Training hooks
 
 The observation kernel writes the three trainer buffers on every pass, the obs-only pass after an auto-reset included, so they always describe the state the observation does.
 
 - `critic_state()`, `[n_envs, 15 + 5 n_agents]` (`15 + 7 n_agents` when the heading is observed): the T's position, the goal relative to it, cos and sin of its heading and heading error, its velocity and angular velocity, the goal pose, then per robot in role-sorted order its position, velocity, role sign and, when it matters, cos and sin of its heading.
 - `agent_roles()` with `role_counts = (n_pushers, n_agents − n_pushers)` and `n_roles = 2`.
-- `aux_targets()`, `[n_envs, n_agents, 4]`: the T's position relative to each robot divided by the lidar range, and cos and sin of its heading.
+- `aux_targets()`, `[n_envs, n_agents, 4]`: the T's position relative to each robot divided by the lidar range, and cos and sin of its heading. With `aux_goal` a fifth column is 1 while the T is on goal and 0 otherwise, so the aux head doubles as each robot's estimate of whether the task is done.
 
 `SPECS["pusht_lidar"]` is stage T0: Push-T's recipe with five robots at `obs_level=0`, a `PolicyNet` with one head per role, and a per-slot `StateCritic` on `critic_state()`, with the auxiliary loss off.
 

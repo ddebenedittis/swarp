@@ -148,6 +148,33 @@ It trained in 14156 iterations (365 ms each, about 86 min) with no rollback, and
 In Gazebo it solved 39/40 (ground truth) and 34/40 (AMCL) with spread-out landmarks, and 31/40 and 26/40 with them at the arena's edge, where L9c solved none.
 It has not run on the real robots yet.
 
+## L13: settled hold from L12 (failed)
+
+Branch `pusht-lidar-stop-comm` (kept as is; its useful commits are ported to `pusht-lidar-roles`) asked L12 to hold the T on its goal: on goal and settled for 1 s (`hold_steps` 5, T below 3 cm/s and 0.1 rad/s, robots below 0.1 m/s and 0.4 rad/s).
+L12 solves 0.96 when passing through the goal counts.
+Every fine-tune onto the full hold peaked at about 0.15 greedy hold-solve and then decayed.
+The runs are under `~/Documents/lp/swarp/runs/` on davide-cf; H2 (`runs/ckpt/H2_4000.pt`) is L12 fine-tuned on the hold ramp, the base of the R runs.
+
+| runs | change | greedy hold-solve |
+|---|---|---|
+| F0–F3 | full hold, 20% dead lidars, aux on-goal target | → ~0 |
+| G1 / G2 | no entropy / normalised advantage | decline / 0.09 → 0.03 |
+| R0 (none), R2 (vae), R5 (vae), R6 (latent) | delayed messages from H2, gate 0.5 | training solve 0.25 at iteration 540 (R0), 0.26 at 369 (R2), 0.54–0.56 at 85 (R5, R6, before the hold ramp had come in); all stopped early |
+| R3, R4 | gate 0.5 ramp | stall at clock ~11700, 0.14 → 0.03 |
+| B0, B1 | learned brake output | 0.06 → 0.01–0.02 |
+| P0, P1 | on-goal reward 3 | 0.16 at iteration 500 → 0.02–0.04 at 1500 |
+| P2 | on-goal reward 3 + ramp | ~0.13, stalls at clock 11704 |
+| K0–K2 | frozen drive, brake only | 0.002 → 0.021 (K0), others ≤ 0.02 |
+
+K0's last word: best training solve 0.070, final windowed 0.020 (stochastic policy).
+Decayed policies lose reach (F0: reach 73% → 0.3%) and slow down everywhere (P0 at iteration 1500 drives at 0.13 m/s against L12's 0.24 m/s).
+The learned brake is dropped from the code.
+
+The hold is feasible: with H2's T within tolerance, every settle check passes on 21–27% of steps.
+The likely cause is perception.
+Each robot's own estimate of the T pose (its aux head) has a median error of 0.18 m / 17° at contact range and 0.24 m / 39° at 0.4–1 m, against a 0.15 m / 14° goal tolerance, so the robots cannot tell when the T is on goal.
+AMCL-sized pose noise adds a median 0.12 m to every goal-frame estimate.
+
 ## What the consolidation removed
 
 Besides the recipe variants, the scenario knobs that only they used were pruned (all are in the tag):

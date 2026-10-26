@@ -65,6 +65,20 @@ Three are its own:
 `--compile`
 : `torch.compile` the minibatch loss (needs triton). Adds tens of seconds of startup; the compiled code is still captured by the minibatch graph.
 
+Four more serve fine-tunes from a checkpoint (`--resume`):
+
+`--resume-widen`
+: load a checkpoint whose networks are narrower than the new ones (more observation, state or aux columns, a message input); the new weights start at zero, so the policy acts as it did.
+
+`--train-only PREFIX ...`
+: train only the actor parameters whose names start with one of the prefixes; the rest of the actor is frozen and the critic trains.
+
+`--ramp-gate`
+: override the solve rate the gated ramp clock needs to advance.
+
+`--start-clock`
+: with a ramp gate, start the ramps' clock at this tick, e.g. where the checkpoint's run ended.
+
 The network options (`--actor`, `--role-params`, `--critic-input`, `--per-agent-value`, `--aux-coef`, `--resume-critic-only`) are described in [Roles, privileged critics and auxiliary losses](#roles-privileged-critics-and-auxiliary-losses), and the actor's memory and communication (`--recurrent`, `--hidden-dim`, `--seq-len`, `--comm`, `--comm-dim`) in [Memory and communication](#memory-and-communication).
 
 ## Using it from Python
@@ -159,8 +173,11 @@ Both are off by default, and with both off the networks, buffers and graphs are 
 | `recurrent` | `--recurrent` | `False`, `True` | nothing |
 | `hidden_dim` | `--hidden-dim` | `128`, any width | nothing |
 | `seq_len` | `--seq-len` | `0` (= `steps_per_batch`), a divisor of `steps_per_batch` | nothing |
-| `comm` | `--comm` | `"none"`, `"attn"` | `comm_mask()`, optionally |
+| `comm` | `--comm` | `"none"`, `"attn"`, `"latent"`, `"vae"`, `"pose"` | `comm_mask()`, optionally; `aux_targets()` for `"vae"` and `"pose"` |
 | `comm_dim` | `--comm-dim` | `64`, any width | nothing |
+| `msg_coef` | `--msg-coef` | `1.0` | nothing |
+| `msg_beta` | `--msg-beta` | `1e-3` | nothing |
+| `msg_drop` | `--msg-drop` | `0.1`, in `[0, 1)` | nothing |
 
 **Memory.**
 `recurrent` puts a `GRUCell` after the trunk (one per role with `"separate"`), and the action heads and the auxiliary head read its output.
@@ -185,6 +202,20 @@ An agent that hears nobody gets a zero message.
 The message is computed from the current step's inputs, so communication works with and without memory, and with memory the GRU is what lets a message's content persist.
 Communication needs one shared trunk, so it combines with `role_params` `"heads"` or `"shared"`; with roles and `"separate"`, `train` refuses it.
 
+**Delayed messages.**
+`"attn"` reads every teammate's *current* input, which a deployment can only reproduce by exchanging observations and waiting for them within the step.
+`"latent"`, `"vae"` and `"pose"` are messages a deployment can send over a network at the policy rate instead.
+Each agent encodes its own observation and role one-hot into a message with a one-hidden-layer MLP (never its recurrent state), broadcasts it, and its teammates read it on their *next* step.
+The listener's trunk reads its own observation and role, then the mean of the messages it received and a flag for whether it received any; those columns come last, so a policy trained without messages widens into one with zero weights on them (`--resume-widen`).
+The rollout stores the previous step's observation next to each step, and draws which packets arrive: a message is never heard across an episode start, and each sender-receiver pair loses a packet with probability `msg_drop` per step, so the policy learns to act without one.
+The three differ in what shapes the message:
+
+- `"latent"`: a `tanh` code of width `comm_dim`, trained only through the listeners' losses (the PPO objective and their aux loss), so it carries whatever helps them.
+- `"vae"`: a Gaussian code of width `comm_dim`, sampled with noise the rollout stores, so the update recomputes the log-probabilities the rollout acted with. Its own loss (weight `msg_coef`) is a decoder's squared error on the *sender's* aux targets plus `msg_beta` times the KL to the unit Gaussian, which bottlenecks the code and keeps it grounded; the listeners' gradients reach it too. The greedy message is the mean.
+- `"pose"`: the sender's own estimate of its aux targets and their log-variances, trained by a Gaussian likelihood (weight `msg_coef`) and detached from the listeners: an explicit, inspectable message whose variance says how much to trust it.
+
+`metrics.csv` logs the message's own loss as `loss_msg`.
+
 The mask is a training hook with the same fixed-address contract as the others ([Writing a scenario](writing-a-scenario.md#training-hooks-optional)); the rollout records it next to the observation and the update reads it back with each sample.
 Whether a scenario has one is decided once, when `MAPPO` is built, from whether `comm_mask()` returns `None`.
 
@@ -192,6 +223,7 @@ Whether a scenario has one is decided once, when `MAPPO` is built, from whether 
 `swarp.rl.greedy_env_arm(actor)` (and `examples/eval_mappo.py`, which goes through it) gives a recurrent policy a stateful action function: it starts from a zero hidden state and carries it from call to call, which is right for the evaluator's single un-reset episode per env.
 A loop whose envs reset mid-run builds a fresh action function per episode.
 `PolicyNet.greedy(obs, roles, h)` acts from a given hidden state and drops the new one; `PolicyNet.step` returns it.
+For a delayed-message policy the action function also keeps the previous observation and hears every teammate from the second step on, with no packet loss.
 
 ```bash
 python -m swarp.rl --scenario <name> --actor policynet --recurrent --hidden-dim 128 \
