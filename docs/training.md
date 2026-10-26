@@ -80,7 +80,7 @@ Four more serve fine-tunes from a checkpoint (`--resume`):
 `--start-clock`
 : with a ramp gate, start the ramps' clock at this tick, e.g. where the checkpoint's run ended.
 
-The network options (`--actor`, `--role-params`, `--critic-input`, `--per-agent-value`, `--aux-coef`, `--privileged-actor`, `--learned-roles`, `--resume-critic-only`) are described in [Roles, privileged critics and auxiliary losses](#roles-privileged-critics-and-auxiliary-losses), and the actor's memory and communication (`--recurrent`, `--hidden-dim`, `--seq-len`, `--comm`, `--comm-dim`) in [Memory and communication](#memory-and-communication).
+The network options (`--actor`, `--role-params`, `--critic-input`, `--per-agent-value`, `--aux-coef`, `--privileged-actor`, `--learned-roles`, `--teacher`, `--resume-critic-only`) are described in [Roles, privileged critics and auxiliary losses](#roles-privileged-critics-and-auxiliary-losses), and the actor's memory and communication (`--recurrent`, `--hidden-dim`, `--seq-len`, `--comm`, `--comm-dim`) in [Memory and communication](#memory-and-communication).
 
 ## Using it from Python
 
@@ -165,6 +165,12 @@ The actor reads its previous role as the role one-hot and the teammates' mean pr
 The critic keeps the scenario's roles and reads every agent's previous role and dwell age appended to its state.
 The loss gains `role_entropy_coeff` (`--role-entropy-coeff`, 0.01) times the exact categorical entropy averaged over the decision steps, logged as `role_entropy`; `role1_frac` and `switch_rate` (the decisions that changed the role) are logged with the metrics.
 `--resume --resume-widen --learned-roles` starts from a checkpoint without learned roles with every role's head and role input tied to role 0's, so the policy acts as it did whichever role it holds.
+
+**Distillation from a privileged teacher.**
+`teacher` (`--teacher PATH`, with `"policynet"` and `aux_coef > 0`) distils a privileged checkpoint into the actor, DAgger-style: the actor keeps acting with its own samples, and at every rollout step the act graph also records the frozen teacher's pre-tanh mean on the observation and the aux targets under the scenario's roles.
+The update adds `bc_coef` (`--bc-coef`, 1.0) times the mean squared distance between the actor's mean and the teacher's on the same minibatch rows, through the actor's own forward pass, so it composes with memory, messages and learned roles; it is logged as `loss_bc`.
+`--bc-decay-iters N` decays the weight linearly to 0 over the first `N` iterations.
+The teacher must be a `PolicyNet` without memory, communication or learned roles whose observation, privileged and action widths match the scenario's; checkpoints do not store it.
 
 The rollout records the critic state, the roles and the auxiliary targets next to the observation, inside the same captured act graph, and reads them back by address, as it reads the observation.
 That is why the scenario has to write them in the observation pass.

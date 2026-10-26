@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import copy
 import csv
 import gc
 import math
 from dataclasses import replace
+from functools import partial
 
 import pytest
 import torch
@@ -373,10 +375,12 @@ def _algo(
     patch=_patch_training_hooks,
     scen_kwargs=(),
     train_only=(),
+    teacher=None,
     **spec_kw,
 ) -> MAPPO:
     """Navigation at test size; ``features`` turns on the state critic (state + obs, per
-    agent), role heads and the aux loss over ``patch`` (:func:`_patch_training_hooks`)."""
+    agent), role heads and the aux loss over ``patch`` (:func:`_patch_training_hooks`).
+    ``teacher(actor, env)`` builds a teacher to distil into the actor."""
     # A previous test's MAPPO holds captured torch graphs in reference cycles (bound
     # methods); collected during this env's Warp capture, their teardown would invalidate
     # it. ``torch.cuda.graph`` collects before its own captures for the same reason.
@@ -422,9 +426,16 @@ def _algo(
         critic = Critic(Ob, A, spec.num_cells)
     if train_only:
         freeze_actor(actor, train_only)
-    algo = MAPPO(env, actor.to(device), critic.to(device), spec, graphs=graphs)
+    module = None if teacher is None else teacher(actor, env).to(device)
+    algo = MAPPO(env, actor.to(device), critic.to(device), spec, graphs=graphs, teacher=module)
     algo.reset()
     return algo
+
+
+def _fresh_teacher(actor, env, **kw) -> PolicyNet:
+    """A privileged teacher over the env's roles, with weights of its own."""
+    return PolicyNet(env.obs_dim, env.act_dim, 32, role_counts=env.role_counts,
+                     aux_dim=AUX_DIM, priv_dim=AUX_DIM, **kw)
 
 
 def test_defaults_allocate_no_new_buffers_and_keep_the_legacy_stats():
@@ -589,7 +600,7 @@ _COMM = {"actor": "policynet", "comm": "attn", "comm_dim": 8, "patch": _patch_co
 _ROLLOUT = ("obs_buf", "u_buf", "logp_buf", "rew_buf", "term_buf", "trunc_buf",
             "state_buf", "role_buf", "aux_buf", "h_buf", "mask_buf", "msg_obs_buf",
             "msg_mask_buf", "msg_noise_buf", "msg_aux_buf", "msg_valid_buf", "lrole_in_buf",
-            "lrole_buf", "decide_buf")
+            "lrole_buf", "decide_buf", "teacher_loc_buf")
 # Learned roles over one filled role, decided every 3 steps in 5-step episodes.
 _LEARNED = {"learned_roles": True, "role_dwell": 3, "normalize_advantage": False,
             "critic_input": "state+obs", "max_steps": 5, "patch": _patch_single_role}
@@ -614,10 +625,11 @@ def _copy_rollout(dst: MAPPO, src: MAPPO) -> None:
         (True, _LEARNED),
         (True, {**_LEARNED, "comm": "pose", "comm_dim": 4, "msg_drop": 0.3}),
         (True, {**_LEARNED, "recurrent": True, "hidden_dim": HIDDEN, "seq_len": 4}),
+        (True, {**_MEMORY, "seq_len": 4, "teacher": _fresh_teacher}),
     ],
     ids=["default", "features", "reset-roles", "recurrent", "comm", "recurrent-comm-features",
          "recurrent-separate", "vae-message", "privileged", "learned-roles",
-         "learned-roles-pose", "learned-roles-recurrent"],
+         "learned-roles-pose", "learned-roles-recurrent", "teacher"],
 )
 def test_captured_update_matches_eager_update(features, kw):
     """Same weights, same rollout, same permutations: the graphed update lands where the
@@ -1430,3 +1442,47 @@ def test_learned_roles_are_refused_where_they_cannot_work():
     for counts in ((), (1, 3), (4,)):
         with pytest.raises(ValueError, match="roles past the first are empty"):
             PolicyNet(6, 2, 16, role_counts=counts, learned_roles=True)
+
+
+# --------------------------------------------------------------------------- distillation
+
+
+def test_a_teacher_is_recorded_on_the_rollout_and_distilled_into_the_actor_only():
+    """The rollout records the frozen teacher's mean on ``cat(obs, aux targets)`` under the
+    env's roles; ``loss_bc`` is positive against another network, zero for a student that
+    is the teacher, and the update leaves the teacher as it was."""
+    algo = _algo(graphs=False, device="cpu", features=True, teacher=_fresh_teacher)
+    assert algo.stat_names == [*LEGACY_STAT_NAMES[:6], "loss_aux", "loss_bc", "grad_skips"]
+    frozen = [p.clone() for p in algo.teacher.parameters()]
+    assert not any(p.requires_grad for p in algo.teacher.parameters())
+    algo.rollout()
+    T = algo.T
+    with torch.no_grad():
+        obs = torch.cat([algo.obs_buf[:T], algo.aux_buf], -1)
+        ref = algo.teacher.step(obs, algo.role_buf[:T])[0]
+    torch.testing.assert_close(algo.teacher_loc_buf, ref)
+    stats = algo.update(algo.spec.entropy_coeff)
+    assert stats["loss_bc"] > 0 and stats["grad_skips"] == 0
+    assert all(torch.equal(a, b) for a, b in zip(frozen, algo.teacher.parameters(), strict=True))
+    same = _algo(graphs=False, device="cpu", features=True, privileged_actor=True,
+                 teacher=lambda actor, env: copy.deepcopy(actor))
+    same.rollout()
+    same._prepare_body()
+    same._minibatch_body()  # the first minibatch, before the actor has moved
+    assert same.mb_stats[same.stat_names.index("loss_bc") - 3].item() < 1e-10
+
+
+def test_a_teacher_is_refused_without_the_aux_targets_or_with_other_networks():
+    with pytest.raises(ValueError, match="a teacher reads the aux targets"):
+        replace(SPECS["navigation"], actor="policynet", teacher="teacher.pt")
+    with pytest.raises(ValueError, match="needs aux_coef > 0"):
+        _algo(graphs=False, device="cpu", actor="policynet", teacher=_fresh_teacher)
+    with pytest.raises(ValueError, match="without memory"):
+        _algo(graphs=False, device="cpu", features=True,
+              teacher=partial(_fresh_teacher, recurrent=True))
+    for more_obs, priv in ((0, AUX_DIM + 1), (1, AUX_DIM)):
+        with pytest.raises(ValueError, match=r"the teacher's \(obs_dim, priv_dim"):
+            _algo(graphs=False, device="cpu", features=True,
+                  teacher=lambda actor, env, o=more_obs, d=priv: PolicyNet(
+                      env.obs_dim + o, env.act_dim, 32, role_counts=env.role_counts,
+                      aux_dim=AUX_DIM, priv_dim=d))

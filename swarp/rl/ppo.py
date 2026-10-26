@@ -331,6 +331,7 @@ def ppo_loss(
     role_in: torch.Tensor | None = None,
     role_out: torch.Tensor | None = None,
     decide: torch.Tensor | None = None,
+    teacher_loc: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, ...]:
     """Clipped surrogate, smooth-L1 value loss and MC entropy for one minibatch.
 
@@ -357,6 +358,10 @@ def ppo_loss(
     acting role's log-probability enters the ratio on the decision rows, and the exact
     categorical entropy averaged over them follows the other extra losses.
 
+    ``teacher_loc`` ``[B, A, act_dim]``, a teacher's pre-tanh mean on the same rows, adds
+    the distillation loss ``mse(loc, teacher_loc)`` after the message loss (before the role
+    entropy).
+
     A thin wrapper over :func:`ppo_terms` that keeps the original op order (advantages,
     actor, policy terms, critic), so a default run launches the same kernels in the same
     sequence.
@@ -382,6 +387,8 @@ def ppo_loss(
         extra.append(actor.message_loss(
             msg["msg_obs"], actor_roles, msg_target, msg_valid, msg_beta, msg.get("msg_noise")
         ))
+    if teacher_loc is not None:
+        extra.append(F.mse_loss(loc, teacher_loc))
     if logits:
         ent = -(log_pr.exp() * log_pr).sum(-1)
         extra.append((decide * ent).sum() / decide.sum().clamp_min(1.0))
@@ -453,6 +460,14 @@ class MAPPO:
     update. The critic keeps the env's roles and reads, appended to its state, every
     agent's ``onehot(r_{t-1})`` and ``min(age, dwell) / dwell`` in agent order.
 
+    A ``teacher`` (a privileged :class:`PolicyNet` without memory, communication or learned
+    roles, frozen here) is distilled into the actor on the actor's own rollouts: the act
+    graph records the teacher's pre-tanh mean on ``cat(obs, aux targets)`` under the env's
+    roles in ``teacher_loc_buf`` ``[T, E, A, act_dim]``, and the update adds
+    ``bc_coef * mse(actor mean, teacher mean)`` (``bc_coef`` a device tensor that
+    :func:`train` decays). The actor still acts with its own samples, and the term reaches
+    it through the same forward pass as the PPO loss, memory, messages and roles included.
+
     A communicating :class:`PolicyNet` on a scenario whose ``comm_mask()`` is not
     ``None`` (decided once, here) adds a ``[T, E, A, A]`` buffer of the mask. A recurrent
     one adds the carried hidden state ``h`` ``[E, A, H]`` and ``h_buf`` ``[T, E, A, H]``,
@@ -474,6 +489,7 @@ class MAPPO:
         metrics: Mapping[str, int] = (),
         graphs: bool = True,
         compile: bool = False,
+        teacher: torch.nn.Module | None = None,
     ) -> None:
         if not env.auto_reset or env.clone_outputs:
             raise ValueError("MAPPO needs an Environment with auto_reset=True, clone_outputs=False")
@@ -533,8 +549,10 @@ class MAPPO:
         if self.learned and self.role_adv:
             raise ValueError("learned roles need normalize_advantage=False: per-role advantage "
                              "statistics assume fixed role counts")
+        self.distil = teacher is not None
         self.use_roles = (
             self.actor_roles or (self.state_critic and critic.uses_roles) or self.role_adv
+            or (self.distil and getattr(teacher, "uses_roles", False))
         )
         self.use_aux = spec.aux_coef > 0
         if self.use_aux and not (self.policy_net and actor.aux_head is not None):
@@ -551,6 +569,21 @@ class MAPPO:
                 f"needs aux_coef > 0 and aux_dim={actor.priv_dim} (got aux_coef="
                 f"{spec.aux_coef}, aux_dim={env.aux_dim})"
             )
+        self.teacher = teacher
+        if self.distil:
+            if not isinstance(teacher, PolicyNet) or teacher.stateful:
+                raise ValueError("a teacher must be a PolicyNet without memory, communication "
+                                 "or learned roles")
+            if not self.use_aux:
+                raise ValueError("a teacher reads the aux targets: it needs aux_coef > 0")
+            got = (teacher.obs_dim, teacher.priv_dim, teacher.act_dim, tuple(teacher.role_counts))
+            want = (Ob, env.aux_dim, D, tuple(env.role_counts) if teacher.uses_roles else ())
+            if got != want:
+                raise ValueError(
+                    f"the teacher's (obs_dim, priv_dim, act_dim, role_counts) are {got}; the "
+                    f"env needs {want}"
+                )
+            teacher.requires_grad_(False).eval()
         if self.actor_roles and env.role_counts != actor.role_counts:
             raise ValueError(
                 f"the actor expects role_counts {actor.role_counts}; the env has "
@@ -570,6 +603,7 @@ class MAPPO:
         self.state_buf = z(T + 1, E, critic.state_dim) if self.use_state else None
         self.role_buf = z(T + 1, E, A, dtype=torch.long) if self.use_roles else None
         self.aux_buf = z(T, E, A, env.aux_dim) if self.use_aux else None
+        self.teacher_loc_buf = z(T, E, A, D) if self.distil else None
         # Memory and communication.
         self.recurrent = self.policy_net and actor.recurrent
         self.use_mask = self.policy_net and actor.communicates and env.comm_mask() is not None
@@ -634,10 +668,16 @@ class MAPPO:
         self.perms = z(spec.epochs * self.M, self.mb_units, dtype=torch.long)
         self.k = z(1, dtype=torch.long)
         self.ent_coef = torch.tensor(spec.entropy_coeff, device=dev)
+        if self.distil:
+            #: The distillation weight the captured minibatch graph reads; :func:`train`
+            #: decays it.
+            self.bc_coef = torch.tensor(spec.bc_coef, device=dev)
         # [mean reward, n_terminated, n_done] from prepare, then
-        # [objective, critic, entropy, (aux,) skips, (KL, KL stops)] summed over the
-        # minibatch steps.
-        self.n_losses = 3 + int(self.use_aux) + int(self.msg_loss) + int(self.learned)
+        # [objective, critic, entropy, (aux, msg, bc, role entropy,) skips, (KL, KL stops)]
+        # summed over the minibatch steps.
+        self.n_losses = (
+            3 + int(self.use_aux) + int(self.msg_loss) + int(self.distil) + int(self.learned)
+        )
         # The KL is measured for the brake and for the adaptive lr; only the brake trips.
         self.kl_brake = spec.target_kl is not None or spec.adaptive_kl is not None
         self._kl_trip = 1.5 * spec.target_kl if spec.target_kl is not None else math.inf
@@ -650,6 +690,7 @@ class MAPPO:
         #: The keys of :meth:`update`'s result, in the order the stats buffers hold them.
         losses = [*LEGACY_STAT_NAMES[:6], *(["loss_aux"] if self.use_aux else []),
                   *(["loss_msg"] if self.msg_loss else []),
+                  *(["loss_bc"] if self.distil else []),
                   *(["role_entropy"] if self.learned else [])]
         kl = ["approx_kl", "kl_stops"] if self.kl_brake else []
         self.stat_names = [*losses, "grad_skips", *kl, *self.metric_names]
@@ -873,6 +914,7 @@ class MAPPO:
         if self.role_buf is not None:
             roles = roles.long()
             self.role_buf.index_copy_(0, self.t, roles.unsqueeze(0))
+        env_roles = roles  # learned roles replace them for the actor, not for a teacher
         if self.aux_buf is not None:
             self.aux_buf.index_copy_(0, self.t, aux.unsqueeze(0))
         if self.mask_buf is not None:
@@ -931,6 +973,9 @@ class MAPPO:
             self.decide_buf.index_copy_(0, self.t, decide.unsqueeze(0))
             self._advance_roles(role)
         self.logp_buf.index_copy_(0, self.t, logp.unsqueeze(0))
+        if self.distil:
+            t_loc = self.teacher.step(torch.cat([obs, aux], -1), env_roles)[0]
+            self.teacher_loc_buf.index_copy_(0, self.t, t_loc.unsqueeze(0))
 
     def _store_body(self) -> None:
         _, rew, term, trunc, info = self._out
@@ -1137,6 +1182,8 @@ class MAPPO:
                 valid = self.msg_valid_buf.reshape(N).index_select(0, idx)
                 extra["msg_valid"] = valid.unsqueeze(-1).expand(-1, A)
                 extra["msg_beta"] = self.spec.msg_beta
+        if self.distil:
+            extra["teacher_loc"] = self.teacher_loc_buf.reshape(self.N, A, -1).index_select(0, idx)
         noise = torch.randn_like(u)  # drawn here, not in the (possibly compiled) loss
         if self.kl_brake:
             extra["with_kl"] = True
@@ -1159,6 +1206,8 @@ class MAPPO:
             total = total + self.spec.aux_coef * losses[3]
         if self.msg_loss:
             total = total + self.spec.msg_coef * losses[3 + int(self.use_aux)]
+        if self.distil:
+            total = total + self.bc_coef * losses[3 + int(self.use_aux) + int(self.msg_loss)]
         if self.learned:
             total = total - self.spec.role_entropy_coeff * losses[-1]
         total.backward()
@@ -1792,6 +1841,11 @@ def parse_args(argv: list[str] | None = None) -> TrainConfig:
     p.add_argument("--role-dwell", type=int, help="steps a learned role is held")
     p.add_argument("--role-entropy-coeff", type=float,
                    help="weight of the learned roles' categorical entropy bonus")
+    p.add_argument("--teacher", metavar="PATH",
+                   help="privileged policynet checkpoint to distil into the actor")
+    p.add_argument("--bc-coef", type=float, help="weight of the distillation loss")
+    p.add_argument("--bc-decay-iters", type=int,
+                   help="iterations over which --bc-coef decays linearly to 0 (0: none)")
     p.add_argument("--action-rate-coef", type=float,
                    help="weight of the action-rate penalty on each agent's reward")
     p.add_argument("--action-rate-ramp-iters", type=int,
@@ -1852,7 +1906,7 @@ def parse_args(argv: list[str] | None = None) -> TrainConfig:
             "per_agent_value", "aux_coef", "action_rate_coef", "action_rate_ramp_iters",
             "recurrent", "hidden_dim", "seq_len", "comm", "comm_dim", "msg_coef",
             "msg_beta", "msg_drop", "ramp_gate", "privileged_actor", "learned_roles",
-            "role_dwell", "role_entropy_coeff",
+            "role_dwell", "role_entropy_coeff", "teacher", "bc_coef", "bc_decay_iters",
         )
         if getattr(a, f) is not None
     }
@@ -2027,8 +2081,10 @@ def train(cfg: TrainConfig) -> Path:
 
     set_curriculum(None)
     set_ramps(cfg.start_clock)
+    teacher = load_checkpoint(spec.teacher, device)[0] if spec.teacher else None
     algo = MAPPO(
-        env, actor, critic, spec, metrics=metrics, graphs=cfg.graphs, compile=cfg.compile
+        env, actor, critic, spec, metrics=metrics, graphs=cfg.graphs, compile=cfg.compile,
+        teacher=teacher,
     )
     algo.reset()  # after the knobs, so the first episodes run at the starting difficulty
 
@@ -2038,7 +2094,7 @@ def train(cfg: TrainConfig) -> Path:
     csv_writer = csv.writer(csv_file)
     # loss_aux only when the aux loss is on, so a default run's header is unchanged.
     aux_col = (["loss_aux"] if algo.use_aux else []) + (["loss_msg"] if algo.msg_loss else [])
-    aux_col += ["role_entropy"] if algo.learned else []
+    aux_col += (["loss_bc"] if algo.distil else []) + (["role_entropy"] if algo.learned else [])
     ramp_col = ["ramp"] if spec.ramps else []
     # The guards' columns only when each is on, likewise.
     clock_col = ["ramp_clock"] if spec.ramp_gate is not None else []
@@ -2118,6 +2174,7 @@ def train(cfg: TrainConfig) -> Path:
             + (f" (drop {spec.msg_drop}, msg_coef {spec.msg_coef})" if algo.delayed else "")
             + (" over comm_mask()" if algo.use_mask else "")
             + (f", learned roles (dwell {spec.role_dwell})" if algo.learned else "")
+            + (f", teacher {spec.teacher} (bc_coef {spec.bc_coef})" if algo.distil else "")
         )
     if cfg.scen_kwargs:
         print(f"  scenario kwargs: {cfg.scen_kwargs}")
@@ -2157,6 +2214,8 @@ def train(cfg: TrainConfig) -> Path:
         if algo.action_rate and spec.action_rate_ramp_iters > 0:
             ramp = min(1.0, (it + 1) / spec.action_rate_ramp_iters)
             algo.rate_coef.fill_(spec.action_rate_coef * ramp)
+        if algo.distil and spec.bc_decay_iters > 0:
+            algo.bc_coef.fill_(spec.bc_coef * max(0.0, 1.0 - it / spec.bc_decay_iters))
         algo.rollout()
         stats = algo.update(coeff)  # the iteration's one host sync
         wall = time.perf_counter() - t0
@@ -2260,6 +2319,7 @@ def train(cfg: TrainConfig) -> Path:
             + (f"kl {stats['approx_kl'] / max(n_mb - skips, 1):.4f}  " if kl_col else "")
             + (f"lr x{kl_lr:.3g}  " if adapt_col else "")
             + f"ent {ent / updates:+.3f}  "
+            + (f"bc {stats['loss_bc'] / updates:.4f}  " if algo.distil else "")
             + (f"role1 {stats['role1_frac']:.2f}  switch {stats['switch_rate']:.2f}  "
                if algo.learned else "")
             + f"{wall * 1e3:.1f}ms"

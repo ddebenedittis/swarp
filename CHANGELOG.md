@@ -7,6 +7,8 @@ All notable changes to `swarp`. Newest first. Nothing has been released yet — 
 
 ### Added
 
+- **`TrainSpec.teacher` (`--teacher`, `--bc-coef`, `--bc-decay-iters`)**: distils a privileged `PolicyNet` checkpoint into the actor on its own rollouts, adding `bc_coef * mse(actor mean, teacher mean)` to the PPO loss and logging it as `loss_bc`.
+
 - **`TrainSpec.learned_roles` (`--learned-roles`, `--role-dwell`, `--role-entropy-coeff`)**: on a scenario with `role_counts` `(A, 0)` each agent samples its role every `role_dwell` steps from a role head, the choice entering the PPO ratio; a checkpoint without it widens into one that acts as before under either role.
 
 - **`TrainSpec.privileged_actor` (`--privileged-actor`, `PolicyNet(priv_dim=...)`)**: the actor reads the scenario's aux targets as extra last trunk columns, a diagnostic for whether a task fails on perception; a plain checkpoint widens into it acting as before.

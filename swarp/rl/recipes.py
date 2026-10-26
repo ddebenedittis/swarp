@@ -250,6 +250,17 @@ class TrainSpec:
     role_entropy_coeff: float = 0.01
     """Weight of the learned roles' entropy bonus: the exact categorical entropy averaged
     over the decision steps."""
+    teacher: str = ""
+    """Path to a :func:`~swarp.rl.ppo.train` checkpoint of a privileged ``PolicyNet``
+    (``priv_dim`` = the scenario's ``aux_dim``, not recurrent, not communicating) to distil
+    into the actor: on the actor's own rollouts the teacher's pre-tanh mean is recorded, and
+    the update adds ``bc_coef * mse(actor mean, teacher mean)``. Empty: no teacher. Needs
+    ``actor="policynet"`` and ``aux_coef > 0`` (the teacher reads the aux targets)."""
+    bc_coef: float = 1.0
+    """Weight of the distillation loss. Ignored without ``teacher``."""
+    bc_decay_iters: int = 0
+    """Iterations over which ``bc_coef`` decays linearly to 0; 0 keeps it constant. Counted
+    from the run's first iteration, a resumed run included."""
     action_rate_coef: float = 0.0
     """Weight of the action-rate penalty: every agent's reward loses
     ``action_rate_coef * mean_i(((a_t - a_{t-1}) / half_i)^2)``, ``half_i`` the action
@@ -311,6 +322,11 @@ class TrainSpec:
                              "critic_input 'state' or 'state+obs' and normalize_advantage=False")
         if self.role_dwell < 1 or self.role_entropy_coeff < 0:
             raise ValueError("role_dwell must be >= 1 and role_entropy_coeff >= 0")
+        if self.teacher and not (self.actor == "policynet" and self.aux_coef > 0):
+            raise ValueError("a teacher reads the aux targets: it needs actor='policynet' and "
+                             "aux_coef > 0")
+        if self.bc_coef < 0 or self.bc_decay_iters < 0:
+            raise ValueError("bc_coef and bc_decay_iters must be >= 0")
         if self.recurrent and self.actor != "policynet":
             raise ValueError("recurrent=True needs actor='policynet' (the GRU lives there)")
         if self.comm != "none" and self.actor != "policynet":
