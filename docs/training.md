@@ -54,6 +54,7 @@ The speedup carries through to time-to-solve: on `giveway`, over three seeds, ev
 ## Flags
 
 `python -m swarp.rl` takes the same flags as `examples/train_mappo.py`: every `TrainSpec` field (`--iters`, `--n-envs`, `--lr`, `--entropy-coeff`, ...), `--scen-kwarg k=v` for any scenario keyword, and the curriculum, checkpoint and eval controls.
+A `--scen-kwarg` on an attribute the spec ramps pins it: the ramp on it is dropped, since it would overwrite the value from the first iteration on.
 Three are its own:
 
 `--no-graphs`

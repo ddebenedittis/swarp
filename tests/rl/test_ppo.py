@@ -1161,3 +1161,12 @@ def test_train_only_moves_the_named_actor_parameters_and_the_critic(graphs):
     assert any(not torch.equal(p, q) for p, q in zip(algo.critic.parameters(), critic, strict=True))
     with pytest.raises(ValueError, match="matches none"):
         freeze_actor(algo.actor, ("nope",))
+
+
+def test_a_scen_kwarg_pins_its_attribute_and_drops_the_ramp_on_it():
+    """A ramp would overwrite a --scen-kwarg from the first iteration on; the flag wins."""
+    ramped = {r.attr for r in SPECS["pusht_lidar_limo"].ramps}
+    assert "pose_noise" in ramped
+    cfg = parse_args(["--scenario", "pusht_lidar_limo", "--scen-kwarg", "pose_noise=0"])
+    assert cfg.scen_kwargs["pose_noise"] == 0
+    assert {r.attr for r in cfg.spec.ramps} == ramped - {"pose_noise"}

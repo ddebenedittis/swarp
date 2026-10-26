@@ -1610,9 +1610,16 @@ def parse_args(argv: list[str] | None = None) -> TrainConfig:
         p.error("--start-clock sets the gated ramp clock: the spec needs ramp_gate")
     scen_kwargs = dict(spec.scen_kwargs)
     try:
-        scen_kwargs.update(coerce_scen_kwargs(a.scenario, a.scen_kwarg))
+        pinned = coerce_scen_kwargs(a.scenario, a.scen_kwarg)
     except (ValueError, KeyError) as exc:
         p.error(str(exc))
+    scen_kwargs.update(pinned)
+    # A --scen-kwarg pins its attribute: a ramp on it would overwrite the value from the first
+    # iteration on (and the greedy eval, which runs no ramps, would score another world).
+    dropped = [r.attr for r in spec.ramps if r.attr in pinned]
+    if dropped:
+        spec = replace(spec, ramps=tuple(r for r in spec.ramps if r.attr not in pinned))
+        print(f"--scen-kwarg pins {dropped}: their ramps are dropped")
 
     return TrainConfig(
         scenario=a.scenario, spec=spec, scen_kwargs=scen_kwargs, device=a.device,
