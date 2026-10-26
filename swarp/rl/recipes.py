@@ -238,6 +238,18 @@ class TrainSpec:
     else (``PolicyNet``'s ``priv_dim``): the truth an aux head would estimate, handed over.
     An experiment, not a deployable policy: it tells whether a task fails on perception.
     Needs ``actor="policynet"`` and ``aux_coef > 0``."""
+    learned_roles: bool = False
+    """Each agent chooses its role (``PolicyNet``'s ``learned_roles``): every
+    ``role_dwell`` steps a role head samples it, the choice enters the PPO ratio, and the
+    role is held in between. Needs ``actor="policynet"``, ``role_params="heads"``, a
+    critic that reads the state (the roles and their ages are appended to it),
+    ``normalize_advantage=False`` (per-role statistics assume fixed counts), and a
+    scenario whose roles past the first are empty, like ``role_counts`` ``(A, 0)``."""
+    role_dwell: int = 5
+    """Steps a learned role is held between decisions; an episode's first step decides."""
+    role_entropy_coeff: float = 0.01
+    """Weight of the learned roles' entropy bonus: the exact categorical entropy averaged
+    over the decision steps."""
     action_rate_coef: float = 0.0
     """Weight of the action-rate penalty: every agent's reward loses
     ``action_rate_coef * mean_i(((a_t - a_{t-1}) / half_i)^2)``, ``half_i`` the action
@@ -291,6 +303,14 @@ class TrainSpec:
         if self.privileged_actor and not (self.actor == "policynet" and self.aux_coef > 0):
             raise ValueError("privileged_actor reads the aux targets as inputs: it needs "
                              "actor='policynet' and aux_coef > 0")
+        if self.learned_roles and not (
+            self.actor == "policynet" and self.role_params == "heads"
+            and self.critic_input in ("state", "state+obs") and not self.normalize_advantage
+        ):
+            raise ValueError("learned_roles needs actor='policynet', role_params='heads', "
+                             "critic_input 'state' or 'state+obs' and normalize_advantage=False")
+        if self.role_dwell < 1 or self.role_entropy_coeff < 0:
+            raise ValueError("role_dwell must be >= 1 and role_entropy_coeff >= 0")
         if self.recurrent and self.actor != "policynet":
             raise ValueError("recurrent=True needs actor='policynet' (the GRU lives there)")
         if self.comm != "none" and self.actor != "policynet":

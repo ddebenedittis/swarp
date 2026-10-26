@@ -80,7 +80,7 @@ Four more serve fine-tunes from a checkpoint (`--resume`):
 `--start-clock`
 : with a ramp gate, start the ramps' clock at this tick, e.g. where the checkpoint's run ended.
 
-The network options (`--actor`, `--role-params`, `--critic-input`, `--per-agent-value`, `--aux-coef`, `--privileged-actor`, `--resume-critic-only`) are described in [Roles, privileged critics and auxiliary losses](#roles-privileged-critics-and-auxiliary-losses), and the actor's memory and communication (`--recurrent`, `--hidden-dim`, `--seq-len`, `--comm`, `--comm-dim`) in [Memory and communication](#memory-and-communication).
+The network options (`--actor`, `--role-params`, `--critic-input`, `--per-agent-value`, `--aux-coef`, `--privileged-actor`, `--learned-roles`, `--resume-critic-only`) are described in [Roles, privileged critics and auxiliary losses](#roles-privileged-critics-and-auxiliary-losses), and the actor's memory and communication (`--recurrent`, `--hidden-dim`, `--seq-len`, `--comm`, `--comm-dim`) in [Memory and communication](#memory-and-communication).
 
 ## Using it from Python
 
@@ -111,8 +111,8 @@ The map's Jacobian is constant, so it cancels in the PPO ratio and the loss is t
 
 ## Roles, privileged critics and auxiliary losses
 
-Six `TrainSpec` fields, each with a CLI flag, change the networks.
-Their defaults are the plain trainer: with all six at their default the same kernels run in the same order with the same random draws, and no buffer is added.
+Seven `TrainSpec` fields, each with a CLI flag, change the networks.
+Their defaults are the plain trainer: with all seven at their default the same kernels run in the same order with the same random draws, and no buffer is added.
 
 | field | flag | values (default first) | needs from the scenario |
 |---|---|---|---|
@@ -122,6 +122,7 @@ Their defaults are the plain trainer: with all six at their default the same ker
 | `per_agent_value` | `--per-agent-value` | `False`, `True` | nothing |
 | `aux_coef` | `--aux-coef` | `0.0`, any positive weight | `aux_targets()` |
 | `privileged_actor` | `--privileged-actor` | `False`, `True` | `aux_targets()` |
+| `learned_roles` | `--learned-roles` | `False`, `True` | `agent_roles()` with `role_counts` `(A, 0)` |
 
 The scenario side is three optional hooks, `critic_state()`, `agent_roles()` and `aux_targets()`, described in [Writing a scenario](writing-a-scenario.md#training-hooks-optional).
 `train` refuses an option whose hook the scenario does not provide, rather than training without it.
@@ -155,6 +156,15 @@ The mean auxiliary MSE is logged as a `loss_aux` column, which `metrics.csv` has
 It is a diagnostic, not a deployable policy: if a fine-tune with it learns what the plain policy cannot, the task fails on perception rather than on control.
 The targets enter the trunk as its last columns, after the role one-hot and any message, so `--resume --resume-widen --privileged-actor` starts from a plain checkpoint that acts exactly as it did.
 The rollout buffer, the critic and the messages keep the plain observation; the update appends the recorded targets, and the greedy evaluation reads them from the env.
+
+**Learned roles.**
+`learned_roles` lets each agent choose its role, on a scenario whose roles past the first are empty (`role_counts` `(A, 0)`, every agent in role 0), with `"policynet"`, `"heads"`, a critic that reads the state and `normalize_advantage=False`.
+A zero-initialised role head on the last hidden layer gives role logits, so every role starts equally likely.
+Every `role_dwell` steps (`--role-dwell`, 5), and on an episode's first step, the rollout samples the role by Gumbel-argmax and its log-probability joins the action's in the PPO ratio; in between the role is held and adds nothing to the ratio.
+The actor reads its previous role as the role one-hot and the teammates' mean previous-role one-hot right after it, and acts with the head of the role it holds now; its messages are encoded with the previous role.
+The critic keeps the scenario's roles and reads every agent's previous role and dwell age appended to its state.
+The loss gains `role_entropy_coeff` (`--role-entropy-coeff`, 0.01) times the exact categorical entropy averaged over the decision steps, logged as `role_entropy`; `role1_frac` and `switch_rate` (the decisions that changed the role) are logged with the metrics.
+`--resume --resume-widen --learned-roles` starts from a checkpoint without learned roles with every role's head and role input tied to role 0's, so the policy acts as it did whichever role it holds.
 
 The rollout records the critic state, the roles and the auxiliary targets next to the observation, inside the same captured act graph, and reads them back by address, as it reads the observation.
 That is why the scenario has to write them in the observation pass.

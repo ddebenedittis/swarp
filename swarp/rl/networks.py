@@ -11,7 +11,7 @@ trainers are not interchangeable; :func:`swarp.rl.ppo.load_checkpoint` reads thi
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 import torch
 from torch import nn
@@ -218,6 +218,16 @@ class PolicyNet(nn.Module):
     without them widens into this network acting exactly as before. Refused with
     ``"separate"`` roles.
 
+    ``learned_roles`` lets each agent choose its role, for a scenario whose roles past the
+    first are empty (``role_counts`` ``(A, 0, ...)``) with ``"heads"``. A zero-initialised
+    ``role_head`` maps the features to ``R`` role logits; ``roles`` then carries each
+    agent's previous role ``r_{t-1}`` (the role one-hot input, the message encoder's role),
+    ``head_roles`` the role ``r_t`` whose head acts, and :meth:`step` returns the logits
+    after ``(loc, scale, aux, h)``. The input also gains the teammates' mean previous-role
+    one-hot, ``R`` columns after the agent's own, which reach the message encoder too.
+    When to decide, and how, is the trainer's (``role_dwell`` steps between decisions; see
+    :class:`swarp.rl.ppo.MAPPO`).
+
     :meth:`step` is the one-step entry point, ``(obs, roles, h) -> (loc, scale, aux, h)``;
     without ``recurrent`` the hidden state is passed through untouched. :meth:`unroll` runs
     a ``[L, ...]`` sequence from a starting hidden state, resetting it at episode ends.
@@ -237,6 +247,8 @@ class PolicyNet(nn.Module):
         comm: str = "none",
         comm_dim: int = 64,
         priv_dim: int = 0,
+        learned_roles: bool = False,
+        role_dwell: int = 5,
         low: torch.Tensor | Sequence[float] | None = None,
         high: torch.Tensor | Sequence[float] | None = None,
         scale_min: float = _SCALE_MIN,
@@ -273,6 +285,15 @@ class PolicyNet(nn.Module):
             )
         if comm == "pose" and not aux_dim:
             raise ValueError("comm='pose' sends the aux estimate: it needs aux_dim > 0")
+        self.learned_roles, self.role_dwell = bool(learned_roles), int(role_dwell)
+        if self.learned_roles and not (
+            self.role_heads and R > 1 and not any(self.role_counts[1:]) and self.role_dwell >= 1
+        ):
+            raise ValueError(
+                "learned_roles needs role_params 'heads', role_dwell >= 1 and a scenario whose "
+                f"roles past the first are empty, like (A, 0); got role_params {role_params!r}, "
+                f"role_counts {self.role_counts}, role_dwell {role_dwell}"
+            )
         #: Width of one delayed message (0 without).
         self.msg_dim = {"latent": comm_dim, "vae": comm_dim, "pose": 2 * aux_dim}.get(comm, 0)
         feat_dim = hidden_dim if self.recurrent else num_cells
@@ -284,7 +305,8 @@ class PolicyNet(nn.Module):
             offsets = [sum(self.role_counts[:r]) for r in range(R)]
             self._spans = list(zip(offsets, self.role_counts, strict=True))
         else:
-            n_in = obs_dim + (R if self.role_input else 0)
+            # The role one-hot, and with learned roles the teammates' mean one-hot.
+            n_in = obs_dim + (R if self.role_input else 0) * (2 if self.learned_roles else 1)
             if comm == "attn":
                 self.comm_enc = nn.Linear(n_in, comm_dim)
                 self.comm_qkv = nn.Linear(comm_dim, 3 * comm_dim)
@@ -305,6 +327,11 @@ class PolicyNet(nn.Module):
                 self.gru = nn.GRUCell(num_cells, hidden_dim)
             self.head = nn.Linear(feat_dim, (R if self.role_heads else 1) * 2 * act_dim)
         self.aux_head = nn.Linear(feat_dim, aux_dim) if aux_dim else None
+        if self.learned_roles:
+            # Zero: every role equally likely until the role head learns.
+            self.role_head = nn.Linear(feat_dim, R)
+            nn.init.zeros_(self.role_head.weight)
+            nn.init.zeros_(self.role_head.bias)
         self.register_buffer("role_ids", torch.arange(self.n_roles), persistent=False)
         lo = -torch.ones(act_dim) if low is None else torch.as_tensor(low, dtype=torch.float32)
         hi = torch.ones(act_dim) if high is None else torch.as_tensor(high, dtype=torch.float32)
@@ -332,6 +359,8 @@ class PolicyNet(nn.Module):
             self.config.update(comm=comm, comm_dim=comm_dim)
         if self.priv_dim:
             self.config.update(priv_dim=self.priv_dim)
+        if self.learned_roles:
+            self.config.update(learned_roles=True, role_dwell=self.role_dwell)
         if self.scale_min != _SCALE_MIN:
             self.config.update(scale_min=self.scale_min)
 
@@ -343,8 +372,9 @@ class PolicyNet(nn.Module):
     @property
     def stateful(self) -> bool:
         """Whether acting needs more than ``(obs, roles)``: a hidden state to carry, a
-        communication mask to read from the env, or the previous step's messages."""
-        return self.recurrent or self.communicates
+        communication mask to read from the env, the previous step's messages, or the
+        learned roles' carries."""
+        return self.recurrent or self.communicates or self.learned_roles
 
     # ------------------------------------------------------------------ the pieces
     # A role layout ``route`` is ``(slots, perm)`` for "separate" (role_slots and its
@@ -372,7 +402,10 @@ class PolicyNet(nn.Module):
         if not self.role_input:
             return obs
         onehot = (roles.unsqueeze(-1) == self.role_ids).to(obs.dtype)
-        return torch.cat([obs, onehot], -1)
+        if not self.learned_roles:
+            return torch.cat([obs, onehot], -1)
+        team = (onehot.sum(-2, keepdim=True) - onehot) / max(onehot.shape[-2] - 1, 1)
+        return torch.cat([obs, onehot, team], -1)
 
     def _communicate(
         self, x: torch.Tensor, comm_mask: torch.Tensor | None
@@ -535,9 +568,26 @@ class PolicyNet(nn.Module):
         scale = (F.softplus(raw + self._scale_bias) + self.scale_min).clamp_min(_SCALE_LB)
         return loc, scale, self.aux_head(feat) if with_aux else None
 
-    def _check(self, roles: torch.Tensor | None, with_aux: bool) -> torch.Tensor | None:
+    def _heads(self, feat, roles, head_roles, route, with_aux):
+        """:meth:`_post`, and with learned roles the role logits after it, the heads read by
+        ``head_roles`` (a tensor, or a function of the logits that returns one)."""
+        if not self.learned_roles:
+            return self._post(feat, roles, route, with_aux)
+        logits = self.role_head(feat)
+        if callable(head_roles):
+            head_roles = head_roles(logits)
+        return (*self._post(feat, head_roles.long(), route, with_aux), logits)
+
+    def _check(
+        self, roles: torch.Tensor | None, with_aux: bool, head_roles: object = None
+    ) -> torch.Tensor | None:
         if self.role_counts and roles is None:
             raise ValueError("this PolicyNet has roles; pass roles [*, n_agents]")
+        if self.learned_roles and head_roles is None:
+            raise ValueError(
+                "this PolicyNet learns its roles: pass the previous roles as roles and the "
+                "acting ones as head_roles, carried as swarp.rl.ppo.greedy_env_arm does"
+            )
         if with_aux and self.aux_head is None:
             raise ValueError("this PolicyNet has no aux head (aux_dim=0)")
         return roles.long() if self.role_counts else roles
@@ -555,22 +605,25 @@ class PolicyNet(nn.Module):
         msg_obs: torch.Tensor | None = None,
         msg_mask: torch.Tensor | None = None,
         msg_noise: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        head_roles: torch.Tensor | Callable[[torch.Tensor], torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor | None, ...]:
         """``(loc, scale, aux, h)``: the Gaussian over the pre-tanh action, ``[*, A,
         act_dim]`` each, the auxiliary prediction ``[*, A, aux_dim]`` when ``with_aux``
         (else ``None``), and the hidden state: the GRU's output when ``recurrent`` (from
         zeros when ``h`` is ``None``), else ``h`` passed through. ``msg_*`` are the
         delayed messages' inputs (see the class docstring); without them nothing is
-        heard."""
-        roles = self._check(roles, with_aux)
+        heard. With ``learned_roles`` the role logits ``[*, A, R]`` follow, and
+        ``head_roles`` (needed) picks the acting head: ``[*, A]``, or a function of the
+        logits returning it."""
+        roles = self._check(roles, with_aux, head_roles)
         route = self._route(roles)
         feat = self._pre(obs, roles, route, comm_mask, (msg_obs, msg_mask, msg_noise))
         if self.recurrent:
             if h is None:
                 h = obs.new_zeros(*obs.shape[:-1], self.hidden_dim)
             feat, h = self._core(self._input_gates(feat), h, route)
-        loc, scale, aux = self._post(feat, roles, route, with_aux)
-        return loc, scale, aux, h
+        loc, scale, aux, *logits = self._heads(feat, roles, head_roles, route, with_aux)
+        return loc, scale, aux, h, *logits
 
     def unroll(
         self,
@@ -584,7 +637,8 @@ class PolicyNet(nn.Module):
         msg_obs: torch.Tensor | None = None,
         msg_mask: torch.Tensor | None = None,
         msg_noise: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        head_roles: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor | None, ...]:
         """:meth:`step` over a sequence: ``obs`` ``[L, *, A, obs_dim]`` (``roles`` and
         ``comm_mask`` with the same leading ``[L, *]``), from the hidden state ``h``
         ``[*, A, hidden_dim]`` entering step 0.
@@ -598,8 +652,9 @@ class PolicyNet(nn.Module):
         msg = (msg_obs, msg_mask, msg_noise)
         if not self.recurrent:
             return self.step(obs, roles, h, with_aux=with_aux, comm_mask=comm_mask,
-                             msg_obs=msg_obs, msg_mask=msg_mask, msg_noise=msg_noise)
-        roles = self._check(roles, with_aux)
+                             msg_obs=msg_obs, msg_mask=msg_mask, msg_noise=msg_noise,
+                             head_roles=head_roles)
+        roles = self._check(roles, with_aux, head_roles)
         route = self._route(roles)
         gi = self._input_gates(self._pre(obs, roles, route, comm_mask, msg))
         if h is None:
@@ -621,8 +676,8 @@ class PolicyNet(nn.Module):
             core = [torch.stack([o[r] for o in outs]) for r in range(len(self._spans))]
         else:
             core = torch.stack(outs)
-        loc, scale, aux = self._post(core, roles, route, with_aux)
-        return loc, scale, aux, h
+        loc, scale, aux, *logits = self._heads(core, roles, head_roles, route, with_aux)
+        return loc, scale, aux, h, *logits
 
     def comm_weights(
         self,
@@ -641,7 +696,7 @@ class PolicyNet(nn.Module):
     def forward(
         self, obs: torch.Tensor, roles: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        loc, scale, _, _ = self.step(obs, roles)
+        loc, scale = self.step(obs, roles)[:2]
         return loc, scale
 
     def squash(self, u: torch.Tensor) -> torch.Tensor:
@@ -658,12 +713,16 @@ class PolicyNet(nn.Module):
         comm_mask: torch.Tensor | None = None,
         msg_obs: torch.Tensor | None = None,
         msg_mask: torch.Tensor | None = None,
+        head_roles: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """The deterministic action ``squash(loc)``: consumes no RNG (a ``"vae"`` message
         is its mean). A recurrent net acts from ``h`` (zeros when ``None``) and the new
         hidden state is dropped; carry it, and the previous observation a delayed message
-        is encoded from, with :meth:`step`, as :func:`swarp.rl.ppo.greedy_env_arm` does."""
-        out = self.step(obs, roles, h, comm_mask=comm_mask, msg_obs=msg_obs, msg_mask=msg_mask)
+        is encoded from, with :meth:`step`, as :func:`swarp.rl.ppo.greedy_env_arm` does.
+        A learned-roles net needs ``head_roles`` and its previous ``roles`` (it raises
+        without them), carried the same way."""
+        out = self.step(obs, roles, h, comm_mask=comm_mask, msg_obs=msg_obs, msg_mask=msg_mask,
+                        head_roles=head_roles)
         return self.squash(out[0])
 
 

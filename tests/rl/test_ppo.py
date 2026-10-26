@@ -22,7 +22,9 @@ from swarp.rl.ppo import (
     load_widened,
     network_archs,
     policy_outputs,
+    ppo_loss,
     standardize_advantage,
+    tie_learned_roles,
 )
 from swarp.rl.recipes import SPECS, Ramp, SolveRateWindow, build_env, scenario_name, score
 
@@ -328,6 +330,16 @@ def _patch_training_hooks(env) -> None:
     scen.aux_targets = lambda: scen.observations()[..., :AUX_DIM]
 
 
+def _patch_single_role(env) -> None:
+    """:func:`_patch_training_hooks` with one role filled, what learned roles need:
+    ``role_counts`` ``(A, 0)`` and every agent in role 0."""
+    _patch_training_hooks(env)
+    scen = env.scenario
+    roles = torch.zeros(env.n_envs, env.n_agents, dtype=torch.int32, device=env.device)
+    scen.role_counts = (env.n_agents, 0)
+    scen.agent_roles = lambda: roles
+
+
 def _patch_reset_roles(env) -> None:
     """:func:`_patch_training_hooks`, with roles that change at every reset: a
     fixed-address buffer that ``reset_world`` re-permutes for the masked envs with
@@ -388,14 +400,17 @@ def _algo(
     }
     if features:
         patch(env)
+        counts = env.role_counts
         actor = PolicyNet(
-            Ob, env.act_dim, spec.num_cells, role_counts=ROLE_COUNTS,
+            Ob, env.act_dim, spec.num_cells, role_counts=counts,
             role_params=spec.role_params, aux_dim=AUX_DIM,
-            priv_dim=AUX_DIM if spec.privileged_actor else 0, **memory,
+            priv_dim=AUX_DIM if spec.privileged_actor else 0,
+            learned_roles=spec.learned_roles, role_dwell=spec.role_dwell, **memory,
         )
+        role_state = A * (len(counts) + 1) if spec.learned_roles else 0
         critic = StateCritic(
-            env.state_dim, Ob, A, spec.num_cells, use_obs=True, role_counts=ROLE_COUNTS,
-            per_agent=True,
+            env.state_dim + role_state, Ob, A, spec.num_cells, use_obs=True,
+            role_counts=counts, per_agent=True,
         )
     elif spec.actor == "policynet":
         if patch is not _patch_training_hooks:
@@ -573,7 +588,11 @@ _COMM = {"actor": "policynet", "comm": "attn", "comm_dim": 8, "patch": _patch_co
 
 _ROLLOUT = ("obs_buf", "u_buf", "logp_buf", "rew_buf", "term_buf", "trunc_buf",
             "state_buf", "role_buf", "aux_buf", "h_buf", "mask_buf", "msg_obs_buf",
-            "msg_mask_buf", "msg_noise_buf", "msg_aux_buf", "msg_valid_buf")
+            "msg_mask_buf", "msg_noise_buf", "msg_aux_buf", "msg_valid_buf", "lrole_in_buf",
+            "lrole_buf", "decide_buf")
+# Learned roles over one filled role, decided every 3 steps in 5-step episodes.
+_LEARNED = {"learned_roles": True, "role_dwell": 3, "normalize_advantage": False,
+            "critic_input": "state+obs", "max_steps": 5, "patch": _patch_single_role}
 
 
 def _copy_rollout(dst: MAPPO, src: MAPPO) -> None:
@@ -592,9 +611,13 @@ def _copy_rollout(dst: MAPPO, src: MAPPO) -> None:
         (True, {**_MEMORY, "role_params": "separate"}),
         (True, {"comm": "vae", "comm_dim": 4, "msg_drop": 0.3, "max_steps": 3}),
         (True, {"privileged_actor": True}),
+        (True, _LEARNED),
+        (True, {**_LEARNED, "comm": "pose", "comm_dim": 4, "msg_drop": 0.3}),
+        (True, {**_LEARNED, "recurrent": True, "hidden_dim": HIDDEN, "seq_len": 4}),
     ],
     ids=["default", "features", "reset-roles", "recurrent", "comm", "recurrent-comm-features",
-         "recurrent-separate", "vae-message", "privileged"],
+         "recurrent-separate", "vae-message", "privileged", "learned-roles",
+         "learned-roles-pose", "learned-roles-recurrent"],
 )
 def test_captured_update_matches_eager_update(features, kw):
     """Same weights, same rollout, same permutations: the graphed update lands where the
@@ -1270,3 +1293,140 @@ def test_privileged_actor_is_refused_without_the_aux_targets():
     assert network_archs(spec, env, *box)[1]["priv_dim"] == AUX_DIM
     with pytest.raises(ValueError, match="not 'separate'"):
         network_archs(replace(spec, role_params="separate"), env, *box)
+
+
+# ------------------------------------------------------------------------- learned roles
+
+
+@pytest.mark.parametrize("comm", ["none", "pose"])
+def test_learned_roles_decide_every_dwell_and_recompute_the_rollout_log_probs(comm):
+    """A role is chosen when its age reaches the dwell or after a done and held otherwise;
+    the next step reads it as the previous role (0 after a done). The update recomputes the
+    stored log-probabilities, messages encoded with the previous roles, and the role head
+    moves them only on decision rows, where the role entropy is averaged."""
+    kw = {"comm": comm, "comm_dim": 4, "msg_drop": 0.3} if comm != "none" else {}
+    algo = _algo(graphs=False, device="cpu", features=True, **_LEARNED, **kw)
+    age = algo.role_age.clone()
+    algo.rollout()
+    T, A, N, dwell = algo.T, algo.A, algo.N, algo.dwell
+    ended = (torch.maximum(algo.term_buf, algo.trunc_buf) > 0).unsqueeze(-1)  # [T, E, 1]
+    decide = algo.decide_buf > 0
+    for t in range(T):
+        assert torch.equal(decide[t], age >= dwell)
+        age = (age + 1).masked_fill(decide[t], 1).masked_fill(ended[t], dwell)
+    role, role_in = algo.lrole_buf, algo.lrole_in_buf
+    assert torch.equal(role[~decide], role_in[:T][~decide])
+    assert torch.equal(role_in[1:], role.masked_fill(ended, 0))
+    assert ended.any() and (role != role_in[:T])[decide].any()
+    assert algo.state_buf.shape[-1] == algo.env.state_dim + A * 3
+    msg = {}
+    if comm != "none":
+        msg = {"msg_obs": algo.msg_obs_buf.reshape(N, A, -1),
+               "msg_mask": algo.msg_mask_buf.reshape(N, A, A)}
+    rows = {"role_in": role_in[:T].reshape(N, A), "role_out": role.reshape(N, A),
+            "decide": algo.decide_buf.reshape(N, A)}
+    obs, u = algo.obs_buf[:T].reshape(N, A, -1), algo.u_buf.reshape(N, A, -1)
+
+    def logp() -> tuple[torch.Tensor, torch.Tensor]:
+        with torch.no_grad():
+            loc, scale, _, logits = policy_outputs(
+                algo.actor, obs, rows["role_in"], msg=msg, head_roles=rows["role_out"]
+            )
+        log_pr = logits.log_softmax(-1)
+        pick = log_pr.gather(-1, rows["role_out"].unsqueeze(-1)).squeeze(-1)
+        ent = -(log_pr.exp() * log_pr).sum(-1)
+        return tanh_normal_log_prob(u, loc, scale) + rows["decide"] * pick, ent
+
+    stored = algo.logp_buf.reshape(N, A)
+    assert torch.allclose(logp()[0], stored, atol=1e-5)
+    with torch.no_grad():
+        algo.actor.role_head.weight.normal_()
+    new, ent = logp()
+    moved = (new - stored).abs() > 1e-6
+    rows_d = rows["decide"] > 0
+    assert moved[rows_d].any() and not moved[~rows_d].any()
+    algo._prepare_body()
+    with torch.no_grad():
+        out = ppo_loss(
+            algo.actor, algo.critic, obs, u, stored, algo.adv_buf.reshape(N, A),
+            algo.ret_buf.reshape(N, A), torch.zeros_like(u), False,
+            state=algo.state_buf[:T].reshape(N, -1), roles=algo.role_buf[:T].reshape(N, A),
+            msg=msg or None, **rows,
+        )
+    torch.testing.assert_close(out[-1], ent[rows_d].mean())
+    assert not torch.isclose(out[-1], ent.mean())
+    stats = algo.update(algo.spec.entropy_coeff)
+    assert stats["grad_skips"] == 0 and math.isfinite(stats["role_entropy"])
+
+
+def test_teammate_role_columns_and_a_tied_warm_start_that_acts_as_before():
+    """The teammates' mean previous-role one-hot follows the agent's own; a checkpoint
+    without learned roles (plain, or sending pose messages) widens into one that acts in
+    any previous and acting role as the checkpoint did in role 0, from uniform role
+    logits."""
+    torch.manual_seed(0)
+    kw = {"role_counts": (3, 0), "aux_dim": 3}
+    net = PolicyNet(6, 2, 16, learned_roles=True, **kw)
+    x = net._with_role(torch.zeros(1, 3, 6), torch.tensor([[0, 1, 1]]))
+    assert torch.equal(x[0, :, 8:], torch.tensor([[0.0, 1.0], [0.5, 0.5], [0.5, 0.5]]))
+    for comm in ({}, {"comm": "pose", "comm_dim": 4}):
+        plain = PolicyNet(6, 2, 16, **kw, **comm)
+        learned = PolicyNet(6, 2, 16, learned_roles=True, role_dwell=2, **kw, **comm)
+        assert "learned_roles" not in plain.config and learned.config["role_dwell"] == 2
+        critic = ("Critic", {"obs_dim": 6, "n_agents": 3, "num_cells": 16})
+        ckpt = {"format": "swarp.rl/2", "actor_cls": "PolicyNet", "actor_kwargs": plain.config,
+                "critic_cls": critic[0], "critic_kwargs": critic[1]}
+        check_resume("plain.pt", ckpt, ("PolicyNet", learned.config, *critic), widen=True)
+        fresh = load_widened(learned, tie_learned_roles(learned, plain.state_dict()))
+        assert fresh == ["role_head.weight", "role_head.bias"]
+        obs = torch.randn(5, 3, 6)
+        msg = {"msg_obs": torch.randn(5, 3, 6), "msg_mask": torch.rand(5, 3, 3) < 0.7}
+        msg = msg if comm else {}
+        ref = plain.step(obs, torch.zeros(5, 3, dtype=torch.long), **msg)
+        for _ in range(3):
+            prev, role = torch.randint(0, 2, (2, 5, 3))
+            out = learned.step(obs, prev, head_roles=role, **msg)
+            torch.testing.assert_close(out[0], ref[0])
+            torch.testing.assert_close(out[1], ref[1])
+            assert torch.equal(out[4], torch.zeros(5, 3, 2))
+
+
+def test_greedy_arm_holds_a_learned_role_for_the_dwell():
+    env = build_env("navigation", n_envs=3, n_agents=4, device="cpu", dt=0.1, substeps=1,
+                    max_steps=None, seed=0)
+    _patch_single_role(env)
+    torch.manual_seed(0)
+    actor = PolicyNet(env.obs_dim, env.act_dim, 16, role_counts=(4, 0), learned_roles=True,
+                      role_dwell=3)
+    obs = env.reset()
+    with pytest.raises(ValueError, match="learns its roles"):
+        actor.greedy(obs, env.agent_roles())
+
+    def acting(prev: int, role: int) -> torch.Tensor:
+        full = torch.full((3, 4), prev, dtype=torch.long)
+        return actor.greedy(obs, full, head_roles=torch.full_like(full, role))
+
+    act = greedy_score_kwargs(actor)["policy_from_env"](env)
+    bias = actor.role_head.bias
+    with torch.no_grad():
+        bias.copy_(torch.tensor([0.0, 5.0]))
+    assert torch.equal(act(obs), acting(0, 1))  # the first call decides
+    with torch.no_grad():
+        bias.copy_(torch.tensor([5.0, 0.0]))
+    assert torch.equal(act(obs), acting(1, 1)) and torch.equal(act(obs), acting(1, 1))
+    assert torch.equal(act(obs), acting(1, 0))  # held for the dwell, then decided again
+    assert not torch.equal(acting(1, 1), acting(1, 0))
+
+
+def test_learned_roles_are_refused_where_they_cannot_work():
+    base = replace(SPECS["navigation"], actor="policynet", critic_input="state",
+                   normalize_advantage=False)
+    for bad in ({"actor": "mlp"}, {"role_params": "shared"}, {"critic_input": "obs"},
+                {"normalize_advantage": True}):
+        with pytest.raises(ValueError, match="learned_roles needs"):
+            replace(base, learned_roles=True, **bad)
+    with pytest.raises(ValueError, match="role_dwell must be >= 1"):
+        replace(base, learned_roles=True, role_dwell=0)
+    for counts in ((), (1, 3), (4,)):
+        with pytest.raises(ValueError, match="roles past the first are empty"):
+            PolicyNet(6, 2, 16, role_counts=counts, learned_roles=True)

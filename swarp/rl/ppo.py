@@ -40,6 +40,7 @@ import math
 import time
 from collections.abc import Callable, Hashable, Mapping, Sequence
 from dataclasses import dataclass, replace
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -218,6 +219,7 @@ def ppo_terms(
     adv: torch.Tensor,
     noise: torch.Tensor,
     with_kl: bool = False,
+    role_logp: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, ...]:
     """The policy half of the loss from the actor's outputs: ``(objective, entropy)``.
 
@@ -227,9 +229,13 @@ def ppo_terms(
     ``[B, A]``. Network-free, so any actor (role heads, a recurrent core) reuses it.
     ``with_kl`` appends the detached approximate KL to the rollout policy,
     ``mean((r - 1) - log r)`` with ``r`` the probability ratio (Schulman's k3 estimator:
-    unbiased and never negative).
+    unbiased and never negative). ``role_logp`` ``[B, A]``, a learned role's log-probability
+    on its decision rows (zero elsewhere), joins the ratio's new log-probability.
     """
-    log_w = tanh_normal_log_prob(u, loc, scale) - logp_old
+    logp = tanh_normal_log_prob(u, loc, scale)
+    if role_logp is not None:
+        logp = logp + role_logp
+    log_w = logp - logp_old
     gain = torch.minimum(
         log_w.exp() * adv,
         log_w.clamp(math.log1p(-_CLIP_EPS), math.log1p(_CLIP_EPS)).exp() * adv,
@@ -250,10 +256,12 @@ def policy_outputs(
     done: torch.Tensor | None = None,
     comm_mask: torch.Tensor | None = None,
     msg: Mapping[str, torch.Tensor | None] | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    head_roles: torch.Tensor | Callable[[torch.Tensor], torch.Tensor] | None = None,
+) -> tuple[torch.Tensor | None, ...]:
     """``(loc, scale, aux)`` from either actor: :class:`Actor` reads only ``obs``.
     ``msg`` holds a delayed-message :class:`PolicyNet`'s ``msg_obs``, ``msg_mask`` and
-    ``msg_noise``, row-aligned with ``obs``.
+    ``msg_noise``, row-aligned with ``obs``. A learned-roles :class:`PolicyNet` reads its
+    previous roles from ``roles`` and acts with ``head_roles``; its role logits follow.
 
     With ``h0`` ``[S, A, H]`` and ``done`` ``[L, S]``, the rows of ``obs`` (and of
     ``roles``, ``comm_mask``) are ``S`` sequences of ``L`` steps, time-major (row
@@ -267,16 +275,20 @@ def policy_outputs(
         def seq(x: torch.Tensor | None) -> torch.Tensor | None:
             return None if x is None else x.view(L, -1, *x.shape[1:])
 
-        loc, scale, aux, _ = actor.unroll(
+        loc, scale, aux, _, *logits = actor.unroll(
             seq(obs), seq(roles), h0, done, with_aux=with_aux, comm_mask=seq(comm_mask),
-            **{k: seq(v) for k, v in (msg or {}).items()},
+            head_roles=seq(head_roles), **{k: seq(v) for k, v in (msg or {}).items()},
         )
-        return loc.flatten(0, 1), scale.flatten(0, 1), None if aux is None else aux.flatten(0, 1)
+        return (
+            loc.flatten(0, 1), scale.flatten(0, 1), None if aux is None else aux.flatten(0, 1),
+            *(x.flatten(0, 1) for x in logits),
+        )
     if isinstance(actor, PolicyNet):
-        loc, scale, aux, _ = actor.step(
-            obs, roles, with_aux=with_aux, comm_mask=comm_mask, **(msg or {})
+        loc, scale, aux, _, *logits = actor.step(
+            obs, roles, with_aux=with_aux, comm_mask=comm_mask, head_roles=head_roles,
+            **(msg or {}),
         )
-        return loc, scale, aux
+        return loc, scale, aux, *logits
     loc, scale = actor(obs)
     return loc, scale, None
 
@@ -316,6 +328,9 @@ def ppo_loss(
     msg_valid: torch.Tensor | None = None,
     msg_beta: float = 0.0,
     priv: torch.Tensor | None = None,
+    role_in: torch.Tensor | None = None,
+    role_out: torch.Tensor | None = None,
+    decide: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, ...]:
     """Clipped surrogate, smooth-L1 value loss and MC entropy for one minibatch.
 
@@ -336,25 +351,55 @@ def ppo_loss(
     follows the aux MSE. ``priv`` ``[B, A, priv_dim]`` is appended to the actor's ``obs``
     (never the critic's) for a privileged :class:`PolicyNet`.
 
+    A learned-roles :class:`PolicyNet` takes ``role_in`` (the previous roles, its role
+    input and its messages' role), ``role_out`` (the acting roles) and ``decide`` (``{0,
+    1}``, the decision rows), all ``[B, A]``; ``roles`` then reaches only the critic. The
+    acting role's log-probability enters the ratio on the decision rows, and the exact
+    categorical entropy averaged over them follows the other extra losses.
+
     A thin wrapper over :func:`ppo_terms` that keeps the original op order (advantages,
     actor, policy terms, critic), so a default run launches the same kernels in the same
     sequence.
     """
     if normalize_advantage:
         adv = standardize_advantage(adv, roles, role_counts)
-    loc, scale, aux = policy_outputs(
-        actor, obs if priv is None else torch.cat([obs, priv], -1), roles,
+    actor_roles = roles if role_in is None else role_in
+    loc, scale, aux, *logits = policy_outputs(
+        actor, obs if priv is None else torch.cat([obs, priv], -1), actor_roles,
         with_aux=aux_target is not None, h0=h0, done=done,
-        comm_mask=comm_mask, msg=msg,
+        comm_mask=comm_mask, msg=msg, head_roles=role_out,
     )
-    objective, entropy, *kl = ppo_terms(loc, scale, u, logp_old, adv, noise, with_kl)
+    role_logp = None
+    if logits:
+        log_pr = logits[0].log_softmax(-1)
+        role_logp = decide * log_pr.gather(-1, role_out.unsqueeze(-1)).squeeze(-1)
+    objective, entropy, *kl = ppo_terms(
+        loc, scale, u, logp_old, adv, noise, with_kl, role_logp=role_logp
+    )
     value = critic_values(critic, obs, state, roles)
     extra = [] if aux_target is None else [F.mse_loss(aux, aux_target)]
     if msg_target is not None:
         extra.append(actor.message_loss(
-            msg["msg_obs"], roles, msg_target, msg_valid, msg_beta, msg.get("msg_noise")
+            msg["msg_obs"], actor_roles, msg_target, msg_valid, msg_beta, msg.get("msg_noise")
         ))
+    if logits:
+        ent = -(log_pr.exp() * log_pr).sum(-1)
+        extra.append((decide * ent).sum() / decide.sum().clamp_min(1.0))
     return objective, F.smooth_l1_loss(value, ret), entropy, *extra, *kl
+
+
+def next_role(
+    logits: torch.Tensor,
+    prev: torch.Tensor,
+    age: torch.Tensor,
+    dwell: int,
+    noise: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Each agent's learned role ``r_t`` ``[*, A]``: on a decision step (``age >= dwell``)
+    the argmax of ``logits`` ``[*, A, R]``, plus Gumbel ``noise`` for a sample, else the
+    previous role ``prev`` held."""
+    score = logits if noise is None else logits + noise
+    return torch.where(age >= dwell, score.argmax(-1), prev)
 
 
 # ------------------------------------------------------------------------------ the core
@@ -397,6 +442,16 @@ class MAPPO:
     the update appends the ``aux_buf`` rows the act graph recorded next to it, so it sees
     exactly what the rollout acted on. Delayed messages are still encoded from the plain
     observation.
+
+    A learned-roles :class:`PolicyNet` chooses each agent's role every ``role_dwell`` steps
+    and holds it in between. The carries ``role_prev`` (``r_{t-1}``, 0 at an episode start)
+    and ``role_age`` (steps since the last decision, ``role_dwell`` at an episode start, so
+    the first step decides) are reset by the store graph at a done. On a decision step the
+    act graph samples ``r_t`` by Gumbel-argmax over the role logits and adds its
+    log-probability to the action's; ``lrole_in_buf`` ``[T + 1, E, A]``, ``lrole_buf`` and
+    ``decide_buf`` ``[T, E, A]`` record ``r_{t-1}``, ``r_t`` and the decision rows for the
+    update. The critic keeps the env's roles and reads, appended to its state, every
+    agent's ``onehot(r_{t-1})`` and ``min(age, dwell) / dwell`` in agent order.
 
     A communicating :class:`PolicyNet` on a scenario whose ``comm_mask()`` is not
     ``None`` (decided once, here) adds a ``[T, E, A, A]`` buffer of the mask. A recurrent
@@ -465,10 +520,19 @@ class MAPPO:
         self.policy_net = isinstance(actor, PolicyNet)
         self.actor_roles = self.policy_net and actor.uses_roles
         self.use_state = self.state_critic and critic.state_dim > 0
+        self.learned = self.policy_net and actor.learned_roles
+        # The learned roles' critic columns: per agent its previous role's one-hot and age.
+        self.role_state_dim = A * (actor.n_roles + 1) if self.learned else 0
+        if self.learned and not self.use_state:
+            raise ValueError("learned roles append to the critic's state: they need a "
+                             "StateCritic that reads one (critic_input 'state' or 'state+obs')")
         self.role_counts = tuple(env.role_counts)
         # With roles, the advantages are normalized per role-sorted slot, which reads them
         # too (see standardize_advantage).
         self.role_adv = bool(self.role_counts) and spec.normalize_advantage
+        if self.learned and self.role_adv:
+            raise ValueError("learned roles need normalize_advantage=False: per-role advantage "
+                             "statistics assume fixed role counts")
         self.use_roles = (
             self.actor_roles or (self.state_critic and critic.uses_roles) or self.role_adv
         )
@@ -492,17 +556,18 @@ class MAPPO:
                 f"the actor expects role_counts {actor.role_counts}; the env has "
                 f"{env.role_counts}"
             )
-        if self.use_state and env.state_dim != critic.state_dim:
+        if self.use_state and env.state_dim + self.role_state_dim != critic.state_dim:
             raise ValueError(
                 f"the critic reads a {critic.state_dim}-wide state; the env provides "
                 f"state_dim={env.state_dim}"
+                + (f", plus {self.role_state_dim} learned-role columns" if self.learned else "")
             )
         if self.state_critic and critic.uses_roles and env.role_counts != critic.role_counts:
             raise ValueError(
                 f"the critic expects role_counts {critic.role_counts}; the env has "
                 f"{env.role_counts}"
             )
-        self.state_buf = z(T + 1, E, env.state_dim) if self.use_state else None
+        self.state_buf = z(T + 1, E, critic.state_dim) if self.use_state else None
         self.role_buf = z(T + 1, E, A, dtype=torch.long) if self.use_roles else None
         self.aux_buf = z(T, E, A, env.aux_dim) if self.use_aux else None
         # Memory and communication.
@@ -529,6 +594,17 @@ class MAPPO:
                 self.prev_aux = z(E, A, env.aux_dim)
                 self.msg_aux_buf = z(T, E, A, env.aux_dim)
                 self.msg_valid_buf = z(T, E)
+        # Learned roles: the carries and what the update needs of each step's choice.
+        self.role_prev = self.role_age = None
+        self.lrole_in_buf = self.lrole_buf = self.decide_buf = None
+        if self.learned:
+            self.dwell = actor.role_dwell
+            self._role_ids = torch.arange(actor.n_roles, device=dev)
+            self.role_prev = z(E, A, dtype=torch.long)
+            self.role_age = torch.full((E, A), self.dwell, device=dev, dtype=torch.long)
+            self.lrole_in_buf = z(T + 1, E, A, dtype=torch.long)
+            self.lrole_buf = z(T, E, A, dtype=torch.long)
+            self.decide_buf = z(T, E, A)
         self.h = self.h_buf = self.done_buf = None
         # The update draws minibatches of ``mb_units`` units out of ``n_units``: samples,
         # or (recurrent) chunks of L consecutive steps of one env.
@@ -561,7 +637,7 @@ class MAPPO:
         # [mean reward, n_terminated, n_done] from prepare, then
         # [objective, critic, entropy, (aux,) skips, (KL, KL stops)] summed over the
         # minibatch steps.
-        self.n_losses = 3 + int(self.use_aux) + int(self.msg_loss)
+        self.n_losses = 3 + int(self.use_aux) + int(self.msg_loss) + int(self.learned)
         # The KL is measured for the brake and for the adaptive lr; only the brake trips.
         self.kl_brake = spec.target_kl is not None or spec.adaptive_kl is not None
         self._kl_trip = 1.5 * spec.target_kl if spec.target_kl is not None else math.inf
@@ -573,7 +649,8 @@ class MAPPO:
         self.kl_stop = z(()) if self.kl_brake else None
         #: The keys of :meth:`update`'s result, in the order the stats buffers hold them.
         losses = [*LEGACY_STAT_NAMES[:6], *(["loss_aux"] if self.use_aux else []),
-                  *(["loss_msg"] if self.msg_loss else [])]
+                  *(["loss_msg"] if self.msg_loss else []),
+                  *(["role_entropy"] if self.learned else [])]
         kl = ["approx_kl", "kl_stops"] if self.kl_brake else []
         self.stat_names = [*losses, "grad_skips", *kl, *self.metric_names]
 
@@ -606,9 +683,13 @@ class MAPPO:
         hidden = (self.h,) if self.recurrent else ()
         sent = tuple(x for x in (self.prev_obs, self.prev_aux) if x is not None)
         valid = (self.prev_valid,) if self.delayed else ()
-        self._act = _Graphed(self._act_body, self.graphs, carries=(self.t, *hidden, *sent))
+        role = (self.role_prev, self.role_age) if self.learned else ()
+        self._act = _Graphed(
+            self._act_body, self.graphs, carries=(self.t, *hidden, *sent, *role)
+        )
         self._store = _Graphed(
-            self._store_body, self.graphs, carries=(self.t, self.metric_acc, *hidden, *valid)
+            self._store_body, self.graphs,
+            carries=(self.t, self.metric_acc, *hidden, *valid, *role),
         )
         self._prepare = _Graphed(self._prepare_body, self.graphs, carries=(), warmup=1)
         kl_carry = (self.kl_stop,) if self.kl_brake else ()
@@ -642,6 +723,8 @@ class MAPPO:
             self.prev_valid.zero_()
         if self.action_rate:
             self.prev_actions.zero_()
+        if self.learned:
+            self._reset_roles(None)
         horizon = self.env.max_steps or 0
         if self.spec.stagger_starts and horizon > 1:
             gen = torch.Generator(device=self.device).manual_seed(0)
@@ -656,6 +739,8 @@ class MAPPO:
                         self.h.masked_fill_(done.view(-1, 1, 1), 0.0)
                     if self.delayed:
                         self.prev_valid.copy_((~done).float())
+                    if self.learned:
+                        self._reset_roles(done)
         self._out = (obs, None, None, None, None)
         self._fetch_sources()
         if self.use_roles:
@@ -692,7 +777,7 @@ class MAPPO:
         sends this observation's messages for the next step."""
         if self.priv:
             obs = torch.cat([obs, self.env.aux_targets()], -1)
-        if not (self.recurrent or self.use_mask or self.delayed):
+        if not (self.recurrent or self.use_mask or self.delayed or self.learned):
             if self.actor_roles:
                 return self.actor.greedy(obs, self.env.agent_roles())
             return self.actor.greedy(obs)
@@ -702,13 +787,45 @@ class MAPPO:
         if self.delayed:
             heard = (self.prev_valid > 0).view(-1, 1, 1).expand(-1, self.A, self.A)
             msg = {"msg_obs": self.prev_obs, "msg_mask": heard if mask is None else heard & mask}
+        head = None
+        if self.learned:
+            roles = self.role_prev
+            head = partial(next_role, prev=roles, age=self.role_age, dwell=self.dwell)
         with torch.no_grad():
-            loc, _, _, h = self.actor.step(obs, roles, self.h, comm_mask=mask, **msg)
+            loc, _, _, h, *logits = self.actor.step(
+                obs, roles, self.h, comm_mask=mask, head_roles=head, **msg
+            )
+        if self.learned:
+            self._advance_roles(head(logits[0]))
         if self.recurrent:
             self.h.copy_(h)
         if self.delayed:
             self.prev_obs.copy_(obs[..., : self.env.obs_dim])
         return self.actor.squash(loc)
+
+    def _reset_roles(self, done: torch.Tensor | None) -> None:
+        """Start the learned roles of the envs ``done`` ``[E]`` marks (all with ``None``)
+        afresh: role 0 as the previous role, and an age that makes the next step decide."""
+        if done is None:
+            self.role_prev.zero_()
+            self.role_age.fill_(self.dwell)
+            return
+        self.role_prev.masked_fill_(done.view(-1, 1), 0)
+        self.role_age.masked_fill_(done.view(-1, 1), self.dwell)
+
+    def _advance_roles(self, role: torch.Tensor) -> None:
+        """Carry ``role`` ``[E, A]``, this step's learned roles, to the next step: the age
+        restarts at 1 where this step decided."""
+        decide = self.role_age >= self.dwell
+        self.role_prev.copy_(role)
+        self.role_age.copy_((self.role_age + 1).masked_fill(decide, 1))
+
+    def _role_state(self) -> torch.Tensor:
+        """``[E, A * (R + 1)]``, the critic's learned-role columns: per agent in agent order
+        the one-hot of its previous role and ``min(age, dwell) / dwell``."""
+        onehot = (self.role_prev.unsqueeze(-1) == self._role_ids).float()
+        age = self.role_age.clamp_max(self.dwell).float() / self.dwell
+        return torch.cat([onehot, age.unsqueeze(-1)], -1).flatten(-2)
 
     def _fetch_sources(self) -> None:
         """Point at the env's state/role/aux/mask buffers for the current observation
@@ -749,6 +866,8 @@ class MAPPO:
         obs = self._out[0]
         self.obs_buf.index_copy_(0, self.t, obs.unsqueeze(0))
         state, roles, aux, mask = self._src
+        if self.learned:
+            state = torch.cat([state, self._role_state()], -1)
         if self.state_buf is not None:
             self.state_buf.index_copy_(0, self.t, state.unsqueeze(0))
         if self.role_buf is not None:
@@ -776,12 +895,25 @@ class MAPPO:
                 self.msg_valid_buf.index_copy_(0, self.t, self.prev_valid.unsqueeze(0))
             msg = {"msg_obs": self.prev_obs, "msg_mask": heard, "msg_noise": noise}
         act_obs = torch.cat([obs, aux], -1) if self.priv else obs
+        head = None
+        if self.learned:
+            # The actor reads the previous roles; a decision samples by Gumbel-argmax.
+            roles = self.role_prev
+            self.lrole_in_buf.index_copy_(0, self.t, roles.unsqueeze(0))
+            gumbel = -torch.log(-torch.log(torch.rand(*roles.shape, self.actor.n_roles,
+                                                      device=self.device)))
+            head = partial(next_role, prev=roles, age=self.role_age, dwell=self.dwell,
+                           noise=gumbel)
         if self.recurrent:
             self.h_buf.index_copy_(0, self.t, self.h.unsqueeze(0))
-            loc, scale, _, h = self.actor.step(act_obs, roles, self.h, comm_mask=mask, **msg)
+            loc, scale, _, h, *logits = self.actor.step(
+                act_obs, roles, self.h, comm_mask=mask, head_roles=head, **msg
+            )
             self.h.copy_(h)
         else:
-            loc, scale, _ = policy_outputs(self.actor, act_obs, roles, comm_mask=mask, msg=msg)
+            loc, scale, _, *logits = policy_outputs(
+                self.actor, act_obs, roles, comm_mask=mask, msg=msg, head_roles=head
+            )
         if self.delayed:
             self.prev_obs.copy_(obs)
             if self.msg_loss:
@@ -789,23 +921,39 @@ class MAPPO:
         u = loc + scale * torch.randn_like(loc)
         self.actions.copy_(self.actor.squash(u))
         self.u_buf.index_copy_(0, self.t, u.unsqueeze(0))
-        self.logp_buf.index_copy_(0, self.t, tanh_normal_log_prob(u, loc, scale).unsqueeze(0))
+        logp = tanh_normal_log_prob(u, loc, scale)
+        if self.learned:
+            role = head(logits[0])
+            decide = (self.role_age >= self.dwell).float()
+            log_pr = logits[0].log_softmax(-1).gather(-1, role.unsqueeze(-1)).squeeze(-1)
+            logp = logp + decide * log_pr
+            self.lrole_buf.index_copy_(0, self.t, role.unsqueeze(0))
+            self.decide_buf.index_copy_(0, self.t, decide.unsqueeze(0))
+            self._advance_roles(role)
+        self.logp_buf.index_copy_(0, self.t, logp.unsqueeze(0))
 
     def _store_body(self) -> None:
         _, rew, term, trunc, info = self._out
-        rate = None
+        own = {}  # the trainer's own metrics, by key
         if self.action_rate:
             rate = ((self.actions - self.prev_actions) / self.act_half).square().mean(-1)
             rew = rew - self.rate_coef * rate
             done = torch.logical_or(term, trunc).view(-1, 1, 1)
             self.prev_actions.copy_(self.actions.masked_fill(done, 0.0))
+            own["action_rate"] = rate
+        if self.learned:
+            role = self.lrole_buf.index_select(0, self.t)[0]
+            decide = self.decide_buf.index_select(0, self.t)[0]
+            switched = decide * (role != self.lrole_in_buf.index_select(0, self.t)[0]).float()
+            own["role1_frac"] = (role == 1).float()
+            own["switch_rate"] = switched.sum() / decide.sum().clamp_min(1.0)
         self.rew_buf.index_copy_(0, self.t, rew.unsqueeze(0))
         self.term_buf.index_copy_(0, self.t, term.unsqueeze(0).float())
         self.trunc_buf.index_copy_(0, self.t, trunc.unsqueeze(0).float())
         off = 0
         for key, width in self.metrics.items():
-            if key == "action_rate" and rate is not None:
-                self.metric_acc[off : off + 1] += rate.mean()
+            if key in own:
+                self.metric_acc[off : off + 1] += own[key].mean()
                 off += 1
                 continue
             x = info[key].float().reshape(-1, width).mean(0)
@@ -817,6 +965,8 @@ class MAPPO:
         if self.delayed:
             # So does its message's source: the next step hears nothing from this one.
             self.prev_valid.copy_(1.0 - torch.logical_or(term, trunc).float())
+        if self.learned:
+            self._reset_roles(torch.logical_or(term, trunc))
         self.t.add_(1)
 
     @torch.no_grad()
@@ -849,6 +999,9 @@ class MAPPO:
             self._store()
         self.obs_buf[self.T].copy_(self._out[0])
         state, roles = self._src[:2]
+        if self.learned:
+            state = torch.cat([state, self._role_state()], -1)
+            self.lrole_in_buf[self.T].copy_(self.role_prev)
         if self.state_buf is not None:
             self.state_buf[self.T].copy_(state)
         if self.role_buf is not None:
@@ -961,6 +1114,10 @@ class MAPPO:
                 extra["priv"] = extra["aux_target"]
         if self.mask_buf is not None:
             extra["comm_mask"] = self.mask_buf.reshape(self.N, A, A).index_select(0, idx)
+        if self.learned:
+            extra["role_in"] = self.lrole_in_buf[: self.T].reshape(self.N, A).index_select(0, idx)
+            extra["role_out"] = self.lrole_buf.reshape(self.N, A).index_select(0, idx)
+            extra["decide"] = self.decide_buf.reshape(self.N, A).index_select(0, idx)
         if self.recurrent:
             # The stored hidden state entering each chunk's first step, not a recomputed one.
             h_rows = self.h_buf.reshape(self.N, A, -1)
@@ -1002,6 +1159,8 @@ class MAPPO:
             total = total + self.spec.aux_coef * losses[3]
         if self.msg_loss:
             total = total + self.spec.msg_coef * losses[3 + int(self.use_aux)]
+        if self.learned:
+            total = total - self.spec.role_entropy_coeff * losses[-1]
         total.backward()
         gnorm = torch.nn.utils.clip_grad_norm_(
             self.params, _MAX_GRAD_NORM, foreach=self.cuda or None
@@ -1151,6 +1310,8 @@ def _network_flags(cls: str, kwargs: Mapping[str, Any]) -> list[str]:
             flags += ["--comm", kwargs["comm"], "--comm-dim", str(kwargs["comm_dim"])]
         if kwargs.get("priv_dim"):
             flags += ["--privileged-actor"]
+        if kwargs.get("learned_roles"):
+            flags += ["--learned-roles", "--role-dwell", str(kwargs["role_dwell"])]
         return [*flags, "--aux-coef", "<positive>"] if kwargs.get("aux_dim") else flags
     if cls == "Critic":
         return ["--critic-input", "obs", "--no-per-agent-value", *flags]
@@ -1162,8 +1323,9 @@ def _network_flags(cls: str, kwargs: Mapping[str, Any]) -> list[str]:
 
 #: Network keywords that ``--resume-widen`` lets grow: input and aux widths, whose new
 #: columns (appended at the end) load with zero weights. It also accepts an option the
-#: checkpoint's network does not record at all (communication or privileged inputs added to a
-#: policy trained without), whose new parameters keep their fresh initialisation.
+#: checkpoint's network does not record at all (communication, privileged inputs or learned
+#: roles added to a policy trained without), whose new parameters keep their fresh
+#: initialisation.
 WIDENABLE = ("obs_dim", "state_dim", "aux_dim", "priv_dim")
 
 
@@ -1247,6 +1409,38 @@ def load_widened(module: torch.nn.Module, state: Mapping[str, torch.Tensor]) -> 
     return fresh
 
 
+def tie_learned_roles(
+    actor: PolicyNet, state: Mapping[str, torch.Tensor]
+) -> dict[str, torch.Tensor]:
+    """``state``, the weights of a ``"heads"`` :class:`PolicyNet` without learned roles,
+    laid out for the learned-roles ``actor`` before :func:`load_widened`.
+
+    The teammates' role columns enter the trunk after the role one-hot, ahead of any
+    message or privileged columns, so those are moved right and the new ones zeroed (a
+    leading-corner widening would misplace them). Every role's head rows and role-input
+    column (trunk or attention encoder, message encoder) are tied to role 0's, so the
+    widened actor acts under any role as the checkpoint did in role 0, the only one a
+    ``(A, 0)`` scenario fills."""
+    state = dict(state)
+    Ob, R, two_d = actor.obs_dim, actor.n_roles, 2 * actor.act_dim
+    first = "comm_enc.weight" if actor.comm == "attn" else "trunk.0.weight"
+    for name in (first, "msg_enc.0.weight"):
+        if name in state:
+            w = state[name].clone()
+            w[:, Ob + 1 : Ob + R] = w[:, Ob : Ob + 1]
+            state[name] = w
+    w = state["trunk.0.weight"]
+    if actor.comm != "attn" and w.shape[1] > Ob + R:
+        state["trunk.0.weight"] = torch.cat(
+            [w[:, : Ob + R], w.new_zeros(w.shape[0], R), w[:, Ob + R :]], 1
+        )
+    for name in ("head.weight", "head.bias"):
+        h = state[name].clone().view(R, two_d, *state[name].shape[1:])
+        h[1:] = h[:1]
+        state[name] = h.view(state[name].shape)
+    return state
+
+
 def load_policy(path: str | Path, device: str = "cpu") -> torch.nn.Module:
     """The actor of a :func:`train` checkpoint; ``actor.greedy(obs)`` is the eval action
     (``actor.greedy(obs, roles)`` for a role-aware :class:`PolicyNet`)."""
@@ -1267,7 +1461,9 @@ def greedy_env_arm(actor: torch.nn.Module) -> Callable[[Environment], ActionFn]:
     For a recurrent :class:`PolicyNet` the action function is stateful: each ``make(env)``
     starts from a zero hidden state and carries it from call to call. It never resets it,
     which is right for :func:`score`'s one un-reset episode per env; a loop whose env
-    resets mid-run must build a fresh action function per episode.
+    resets mid-run must build a fresh action function per episode. A learned-roles one
+    carries each agent's role the same way, from role 0 with a decision on the first call:
+    the argmax of the role logits every ``role_dwell`` calls, held in between.
     """
 
     priv = getattr(actor, "priv_dim", 0) > 0
@@ -1285,10 +1481,15 @@ def greedy_env_arm(actor: torch.nn.Module) -> Callable[[Environment], ActionFn]:
         h: torch.Tensor | None = None
 
         prev: torch.Tensor | None = None
+        learned = actor.learned_roles
+        role = age = None
+        if learned:
+            role = torch.zeros(env.n_envs, env.n_agents, dtype=torch.long, device=env.device)
+            age = torch.full_like(role, actor.role_dwell)
 
         @torch.no_grad()
         def act(obs: torch.Tensor) -> torch.Tensor:
-            nonlocal h, prev
+            nonlocal h, prev, role, age
             roles = env.agent_roles() if uses_roles else None
             mask = env.comm_mask() if actor.communicates else None
             msg = {}
@@ -1296,9 +1497,16 @@ def greedy_env_arm(actor: torch.nn.Module) -> Callable[[Environment], ActionFn]:
                 n = obs.shape[-2]
                 heard = torch.ones(*obs.shape[:-2], n, n, dtype=torch.bool, device=obs.device)
                 msg = {"msg_obs": prev, "msg_mask": heard if mask is None else heard & mask}
-            loc, _, _, h_next = actor.step(actor_obs(obs), roles, h, comm_mask=mask, **msg)
+            head = None
+            if learned:
+                roles, head = role, partial(next_role, prev=role, age=age, dwell=actor.role_dwell)
+            loc, _, _, h_next, *logits = actor.step(
+                actor_obs(obs), roles, h, comm_mask=mask, head_roles=head, **msg
+            )
             h = h_next if actor.recurrent else None
             prev = obs.clone() if getattr(actor, "delayed", False) else None
+            if learned:
+                role, age = head(logits[0]), (age + 1).masked_fill(age >= actor.role_dwell, 1)
             return actor.squash(loc)
 
         return act
@@ -1365,16 +1573,20 @@ def network_archs(
                     "'heads' or 'shared', not 'separate'"
                 )
             actor[1].update(priv_dim=env.aux_dim)
+        if spec.learned_roles:
+            actor[1].update(learned_roles=True, role_dwell=spec.role_dwell)
     use_state = spec.critic_input in ("state", "state+obs")
     if use_state and env.state_dim == 0:
         raise ValueError(
             f"critic_input={spec.critic_input!r}, but the scenario provides no critic_state()"
         )
+    # Learned roles append each agent's previous-role one-hot and dwell age to the state.
+    role_state = n_agents * (len(roles) + 1) if spec.learned_roles else 0
     if spec.critic_input == "obs" and not spec.per_agent_value and not roles:
         critic = "Critic", {"obs_dim": obs_dim, "n_agents": n_agents, "num_cells": cells}
     else:
         critic = "StateCritic", {
-            "state_dim": env.state_dim if use_state else 0, "obs_dim": obs_dim,
+            "state_dim": env.state_dim + role_state if use_state else 0, "obs_dim": obs_dim,
             "n_agents": n_agents, "num_cells": cells,
             "use_obs": spec.critic_input in ("obs", "state+obs"), "role_counts": roles,
             "per_agent": spec.per_agent_value,
@@ -1575,6 +1787,11 @@ def parse_args(argv: list[str] | None = None) -> TrainConfig:
     p.add_argument("--aux-coef", type=float, help="auxiliary-loss weight (needs policynet)")
     p.add_argument("--privileged-actor", action="store_true", default=None,
                    help="append the aux targets to the policynet's input (needs --aux-coef)")
+    p.add_argument("--learned-roles", action="store_true", default=None,
+                   help="each agent chooses its role (scenario roles (A, 0), role heads)")
+    p.add_argument("--role-dwell", type=int, help="steps a learned role is held")
+    p.add_argument("--role-entropy-coeff", type=float,
+                   help="weight of the learned roles' categorical entropy bonus")
     p.add_argument("--action-rate-coef", type=float,
                    help="weight of the action-rate penalty on each agent's reward")
     p.add_argument("--action-rate-ramp-iters", type=int,
@@ -1634,7 +1851,8 @@ def parse_args(argv: list[str] | None = None) -> TrainConfig:
             "curriculum_iters", "curriculum_gate", "actor", "role_params", "critic_input",
             "per_agent_value", "aux_coef", "action_rate_coef", "action_rate_ramp_iters",
             "recurrent", "hidden_dim", "seq_len", "comm", "comm_dim", "msg_coef",
-            "msg_beta", "msg_drop", "ramp_gate", "privileged_actor",
+            "msg_beta", "msg_drop", "ramp_gate", "privileged_actor", "learned_roles",
+            "role_dwell", "role_entropy_coeff",
         )
         if getattr(a, f) is not None
     }
@@ -1748,6 +1966,8 @@ def train(cfg: TrainConfig) -> Path:
     }
     if spec.action_rate_coef > 0:
         metrics["action_rate"] = 1  # computed by the trainer, not read from info
+    if spec.learned_roles:
+        metrics.update(role1_frac=1, switch_rate=1)  # likewise
     metric_cols = metric_names(metrics)
 
     actor_cls, actor_kwargs, critic_cls, critic_kwargs = network_archs(
@@ -1760,11 +1980,18 @@ def train(cfg: TrainConfig) -> Path:
         built = (actor_cls, actor_kwargs, critic_cls, critic_kwargs)
         check_resume(cfg.resume, ckpt, built, critic_only=cfg.resume_critic_only,
                      widen=cfg.resume_widen)
-        fresh = [] if cfg.resume_critic_only else load_widened(actor, a.state_dict())
+        state = a.state_dict()
+        # A checkpoint without learned roles: every role starts as its role 0.
+        tie = (spec.learned_roles and not cfg.resume_critic_only
+               and not checkpoint_archs(ckpt)[1].get("learned_roles"))
+        if tie:
+            state = tie_learned_roles(actor, state)
+        fresh = [] if cfg.resume_critic_only else load_widened(actor, state)
         fresh += load_widened(critic, c.state_dict())
         what = "critic" if cfg.resume_critic_only else "actor + critic"
         print(f"resumed {what} from {cfg.resume}"
-              + (f"; freshly initialised: {', '.join(fresh)}" if fresh else ""))
+              + (f"; freshly initialised: {', '.join(fresh)}" if fresh else "")
+              + ("; every role tied to role 0 (heads, role inputs)" if tie else ""))
     if cfg.train_only:
         keep = freeze_actor(actor, cfg.train_only)
         print(f"training only the actor's {', '.join(keep)} (and the critic)")
@@ -1811,6 +2038,7 @@ def train(cfg: TrainConfig) -> Path:
     csv_writer = csv.writer(csv_file)
     # loss_aux only when the aux loss is on, so a default run's header is unchanged.
     aux_col = (["loss_aux"] if algo.use_aux else []) + (["loss_msg"] if algo.msg_loss else [])
+    aux_col += ["role_entropy"] if algo.learned else []
     ramp_col = ["ramp"] if spec.ramps else []
     # The guards' columns only when each is on, likewise.
     clock_col = ["ramp_clock"] if spec.ramp_gate is not None else []
@@ -1889,6 +2117,7 @@ def train(cfg: TrainConfig) -> Path:
             + (f", comm {spec.comm} {spec.comm_dim}" if spec.comm != "none" else "")
             + (f" (drop {spec.msg_drop}, msg_coef {spec.msg_coef})" if algo.delayed else "")
             + (" over comm_mask()" if algo.use_mask else "")
+            + (f", learned roles (dwell {spec.role_dwell})" if algo.learned else "")
         )
     if cfg.scen_kwargs:
         print(f"  scenario kwargs: {cfg.scen_kwargs}")
@@ -2030,7 +2259,10 @@ def train(cfg: TrainConfig) -> Path:
             + (f"clock {tick}  " if clock_col else "")
             + (f"kl {stats['approx_kl'] / max(n_mb - skips, 1):.4f}  " if kl_col else "")
             + (f"lr x{kl_lr:.3g}  " if adapt_col else "")
-            + f"ent {ent / updates:+.3f}  {wall * 1e3:.1f}ms"
+            + f"ent {ent / updates:+.3f}  "
+            + (f"role1 {stats['role1_frac']:.2f}  switch {stats['switch_rate']:.2f}  "
+               if algo.learned else "")
+            + f"{wall * 1e3:.1f}ms"
             + (f"  skipped {skips}" if skips else "")
         )
         if cfg.checkpoint_every and (it + 1) % cfg.checkpoint_every == 0:

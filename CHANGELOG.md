@@ -7,6 +7,8 @@ All notable changes to `swarp`. Newest first. Nothing has been released yet — 
 
 ### Added
 
+- **`TrainSpec.learned_roles` (`--learned-roles`, `--role-dwell`, `--role-entropy-coeff`)**: on a scenario with `role_counts` `(A, 0)` each agent samples its role every `role_dwell` steps from a role head, the choice entering the PPO ratio; a checkpoint without it widens into one that acts as before under either role.
+
 - **`TrainSpec.privileged_actor` (`--privileged-actor`, `PolicyNet(priv_dim=...)`)**: the actor reads the scenario's aux targets as extra last trunk columns, a diagnostic for whether a task fails on perception; a plain checkpoint widens into it acting as before.
 
 - **`pusht`/`pusht_lidar` per-env arena (`arena_size`), solid surroundings (`scenery_probs`) and T sizes (`tee_scale`).**
