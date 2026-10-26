@@ -7,6 +7,8 @@ All notable changes to `swarp`. Newest first. Nothing has been released yet — 
 
 ### Added
 
+- **`TrainSpec.priv_noise` (`--priv-noise`)**: trains a privileged actor on a `pusht_lidar` T pose with a per-episode bias, per-step jitter and gross outliers, as a lidar estimator would report it; the update reads back the noisy input the rollout acted on, and `examples/eval_mappo.py --priv-noise` evaluates under the same model.
+
 - **`TrainSpec.teacher` (`--teacher`, `--bc-coef`, `--bc-decay-iters`)**: distils a privileged `PolicyNet` checkpoint into the actor on its own rollouts, adding `bc_coef * mse(actor mean, teacher mean)` to the PPO loss and logging it as `loss_bc`.
 
 - **`TrainSpec.learned_roles` (`--learned-roles`, `--role-dwell`, `--role-entropy-coeff`)**: on a scenario with `role_counts` `(A, 0)` each agent samples its role every `role_dwell` steps from a role head, the choice entering the PPO ratio; a checkpoint without it widens into one that acts as before under either role.

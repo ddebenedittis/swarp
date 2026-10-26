@@ -93,19 +93,24 @@ def _load(path: str, device: str):
     return policy, ckpt
 
 
-def _load_arm(path: str, device: str) -> tuple[dict[str, Any], dict]:
+def _load_arm(
+    path: str, device: str, priv_noise: tuple[float, ...] = ()
+) -> tuple[dict[str, Any], dict]:
     """The greedy policy arm and metadata of either trainer's checkpoint.
 
     The arm is the keyword :func:`score` takes it as: ``{"policy": PolicyArm}``, or
     ``{"policy_from_env": ...}`` for a role-aware ``swarp.rl`` policy, which reads the
     roles from the env at every call. A ``swarp.rl`` checkpoint acts with ``tanh(loc)``;
     a ``train_mappo.py`` one keeps its historical ``loc.clamp(lo, hi)`` (see
-    :func:`mappo.greedy_actions`).
+    :func:`mappo.greedy_actions`). ``priv_noise`` feeds a privileged ``swarp.rl`` actor a
+    noisy T pose (see :func:`swarp.rl.ppo.greedy_env_arm`).
     """
     ckpt = torch.load(path, map_location=device, weights_only=True)
     if ckpt.get("format") in CHECKPOINT_FORMATS:
         actor, _, ckpt = load_checkpoint(path, device)
-        return greedy_score_kwargs(actor), ckpt
+        return greedy_score_kwargs(actor, priv_noise), ckpt
+    if priv_noise:
+        raise ValueError("--priv-noise needs a privileged swarp.rl checkpoint")
     if ckpt.get("format") == "rsl_rl/1":  # examples/train_rsl_rl.py: acts with clamp(mean)
         import train_rsl_rl
 
@@ -150,6 +155,9 @@ def main() -> int:
                    help="default = the checkpoint's; the shared-weight actor runs at any count")
     p.add_argument("--scen-kwarg", action="append", default=[], metavar="K=V",
                    help="scenario keyword over the checkpoint's own; repeatable")
+    p.add_argument("--priv-noise", nargs=5, type=float, default=(),
+                   metavar=("POS_BIAS", "POS_JITTER", "HEAD_BIAS", "HEAD_JITTER", "OUTLIER"),
+                   help="evaluate a privileged actor on a noisy T pose (metres, radians, prob)")
     p.add_argument("--arms", default="policy,random,zero,scripted")
     p.add_argument("--target", type=float, help="exit nonzero below this solve rate")
     p.add_argument("--success-key", help="info() key to threshold, for a done()-less scenario")
@@ -172,7 +180,7 @@ def main() -> int:
     if not args.checkpoint:
         return 0
 
-    arm, ckpt = _load_arm(args.checkpoint, args.device)
+    arm, ckpt = _load_arm(args.checkpoint, args.device, tuple(args.priv_noise))
     scenario = args.scenario or ckpt.get("scenario")
     if scenario is None:
         p.error(

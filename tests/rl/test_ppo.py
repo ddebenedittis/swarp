@@ -342,6 +342,19 @@ def _patch_single_role(env) -> None:
     scen.agent_roles = lambda: roles
 
 
+POSE_SCALE = 0.5
+
+
+def _patch_pose_aux(env) -> None:
+    """:func:`_patch_training_hooks` with ``pusht_lidar``'s flag-free aux layout as far as
+    ``priv_noise`` reads it: four columns (a position over ``aux_scale``, then a heading's
+    cos/sin) and an ``aux_scale``."""
+    _patch_training_hooks(env)
+    scen = env.scenario
+    scen.aux_dim, scen.aux_scale = 4, POSE_SCALE
+    scen.aux_targets = lambda: scen.observations()[..., :4]
+
+
 def _patch_reset_roles(env) -> None:
     """:func:`_patch_training_hooks`, with roles that change at every reset: a
     fixed-address buffer that ``reset_world`` re-permutes for the masked envs with
@@ -407,8 +420,8 @@ def _algo(
         counts = env.role_counts
         actor = PolicyNet(
             Ob, env.act_dim, spec.num_cells, role_counts=counts,
-            role_params=spec.role_params, aux_dim=AUX_DIM,
-            priv_dim=AUX_DIM if spec.privileged_actor else 0,
+            role_params=spec.role_params, aux_dim=env.aux_dim,
+            priv_dim=env.aux_dim if spec.privileged_actor else 0,
             learned_roles=spec.learned_roles, role_dwell=spec.role_dwell, **memory,
         )
         role_state = A * (len(counts) + 1) if spec.learned_roles else 0
@@ -600,7 +613,9 @@ _COMM = {"actor": "policynet", "comm": "attn", "comm_dim": 8, "patch": _patch_co
 _ROLLOUT = ("obs_buf", "u_buf", "logp_buf", "rew_buf", "term_buf", "trunc_buf",
             "state_buf", "role_buf", "aux_buf", "h_buf", "mask_buf", "msg_obs_buf",
             "msg_mask_buf", "msg_noise_buf", "msg_aux_buf", "msg_valid_buf", "lrole_in_buf",
-            "lrole_buf", "decide_buf", "teacher_loc_buf")
+            "lrole_buf", "decide_buf", "teacher_loc_buf", "priv_buf")
+# An estimator's errors on the privileged pose, outliers included.
+_NOISE = (0.03, 0.03, 0.05, 0.05, 0.05)
 # Learned roles over one filled role, decided every 3 steps in 5-step episodes.
 _LEARNED = {"learned_roles": True, "role_dwell": 3, "normalize_advantage": False,
             "critic_input": "state+obs", "max_steps": 5, "patch": _patch_single_role}
@@ -626,10 +641,11 @@ def _copy_rollout(dst: MAPPO, src: MAPPO) -> None:
         (True, {**_LEARNED, "comm": "pose", "comm_dim": 4, "msg_drop": 0.3}),
         (True, {**_LEARNED, "recurrent": True, "hidden_dim": HIDDEN, "seq_len": 4}),
         (True, {**_MEMORY, "seq_len": 4, "teacher": _fresh_teacher}),
+        (True, {"privileged_actor": True, "priv_noise": _NOISE, "patch": _patch_pose_aux}),
     ],
     ids=["default", "features", "reset-roles", "recurrent", "comm", "recurrent-comm-features",
          "recurrent-separate", "vae-message", "privileged", "learned-roles",
-         "learned-roles-pose", "learned-roles-recurrent", "teacher"],
+         "learned-roles-pose", "learned-roles-recurrent", "teacher", "priv-noise"],
 )
 def test_captured_update_matches_eager_update(features, kw):
     """Same weights, same rollout, same permutations: the graphed update lands where the
@@ -1305,6 +1321,87 @@ def test_privileged_actor_is_refused_without_the_aux_targets():
     assert network_archs(spec, env, *box)[1]["priv_dim"] == AUX_DIM
     with pytest.raises(ValueError, match="not 'separate'"):
         network_archs(replace(spec, role_params="separate"), env, *box)
+
+
+def _priv_algo(noise, device="cpu", patch=_patch_pose_aux, **kw) -> MAPPO:
+    return _algo(graphs=device != "cpu", device=device, features=True, privileged_actor=True,
+                 priv_noise=noise, patch=patch, **kw)
+
+
+def test_zero_priv_noise_acts_on_the_truth_and_jitter_has_the_requested_std():
+    """All-zero noise hands the actor the exact targets: the stored log-probs are the
+    noise-free policy's on ``cat(obs, aux)``, and the update reads ``priv_buf``, equal to
+    ``aux_buf``. A jitter alone moves the position columns by its std in metres and leaves
+    the heading as it is."""
+    algo = _priv_algo((0.0,) * 5)
+    algo.rollout()
+    T, A, N = algo.T, algo.A, algo.N
+    assert torch.equal(algo.priv_buf, algo.aux_buf)
+    obs = torch.cat([algo.obs_buf[:T], algo.aux_buf], -1).reshape(N, A, -1)
+    with torch.no_grad():
+        loc, scale, _ = policy_outputs(algo.actor, obs, algo.role_buf[:T].reshape(N, A))
+    logp = tanh_normal_log_prob(algo.u_buf.reshape(N, A, -1), loc, scale)
+    torch.testing.assert_close(logp, algo.logp_buf.reshape(N, A))
+    algo = _priv_algo((0.0, 0.05, 0.0, 0.0, 0.0))
+    algo.rollout()
+    d = (algo.priv_buf - algo.aux_buf)[..., :2] / POSE_SCALE
+    assert abs(d.std().item() - 0.05) < 0.005 and abs(d.mean().item()) < 0.005
+    assert torch.equal(algo.priv_buf[..., 2:], algo.aux_buf[..., 2:])
+    stats = algo.update(algo.spec.entropy_coeff)
+    assert stats["grad_skips"] == 0
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda:0", marks=pytest.mark.gpu)])
+def test_the_priv_noise_bias_holds_within_an_episode_and_is_redrawn_after_a_done(device):
+    algo = _priv_algo((0.1, 0.0, 0.0, 0.0, 0.0), device=device, max_steps=3)
+    for _ in range(2):  # the second one replays the captured graphs
+        algo.rollout()
+    d = (algo.priv_buf - algo.aux_buf)[..., :2] / POSE_SCALE  # [T, E, A, 2]
+    assert d[0].abs().amax() > 0.05
+    done = torch.logical_or(algo.term_buf > 0, algo.trunc_buf > 0)[:-1]  # [T - 1, E]
+    step = (d[1:] - d[:-1]).abs().amax((-1, -2))
+    assert done.any() and (~done).any()
+    assert (step[~done] < 1e-4).all() and (step[done] > 1e-3).all()
+
+
+def test_greedy_env_arm_holds_a_noisy_pose_s_bias_and_zero_noise_is_the_truth():
+    env = build_env("navigation", n_envs=3, n_agents=4, device="cpu", dt=0.1, substeps=1,
+                    max_steps=None, seed=0)
+    _patch_pose_aux(env)
+    actor = PolicyNet(env.obs_dim, env.act_dim, 16, aux_dim=4, priv_dim=4)
+    obs = env.reset()
+    truth = greedy_score_kwargs(actor)["policy_from_env"](env)(obs)
+    exact = greedy_score_kwargs(actor, (0.0,) * 5)["policy_from_env"](env)
+    assert torch.equal(exact(obs), truth)
+    biased = greedy_env_arm(actor, (0.2, 0.0, 0.3, 0.0, 0.0))(env)
+    first = biased(obs)
+    assert torch.equal(biased(obs), first) and not torch.allclose(first, truth)
+
+
+def test_priv_noise_is_refused_where_it_cannot_work():
+    spec = replace(SPECS["navigation"], actor="policynet", aux_coef=0.5)
+    with pytest.raises(ValueError, match="needs privileged_actor"):
+        replace(spec, priv_noise=(0.0,) * 5)
+    spec = replace(spec, privileged_actor=True)
+    for bad in [(0.1, 0.1), (0.1, -0.1, 0.0, 0.0, 0.0)]:
+        with pytest.raises(ValueError, match="5 values >= 0"):
+            replace(spec, priv_noise=bad)
+    with pytest.raises(ValueError, match=r"outlier_prob must lie in \[0, 1\)"):
+        replace(spec, priv_noise=(0.0, 0.0, 0.0, 0.0, 1.0))
+    with pytest.raises(ValueError, match="aux_scale and aux_dim >= 4"):
+        _priv_algo(_NOISE, patch=_patch_training_hooks)
+
+    def with_flag(env):
+        _patch_pose_aux(env)
+        env.scenario.aux_goal = True
+
+    with pytest.raises(ValueError, match="aux_goal=False"):
+        _priv_algo(_NOISE, patch=with_flag)
+    with pytest.raises(ValueError, match="the actor has none"):
+        greedy_env_arm(PolicyNet(4, 2, 8), _NOISE)
+    assert parse_args(["--scenario", "pusht_lidar", "--privileged-actor", "--aux-coef", "0.5",
+                       "--actor", "policynet", "--priv-noise", *map(str, _NOISE)]
+                      ).spec.priv_noise == _NOISE
 
 
 # ------------------------------------------------------------------------- learned roles

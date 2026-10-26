@@ -409,6 +409,54 @@ def next_role(
     return torch.where(age >= dwell, score.argmax(-1), prev)
 
 
+#: Side of the square, in metres and centred on the truth, an outlier position is drawn in.
+PRIV_OUTLIER_BOX = 1.0
+
+
+def priv_noise_scale(env: Environment) -> float:
+    """The metres-to-aux factor ``scenario.aux_scale`` that ``TrainSpec.priv_noise`` scales
+    its position noise by; raises unless the scenario has ``pusht_lidar``'s flag-free aux
+    layout (relative T position over ``aux_scale``, then the cos/sin of its heading)."""
+    scen = env.scenario
+    scale = getattr(scen, "aux_scale", None)
+    if scale is None or env.aux_dim < 4:
+        raise ValueError(
+            "priv_noise perturbs a T pose in the aux targets: it needs a scenario with "
+            f"aux_scale and aux_dim >= 4 (got aux_scale={scale}, aux_dim={env.aux_dim})"
+        )
+    if getattr(scen, "aux_goal", False):
+        raise ValueError("priv_noise needs aux_goal=False: a noisy pose next to the true "
+                         "on-goal flag leaks the truth")
+    return float(scale)
+
+
+def priv_bias(noise: Sequence[float], aux: torch.Tensor) -> torch.Tensor:
+    """``[E, A, 3]``: a fresh per-episode estimator bias for each robot of ``aux``
+    ``[E, A, aux_dim]``, position (metres) then heading (radians). Capture-safe."""
+    b = torch.randn(*aux.shape[:-1], 3, device=aux.device)
+    return torch.cat([b[..., :2] * noise[0], b[..., 2:] * noise[2]], -1)
+
+
+def noisy_priv(
+    aux: torch.Tensor, bias: torch.Tensor, noise: Sequence[float], scale: float
+) -> torch.Tensor:
+    """``aux`` as a pose estimator would report it (see ``TrainSpec.priv_noise``): ``bias``
+    plus a fresh jitter, or with probability ``noise[4]`` a gross error, moves the position
+    columns 0:2 by metres times ``scale`` and rotates the heading's (cos, sin) in columns
+    2:4; any later column passes through. Capture-safe."""
+    jit = torch.randn_like(bias)
+    d_pos = bias[..., :2] + jit[..., :2] * noise[1]
+    d_th = bias[..., 2] + jit[..., 2] * noise[3]
+    if noise[4] > 0:
+        u = torch.rand_like(bias)
+        out = torch.rand_like(d_th) < noise[4]
+        d_pos = torch.where(out.unsqueeze(-1), (u[..., :2] - 0.5) * PRIV_OUTLIER_BOX, d_pos)
+        d_th = torch.where(out, (2.0 * u[..., 2] - 1.0) * math.pi, d_th)
+    c, s, cd, sd = aux[..., 2], aux[..., 3], d_th.cos(), d_th.sin()
+    rot = torch.stack([c * cd - s * sd, s * cd + c * sd], -1)
+    return torch.cat([aux[..., :2] + d_pos * scale, rot, aux[..., 4:]], -1)
+
+
 # ------------------------------------------------------------------------------ the core
 
 
@@ -448,7 +496,11 @@ class MAPPO:
     ``cat(obs, aux targets)``: ``obs_buf`` and the critic keep the plain observation, and
     the update appends the ``aux_buf`` rows the act graph recorded next to it, so it sees
     exactly what the rollout acted on. Delayed messages are still encoded from the plain
-    observation.
+    observation. With ``spec.priv_noise`` it acts on :func:`noisy_priv` of the targets
+    instead, recorded in ``priv_buf`` ``[T, E, A, aux_dim]`` for the update while
+    ``aux_buf`` keeps the truth for the aux loss; the carried per-robot bias
+    ``priv_bias`` ``[E, A, 3]`` is drawn at :meth:`reset` and redrawn by the store graph
+    for the envs whose episode just ended.
 
     A learned-roles :class:`PolicyNet` chooses each agent's role every ``role_dwell`` steps
     and holds it in between. The carries ``role_prev`` (``r_{t-1}``, 0 at an episode start)
@@ -569,6 +621,11 @@ class MAPPO:
                 f"needs aux_coef > 0 and aux_dim={actor.priv_dim} (got aux_coef="
                 f"{spec.aux_coef}, aux_dim={env.aux_dim})"
             )
+        self.priv_noise = tuple(spec.priv_noise)
+        if self.priv_noise and not self.priv:
+            raise ValueError("priv_noise perturbs the privileged input: it needs a privileged "
+                             "PolicyNet (priv_dim > 0)")
+        self.priv_scale = priv_noise_scale(env) if self.priv_noise else 1.0
         self.teacher = teacher
         if self.distil:
             if not isinstance(teacher, PolicyNet) or teacher.stateful:
@@ -604,6 +661,10 @@ class MAPPO:
         self.role_buf = z(T + 1, E, A, dtype=torch.long) if self.use_roles else None
         self.aux_buf = z(T, E, A, env.aux_dim) if self.use_aux else None
         self.teacher_loc_buf = z(T, E, A, D) if self.distil else None
+        # Noisy privileged input: what the actor read (the update reads it back) and the
+        # carried per-episode bias, redrawn at a done.
+        self.priv_buf = z(T, E, A, env.aux_dim) if self.priv_noise else None
+        self.priv_bias = z(E, A, 3) if self.priv_noise else None
         # Memory and communication.
         self.recurrent = self.policy_net and actor.recurrent
         self.use_mask = self.policy_net and actor.communicates and env.comm_mask() is not None
@@ -725,12 +786,13 @@ class MAPPO:
         sent = tuple(x for x in (self.prev_obs, self.prev_aux) if x is not None)
         valid = (self.prev_valid,) if self.delayed else ()
         role = (self.role_prev, self.role_age) if self.learned else ()
+        bias = (self.priv_bias,) if self.priv_noise else ()
         self._act = _Graphed(
-            self._act_body, self.graphs, carries=(self.t, *hidden, *sent, *role)
+            self._act_body, self.graphs, carries=(self.t, *hidden, *sent, *role, *bias)
         )
         self._store = _Graphed(
             self._store_body, self.graphs,
-            carries=(self.t, self.metric_acc, *hidden, *valid, *role),
+            carries=(self.t, self.metric_acc, *hidden, *valid, *role, *bias),
         )
         self._prepare = _Graphed(self._prepare_body, self.graphs, carries=(), warmup=1)
         kl_carry = (self.kl_stop,) if self.kl_brake else ()
@@ -784,6 +846,8 @@ class MAPPO:
                         self._reset_roles(done)
         self._out = (obs, None, None, None, None)
         self._fetch_sources()
+        if self.priv_noise:
+            self.priv_bias.copy_(priv_bias(self.priv_noise, self._src[2]))
         if self.use_roles:
             self._check_role_counts(self._src[1])
 
@@ -936,7 +1000,11 @@ class MAPPO:
                 self.msg_aux_buf.index_copy_(0, self.t, self.prev_aux.unsqueeze(0))
                 self.msg_valid_buf.index_copy_(0, self.t, self.prev_valid.unsqueeze(0))
             msg = {"msg_obs": self.prev_obs, "msg_mask": heard, "msg_noise": noise}
-        act_obs = torch.cat([obs, aux], -1) if self.priv else obs
+        priv = aux
+        if self.priv_noise:
+            priv = noisy_priv(aux, self.priv_bias, self.priv_noise, self.priv_scale)
+            self.priv_buf.index_copy_(0, self.t, priv.unsqueeze(0))
+        act_obs = torch.cat([obs, priv], -1) if self.priv else obs
         head = None
         if self.learned:
             # The actor reads the previous roles; a decision samples by Gumbel-argmax.
@@ -1012,6 +1080,11 @@ class MAPPO:
             self.prev_valid.copy_(1.0 - torch.logical_or(term, trunc).float())
         if self.learned:
             self._reset_roles(torch.logical_or(term, trunc))
+        if self.priv_noise:
+            # A new episode, a new estimator bias.
+            done = torch.logical_or(term, trunc).view(-1, 1, 1)
+            fresh = priv_bias(self.priv_noise, self.priv_bias)
+            self.priv_bias.copy_(torch.where(done, fresh, self.priv_bias))
         self.t.add_(1)
 
     @torch.no_grad()
@@ -1155,7 +1228,9 @@ class MAPPO:
             extra["role_counts"] = self.role_counts
         if self.aux_buf is not None:
             extra["aux_target"] = self.aux_buf.reshape(self.N, A, -1).index_select(0, idx)
-            if self.priv:
+            if self.priv_buf is not None:
+                extra["priv"] = self.priv_buf.reshape(self.N, A, -1).index_select(0, idx)
+            elif self.priv:
                 extra["priv"] = extra["aux_target"]
         if self.mask_buf is not None:
             extra["comm_mask"] = self.mask_buf.reshape(self.N, A, A).index_select(0, idx)
@@ -1501,7 +1576,9 @@ def greedy_arm(actor: Actor) -> PolicyArm:
     return lambda n_envs, device, lo, hi: actor.greedy
 
 
-def greedy_env_arm(actor: torch.nn.Module) -> Callable[[Environment], ActionFn]:
+def greedy_env_arm(
+    actor: torch.nn.Module, priv_noise: Sequence[float] = ()
+) -> Callable[[Environment], ActionFn]:
     """The env-reading policy arm of :func:`~swarp.rl.recipes.score`: the greedy action
     of ``actor`` with the roles ``env.agent_roles()`` and the mask ``env.comm_mask()``
     hold at each call. A privileged :class:`PolicyNet` also reads ``env.aux_targets()``,
@@ -1513,15 +1590,30 @@ def greedy_env_arm(actor: torch.nn.Module) -> Callable[[Environment], ActionFn]:
     resets mid-run must build a fresh action function per episode. A learned-roles one
     carries each agent's role the same way, from role 0 with a decision on the first call:
     the argmax of the role logits every ``role_dwell`` calls, held in between.
+
+    ``priv_noise`` (``TrainSpec.priv_noise``'s tuple) feeds a privileged actor
+    :func:`noisy_priv` of the aux targets instead, with each robot's bias drawn on the
+    first call and held from call to call, like the hidden state.
     """
 
     priv = getattr(actor, "priv_dim", 0) > 0
+    if priv_noise and not priv:
+        raise ValueError("priv_noise perturbs the privileged input: the actor has none")
 
     def make(env: Environment) -> ActionFn:
         uses_roles = getattr(actor, "uses_roles", False)
+        scale = priv_noise_scale(env) if priv_noise else 1.0
+        bias: torch.Tensor | None = None
 
         def actor_obs(obs: torch.Tensor) -> torch.Tensor:
-            return torch.cat([obs, env.aux_targets()], -1) if priv else obs
+            nonlocal bias
+            if not priv:
+                return obs
+            aux = env.aux_targets()
+            if priv_noise:
+                bias = priv_bias(priv_noise, aux) if bias is None else bias
+                aux = noisy_priv(aux, bias, priv_noise, scale)
+            return torch.cat([obs, aux], -1)
 
         if not getattr(actor, "stateful", False):
             if uses_roles:
@@ -1563,13 +1655,16 @@ def greedy_env_arm(actor: torch.nn.Module) -> Callable[[Environment], ActionFn]:
     return make
 
 
-def greedy_score_kwargs(actor: torch.nn.Module) -> dict[str, Any]:
+def greedy_score_kwargs(
+    actor: torch.nn.Module, priv_noise: Sequence[float] = ()
+) -> dict[str, Any]:
     """The keyword :func:`~swarp.rl.recipes.score` takes for ``actor``'s greedy policy:
     ``policy`` for an obs-only actor, ``policy_from_env`` for one that reads roles, carries
-    a hidden state, reads a communication mask or the aux targets."""
+    a hidden state, reads a communication mask or the aux targets (noisy with
+    ``priv_noise``, see :func:`greedy_env_arm`)."""
     reads_env = ("uses_roles", "stateful", "priv_dim")
-    if any(getattr(actor, k, False) for k in reads_env):
-        return {"policy_from_env": greedy_env_arm(actor)}
+    if any(getattr(actor, k, False) for k in reads_env) or priv_noise:
+        return {"policy_from_env": greedy_env_arm(actor, priv_noise)}
     return {"policy": greedy_arm(actor)}
 
 
@@ -1836,6 +1931,9 @@ def parse_args(argv: list[str] | None = None) -> TrainConfig:
     p.add_argument("--aux-coef", type=float, help="auxiliary-loss weight (needs policynet)")
     p.add_argument("--privileged-actor", action="store_true", default=None,
                    help="append the aux targets to the policynet's input (needs --aux-coef)")
+    p.add_argument("--priv-noise", nargs=5, type=float,
+                   metavar=("POS_BIAS", "POS_JITTER", "HEAD_BIAS", "HEAD_JITTER", "OUTLIER"),
+                   help="train the privileged actor on a noisy T pose (metres, radians, prob)")
     p.add_argument("--learned-roles", action="store_true", default=None,
                    help="each agent chooses its role (scenario roles (A, 0), role heads)")
     p.add_argument("--role-dwell", type=int, help="steps a learned role is held")
@@ -1894,6 +1992,8 @@ def parse_args(argv: list[str] | None = None) -> TrainConfig:
     p.add_argument("--tf32", action="store_true", help="TF32 matmuls (Ampere and later)")
     p.add_argument("--compile", action="store_true", help="torch.compile the minibatch loss")
     a = p.parse_args(argv)
+    if a.priv_noise is not None:
+        a.priv_noise = tuple(a.priv_noise)
 
     spec = SPECS[a.scenario]
     overrides = {
@@ -1905,7 +2005,7 @@ def parse_args(argv: list[str] | None = None) -> TrainConfig:
             "curriculum_iters", "curriculum_gate", "actor", "role_params", "critic_input",
             "per_agent_value", "aux_coef", "action_rate_coef", "action_rate_ramp_iters",
             "recurrent", "hidden_dim", "seq_len", "comm", "comm_dim", "msg_coef",
-            "msg_beta", "msg_drop", "ramp_gate", "privileged_actor", "learned_roles",
+            "msg_beta", "msg_drop", "ramp_gate", "privileged_actor", "priv_noise", "learned_roles",
             "role_dwell", "role_entropy_coeff", "teacher", "bc_coef", "bc_decay_iters",
         )
         if getattr(a, f) is not None
@@ -2175,6 +2275,7 @@ def train(cfg: TrainConfig) -> Path:
             + (" over comm_mask()" if algo.use_mask else "")
             + (f", learned roles (dwell {spec.role_dwell})" if algo.learned else "")
             + (f", teacher {spec.teacher} (bc_coef {spec.bc_coef})" if algo.distil else "")
+            + (f", priv_noise {algo.priv_noise}" if algo.priv_noise else "")
         )
     if cfg.scen_kwargs:
         print(f"  scenario kwargs: {cfg.scen_kwargs}")
@@ -2280,7 +2381,7 @@ def train(cfg: TrainConfig) -> Path:
         eval_rate = eval_lo = eval_hi = None
         if cfg.eval_every and (it + 1) % cfg.eval_every == 0:
             res = score(
-                cfg.scenario, **greedy_score_kwargs(actor), n_agents=n_agents,
+                cfg.scenario, **greedy_score_kwargs(actor, spec.priv_noise), n_agents=n_agents,
                 n_envs=cfg.eval_envs, steps=spec.max_steps, device=device,
                 seed=cfg.seed + 1_000, dt=spec.dt, substeps=spec.substeps,
                 scen_kwargs=cfg.scen_kwargs, arms=("policy",),

@@ -80,7 +80,7 @@ Four more serve fine-tunes from a checkpoint (`--resume`):
 `--start-clock`
 : with a ramp gate, start the ramps' clock at this tick, e.g. where the checkpoint's run ended.
 
-The network options (`--actor`, `--role-params`, `--critic-input`, `--per-agent-value`, `--aux-coef`, `--privileged-actor`, `--learned-roles`, `--teacher`, `--resume-critic-only`) are described in [Roles, privileged critics and auxiliary losses](#roles-privileged-critics-and-auxiliary-losses), and the actor's memory and communication (`--recurrent`, `--hidden-dim`, `--seq-len`, `--comm`, `--comm-dim`) in [Memory and communication](#memory-and-communication).
+The network options (`--actor`, `--role-params`, `--critic-input`, `--per-agent-value`, `--aux-coef`, `--privileged-actor`, `--priv-noise`, `--learned-roles`, `--teacher`, `--resume-critic-only`) are described in [Roles, privileged critics and auxiliary losses](#roles-privileged-critics-and-auxiliary-losses), and the actor's memory and communication (`--recurrent`, `--hidden-dim`, `--seq-len`, `--comm`, `--comm-dim`) in [Memory and communication](#memory-and-communication).
 
 ## Using it from Python
 
@@ -122,6 +122,7 @@ Their defaults are the plain trainer: with all seven at their default the same k
 | `per_agent_value` | `--per-agent-value` | `False`, `True` | nothing |
 | `aux_coef` | `--aux-coef` | `0.0`, any positive weight | `aux_targets()` |
 | `privileged_actor` | `--privileged-actor` | `False`, `True` | `aux_targets()` |
+| `priv_noise` | `--priv-noise` | `()`, five values `>= 0` | `aux_targets()` with `aux_scale`, no on-goal flag |
 | `learned_roles` | `--learned-roles` | `False`, `True` | `agent_roles()` with `role_counts` `(A, 0)` |
 
 The scenario side is three optional hooks, `critic_state()`, `agent_roles()` and `aux_targets()`, described in [Writing a scenario](writing-a-scenario.md#training-hooks-optional).
@@ -156,6 +157,14 @@ The mean auxiliary MSE is logged as a `loss_aux` column, which `metrics.csv` has
 It is a diagnostic, not a deployable policy: if a fine-tune with it learns what the plain policy cannot, the task fails on perception rather than on control.
 The targets enter the trunk as its last columns, after the role one-hot and any message, so `--resume --resume-widen --privileged-actor` starts from a plain checkpoint that acts exactly as it did.
 The rollout buffer, the critic and the messages keep the plain observation; the update appends the recorded targets, and the greedy evaluation reads them from the env.
+
+**Noisy privileged input.**
+`priv_noise` (`--priv-noise POS_BIAS POS_JITTER HEAD_BIAS HEAD_JITTER OUTLIER`, with `privileged_actor`) trains the privileged actor on a T pose as a lidar estimator would report it, so a teacher meant for deployment learns not to trust the truth.
+Each robot's estimate carries a Gaussian bias drawn once per episode (position in metres, heading in radians), a Gaussian jitter drawn every step, and with probability `OUTLIER` per robot-step a gross error: a position uniform in a 1 m square around the truth and a uniform heading.
+The layout is `pusht_lidar`'s: the position noise is scaled by the scenario's `aux_scale` onto the relative-position columns, and the heading noise rotates the cos/sin pair.
+It needs `aux_goal=False` (`--scen-kwarg aux_goal=False`), since a noisy pose next to the true on-goal flag would leak the truth; `train` refuses it otherwise.
+Only the actor's input is noisy: the rollout records what the actor read, the update reads that back, and the aux loss and a `--teacher` keep the true targets.
+The periodic greedy evaluation applies the same noise, so the logged `eval_solve_rate` is the noisy condition's; `examples/eval_mappo.py --priv-noise` evaluates a checkpoint under any noise, and without the flag on the truth.
 
 **Learned roles.**
 `learned_roles` lets each agent choose its role, on a scenario whose roles past the first are empty (`role_counts` `(A, 0)`, every agent in role 0), with `"policynet"`, `"heads"`, a critic that reads the state and `normalize_advantage=False`.

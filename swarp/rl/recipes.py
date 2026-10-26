@@ -238,6 +238,16 @@ class TrainSpec:
     else (``PolicyNet``'s ``priv_dim``): the truth an aux head would estimate, handed over.
     An experiment, not a deployable policy: it tells whether a task fails on perception.
     Needs ``actor="policynet"`` and ``aux_coef > 0``."""
+    priv_noise: tuple[float, ...] = ()
+    """Train the privileged actor under a pose estimator's errors: ``(pos_bias_m,
+    pos_jitter_m, heading_bias_rad, heading_jitter_rad, outlier_prob)``. Per robot, a
+    Gaussian bias drawn once per episode plus a Gaussian jitter per step perturb the
+    T-pose columns of ``pusht_lidar``'s aux layout (relative position over
+    ``aux_scale``, heading as cos/sin), and with ``outlier_prob`` per robot-step the
+    estimate is a gross error (position uniform in a 1 m box around the truth, heading
+    uniform). Only the actor's input is noisy: the aux loss and a teacher keep the truth.
+    Empty: off. Needs ``privileged_actor`` and a flag-free aux layout (``aux_goal=False``),
+    since a noisy pose next to a true on-goal flag leaks the truth."""
     learned_roles: bool = False
     """Each agent chooses its role (``PolicyNet``'s ``learned_roles``): every
     ``role_dwell`` steps a role head samples it, the choice enters the PPO ratio, and the
@@ -314,6 +324,17 @@ class TrainSpec:
         if self.privileged_actor and not (self.actor == "policynet" and self.aux_coef > 0):
             raise ValueError("privileged_actor reads the aux targets as inputs: it needs "
                              "actor='policynet' and aux_coef > 0")
+        if self.priv_noise:
+            if not self.privileged_actor:
+                raise ValueError("priv_noise perturbs the privileged input: it needs "
+                                 "privileged_actor")
+            if len(self.priv_noise) != 5 or any(x < 0 for x in self.priv_noise):
+                raise ValueError("priv_noise must be 5 values >= 0 (pos_bias, pos_jitter, "
+                                 f"heading_bias, heading_jitter, outlier_prob), got "
+                                 f"{self.priv_noise}")
+            if self.priv_noise[4] >= 1:
+                raise ValueError(f"priv_noise's outlier_prob must lie in [0, 1), got "
+                                 f"{self.priv_noise[4]}")
         if self.learned_roles and not (
             self.actor == "policynet" and self.role_params == "heads"
             and self.critic_input in ("state", "state+obs") and not self.normalize_advantage
