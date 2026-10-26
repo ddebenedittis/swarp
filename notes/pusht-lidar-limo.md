@@ -258,6 +258,23 @@ Training on past the release does not lift it further: 2000 more PPO iterations 
 With both roles acting identically, the choice of role does not change the return, so its policy gradient is zero in expectation: the tied start is a saddle that only a role-dependent incentive breaks (the information reward or an observer view bonus, not built).
 The pose messages, not the roles, are the plausible source of any difference between the two distilled students.
 
+### Gazebo
+
+`../swarp_gz_test` (branch `hold-scoring`), edge landmark layout, 220° field of view, 4 shards × 10 episodes, scored with the hold (`hold_steps:=5 hold_settle:=0.03,0.1,0.1,0.4` for checkpoints trained without it), Wilson 95%:
+
+| policy | robot poses | hold-solve | reached goal |
+|---|---|---|---|
+| L14 student (DS-decay at 1500) | ground truth | 9/40 = 0.23 [0.12, 0.38] | 24/40 |
+| L14 student | AMCL | 2/40 = 0.05 | 6/40 |
+| L12 | ground truth | 0/40 | 32/40 |
+| L12 | AMCL | 0/20 (two shards hung) | 7/20 |
+| RA0-priv (reads the true T pose from `/tee/pose`) | ground truth | 31/40 = 0.78 [0.62, 0.88] | 31/40 |
+
+The privileged policy holds every episode in which it reaches the goal; its nine failures never get there.
+Of the student's 15 reached-but-not-held episodes, 13 ended with the T outside tolerance.
+The videos (`out/vid_L14_student`, `out/vid_L12`, `out/vid_priv`, seed 0, episodes 0–5) show why: the student brings the T onto the goal and both robots stay in contact and keep pushing, so the T turns through the goal and out again (episode 3 is on goal at 32 s and again at 68–72 s); it does not stop and then see the T slide.
+The student loses 0.74 − 0.23 in the transfer, where the privileged policy loses 0.92 − 0.78: the on-goal decision from lidar alone is what does not transfer.
+
 ### What to take from it
 
 - The hold needs a crisp on-goal decision. A lidar policy learns one from a teacher that has it, distilled on its own rollouts and then released to PPO: 0.74 under mocap and 0.71 under AMCL-sized noise, against 0.00 for L12 and 0.33 for the best reward-only run (penalty 0.25), all on one seed.
