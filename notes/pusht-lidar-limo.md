@@ -281,6 +281,43 @@ The student loses 0.74 − 0.23 in the transfer, where the privileged policy los
 - A classical T fit (G0) is accurate enough for the teacher's continuous inputs but not, as is, for its flag: a deployed teacher would need a flag-free or noise-trained policy, which learns far slower.
 - Roles need symmetry breaking before they can be evaluated.
 
+## L15: push and observe with fixed roles (failed)
+
+The plan: fine-tune the L14 student with one pusher and one observer per episode (Phase A), and only if that team beats two pushers, resume it as learned roles so the switch has two distinct heads to choose between (Phase B).
+No teacher in either phase, since the privileged teacher never needs to look.
+`--resume-widen` now resumes a `(2, 0)` checkpoint into `(1, 1)` roles, starting the never-trained observer head and role input from the pusher's (commit f455fdf).
+
+Both runs: the L14 fine-tune flags (`--seed 0 --resume-widen --start-clock 12000 --start-difficulty 1.0 --action-rate-ramp-iters 0 --iters 2000`, exact robot poses `pose_noise=0,1e-6`, the hold `hold_steps=5 hold_reward=1.0`, settle 0.03/0.1/0.1/0.4, `on_goal_reward=3.0 aux_goal=True agent_dist_shaping=0 rot_away_penalty=0`) plus `--comm pose`.
+
+| id | start | roles | machine, commit |
+|---|---|---|---|
+| A1 | DS-decay at 1500 | `n_pushers=1 standoff_dist=0.8`: a pusher and an observer, reshuffled every reset, with the observer terms (standoff, visibility, coverage, occlusion) | davide-cf, f455fdf, 0.46 s/it |
+| A0 | DS-decay at 1500 | `(2, 0)`, the control | laptop, 9759916 |
+
+At iteration 1 the largest observer term (coverage, −0.012 per observer step) was 0.56× the team term (+0.021), so no term needed rescaling.
+The periodic greedy evals (512 envs) wandered within 0.60–0.74 in both runs and the stochastic solve rate fell from 0.66 to 0.53–0.55 by iteration 2000.
+
+Final greedy evaluation (`examples/eval_mappo.py`, 1024 envs, seed 7, the hold, Wilson 95%; each checkpoint under its own roles):
+
+| checkpoint | mocap | AMCL |
+|---|---|---|
+| A1 best | 0.741 [0.714, 0.767] | 0.729 [0.701, 0.756] |
+| A1 at 250 | 0.729 [0.701, 0.756] | 0.723 [0.694, 0.749] |
+| A1 final | 0.673 [0.644, 0.701] | 0.637 [0.607, 0.666] |
+| A0 best | 0.727 [0.698, 0.753] | 0.696 [0.667, 0.724] |
+| A0 final | 0.590 [0.559, 0.620] | 0.599 [0.568, 0.628] |
+| DS-decay at 1500 (the start) | 0.738 [0.711, 0.764] | 0.705 [0.676, 0.732] |
+
+The observer never observed.
+In 512 greedy episodes of A1's best checkpoint its median distance to the T centroid was 0.39 m (the pusher's 0.38 m), it spent 74% of the steps within touching range (0.45 m) and 6% near the 0.8 m standoff, and it was in touching range for 79% of the steps the T moved.
+Coverage rose only from 0.41 to 0.45 over the run, and visibility was 0.97 from the start because a pusher already sees the T.
+The team term goes to every robot and outweighs the observer terms, so the observer keeps the pusher's behaviour it was started from.
+
+Gate A failed: the best checkpoints' intervals overlap each other and DS-decay's, and the observer does not take a viewpoint.
+Only the final checkpoints separate under mocap (0.67 against 0.59), one comparison of four and dependent on where the run stopped.
+Phase B (learned roles from A1) was not run, and neither were the Gazebo evaluations of A1 and A0.
+The Gazebo node can now exchange `--comm pose` messages (`swarp_gz_test` e2ba5a4, matched by stamp), so a messaging policy can be deployed when one is worth it.
+
 ## What the consolidation removed
 
 Besides the recipe variants, the scenario knobs that only they used were pruned (all are in the tag):
@@ -307,7 +344,7 @@ The consolidation changed only which per-robot values L12's resets draw (one few
 - The 5 × 5 m arena and perimeter walls at the edge are the weakest conditions (0.92 and 0.93).
 - Earlier ideas not pursued: a variable team per episode (needs an inactive-agent concept and a per-agent validity mask in PPO), training on other shapes (`ell`, `plus`, `bar`), Success Guided Sampling instead of the hand curriculum.
 - A second seed for DS-decay and RA0-priv before the hold goes into `SPECS["pusht_lidar_limo"]`; every L14 number is one seed.
-- Break the tie between learned roles with a role-dependent incentive (the information reward or a view bonus of the original plan, neither built), then judge roles against DS-decay.
+- Break the tie between learned roles with a role-dependent incentive (the information reward or a view bonus of the original plan, neither built), then judge roles against DS-decay. L15 showed the scenario's observer terms are too weak against the team term to pull a pusher-initialised observer off the T.
 - A deployable on-goal decision: the teacher's flag from a T estimator, or a teacher trained flag-free under noise for longer than TN-hi's 2000 iterations.
 - The video renderer frames the whole world, so on the Limo arena the robots are a few pixels; a camera that follows the T is needed before a video is worth recording.
 

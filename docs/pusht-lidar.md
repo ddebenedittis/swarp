@@ -157,6 +157,7 @@ Without it an episode ends with the goal bonus on the first pass through the goa
 Fine-tuned from the Limo recipe's policy, which passes through the goal at speed while turning the T, the penalty outweighed the pose shaping and the policies stopped pushing altogether instead of learning to stop on the goal.
 With the penalty off a policy that reads the T's true pose learns the hold (0.92 greedy), and a lidar policy distilled from it on its own rollouts (`--teacher`, see [Training](training.md)) reaches 0.74 once the imitation term is decayed away (0.71 under AMCL-sized pose noise); one trained on the reward alone does not, since the penalty was also its dense signal on the T's heading.
 In Gazebo with ground-truth robot poses the distilled student holds 0.23 (9/40) and the policy that reads the T's true pose 0.78 (31/40).
+Fine-tuning the student as one pusher and one observer (`n_pushers=1`, with pose messages) holds no better than two pushers with the same messages: the observer terms are too weak against the team term, and the observer keeps pushing.
 The runs are logged in the Limo working note (`notes/pusht-lidar-limo.md`, L13 and L14).
 
 ### Sensor failure
