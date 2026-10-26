@@ -1655,11 +1655,15 @@ def parse_args(argv: list[str] | None = None) -> TrainConfig:
         p.error(str(exc))
     scen_kwargs.update(pinned)
     # A --scen-kwarg pins its attribute: a ramp on it would overwrite the value from the first
-    # iteration on (and the greedy eval, which runs no ramps, would score another world).
-    dropped = [r.attr for r in spec.ramps if r.attr in pinned]
-    if dropped:
-        spec = replace(spec, ramps=tuple(r for r in spec.ramps if r.attr not in pinned))
-        print(f"--scen-kwarg pins {dropped}: their ramps are dropped")
+    # iteration on (and the greedy eval, which runs no ramps, would score another world). The
+    # ramp is held at the flag's value rather than dropped, so the clock keeps its length.
+    held = [r.attr for r in spec.ramps if r.attr in pinned]
+    if held:
+        spec = replace(spec, ramps=tuple(
+            replace(r, lo=pinned[r.attr], hi=pinned[r.attr]) if r.attr in pinned else r
+            for r in spec.ramps
+        ))
+        print(f"--scen-kwarg pins {held}: their ramps hold the flag's value")
 
     return TrainConfig(
         scenario=a.scenario, spec=spec, scen_kwargs=scen_kwargs, device=a.device,

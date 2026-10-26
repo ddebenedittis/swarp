@@ -1167,13 +1167,19 @@ def test_train_only_moves_the_named_actor_parameters_and_the_critic(graphs):
         freeze_actor(algo.actor, ("nope",))
 
 
-def test_a_scen_kwarg_pins_its_attribute_and_drops_the_ramp_on_it():
-    """A ramp would overwrite a --scen-kwarg from the first iteration on; the flag wins."""
-    ramped = {r.attr for r in SPECS["pusht_lidar_limo"].ramps}
-    assert "pose_noise" in ramped
-    cfg = parse_args(["--scenario", "pusht_lidar_limo", "--scen-kwarg", "pose_noise=0"])
-    assert cfg.scen_kwargs["pose_noise"] == 0
-    assert {r.attr for r in cfg.spec.ramps} == ramped - {"pose_noise"}
+def test_a_scen_kwarg_pins_its_attribute_and_holds_the_ramp_on_it():
+    """A ramp would overwrite a --scen-kwarg from the first iteration on; the flag wins, and
+    the ramp stays (held at the flag's value) so the gated clock keeps its length."""
+    spec = SPECS["pusht_lidar_limo"]
+    assert "rot_away_penalty" in {r.attr for r in spec.ramps}
+    cfg = parse_args(["--scenario", "pusht_lidar_limo", "--scen-kwarg", "rot_away_penalty=0"])
+    assert cfg.scen_kwargs["rot_away_penalty"] == 0
+    for old, new in zip(spec.ramps, cfg.spec.ramps, strict=True):
+        assert (old.attr, old.start, old.end) == (new.attr, new.start, new.end)
+        if new.attr == "rot_away_penalty":
+            assert new.value(new.start) == new.value(new.end) == 0
+        else:
+            assert new == old
 
 
 def test_a_plain_policy_widens_into_a_privileged_one_and_acts_as_before():
