@@ -14,6 +14,7 @@ from swarp.rl import MAPPO, Actor, Critic, load_checkpoint, parse_args, train
 from swarp.rl.networks import PolicyNet, StateCritic, role_permutation, tanh_normal_log_prob
 from swarp.rl.ppo import (
     LEGACY_STAT_NAMES,
+    check_resume,
     freeze_actor,
     gae,
     greedy_env_arm,
@@ -182,6 +183,7 @@ def test_train_with_a_policynet_and_a_per_agent_critic_round_trips(tmp_path):
         (["--comm", "attn"], "needs actor='policynet'"),
         (["--actor", "policynet", "--recurrent", "--seq-len", "3"], "must divide"),
         (["--actor", "policynet", "--seq-len", "2"], "needs recurrent=True"),
+        (["--actor", "policynet", "--privileged-actor"], "privileged_actor reads the aux"),
     ],
 )
 def test_train_refuses_options_the_scenario_cannot_feed(tmp_path, flags, match, capsys):
@@ -388,7 +390,8 @@ def _algo(
         patch(env)
         actor = PolicyNet(
             Ob, env.act_dim, spec.num_cells, role_counts=ROLE_COUNTS,
-            role_params=spec.role_params, aux_dim=AUX_DIM, **memory,
+            role_params=spec.role_params, aux_dim=AUX_DIM,
+            priv_dim=AUX_DIM if spec.privileged_actor else 0, **memory,
         )
         critic = StateCritic(
             env.state_dim, Ob, A, spec.num_cells, use_obs=True, role_counts=ROLE_COUNTS,
@@ -588,9 +591,10 @@ def _copy_rollout(dst: MAPPO, src: MAPPO) -> None:
         (True, {**_MEMORY, "seq_len": 2, "comm": "attn", "comm_dim": 8}),
         (True, {**_MEMORY, "role_params": "separate"}),
         (True, {"comm": "vae", "comm_dim": 4, "msg_drop": 0.3, "max_steps": 3}),
+        (True, {"privileged_actor": True}),
     ],
     ids=["default", "features", "reset-roles", "recurrent", "comm", "recurrent-comm-features",
-         "recurrent-separate", "vae-message"],
+         "recurrent-separate", "vae-message", "privileged"],
 )
 def test_captured_update_matches_eager_update(features, kw):
     """Same weights, same rollout, same permutations: the graphed update lands where the
@@ -1170,3 +1174,93 @@ def test_a_scen_kwarg_pins_its_attribute_and_drops_the_ramp_on_it():
     cfg = parse_args(["--scenario", "pusht_lidar_limo", "--scen-kwarg", "pose_noise=0"])
     assert cfg.scen_kwargs["pose_noise"] == 0
     assert {r.attr for r in cfg.spec.ramps} == ramped - {"pose_noise"}
+
+
+def test_a_plain_policy_widens_into_a_privileged_one_and_acts_as_before():
+    """The privileged columns come last in the trunk, after the role one-hot and the
+    delayed messages: a checkpoint without them widens (and passes the resume check) into
+    a network that acts as before whatever they hold. Messages read only the observation."""
+    torch.manual_seed(0)
+    kw = {"role_counts": (1, 2), "aux_dim": 3, "comm": "pose", "comm_dim": 4}
+    plain = PolicyNet(6, 2, 16, **kw)
+    priv = PolicyNet(6, 2, 16, priv_dim=3, **kw)
+    assert "priv_dim" not in plain.config and priv.config["priv_dim"] == 3
+    load_widened(priv, plain.state_dict())
+    critic = ("Critic", {"obs_dim": 6, "n_agents": 3, "num_cells": 16})
+    ckpt = {"format": "swarp.rl/2", "actor_cls": "PolicyNet", "actor_kwargs": plain.config,
+            "critic_cls": critic[0], "critic_kwargs": critic[1]}
+    built = ("PolicyNet", priv.config, *critic)
+    check_resume("plain.pt", ckpt, built, widen=True)
+    with pytest.raises(ValueError, match="priv_dim None vs 3"):
+        check_resume("plain.pt", ckpt, built)
+    obs, prev = torch.randn(5, 3, 6), torch.randn(5, 3, 6)
+    roles = torch.tensor([0, 1, 1])[torch.stack([torch.randperm(3) for _ in range(5)])]
+    mask = torch.rand(5, 3, 3) < 0.7
+    ref = plain.step(obs, roles, msg_obs=prev, msg_mask=mask)
+    for extra in (torch.zeros(5, 3, 3), torch.randn(5, 3, 3)):
+        wide = torch.cat([obs, extra], -1)
+        for msg_obs in (prev, torch.cat([prev, torch.randn(5, 3, 3)], -1)):
+            out = priv.step(wide, roles, msg_obs=msg_obs, msg_mask=mask)
+            torch.testing.assert_close(out[0], ref[0])
+            torch.testing.assert_close(out[1], ref[1])
+    with pytest.raises(ValueError, match="obs_dim \\+ priv_dim = 6 \\+ 3"):
+        priv.step(obs, roles)
+    with pytest.raises(ValueError, match="not 'separate'"):
+        PolicyNet(6, 2, 16, role_counts=(1, 2), role_params="separate", priv_dim=3)
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda:0", marks=pytest.mark.gpu)])
+def test_a_privileged_actor_acts_and_updates_on_the_obs_and_aux_targets(device):
+    """The rollout acts on ``cat(obs, aux targets)`` (captured on CUDA) while ``obs_buf``,
+    the critic and the messages keep the plain observation; the stored log-probs are the
+    actor's on ``cat(obs_buf, aux_buf)``, which is what the update reads."""
+    algo = _algo(graphs=device != "cpu", device=device, features=True, privileged_actor=True,
+                 comm="pose", comm_dim=4, msg_drop=0.3, max_steps=3)
+    for _ in range(2):
+        algo.rollout()
+    T, A, N, Ob = algo.T, algo.A, algo.N, algo.env.obs_dim
+    assert algo.obs_buf.shape[-1] == Ob and algo.msg_obs_buf.shape[-1] == Ob
+    obs = torch.cat([algo.obs_buf[:T], algo.aux_buf], -1).reshape(N, A, -1)
+    msg = {"msg_obs": algo.msg_obs_buf.reshape(N, A, -1),
+           "msg_mask": algo.msg_mask_buf.reshape(N, A, A)}
+    with torch.no_grad():
+        loc, scale, _ = policy_outputs(algo.actor, obs, algo.role_buf[:T].reshape(N, A),
+                                       msg=msg)
+    logp = tanh_normal_log_prob(algo.u_buf.reshape(N, A, -1), loc, scale)
+    assert torch.allclose(logp, algo.logp_buf.reshape(N, A), atol=1e-4)
+    stats = algo.update(algo.spec.entropy_coeff)
+    assert stats["grad_skips"] == 0 and math.isfinite(stats["loss_objective"])
+
+
+def test_greedy_env_arm_feeds_a_privileged_actor_the_aux_targets():
+    env = build_env("navigation", n_envs=3, n_agents=4, device="cpu", dt=0.1, substeps=1,
+                    max_steps=None, seed=0)
+    _patch_training_hooks(env)
+    torch.manual_seed(0)
+    actor = PolicyNet(env.obs_dim, env.act_dim, 16, role_counts=ROLE_COUNTS, aux_dim=AUX_DIM,
+                      priv_dim=AUX_DIM)
+    obs = env.reset()
+    roles = env.agent_roles()
+    act = greedy_score_kwargs(actor)["policy_from_env"](env)
+    first = act(obs)
+    assert torch.equal(first, actor.greedy(torch.cat([obs, env.aux_targets()], -1), roles))
+    moved = env.aux_targets() + 1.0
+    env.scenario.aux_targets = lambda: moved
+    assert not torch.allclose(act(obs), first)
+    # Without roles or memory it still reads the env.
+    alone = PolicyNet(env.obs_dim, env.act_dim, 16, aux_dim=AUX_DIM, priv_dim=AUX_DIM)
+    act = greedy_score_kwargs(alone)["policy_from_env"](env)
+    assert torch.equal(act(obs), alone.greedy(torch.cat([obs, moved], -1)))
+
+
+def test_privileged_actor_is_refused_without_the_aux_targets():
+    with pytest.raises(ValueError, match="needs actor='policynet' and aux_coef > 0"):
+        replace(SPECS["navigation"], actor="policynet", privileged_actor=True)
+    spec = replace(SPECS["navigation"], actor="policynet", aux_coef=0.5, privileged_actor=True)
+    env = build_env("navigation", n_envs=4, n_agents=4, device="cpu", dt=0.05, substeps=1,
+                    max_steps=5, seed=0)
+    _patch_training_hooks(env)
+    box = (-torch.ones(env.act_dim), torch.ones(env.act_dim))
+    assert network_archs(spec, env, *box)[1]["priv_dim"] == AUX_DIM
+    with pytest.raises(ValueError, match="not 'separate'"):
+        network_archs(replace(spec, role_params="separate"), env, *box)

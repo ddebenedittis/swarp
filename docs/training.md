@@ -80,7 +80,7 @@ Four more serve fine-tunes from a checkpoint (`--resume`):
 `--start-clock`
 : with a ramp gate, start the ramps' clock at this tick, e.g. where the checkpoint's run ended.
 
-The network options (`--actor`, `--role-params`, `--critic-input`, `--per-agent-value`, `--aux-coef`, `--resume-critic-only`) are described in [Roles, privileged critics and auxiliary losses](#roles-privileged-critics-and-auxiliary-losses), and the actor's memory and communication (`--recurrent`, `--hidden-dim`, `--seq-len`, `--comm`, `--comm-dim`) in [Memory and communication](#memory-and-communication).
+The network options (`--actor`, `--role-params`, `--critic-input`, `--per-agent-value`, `--aux-coef`, `--privileged-actor`, `--resume-critic-only`) are described in [Roles, privileged critics and auxiliary losses](#roles-privileged-critics-and-auxiliary-losses), and the actor's memory and communication (`--recurrent`, `--hidden-dim`, `--seq-len`, `--comm`, `--comm-dim`) in [Memory and communication](#memory-and-communication).
 
 ## Using it from Python
 
@@ -111,8 +111,8 @@ The map's Jacobian is constant, so it cancels in the PPO ratio and the loss is t
 
 ## Roles, privileged critics and auxiliary losses
 
-Five `TrainSpec` fields, each with a CLI flag, change the networks.
-Their defaults are the plain trainer: with all five at their default the same kernels run in the same order with the same random draws, and no buffer is added.
+Six `TrainSpec` fields, each with a CLI flag, change the networks.
+Their defaults are the plain trainer: with all six at their default the same kernels run in the same order with the same random draws, and no buffer is added.
 
 | field | flag | values (default first) | needs from the scenario |
 |---|---|---|---|
@@ -121,6 +121,7 @@ Their defaults are the plain trainer: with all five at their default the same ke
 | `critic_input` | `--critic-input` | `"obs"`, `"state"`, `"state+obs"` | `critic_state()` for `state` |
 | `per_agent_value` | `--per-agent-value` | `False`, `True` | nothing |
 | `aux_coef` | `--aux-coef` | `0.0`, any positive weight | `aux_targets()` |
+| `privileged_actor` | `--privileged-actor` | `False`, `True` | `aux_targets()` |
 
 The scenario side is three optional hooks, `critic_state()`, `agent_roles()` and `aux_targets()`, described in [Writing a scenario](writing-a-scenario.md#training-hooks-optional).
 `train` refuses an option whose hook the scenario does not provide, rather than training without it.
@@ -148,6 +149,12 @@ The critic only shapes the advantages, so a privileged state helps training and 
 With `aux_coef > 0` the `PolicyNet` carries a linear `aux_head` on its last hidden layer, and the minibatch loss gains `aux_coef * mse(aux_head(features), aux_targets)`.
 Its use is to make the policy's features encode something the observation only implies, such as a hidden object pose behind a lidar scan.
 The mean auxiliary MSE is logged as a `loss_aux` column, which `metrics.csv` has only when the loss is on.
+
+**Privileged actor.**
+`privileged_actor` (with `"policynet"` and `aux_coef > 0`) appends the auxiliary targets to the actor's input, so the policy reads the truth its aux head would estimate.
+It is a diagnostic, not a deployable policy: if a fine-tune with it learns what the plain policy cannot, the task fails on perception rather than on control.
+The targets enter the trunk as its last columns, after the role one-hot and any message, so `--resume --resume-widen --privileged-actor` starts from a plain checkpoint that acts exactly as it did.
+The rollout buffer, the critic and the messages keep the plain observation; the update appends the recorded targets, and the greedy evaluation reads them from the env.
 
 The rollout records the critic state, the roles and the auxiliary targets next to the observation, inside the same captured act graph, and reads them back by address, as it reads the observation.
 That is why the scenario has to write them in the observation pass.

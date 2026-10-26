@@ -315,6 +315,7 @@ def ppo_loss(
     msg_target: torch.Tensor | None = None,
     msg_valid: torch.Tensor | None = None,
     msg_beta: float = 0.0,
+    priv: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, ...]:
     """Clipped surrogate, smooth-L1 value loss and MC entropy for one minibatch.
 
@@ -332,7 +333,8 @@ def ppo_loss(
     input then lists its rows in the same time-major order. ``msg`` feeds a delayed-message
     actor; with ``msg_target`` (the senders' aux targets for ``msg["msg_obs"]``) and
     ``msg_valid`` ``[B, A]`` the message's own loss (:meth:`PolicyNet.message_loss`)
-    follows the aux MSE.
+    follows the aux MSE. ``priv`` ``[B, A, priv_dim]`` is appended to the actor's ``obs``
+    (never the critic's) for a privileged :class:`PolicyNet`.
 
     A thin wrapper over :func:`ppo_terms` that keeps the original op order (advantages,
     actor, policy terms, critic), so a default run launches the same kernels in the same
@@ -341,7 +343,8 @@ def ppo_loss(
     if normalize_advantage:
         adv = standardize_advantage(adv, roles, role_counts)
     loc, scale, aux = policy_outputs(
-        actor, obs, roles, with_aux=aux_target is not None, h0=h0, done=done,
+        actor, obs if priv is None else torch.cat([obs, priv], -1), roles,
+        with_aux=aux_target is not None, h0=h0, done=done,
         comm_mask=comm_mask, msg=msg,
     )
     objective, entropy, *kl = ppo_terms(loc, scale, u, logp_old, adv, noise, with_kl)
@@ -388,6 +391,12 @@ class MAPPO:
     targets)``. Each is written next to the observation by the act graph. With
     :class:`Actor`, :class:`Critic`, ``aux_coef=0`` and no roles none exists and the
     graphs are the plain ones.
+
+    A privileged :class:`PolicyNet` (``priv_dim > 0``, which needs ``aux_coef > 0``) acts on
+    ``cat(obs, aux targets)``: ``obs_buf`` and the critic keep the plain observation, and
+    the update appends the ``aux_buf`` rows the act graph recorded next to it, so it sees
+    exactly what the rollout acted on. Delayed messages are still encoded from the plain
+    observation.
 
     A communicating :class:`PolicyNet` on a scenario whose ``comm_mask()`` is not
     ``None`` (decided once, here) adds a ``[T, E, A, A]`` buffer of the mask. A recurrent
@@ -470,6 +479,13 @@ class MAPPO:
             raise ValueError(
                 f"the actor predicts {actor.aux_dim} aux targets; the env provides "
                 f"aux_dim={env.aux_dim}"
+            )
+        self.priv = self.policy_net and actor.priv_dim > 0
+        if self.priv and not (self.use_aux and actor.priv_dim == env.aux_dim):
+            raise ValueError(
+                f"a privileged actor reads the {actor.priv_dim} aux targets as inputs: it "
+                f"needs aux_coef > 0 and aux_dim={actor.priv_dim} (got aux_coef="
+                f"{spec.aux_coef}, aux_dim={env.aux_dim})"
             )
         if self.actor_roles and env.role_counts != actor.role_counts:
             raise ValueError(
@@ -674,6 +690,8 @@ class MAPPO:
     def _greedy(self, obs: torch.Tensor) -> torch.Tensor:
         """The greedy action; a recurrent policy advances ``self.h``, a delayed-message one
         sends this observation's messages for the next step."""
+        if self.priv:
+            obs = torch.cat([obs, self.env.aux_targets()], -1)
         if not (self.recurrent or self.use_mask or self.delayed):
             if self.actor_roles:
                 return self.actor.greedy(obs, self.env.agent_roles())
@@ -689,7 +707,7 @@ class MAPPO:
         if self.recurrent:
             self.h.copy_(h)
         if self.delayed:
-            self.prev_obs.copy_(obs)
+            self.prev_obs.copy_(obs[..., : self.env.obs_dim])
         return self.actor.squash(loc)
 
     def _fetch_sources(self) -> None:
@@ -757,12 +775,13 @@ class MAPPO:
                 self.msg_aux_buf.index_copy_(0, self.t, self.prev_aux.unsqueeze(0))
                 self.msg_valid_buf.index_copy_(0, self.t, self.prev_valid.unsqueeze(0))
             msg = {"msg_obs": self.prev_obs, "msg_mask": heard, "msg_noise": noise}
+        act_obs = torch.cat([obs, aux], -1) if self.priv else obs
         if self.recurrent:
             self.h_buf.index_copy_(0, self.t, self.h.unsqueeze(0))
-            loc, scale, _, h = self.actor.step(obs, roles, self.h, comm_mask=mask, **msg)
+            loc, scale, _, h = self.actor.step(act_obs, roles, self.h, comm_mask=mask, **msg)
             self.h.copy_(h)
         else:
-            loc, scale, _ = policy_outputs(self.actor, obs, roles, comm_mask=mask, msg=msg)
+            loc, scale, _ = policy_outputs(self.actor, act_obs, roles, comm_mask=mask, msg=msg)
         if self.delayed:
             self.prev_obs.copy_(obs)
             if self.msg_loss:
@@ -938,6 +957,8 @@ class MAPPO:
             extra["role_counts"] = self.role_counts
         if self.aux_buf is not None:
             extra["aux_target"] = self.aux_buf.reshape(self.N, A, -1).index_select(0, idx)
+            if self.priv:
+                extra["priv"] = extra["aux_target"]
         if self.mask_buf is not None:
             extra["comm_mask"] = self.mask_buf.reshape(self.N, A, A).index_select(0, idx)
         if self.recurrent:
@@ -1128,6 +1149,8 @@ def _network_flags(cls: str, kwargs: Mapping[str, Any]) -> list[str]:
             flags += ["--recurrent", "--hidden-dim", str(kwargs["hidden_dim"])]
         if kwargs.get("comm", "none") != "none":
             flags += ["--comm", kwargs["comm"], "--comm-dim", str(kwargs["comm_dim"])]
+        if kwargs.get("priv_dim"):
+            flags += ["--privileged-actor"]
         return [*flags, "--aux-coef", "<positive>"] if kwargs.get("aux_dim") else flags
     if cls == "Critic":
         return ["--critic-input", "obs", "--no-per-agent-value", *flags]
@@ -1139,9 +1162,9 @@ def _network_flags(cls: str, kwargs: Mapping[str, Any]) -> list[str]:
 
 #: Network keywords that ``--resume-widen`` lets grow: input and aux widths, whose new
 #: columns (appended at the end) load with zero weights. It also accepts an option the
-#: checkpoint's network does not record at all (communication added to a policy trained
-#: without), whose new parameters keep their fresh initialisation.
-WIDENABLE = ("obs_dim", "state_dim", "aux_dim")
+#: checkpoint's network does not record at all (communication or privileged inputs added to a
+#: policy trained without), whose new parameters keep their fresh initialisation.
+WIDENABLE = ("obs_dim", "state_dim", "aux_dim", "priv_dim")
 
 
 def check_resume(
@@ -1238,7 +1261,8 @@ def greedy_arm(actor: Actor) -> PolicyArm:
 def greedy_env_arm(actor: torch.nn.Module) -> Callable[[Environment], ActionFn]:
     """The env-reading policy arm of :func:`~swarp.rl.recipes.score`: the greedy action
     of ``actor`` with the roles ``env.agent_roles()`` and the mask ``env.comm_mask()``
-    hold at each call.
+    hold at each call. A privileged :class:`PolicyNet` also reads ``env.aux_targets()``,
+    appended to the observation as the trainer does.
 
     For a recurrent :class:`PolicyNet` the action function is stateful: each ``make(env)``
     starts from a zero hidden state and carries it from call to call. It never resets it,
@@ -1246,12 +1270,18 @@ def greedy_env_arm(actor: torch.nn.Module) -> Callable[[Environment], ActionFn]:
     resets mid-run must build a fresh action function per episode.
     """
 
+    priv = getattr(actor, "priv_dim", 0) > 0
+
     def make(env: Environment) -> ActionFn:
         uses_roles = getattr(actor, "uses_roles", False)
+
+        def actor_obs(obs: torch.Tensor) -> torch.Tensor:
+            return torch.cat([obs, env.aux_targets()], -1) if priv else obs
+
         if not getattr(actor, "stateful", False):
             if uses_roles:
-                return lambda obs: actor.greedy(obs, env.agent_roles())
-            return actor.greedy
+                return lambda obs: actor.greedy(actor_obs(obs), env.agent_roles())
+            return lambda obs: actor.greedy(actor_obs(obs)) if priv else actor.greedy
         h: torch.Tensor | None = None
 
         prev: torch.Tensor | None = None
@@ -1266,7 +1296,7 @@ def greedy_env_arm(actor: torch.nn.Module) -> Callable[[Environment], ActionFn]:
                 n = obs.shape[-2]
                 heard = torch.ones(*obs.shape[:-2], n, n, dtype=torch.bool, device=obs.device)
                 msg = {"msg_obs": prev, "msg_mask": heard if mask is None else heard & mask}
-            loc, _, _, h_next = actor.step(obs, roles, h, comm_mask=mask, **msg)
+            loc, _, _, h_next = actor.step(actor_obs(obs), roles, h, comm_mask=mask, **msg)
             h = h_next if actor.recurrent else None
             prev = obs.clone() if getattr(actor, "delayed", False) else None
             return actor.squash(loc)
@@ -1279,8 +1309,9 @@ def greedy_env_arm(actor: torch.nn.Module) -> Callable[[Environment], ActionFn]:
 def greedy_score_kwargs(actor: torch.nn.Module) -> dict[str, Any]:
     """The keyword :func:`~swarp.rl.recipes.score` takes for ``actor``'s greedy policy:
     ``policy`` for an obs-only actor, ``policy_from_env`` for one that reads roles, carries
-    a hidden state or reads a communication mask."""
-    if getattr(actor, "uses_roles", False) or getattr(actor, "stateful", False):
+    a hidden state, reads a communication mask or the aux targets."""
+    reads_env = ("uses_roles", "stateful", "priv_dim")
+    if any(getattr(actor, k, False) for k in reads_env):
         return {"policy_from_env": greedy_env_arm(actor)}
     return {"policy": greedy_arm(actor)}
 
@@ -1327,6 +1358,13 @@ def network_archs(
                     "role_params 'heads' or 'shared', not 'separate'"
                 )
             actor[1].update(comm=spec.comm, comm_dim=spec.comm_dim)
+        if spec.privileged_actor:
+            if roles and spec.role_params == "separate":
+                raise ValueError(
+                    "privileged_actor needs one shared trunk; with roles use role_params "
+                    "'heads' or 'shared', not 'separate'"
+                )
+            actor[1].update(priv_dim=env.aux_dim)
     use_state = spec.critic_input in ("state", "state+obs")
     if use_state and env.state_dim == 0:
         raise ValueError(
@@ -1535,6 +1573,8 @@ def parse_args(argv: list[str] | None = None) -> TrainConfig:
                    help="one value per agent (role-sorted slot) instead of one per team")
     p.add_argument("--no-per-agent-value", dest="per_agent_value", action="store_false")
     p.add_argument("--aux-coef", type=float, help="auxiliary-loss weight (needs policynet)")
+    p.add_argument("--privileged-actor", action="store_true", default=None,
+                   help="append the aux targets to the policynet's input (needs --aux-coef)")
     p.add_argument("--action-rate-coef", type=float,
                    help="weight of the action-rate penalty on each agent's reward")
     p.add_argument("--action-rate-ramp-iters", type=int,
@@ -1594,7 +1634,7 @@ def parse_args(argv: list[str] | None = None) -> TrainConfig:
             "curriculum_iters", "curriculum_gate", "actor", "role_params", "critic_input",
             "per_agent_value", "aux_coef", "action_rate_coef", "action_rate_ramp_iters",
             "recurrent", "hidden_dim", "seq_len", "comm", "comm_dim", "msg_coef",
-            "msg_beta", "msg_drop", "ramp_gate",
+            "msg_beta", "msg_drop", "ramp_gate", "privileged_actor",
         )
         if getattr(a, f) is not None
     }

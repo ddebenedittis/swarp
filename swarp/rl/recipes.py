@@ -233,6 +233,11 @@ class TrainSpec:
     """Weight of the auxiliary loss ``mse(aux_head(features), scenario.aux_targets())``;
     0 disables it. Above 0 it needs ``actor="policynet"`` and a scenario with
     ``aux_dim > 0``."""
+    privileged_actor: bool = False
+    """Append ``scenario.aux_targets()`` to the actor's input, as columns after everything
+    else (``PolicyNet``'s ``priv_dim``): the truth an aux head would estimate, handed over.
+    An experiment, not a deployable policy: it tells whether a task fails on perception.
+    Needs ``actor="policynet"`` and ``aux_coef > 0``."""
     action_rate_coef: float = 0.0
     """Weight of the action-rate penalty: every agent's reward loses
     ``action_rate_coef * mean_i(((a_t - a_{t-1}) / half_i)^2)``, ``half_i`` the action
@@ -283,6 +288,9 @@ class TrainSpec:
             raise ValueError("action_rate_coef and action_rate_ramp_iters must be >= 0")
         if self.aux_coef > 0 and self.actor != "policynet":
             raise ValueError("aux_coef > 0 needs actor='policynet' (the aux head lives there)")
+        if self.privileged_actor and not (self.actor == "policynet" and self.aux_coef > 0):
+            raise ValueError("privileged_actor reads the aux targets as inputs: it needs "
+                             "actor='policynet' and aux_coef > 0")
         if self.recurrent and self.actor != "policynet":
             raise ValueError("recurrent=True needs actor='policynet' (the GRU lives there)")
         if self.comm != "none" and self.actor != "policynet":

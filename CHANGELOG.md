@@ -7,6 +7,8 @@ All notable changes to `swarp`. Newest first. Nothing has been released yet — 
 
 ### Added
 
+- **`TrainSpec.privileged_actor` (`--privileged-actor`, `PolicyNet(priv_dim=...)`)**: the actor reads the scenario's aux targets as extra last trunk columns, a diagnostic for whether a task fails on perception; a plain checkpoint widens into it acting as before.
+
 - **`pusht`/`pusht_lidar` per-env arena (`arena_size`), solid surroundings (`scenery_probs`) and T sizes (`tee_scale`).**
   `arena_size` draws each env's W and H on every reset (a value, a range, or a range per axis); the spawns, the arena stop (`Stepper.enable_arena_stop` now takes a per-env edge array), the out-of-bounds limit and the label bound become per env and per axis, and `pusht_lidar` observes the half-extents after the heading.
   `scenery_probs` draws per env nothing, perimeter walls, a rotated room or walls plus circles and capsules outside the arena (plus `scenery_clearance`), held by the stepper as immovable obstacles of a fixed slot bank, so the robots and the T collide with them and the lidar scans them; their per-env poses are mirrored in the new `swarp.sensors.Scenery`, which `lidar_scan(..., scenery=...)` and `lidar_scan_warp` also take.

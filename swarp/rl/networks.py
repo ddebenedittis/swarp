@@ -210,6 +210,14 @@ class PolicyNet(nn.Module):
     the same log-probabilities; ``None`` sends the mean, the greedy message), and
     :meth:`message_loss` is the encoder's own objective.
 
+    ``priv_dim`` gives the actor privileged inputs, for an experiment rather than a
+    deployment: every ``obs`` it acts on is then ``obs_dim + priv_dim`` wide, the
+    observation followed by ``priv_dim`` extra columns (the trainer appends the scenario's
+    aux targets). The observation is used as without them, by the message encoder too,
+    and the extra columns enter the trunk last, after any message columns, so a checkpoint
+    without them widens into this network acting exactly as before. Refused with
+    ``"separate"`` roles.
+
     :meth:`step` is the one-step entry point, ``(obs, roles, h) -> (loc, scale, aux, h)``;
     without ``recurrent`` the hidden state is passed through untouched. :meth:`unroll` runs
     a ``[L, ...]`` sequence from a starting hidden state, resetting it at episode ends.
@@ -228,6 +236,7 @@ class PolicyNet(nn.Module):
         hidden_dim: int = 128,
         comm: str = "none",
         comm_dim: int = 64,
+        priv_dim: int = 0,
         low: torch.Tensor | Sequence[float] | None = None,
         high: torch.Tensor | Sequence[float] | None = None,
         scale_min: float = _SCALE_MIN,
@@ -256,6 +265,12 @@ class PolicyNet(nn.Module):
                 "with roles, not 'separate'"
             )
         self.delayed = comm in DELAYED_COMMS
+        self.priv_dim = int(priv_dim)
+        if self.priv_dim < 0 or (self.priv_dim and self.separate):
+            raise ValueError(
+                f"priv_dim={priv_dim} needs one shared trunk and priv_dim >= 0: with roles "
+                "use role_params 'heads' or 'shared', not 'separate'"
+            )
         if comm == "pose" and not aux_dim:
             raise ValueError("comm='pose' sends the aux estimate: it needs aux_dim > 0")
         #: Width of one delayed message (0 without).
@@ -285,7 +300,7 @@ class PolicyNet(nn.Module):
                         nn.Linear(comm_dim, MSG_HIDDEN), nn.Tanh(), nn.Linear(MSG_HIDDEN, aux_dim)
                     )
                 n_in += self.msg_dim + 1
-            self.trunk = _trunk(n_in, num_cells)
+            self.trunk = _trunk(n_in + self.priv_dim, num_cells)
             if self.recurrent:
                 self.gru = nn.GRUCell(num_cells, hidden_dim)
             self.head = nn.Linear(feat_dim, (R if self.role_heads else 1) * 2 * act_dim)
@@ -315,6 +330,8 @@ class PolicyNet(nn.Module):
             self.config.update(recurrent=True, hidden_dim=hidden_dim)
         if self.communicates:
             self.config.update(comm=comm, comm_dim=comm_dim)
+        if self.priv_dim:
+            self.config.update(priv_dim=self.priv_dim)
         if self.scale_min != _SCALE_MIN:
             self.config.update(scale_min=self.scale_min)
 
@@ -339,6 +356,17 @@ class PolicyNet(nn.Module):
             return None
         slots = role_slots(roles, self.n_roles)
         return slots, invert_permutation(slots)
+
+    def _split(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """``(observation, privileged columns)`` of an actor input (``None`` without)."""
+        if not self.priv_dim:
+            return obs, None
+        if obs.shape[-1] != self.obs_dim + self.priv_dim:
+            raise ValueError(
+                f"this PolicyNet reads obs_dim + priv_dim = {self.obs_dim} + {self.priv_dim} "
+                f"columns, got {obs.shape[-1]}"
+            )
+        return obs[..., : self.obs_dim], obs[..., self.obs_dim :]
 
     def _with_role(self, obs: torch.Tensor, roles: torch.Tensor | None) -> torch.Tensor:
         if not self.role_input:
@@ -368,8 +396,9 @@ class PolicyNet(nn.Module):
         self, msg_obs: torch.Tensor, roles: torch.Tensor | None
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """The encoder's ``(mean, log-variance)`` ``[*, A, *]`` for each agent's own
-        observation (``"latent"``: the pre-``tanh`` code and ``None``)."""
-        out = self.msg_enc(self._with_role(msg_obs, roles))
+        observation (``"latent"``: the pre-``tanh`` code and ``None``). Privileged columns
+        after the observation are ignored: a message carries only what the sender sees."""
+        out = self.msg_enc(self._with_role(msg_obs[..., : self.obs_dim], roles))
         if self.comm == "latent":
             return out, None
         mean, logvar = out.chunk(2, -1)
@@ -440,11 +469,14 @@ class PolicyNet(nn.Module):
                 trunk(o[..., off : off + n, :])
                 for trunk, (off, n) in zip(self.trunks, self._spans, strict=True)
             ]
+        obs, priv = self._split(obs)
         x = self._with_role(obs, roles)
         if self.comm == "attn":
             x = self._communicate(x, comm_mask)[0]
         elif self.delayed:
             x = torch.cat([x, self._listen(obs, roles, *msg)], -1)
+        if priv is not None:
+            x = torch.cat([x, priv], -1)
         return self.trunk(x)
 
     def _input_gates(self, feat):
@@ -604,7 +636,7 @@ class PolicyNet(nn.Module):
         if self.comm != "attn":
             raise ValueError("only comm='attn' has attention weights")
         roles = self._check(roles, False)
-        return self._communicate(self._with_role(obs, roles), comm_mask)[1]
+        return self._communicate(self._with_role(self._split(obs)[0], roles), comm_mask)[1]
 
     def forward(
         self, obs: torch.Tensor, roles: torch.Tensor | None = None
