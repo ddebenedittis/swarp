@@ -175,6 +175,95 @@ The likely cause is perception.
 Each robot's own estimate of the T pose (its aux head) has a median error of 0.18 m / 17° at contact range and 0.24 m / 39° at 0.4–1 m, against a 0.15 m / 14° goal tolerance, so the robots cannot tell when the T is on goal.
 AMCL-sized pose noise adds a median 0.12 m to every goal-frame estimate.
 
+## L14: what blocks the settled hold, and a lidar student that learns it
+
+Branch `pusht-lidar-roles` set out to let the two robots learn pusher and observer roles, so that one robot could watch the T and tell the other when it is on goal.
+Every run fine-tunes L12 (`runs/ckpt/L12_best.pt`) for 2000 iterations at `--start-clock 12000`, one seed, under mocap (`pose_noise=(0, 1e-6)`, which keeps the critic's randomisation columns; 0 removes them and the resume fails), with the full hold (`hold_steps` 5, settle thresholds 0.03 / 0.1 / 0.1 / 0.4, `hold_reward` 1, `on_goal_reward` 3), `aux_goal` and no approach shaping (`agent_dist_shaping` 0).
+The numbers are the periodic greedy hold-solve over 512 envs (`eval_solve_rate`); every run is under `~/Documents/lp/swarp/runs/<id>` on davide-cf or `runs/local/<id>` on the laptop.
+
+### Two gates that did not need roles
+
+- **G0, can the lidar see the T well enough?** A supervised study on teleported viewpoints (scratchpad report, not kept): a template fit of the T outline to the T-labelled points reaches a median 0.04–0.07 m and 2–7° from one scan within 0.8 m of the stem side or a bar end, and fusing both robots' scans through their relative pose reaches 0.05 m / 4° everywhere out to 1.8 m. From behind the bar, where the stem is hidden, one scan's heading error is about 90°. Learned MLPs on the scans reach that accuracy only within 0.5 m. The sensor is enough; the policy's learned estimate (0.18 m / 17°) is the weak part.
+- **G1, does the true T pose fix the hold?** `--privileged-actor` appends the aux targets (the T's position relative to each robot, its heading and the on-goal flag) to the actor's input. From L12 it scored no better than the plain fine-tune.
+
+| id | change | greedy hold-solve (best / final) |
+|---|---|---|
+| N0-plain | plain fine-tune | 0.043 / 0.014 |
+| NP-pose | `--comm pose` | 0.029 / 0.008 |
+| G1-priv | `--privileged-actor` | 0.025 / 0.006 |
+| NG-near | goals within 0.4 m first (`--start-difficulty 0 --curriculum-iters 3000`) | 0.025 / 0.008 |
+| N0H-plain, G1H-priv | the same from H2 (`runs/ckpt/H2_4000.pt`) | 0.176 / 0.100, 0.365 / 0.160 |
+
+### The first block: the turn-away penalty
+
+Greedy rollouts of these checkpoints (scratchpad study D1) showed what happens.
+L12 reaches the goal in 98% of episodes, but crosses it at 0.28 m/s while spinning the T at 0.57 rad/s, about 5.6 times per episode.
+The fine-tunes did not learn to stop: they stopped pushing, with reach falling to 1–8% and the robots' mean speed from 0.24 to 0.06–0.11 m/s.
+Stopping is physically easy: L12 plus a scripted zero command while the T is on goal holds 0.98.
+The cause is `rot_away_penalty` (1.0 per radian the heading error grows): once passing through no longer ends the episode with the goal bonus, L12 pays 0.03–0.06 per step to it against 0.025 of pose shaping, so not pushing is the cheapest policy.
+That also explains the learned-brake runs of L13.
+
+With `rot_away_penalty=0` the privileged actor learns the hold and the lidar actor does not:
+
+| id | change | greedy hold-solve by iteration (250 … 2000) |
+|---|---|---|
+| RA0-priv | penalty 0, `--privileged-actor` | 0, 0, 0, 0.25, 0.62, 0.86, 0.89, **0.92** |
+| RA0-plain | penalty 0 | 0 throughout |
+| NP-RA0, AUX-RA0, LAT-RA0 | penalty 0 with pose messages, aux loss 1.0, latent messages | ≤ 0.002 (stopped early) |
+| RS2 | penalty 0, `rot_shaping_factor` 2 | 0 |
+| RA50 | penalty 0.5 | 0.020 |
+| RA25, RA25b | penalty 0.25, then 3000 more iterations | 0.068, then **0.334** |
+
+Without the penalty the lidar policies hold the T near the goal (0.45 m mean) at a random heading: the penalty was their dense heading signal, and only the privileged actor, which reads the heading, does without it.
+
+### The privileged teacher stops on the on-goal flag
+
+Evaluating RA0-priv with noise on its privileged input (scratchpad study E1): it holds 0.93 clean, 0.72 under 0.05 m / 5° jitter, 0.29 under 0.07 m / 7° and 0.00 under 0.10 m / 10°; a per-episode bias of 0.05 / 0.10 m gives 0.77 / 0.37, and 20% gross outliers 0.22.
+With the on-goal flag zeroed it scores 0.000, and with the true flag kept it shrugs off 0.10 m / 10° of jitter: all the loss comes through the flag recomputed from the noisy pose.
+A teacher without the flag (TF-noflag, `aux_goal=False`) did not learn the hold in 2000 iterations (0.004); one trained under estimator-like noise on its input (`--priv-noise`, flag-free) reached 0.205 at the higher noise (TN-hi, 0.03 / 0.05 m bias / jitter, 3° / 5°, 10% outliers, scored under that noise) and 0.045 at the lower (TN-mid).
+
+### Distilling the teacher into the lidar policy
+
+`--teacher runs/ckpt/RA0priv_best.pt` adds a squared error between the student's and the teacher's pre-tanh action means on the student's own rollouts (DAgger-style, weight `bc_coef` 1) to the PPO loss.
+The student reads only its lidar; the teacher reads the truth.
+
+| id | student | greedy hold-solve |
+|---|---|---|
+| DS-plain, -b, -c | L12, penalty 0 | 0 until 1500, 0.100 at 2000; then 0.17–0.39 over 250–750 and 0.465 at 4000; 0.47–0.61 over 4250–6000 (best 0.605 at 5500) |
+| DS-roles-pose, -b, -c | L12 with learned roles and pose messages | 0 at 1000 (stopped, resumed from iteration 1000); 0.27 at 2500; 0.31–0.42 over 2750–4000 |
+| DS-RA25 | RA25b with the teacher, penalty 0.25 | 0.24 (below RA25b's own 0.33) |
+| DS-decay | DS-plain-c with `--bc-decay-iters 1500` (the imitation weight falls 1 → 0, then PPO alone) | 0.54, 0.63, 0.63, 0.69, 0.67, **0.74** (1500, weight 0), 0.71, 0.70 |
+| DS-amcl, -b | DS-plain-b under the recipe's full pose noise (0–1.25 AMCL scale) | 0.32–0.42 over 2000 iterations, then 0.40–0.50 over 2000 more |
+
+Final greedy evaluation of the candidates (`examples/eval_mappo.py`, 1024 envs, seed 7, the fine-tune's hold settings, Wilson 95%), under mocap and under the recipe's AMCL-sized pose noise (scale 0–1.25):
+
+| checkpoint | mocap | AMCL |
+|---|---|---|
+| L12 | 0.000 | 0.000 |
+| RA25b final | 0.319 [0.292, 0.349] | 0.291 [0.264, 0.320] |
+| DS-plain-c at 1500 | 0.592 [0.561, 0.622] | 0.543 [0.512, 0.573] |
+| DS-decay at 1500 | **0.738 [0.711, 0.764]** | **0.705 [0.676, 0.732]** |
+| DS-decay final | 0.710 [0.681, 0.737] | 0.692 [0.663, 0.720] |
+| DS-amcl final | 0.471 [0.440, 0.501] | 0.426 [0.396, 0.456] |
+| DS-roles-pose-c final | 0.392 [0.362, 0.422] | 0.346 [0.317, 0.375] |
+| RA0-priv (reads the true pose) | 0.921 [0.903, 0.936] | 0.903 [0.884, 0.920] |
+
+The pose noise costs the distilled student about five points, and fine-tuning it under the noise (DS-amcl, the same number of iterations as DS-plain-c) did not help, on one seed.
+Releasing the imitation term is what lifted the student past its plateau: the teacher's mean is a good start but caps the student at what it can copy without the truth, and PPO alone then improves on it.
+Training on past the release does not lift it further: 2000 more PPO iterations from DS-decay's final checkpoint held 0.64–0.71 under mocap (PPO-after) and fell from 0.66 to 0.59 under AMCL-sized noise (PPO-after-amcl), on the 512-env periodic eval, so DS-decay at iteration 1500 stays the best lidar policy (`runs/ckpt/L14_ds_decay_1500.pt`, gitignored).
+
+### Learned roles did not emerge
+
+`--learned-roles` (a role head sampled every 5 steps, tied warm start so both roles act as L12) kept its role choice a coin flip in every run: role entropy stayed at ln 2 and half the decisions switched (RP-roles-pose, no teacher: 0.006 best; DS-roles-pose: see above).
+With both roles acting identically, the choice of role does not change the return, so its policy gradient is zero in expectation: the tied start is a saddle that only a role-dependent incentive breaks (the information reward or an observer view bonus, not built).
+The pose messages, not the roles, are the plausible source of any difference between the two distilled students.
+
+### What to take from it
+
+- The hold needs a crisp on-goal decision. A lidar policy learns one from a teacher that has it, distilled on its own rollouts and then released to PPO: 0.74 under mocap and 0.71 under AMCL-sized noise, against 0.00 for L12 and 0.33 for the best reward-only run (penalty 0.25), all on one seed.
+- A classical T fit (G0) is accurate enough for the teacher's continuous inputs but not, as is, for its flag: a deployed teacher would need a flag-free or noise-trained policy, which learns far slower.
+- Roles need symmetry breaking before they can be evaluated.
+
 ## What the consolidation removed
 
 Besides the recipe variants, the scenario knobs that only they used were pruned (all are in the tag):
@@ -199,7 +288,11 @@ The consolidation changed only which per-robot values L12's resets draw (one few
 - The T spin: a penalty on the T's angular speed instead of `rot_away_penalty`, which a whole turn repays.
 - lm2591's blind sector (+8…+92°), which no recipe models.
 - The 5 × 5 m arena and perimeter walls at the edge are the weakest conditions (0.92 and 0.93).
-- Earlier ideas not pursued: a variable team per episode (needs an inactive-agent concept and a per-agent validity mask in PPO), training on other shapes (`ell`, `plus`, `bar`), Success Guided Sampling instead of the hand curriculum, and distillation from a restricted privileged teacher.
+- Earlier ideas not pursued: a variable team per episode (needs an inactive-agent concept and a per-agent validity mask in PPO), training on other shapes (`ell`, `plus`, `bar`), Success Guided Sampling instead of the hand curriculum.
+- A second seed for DS-decay and RA0-priv before the hold goes into `SPECS["pusht_lidar_limo"]`; every L14 number is one seed.
+- Break the tie between learned roles with a role-dependent incentive (the information reward or a view bonus of the original plan, neither built), then judge roles against DS-decay.
+- A deployable on-goal decision: the teacher's flag from a T estimator, or a teacher trained flag-free under noise for longer than TN-hi's 2000 iterations.
+- The video renderer frames the whole world, so on the Limo arena the robots are a few pixels; a camera that follows the T is needed before a video is worth recording.
 
 ## Working on davide-cf
 

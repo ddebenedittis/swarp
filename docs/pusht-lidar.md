@@ -152,6 +152,12 @@ That is a potential difference, so a hold that breaks gives back what it earned 
 The critic state ends with the hold's progress; the robots do not observe it.
 Every threshold is an attribute a trainer can ramp, and so is `hold_steps` within [1, 255] on a scenario built with a hold; whether the hold is on is fixed at construction, so moving `hold_steps` between 0 and a positive value raises.
 
+The hold changes what `rot_away_penalty` costs.
+Without it an episode ends with the goal bonus on the first pass through the goal; with it the episode goes on, and a policy that keeps pushing and turning the T pays the one-sided penalty for every radian the heading error grows.
+Fine-tuned from the Limo recipe's policy, which passes through the goal at speed while turning the T, the penalty outweighed the pose shaping and the policies stopped pushing altogether instead of learning to stop on the goal.
+With the penalty off a policy that reads the T's true pose learns the hold (0.92 greedy), and a lidar policy distilled from it on its own rollouts (`--teacher`, see [Training](training.md)) reaches 0.74 once the imitation term is decayed away (0.71 under AMCL-sized pose noise); one trained on the reward alone does not, since the penalty was also its dense signal on the T's heading.
+The runs are logged in the Limo working note (`notes/pusht-lidar-limo.md`, L13 and L14).
+
 ### Sensor failure
 
 `lidar_blackout` kills each robot's lidar for a whole episode with that probability, drawn per robot on every reset.
