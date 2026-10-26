@@ -49,6 +49,7 @@ from torch.nn import functional as F
 
 from swarp import Environment
 from swarp.rl.networks import (
+    DELAYED_COMMS,
     Actor,
     Critic,
     PolicyNet,
@@ -65,6 +66,7 @@ from swarp.rl.recipes import (
     SPECS,
     ActionFn,
     PolicyArm,
+    Ramp,
     SolveRateWindow,
     TrainSpec,
     build_env,
@@ -700,6 +702,13 @@ class MAPPO:
             self.lrole_in_buf = z(T + 1, E, A, dtype=torch.long)
             self.lrole_buf = z(T, E, A, dtype=torch.long)
             self.decide_buf = z(T, E, A)
+        # The logged switch rate: switches and decisions summed over the rollout, divided
+        # once in the update (a per-step ratio would average in the steps nobody decides).
+        self.switch_acc = z(2) if self.learned else None
+        self.switch_col = None
+        if self.learned and "switch_rate" in self.metrics:
+            keys = list(self.metrics)
+            self.switch_col = sum(self.metrics[k] for k in keys[: keys.index("switch_rate")])
         self.h = self.h_buf = self.done_buf = None
         # The update draws minibatches of ``mb_units`` units out of ``n_units``: samples,
         # or (recurrent) chunks of L consecutive steps of one env.
@@ -786,13 +795,14 @@ class MAPPO:
         sent = tuple(x for x in (self.prev_obs, self.prev_aux) if x is not None)
         valid = (self.prev_valid,) if self.delayed else ()
         role = (self.role_prev, self.role_age) if self.learned else ()
+        switches = (self.switch_acc,) if self.learned else ()
         bias = (self.priv_bias,) if self.priv_noise else ()
         self._act = _Graphed(
             self._act_body, self.graphs, carries=(self.t, *hidden, *sent, *role, *bias)
         )
         self._store = _Graphed(
             self._store_body, self.graphs,
-            carries=(self.t, self.metric_acc, *hidden, *valid, *role, *bias),
+            carries=(self.t, self.metric_acc, *hidden, *valid, *role, *switches, *bias),
         )
         self._prepare = _Graphed(self._prepare_body, self.graphs, carries=(), warmup=1)
         kl_carry = (self.kl_stop,) if self.kl_brake else ()
@@ -906,6 +916,8 @@ class MAPPO:
             self.h.copy_(h)
         if self.delayed:
             self.prev_obs.copy_(obs[..., : self.env.obs_dim])
+            if self.msg_loss:
+                self.prev_aux.copy_(self.env.aux_targets())
         return self.actor.squash(loc)
 
     def _reset_roles(self, done: torch.Tensor | None) -> None:
@@ -1059,12 +1071,15 @@ class MAPPO:
             decide = self.decide_buf.index_select(0, self.t)[0]
             switched = decide * (role != self.lrole_in_buf.index_select(0, self.t)[0]).float()
             own["role1_frac"] = (role == 1).float()
-            own["switch_rate"] = switched.sum() / decide.sum().clamp_min(1.0)
+            self.switch_acc += torch.stack([switched.sum(), decide.sum()])
         self.rew_buf.index_copy_(0, self.t, rew.unsqueeze(0))
         self.term_buf.index_copy_(0, self.t, term.unsqueeze(0).float())
         self.trunc_buf.index_copy_(0, self.t, trunc.unsqueeze(0).float())
         off = 0
         for key, width in self.metrics.items():
+            if key == "switch_rate" and self.learned:
+                off += 1  # the update divides switch_acc into it
+                continue
             if key in own:
                 self.metric_acc[off : off + 1] += own[key].mean()
                 off += 1
@@ -1094,6 +1109,8 @@ class MAPPO:
             self.reset()
         self.t.zero_()
         self.metric_acc.zero_()
+        if self.learned:
+            self.switch_acc.zero_()
         self.act_recaptures = 0
         self.store_recaptures = 0
         env, actions = self.env, self.actions
@@ -1319,7 +1336,10 @@ class MAPPO:
         self._prepare()
         for _ in range(self.spec.epochs * self.M):
             self._minibatch()
-        stats = torch.cat([self.prep_stats, self.mb_stats, self.metric_acc / self.T])
+        acc = self.metric_acc / self.T
+        if self.switch_col is not None:
+            acc[self.switch_col] = self.switch_acc[0] / self.switch_acc[1].clamp_min(1.0)
+        stats = torch.cat([self.prep_stats, self.mb_stats, acc])
         return dict(zip(self.stat_names, stats.tolist(), strict=True))
 
     def snapshot(self) -> list[torch.Tensor]:
@@ -1446,11 +1466,44 @@ def _network_flags(cls: str, kwargs: Mapping[str, Any]) -> list[str]:
 
 
 #: Network keywords that ``--resume-widen`` lets grow: input and aux widths, whose new
-#: columns (appended at the end) load with zero weights. It also accepts an option the
-#: checkpoint's network does not record at all (communication, privileged inputs or learned
-#: roles added to a policy trained without), whose new parameters keep their fresh
-#: initialisation.
+#: columns load with zero weights. :func:`load_widened` appends them, so a width that grows
+#: ahead of other columns of the same layer is refused (:func:`misplaced_growth`). It also
+#: accepts an option the checkpoint's network does not record at all (delayed messages,
+#: privileged inputs or learned roles added to a policy trained without), whose new
+#: parameters keep their fresh initialisation; not attention or memory, which change what
+#: the trunk or the head reads.
 WIDENABLE = ("obs_dim", "state_dim", "aux_dim", "priv_dim")
+
+
+def misplaced_growth(cls: str, saved: Mapping[str, Any], built: Mapping[str, Any]) -> list[str]:
+    """What ``--resume-widen`` from a ``cls(**saved)`` network to ``cls(**built)`` cannot
+    load: a grown width whose new columns would not come last in the layer they enter, or
+    an added option that changes the meaning of the inputs it would pad."""
+    def grew(k: str) -> bool:
+        return built.get(k, 0) > saved.get(k, 0)
+
+    out = []
+    if "recurrent" in built and "recurrent" not in saved:
+        out.append("recurrent added (the head would read the GRU state, not the trunk)")
+    if built.get("comm") == "attn" and "comm" not in saved:
+        out.append("comm 'attn' added (the trunk would read the attention, not the obs)")
+    if cls == "PolicyNet":
+        comm = saved.get("comm")
+        after = [name for name, on in (
+            ("role", bool(saved.get("role_counts")) and saved.get("role_params") != "separate"),
+            ("message", comm in DELAYED_COMMS),
+            ("privileged", saved.get("priv_dim", 0) > 0),
+        ) if on]
+        if grew("obs_dim") and after:
+            out.append(f"obs_dim grew ahead of the {'/'.join(after)} columns")
+        if grew("aux_dim") and comm == "pose":
+            out.append("aux_dim grew inside the pose messages' [mean | logvar] layout")
+    elif cls in ("Critic", "StateCritic") and (cls == "Critic" or saved.get("use_obs")):
+        if grew("obs_dim") and saved["n_agents"] > 1:
+            out.append("obs_dim grew inside every agent's block of the flattened obs")
+        if grew("state_dim"):
+            out.append("state_dim grew ahead of the obs columns")
+    return out
 
 
 def check_resume(
@@ -1463,7 +1516,8 @@ def check_resume(
     """Raise unless the checkpoint's networks are the ones ``built`` (what
     :func:`network_archs` gives for the current flags) describes, naming the mismatch and
     the flags that rebuild the checkpoint's networks. With ``critic_only`` only the critic
-    must match; with ``widen`` an input width (:data:`WIDENABLE`) may have grown."""
+    must match; with ``widen`` an input width (:data:`WIDENABLE`) may have grown, unless
+    :func:`load_widened` would misplace its columns (:func:`misplaced_growth`)."""
     saved = checkpoint_archs(ckpt)
     nets = [("critic", 2)] if critic_only else [("actor", 0), ("critic", 2)]
     problems: list[str] = []
@@ -1475,10 +1529,12 @@ def check_resume(
                 k for k in keys
                 if k in kw_s and not (k in WIDENABLE and kw_b.get(k, 0) > kw_s.get(k, 0))
             ]
-        if cls_s == cls_b and not keys:
+        misplaced = misplaced_growth(cls_s, kw_s, kw_b) if widen and cls_s == cls_b else []
+        if cls_s == cls_b and not keys and not misplaced:
             continue
         diffs = [f"class {cls_s} vs {cls_b}"] if cls_s != cls_b else []
         diffs += [f"{k} {kw_s.get(k)!r} vs {kw_b.get(k)!r}" for k in keys]
+        diffs += [f"--resume-widen cannot load it: {m}" for m in misplaced]
         hint = f"pass {' '.join(_network_flags(cls_s, kw_s))}"
         if any(k in _SCENARIO_KEYS for k in keys):
             hint += ", and the scenario settings it was trained with (--n-agents, --scen-kwarg)"
@@ -1618,7 +1674,7 @@ def greedy_env_arm(
         if not getattr(actor, "stateful", False):
             if uses_roles:
                 return lambda obs: actor.greedy(actor_obs(obs), env.agent_roles())
-            return lambda obs: actor.greedy(actor_obs(obs)) if priv else actor.greedy
+            return (lambda obs: actor.greedy(actor_obs(obs))) if priv else actor.greedy
         h: torch.Tensor | None = None
 
         prev: torch.Tensor | None = None
@@ -2029,12 +2085,17 @@ def parse_args(argv: list[str] | None = None) -> TrainConfig:
     # A --scen-kwarg pins its attribute: a ramp on it would overwrite the value from the first
     # iteration on (and the greedy eval, which runs no ramps, would score another world). The
     # ramp is held at the flag's value rather than dropped, so the clock keeps its length.
+    # A scalar flag on a tuple-valued ramp (``pose_noise=0.5``) holds that scalar in every
+    # entry, as the scenario's constructor reads it, so the ramp never assigns a float.
+    def hold(r: Ramp) -> Ramp:
+        v = pinned[r.attr]
+        if isinstance(r.hi, tuple) and not isinstance(v, tuple):
+            v = (v,) * len(r.hi)
+        return replace(r, lo=v, hi=v)
+
     held = [r.attr for r in spec.ramps if r.attr in pinned]
     if held:
-        spec = replace(spec, ramps=tuple(
-            replace(r, lo=pinned[r.attr], hi=pinned[r.attr]) if r.attr in pinned else r
-            for r in spec.ramps
-        ))
+        spec = replace(spec, ramps=tuple(hold(r) if r.attr in pinned else r for r in spec.ramps))
         print(f"--scen-kwarg pins {held}: their ramps hold the flag's value")
 
     return TrainConfig(

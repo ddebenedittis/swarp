@@ -389,6 +389,7 @@ def _algo(
     scen_kwargs=(),
     train_only=(),
     teacher=None,
+    metrics=(),
     **spec_kw,
 ) -> MAPPO:
     """Navigation at test size; ``features`` turns on the state critic (state + obs, per
@@ -440,7 +441,8 @@ def _algo(
     if train_only:
         freeze_actor(actor, train_only)
     module = None if teacher is None else teacher(actor, env).to(device)
-    algo = MAPPO(env, actor.to(device), critic.to(device), spec, graphs=graphs, teacher=module)
+    algo = MAPPO(env, actor.to(device), critic.to(device), spec, metrics, graphs=graphs,
+                 teacher=module)
     algo.reset()
     return algo
 
@@ -1231,6 +1233,50 @@ def test_a_scen_kwarg_pins_its_attribute_and_holds_the_ramp_on_it():
             assert new.value(new.start) == new.value(new.end) == 0
         else:
             assert new == old
+    # A scalar on a tuple-valued ramp holds it in every entry, as the constructor reads it.
+    cfg = parse_args(["--scenario", "pusht_lidar_limo", "--scen-kwarg", "pose_noise=0.5"])
+    (ramp,) = (r for r in cfg.spec.ramps if r.attr == "pose_noise")
+    assert ramp.value(ramp.start) == ramp.value(ramp.end) == (0.5, 0.5)
+
+
+def test_resume_widen_refuses_columns_it_would_misplace_and_inputs_it_would_reinterpret():
+    """A width that grows ahead of other columns of its layer, or attention or memory added,
+    is refused; new columns that come last, a fresh message encoder and separate role
+    trunks still widen."""
+    critic = {"state_dim": 3, "obs_dim": 6, "n_agents": 3, "num_cells": 16, "use_obs": False,
+              "role_counts": [], "per_agent": False}
+
+    def resume(saved, built, saved_critic=critic, built_critic=critic):
+        ckpt = {"format": "swarp.rl/2", "actor_cls": "PolicyNet", "actor_kwargs": saved,
+                "critic_cls": "StateCritic", "critic_kwargs": saved_critic}
+        built = ("PolicyNet", built, "StateCritic", built_critic)
+        check_resume("old.pt", ckpt, built, widen=True)
+
+    def config(obs_dim=6, aux_dim=4, **kw):
+        return PolicyNet(obs_dim, 2, 16, aux_dim=aux_dim, **kw).config
+
+    roles, sep = {"role_counts": (2, 0)}, {"role_counts": (1, 2), "role_params": "separate"}
+    pose = {"comm": "pose", "comm_dim": 4}
+    resume(config(**roles), config(aux_dim=5, **roles, **pose))  # a fresh pose encoder
+    resume(config(**sep), config(8, **sep))
+    resume(config(**roles), config(**roles, priv_dim=4))
+    resume(config(), config(comm="latent", comm_dim=4))
+    resume(config(), config(), built_critic={**critic, "state_dim": 5})
+    for saved, built, why in (
+        (config(**roles), config(8, **roles), "obs_dim grew ahead of the role"),
+        (config(**pose), config(8, **pose), "obs_dim grew ahead of the message"),
+        (config(priv_dim=4), config(8, priv_dim=4), "obs_dim grew ahead of the privileged"),
+        (config(**pose), config(aux_dim=5, **pose), "aux_dim grew inside"),
+        (config(), config(comm="attn", comm_dim=4), "comm 'attn' added"),
+        (config(), config(recurrent=True), "recurrent added"),
+    ):
+        with pytest.raises(ValueError, match=why):
+            resume(saved, built)
+    both = {**critic, "use_obs": True}
+    with pytest.raises(ValueError, match="state_dim grew ahead of the obs"):
+        resume(config(), config(), both, {**both, "state_dim": 5})
+    with pytest.raises(ValueError, match="obs_dim grew inside every agent"):
+        resume(config(), config(), both, {**both, "obs_dim": 8})
 
 
 def test_a_plain_policy_widens_into_a_privileged_one_and_acts_as_before():
@@ -1308,6 +1354,8 @@ def test_greedy_env_arm_feeds_a_privileged_actor_the_aux_targets():
     alone = PolicyNet(env.obs_dim, env.act_dim, 16, aux_dim=AUX_DIM, priv_dim=AUX_DIM)
     act = greedy_score_kwargs(alone)["policy_from_env"](env)
     assert torch.equal(act(obs), alone.greedy(torch.cat([obs, moved], -1)))
+    plain = PolicyNet(env.obs_dim, env.act_dim, 16)  # the arm acts, not returns the method
+    assert torch.equal(greedy_env_arm(plain)(env)(obs), plain.greedy(obs))
 
 
 def test_privileged_actor_is_refused_without_the_aux_targets():
@@ -1414,7 +1462,8 @@ def test_learned_roles_decide_every_dwell_and_recompute_the_rollout_log_probs(co
     stored log-probabilities, messages encoded with the previous roles, and the role head
     moves them only on decision rows, where the role entropy is averaged."""
     kw = {"comm": comm, "comm_dim": 4, "msg_drop": 0.3} if comm != "none" else {}
-    algo = _algo(graphs=False, device="cpu", features=True, **_LEARNED, **kw)
+    algo = _algo(graphs=False, device="cpu", features=True,
+                 metrics={"role1_frac": 1, "switch_rate": 1}, **_LEARNED, **kw)
     age = algo.role_age.clone()
     algo.rollout()
     T, A, N, dwell = algo.T, algo.A, algo.N, algo.dwell
@@ -1466,6 +1515,8 @@ def test_learned_roles_decide_every_dwell_and_recompute_the_rollout_log_probs(co
     assert not torch.isclose(out[-1], ent.mean())
     stats = algo.update(algo.spec.entropy_coeff)
     assert stats["grad_skips"] == 0 and math.isfinite(stats["role_entropy"])
+    # The logged switch rate is the rollout's switches over its decisions.
+    assert stats["switch_rate"] == pytest.approx((role != role_in[:T])[decide].float().mean())
 
 
 def test_teammate_role_columns_and_a_tied_warm_start_that_acts_as_before():

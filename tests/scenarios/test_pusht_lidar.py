@@ -551,6 +551,13 @@ def test_hold_validation():
         PushTLidarScenario(on_goal_reward=1.0)
     with pytest.raises(ValueError, match="settle"):
         PushTLidarScenario(hold_steps=3, settle_tee_speed=0.0)
+    # Whether the hold is on is fixed with its buffers: a ramp may move it only within it.
+    off, on = PushTLidarScenario(), PushTLidarScenario(hold_steps=3)
+    on.hold_steps = 40
+    for scen, bad in ((off, 5), (on, 0), (on, 256)):
+        with pytest.raises(ValueError, match="hold_steps must stay"):
+            scen.hold_steps = bad
+    assert (off.hold_steps, on.hold_steps) == (0, 40)
 
 
 # ------------------------------------------------------------------- lidar artefacts

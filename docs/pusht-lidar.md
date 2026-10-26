@@ -150,7 +150,7 @@ The goal bonus is paid on the step the hold completes, and the team term adds `h
 That is a potential difference, so a hold that breaks gives back what it earned and cannot be farmed by stepping in and out of the goal.
 `on_goal_reward` adds a second potential on the pose being within both tolerances: reaching the goal pays it and leaving gives it back, so a reach still pays while passing through no longer counts as success.
 The critic state ends with the hold's progress; the robots do not observe it.
-Every threshold is an attribute a trainer can ramp, and `hold_steps` can ramp too as long as it stays above 0.
+Every threshold is an attribute a trainer can ramp, and so is `hold_steps` within [1, 255] on a scenario built with a hold; whether the hold is on is fixed at construction, so moving `hold_steps` between 0 and a positive value raises.
 
 ### Sensor failure
 

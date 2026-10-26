@@ -570,12 +570,12 @@ class PushTLidarScenario(PushTScenario):
         settle = (settle_tee_speed, settle_tee_ang_vel, settle_robot_speed, settle_robot_ang_vel)
         if min(settle) <= 0.0:
             raise ValueError(f"the settle thresholds must be > 0, got {settle}")
-        #: The settled hold (see the class docstring): steps the T must stay on goal and
-        #: settled for the episode to succeed (0: on goal is enough; a trainer can ramp it
-        #: between resets as long as it stays above 0), the weight of the hold's potential,
-        #: and the speed thresholds below which the T and every robot count as settled.
+        #: The settled hold (see the class docstring): whether it is on, fixed here with its
+        #: buffers, steps the T must stay on goal and settled (:attr:`hold_steps`), the
+        #: weight of the hold's potential, and the speed thresholds below which the T and
+        #: every robot count as settled.
+        self.hold_on = int(hold_steps) > 0
         self.hold_steps = int(hold_steps)
-        self.hold_on = self.hold_steps > 0
         self.hold_reward = float(hold_reward)
         if on_goal_reward and not self.hold_on:
             raise ValueError(
@@ -604,6 +604,22 @@ class PushTLidarScenario(PushTScenario):
             for x in (self.settle_tee_speed, self.settle_tee_ang_vel, self.settle_robot_speed,
                       self.settle_robot_ang_vel)
         )
+
+    @property
+    def hold_steps(self) -> int:
+        """Steps the T must stay on goal and settled for the episode to succeed (0: on goal
+        is enough). A trainer can ramp it between resets within ``[1, 255]`` when the
+        scenario was built with a hold, and only at 0 when it was built without: the hold's
+        buffers and kernel variant are fixed at construction."""
+        return self._hold_steps
+
+    @hold_steps.setter
+    def hold_steps(self, value: int) -> None:
+        v = int(value)
+        if not (1 <= v <= 255 if self.hold_on else v == 0):
+            want = "[1, 255] (built with a hold)" if self.hold_on else "0 (built without a hold)"
+            raise ValueError(f"hold_steps must stay in {want}, got {value}")
+        self._hold_steps = v
 
     # ------------------------------------------------------------- dimensions
 

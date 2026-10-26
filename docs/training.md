@@ -70,6 +70,7 @@ Four more serve fine-tunes from a checkpoint (`--resume`):
 
 `--resume-widen`
 : load a checkpoint whose networks are narrower than the new ones (more observation, state or aux columns, a message input); the new weights start at zero, so the policy acts as it did.
+  New columns are appended to each layer, so it refuses a width that grows ahead of other columns (observations ahead of the role one-hot, messages or privileged inputs; aux targets inside pose messages; state ahead of a critic's observations), and it refuses adding attention or memory, which change what the trunk or head reads.
 
 `--train-only PREFIX ...`
 : train only the actor parameters whose names start with one of the prefixes; the rest of the actor is frozen and the critic trains.
