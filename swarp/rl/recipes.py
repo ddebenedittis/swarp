@@ -248,6 +248,10 @@ class TrainSpec:
     uniform). Only the actor's input is noisy: the aux loss and a teacher keep the truth.
     Empty: off. Needs ``privileged_actor`` and a flag-free aux layout (``aux_goal=False``),
     since a noisy pose next to a true on-goal flag leaks the truth."""
+    actor_drop: tuple[str, ...] = ()
+    """``obs_layout()`` blocks the actor does not read (``PolicyNet``'s ``obs_keep``), e.g.
+    ``("lidar",)`` for a privileged actor that acts on the poses alone. Needs
+    ``actor="policynet"``."""
     learned_roles: bool = False
     """Each agent chooses its role (``PolicyNet``'s ``learned_roles``): every
     ``role_dwell`` steps a role head samples it, the choice enters the PPO ratio, and the
@@ -324,6 +328,8 @@ class TrainSpec:
         if self.privileged_actor and not (self.actor == "policynet" and self.aux_coef > 0):
             raise ValueError("privileged_actor reads the aux targets as inputs: it needs "
                              "actor='policynet' and aux_coef > 0")
+        if self.actor_drop and self.actor != "policynet":
+            raise ValueError("actor_drop needs actor='policynet'")
         if self.priv_noise:
             if not self.privileged_actor:
                 raise ValueError("priv_noise perturbs the privileged input: it needs "

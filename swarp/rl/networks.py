@@ -218,6 +218,12 @@ class PolicyNet(nn.Module):
     without them widens into this network acting exactly as before. Refused with
     ``"separate"`` roles.
 
+    ``obs_keep`` (column indices into the observation) makes the actor read only those
+    columns: the trunk sees ``obs[..., obs_keep]``, so the input stays ``obs_dim`` wide and a
+    deployment feeds the full observation. It is how a policy is trained blind to a sensor
+    (the trainer's ``actor_drop``, e.g. the lidar of a privileged actor). Refused with
+    ``"separate"`` roles, communication and learned roles.
+
     ``learned_roles`` lets each agent choose its role, for a scenario whose roles past the
     first are empty (``role_counts`` ``(A, 0, ...)``) with ``"heads"``. A zero-initialised
     ``role_head`` maps the features to ``R`` role logits; ``roles`` then carries each
@@ -247,6 +253,7 @@ class PolicyNet(nn.Module):
         comm: str = "none",
         comm_dim: int = 64,
         priv_dim: int = 0,
+        obs_keep: Sequence[int] | None = None,
         learned_roles: bool = False,
         role_dwell: int = 5,
         low: torch.Tensor | Sequence[float] | None = None,
@@ -283,6 +290,15 @@ class PolicyNet(nn.Module):
                 f"priv_dim={priv_dim} needs one shared trunk and priv_dim >= 0: with roles "
                 "use role_params 'heads' or 'shared', not 'separate'"
             )
+        self.obs_keep = None if obs_keep is None else [int(i) for i in obs_keep]
+        if self.obs_keep is not None:
+            if self.separate or self.communicates or learned_roles:
+                raise ValueError("obs_keep needs one shared trunk without communication or "
+                                 "learned roles")
+            if not self.obs_keep or not all(0 <= i < obs_dim for i in self.obs_keep):
+                raise ValueError(f"obs_keep must be non-empty indices below {obs_dim}")
+        #: Observation columns the trunk reads (``obs_dim`` without ``obs_keep``).
+        self.n_obs_in = obs_dim if self.obs_keep is None else len(self.obs_keep)
         if comm == "pose" and not aux_dim:
             raise ValueError("comm='pose' sends the aux estimate: it needs aux_dim > 0")
         self.learned_roles, self.role_dwell = bool(learned_roles), int(role_dwell)
@@ -306,7 +322,7 @@ class PolicyNet(nn.Module):
             self._spans = list(zip(offsets, self.role_counts, strict=True))
         else:
             # The role one-hot, and with learned roles the teammates' mean one-hot.
-            n_in = obs_dim + (R if self.role_input else 0) * (2 if self.learned_roles else 1)
+            n_in = self.n_obs_in + (R if self.role_input else 0) * (2 if self.learned_roles else 1)
             if comm == "attn":
                 self.comm_enc = nn.Linear(n_in, comm_dim)
                 self.comm_qkv = nn.Linear(comm_dim, 3 * comm_dim)
@@ -333,6 +349,8 @@ class PolicyNet(nn.Module):
             nn.init.zeros_(self.role_head.weight)
             nn.init.zeros_(self.role_head.bias)
         self.register_buffer("role_ids", torch.arange(self.n_roles), persistent=False)
+        if self.obs_keep is not None:
+            self.register_buffer("keep_ids", torch.tensor(self.obs_keep), persistent=False)
         lo = -torch.ones(act_dim) if low is None else torch.as_tensor(low, dtype=torch.float32)
         hi = torch.ones(act_dim) if high is None else torch.as_tensor(high, dtype=torch.float32)
         self.unit_box = bool((lo == -1.0).all() and (hi == 1.0).all())
@@ -359,6 +377,8 @@ class PolicyNet(nn.Module):
             self.config.update(comm=comm, comm_dim=comm_dim)
         if self.priv_dim:
             self.config.update(priv_dim=self.priv_dim)
+        if self.obs_keep is not None:
+            self.config.update(obs_keep=self.obs_keep)
         if self.learned_roles:
             self.config.update(learned_roles=True, role_dwell=self.role_dwell)
         if self.scale_min != _SCALE_MIN:
@@ -503,6 +523,8 @@ class PolicyNet(nn.Module):
                 for trunk, (off, n) in zip(self.trunks, self._spans, strict=True)
             ]
         obs, priv = self._split(obs)
+        if self.obs_keep is not None:
+            obs = obs.index_select(-1, self.keep_ids)
         x = self._with_role(obs, roles)
         if self.comm == "attn":
             x = self._communicate(x, comm_mask)[0]

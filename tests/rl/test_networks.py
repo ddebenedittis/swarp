@@ -274,3 +274,22 @@ def test_the_hoisted_gru_step_is_torchs_gru_cell(device):
     g_ref = torch.autograd.grad(ref.square().sum(), (x, h, net.gru.weight_hh))
     for a, b in zip(g, g_ref, strict=True):
         assert torch.allclose(a, b, atol=1e-5)
+
+
+def test_a_narrowed_policy_acts_as_the_full_one_with_the_dropped_columns_at_zero():
+    """``obs_keep`` reads a subset of the observation; :func:`narrow_input` cuts a full
+    policy's input layer to it, keeping the role and privileged columns after."""
+    from swarp.rl.ppo import narrow_input
+
+    torch.manual_seed(0)
+    kw = dict(role_counts=(2, 1), aux_dim=2, priv_dim=2)
+    full = PolicyNet(6, 2, 8, **kw)
+    keep = [0, 1, 4]
+    narrow = PolicyNet(6, 2, 8, obs_keep=keep, **kw)
+    narrow.load_state_dict(narrow_input(narrow, full.state_dict(), full.config))
+    obs, roles = torch.randn(5, 3, 8), torch.tensor([0, 0, 1]).expand(5, 3)
+    blind = obs.clone()
+    blind[..., [2, 3, 5]] = 0.0
+    for a, b in zip(narrow(obs, roles), full(blind, roles), strict=True):
+        torch.testing.assert_close(a, b)
+    assert narrow.config["obs_keep"] == keep

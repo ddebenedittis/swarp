@@ -1512,6 +1512,8 @@ def _network_flags(cls: str, kwargs: Mapping[str, Any]) -> list[str]:
             flags += ["--comm", kwargs["comm"], "--comm-dim", str(kwargs["comm_dim"])]
         if kwargs.get("priv_dim"):
             flags += ["--privileged-actor"]
+        if kwargs.get("obs_keep") is not None:
+            flags += ["--actor-drop", "<the blocks it was trained without>"]
         if kwargs.get("learned_roles"):
             flags += ["--learned-roles", "--role-dwell", str(kwargs["role_dwell"])]
         return [*flags, "--aux-coef", "<positive>"] if kwargs.get("aux_dim") else flags
@@ -1661,6 +1663,24 @@ def load_widened(module: torch.nn.Module, state: Mapping[str, torch.Tensor]) -> 
     return fresh
 
 
+def narrow_input(
+    actor: PolicyNet, state: Mapping[str, torch.Tensor], saved: Mapping[str, Any]
+) -> dict[str, torch.Tensor]:
+    """``state``, the weights of a ``PolicyNet(**saved)`` that reads its whole observation,
+    with the trunk's input layer cut to the columns ``actor.obs_keep`` keeps (the columns
+    after the observation, role one-hot and privileged ones, follow unchanged). ``actor``
+    then computes what the saved network did with the dropped columns at zero."""
+    state = dict(state)
+    if actor.obs_keep is None or saved.get("obs_keep") is not None:
+        return state
+    if saved["obs_dim"] != actor.obs_dim:
+        raise ValueError(f"obs_keep indexes an obs_dim {actor.obs_dim} observation; the "
+                         f"checkpoint's is {saved['obs_dim']}")
+    w, Ob = state["trunk.0.weight"], actor.obs_dim
+    state["trunk.0.weight"] = torch.cat([w[:, actor.obs_keep], w[:, Ob:]], 1)
+    return state
+
+
 def tie_roles(
     actor: PolicyNet, state: Mapping[str, torch.Tensor], roles: Iterable[int]
 ) -> dict[str, torch.Tensor]:
@@ -1679,7 +1699,7 @@ def tie_roles(
                 for r in roles:
                     state[f"{prefix[:-2]}{r}.{name[len(prefix):]}"] = state[name].clone()
         return state
-    Ob, R, two_d = actor.obs_dim, actor.n_roles, 2 * actor.act_dim
+    Ob, R, two_d = actor.n_obs_in, actor.n_roles, 2 * actor.act_dim
     first = "comm_enc.weight" if actor.comm == "attn" else "trunk.0.weight"
     if actor.role_input:
         for name in (first, "msg_enc.0.weight"):
@@ -1707,7 +1727,7 @@ def tie_learned_roles(
     are tied to role 0 (:func:`tie_roles`): :func:`train` ties the ones the checkpoint left
     empty, so a ``(A, 0)`` checkpoint acts under any role as it did in role 0, and a
     ``(1, 1)`` one keeps both trained heads."""
-    Ob, R = actor.obs_dim, actor.n_roles
+    Ob, R = actor.n_obs_in, actor.n_roles
     state = tie_roles(actor, state, range(1, R) if roles is None else roles)
     w = state["trunk.0.weight"]
     if actor.comm != "attn" and w.shape[1] > Ob + R:
@@ -1874,6 +1894,14 @@ def network_archs(
                     "'heads' or 'shared', not 'separate'"
                 )
             actor[1].update(priv_dim=env.aux_dim)
+        if spec.actor_drop:
+            layout = env.scenario.obs_layout() if hasattr(env.scenario, "obs_layout") else {}
+            missing = [b for b in spec.actor_drop if b not in layout]
+            if missing:
+                raise ValueError(f"actor_drop {missing} are not obs_layout() blocks of "
+                                 f"{type(env.scenario).__name__}: {sorted(layout)}")
+            drop = {i for b in spec.actor_drop for i in range(obs_dim)[layout[b]]}
+            actor[1].update(obs_keep=[i for i in range(obs_dim) if i not in drop])
         if spec.learned_roles:
             actor[1].update(learned_roles=True, role_dwell=spec.role_dwell)
     use_state = spec.critic_input in ("state", "state+obs")
@@ -2091,6 +2119,8 @@ def parse_args(argv: list[str] | None = None) -> TrainConfig:
     p.add_argument("--priv-noise", nargs=5, type=float,
                    metavar=("POS_BIAS", "POS_JITTER", "HEAD_BIAS", "HEAD_JITTER", "OUTLIER"),
                    help="train the privileged actor on a noisy T pose (metres, radians, prob)")
+    p.add_argument("--actor-drop", nargs="+", metavar="BLOCK",
+                   help="obs_layout() blocks the policynet does not read (e.g. lidar)")
     p.add_argument("--learned-roles", action="store_true", default=None,
                    help="each agent chooses its role (scenario roles (A, 0), role heads)")
     p.add_argument("--role-dwell", type=int, help="steps a learned role is held")
@@ -2162,7 +2192,8 @@ def parse_args(argv: list[str] | None = None) -> TrainConfig:
             "curriculum_iters", "curriculum_gate", "actor", "role_params", "critic_input",
             "per_agent_value", "aux_coef", "action_rate_coef", "action_rate_ramp_iters",
             "recurrent", "hidden_dim", "seq_len", "comm", "comm_dim", "msg_coef",
-            "msg_beta", "msg_drop", "ramp_gate", "privileged_actor", "priv_noise", "learned_roles",
+            "msg_beta", "msg_drop", "ramp_gate", "privileged_actor", "priv_noise", "actor_drop",
+            "learned_roles",
             "role_dwell", "role_entropy_coeff", "teacher", "bc_coef", "bc_decay_iters",
         )
         if getattr(a, f) is not None
@@ -2300,6 +2331,7 @@ def train(cfg: TrainConfig) -> Path:
         tied: list[int] = []
         warm = ""  # the learned-roles warm start, for the print
         if isinstance(actor, PolicyNet) and not cfg.resume_critic_only:
+            state = narrow_input(actor, state, saved)
             old = saved.get("role_counts") or ()
             if spec.learned_roles and not saved.get("learned_roles"):
                 # A checkpoint without learned roles: a role it left empty (or lacks)
